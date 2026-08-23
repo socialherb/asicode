@@ -30,6 +30,7 @@ Both directions are asserted. Over-blocking would be its own outage, so the
 in-repo cases (absolute-inside-repo, nested, ``./x``, and ``sub/../x`` which
 normalises back inside) must keep working.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -67,19 +68,20 @@ def _escape_args(target: str):
     """One entry per write tool, each aimed at *target* (outside the repo)."""
     return [
         ("edit_text", {"file_path": target, "old_string": "ORIGINAL", "new_string": PWNED}),
-        ("anchor_edit", {"file_path": target, "anchor_pattern": "ORIGINAL",
-                         "edit_mode": "replace_line", "code_snippet": PWNED}),
-        ("edit_file", {"path": target,
-                       "operations": [{"type": "replace", "anchor": "ORIGINAL", "content": PWNED}]}),
+        (
+            "anchor_edit",
+            {"file_path": target, "anchor_pattern": "ORIGINAL", "edit_mode": "replace_line", "code_snippet": PWNED},
+        ),
+        ("edit_file", {"path": target, "operations": [{"type": "replace", "anchor": "ORIGINAL", "content": PWNED}]}),
         # `file_path` too: raw-argument recovery can populate it instead of `path`.
-        ("edit_file", {"file_path": target,
-                       "operations": [{"type": "replace", "anchor": "ORIGINAL", "content": PWNED}]}),
+        (
+            "edit_file",
+            {"file_path": target, "operations": [{"type": "replace", "anchor": "ORIGINAL", "content": PWNED}]},
+        ),
         ("edit_ast", {"file_path": target, "operation": "replace", "target": "x", "code": PWNED}),
         ("modify_symbol", {"file_path": target, "symbol": "x", "code": PWNED}),
-        ("write_plan", {"plan": {"ops": [{"type": "create_file", "path": target,
-                                          "content": PWNED + "\n"}]}}),
-        ("apply_patch", {"patch": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n"
-                                  f"-ORIGINAL OUTSIDE\n+{PWNED}\n"}),
+        ("write_plan", {"plan": {"ops": [{"type": "create_file", "path": target, "content": PWNED + "\n"}]}}),
+        ("apply_patch", {"patch": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-ORIGINAL OUTSIDE\n+{PWNED}\n"}),
     ]
 
 
@@ -107,25 +109,26 @@ def test_escape_does_not_depend_on_the_trust_flag(sandbox):
     _, repo, victim = sandbox
     reg = ToolRegistry(str(repo), AgentConfig(unrestricted_read=True))
     victim.write_text(OUTSIDE_MARK, encoding="utf-8")
-    reg.dispatch("edit_text", {"file_path": "../outside/victim.txt",
-                               "old_string": "ORIGINAL", "new_string": PWNED})
+    reg.dispatch("edit_text", {"file_path": "../outside/victim.txt", "old_string": "ORIGINAL", "new_string": PWNED})
     assert PWNED not in victim.read_text(encoding="utf-8"), (
         "unrestricted_read must not grant WRITE access outside repo_root"
     )
 
 
-@pytest.mark.parametrize("rel,target", [
-    ("mod.py", "mod.py"),
-    ("./mod.py", "mod.py"),
-    ("sub/../mod.py", "mod.py"),          # normalises back inside the repo
-    ("sub/deep/x.py", "sub/deep/x.py"),
-])
+@pytest.mark.parametrize(
+    "rel,target",
+    [
+        ("mod.py", "mod.py"),
+        ("./mod.py", "mod.py"),
+        ("sub/../mod.py", "mod.py"),  # normalises back inside the repo
+        ("sub/deep/x.py", "sub/deep/x.py"),
+    ],
+)
 def test_in_repo_paths_still_write(sandbox, rel, target):
     """Guard the other direction — over-blocking would break ordinary edits."""
     reg, repo, _ = sandbox
     (repo / target).write_text(GOOD_SRC, encoding="utf-8")
-    res = reg.dispatch("edit_text", {"file_path": rel,
-                                     "old_string": "return 1", "new_string": "return 42"})
+    res = reg.dispatch("edit_text", {"file_path": rel, "old_string": "return 1", "new_string": "return 42"})
     assert res.ok, res.error
     assert "return 42" in (repo / target).read_text(encoding="utf-8")
 
@@ -133,8 +136,9 @@ def test_in_repo_paths_still_write(sandbox, rel, target):
 def test_absolute_path_inside_repo_still_writes(sandbox):
     reg, repo, _ = sandbox
     (repo / "mod.py").write_text(GOOD_SRC, encoding="utf-8")
-    res = reg.dispatch("edit_text", {"file_path": str(repo / "mod.py"),
-                                     "old_string": "return 1", "new_string": "return 42"})
+    res = reg.dispatch(
+        "edit_text", {"file_path": str(repo / "mod.py"), "old_string": "return 1", "new_string": "return 42"}
+    )
     assert res.ok, res.error
     assert "return 42" in (repo / "mod.py").read_text(encoding="utf-8")
 

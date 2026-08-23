@@ -4,7 +4,7 @@ RED→GREEN tests for external_llm/context_builder.py (56% → 100%).
 Real defects found while writing these (fixed in the same change):
   CB-1 fallback target leak: _find_related_files' fallback compared the raw
       ``target_file``, while the preferred path compares
-      normalize_rel_path_fast(target_file).  A "./pkg/__init__.py"-style
+      normalize_rel_path(target_file) (SSOT).  A "./pkg/__init__.py"-style
       target that imports its own package never matched, so the TARGET
       leaked into its own Related Files — its content embedded twice in
       the prompt (defect A class, fallback half).
@@ -16,6 +16,7 @@ Real defects found while writing these (fixed in the same change):
       even when truncation was caused solely by the 5000-line cap of a
       <1 MiB file — a false statement shipped to the model.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -34,6 +35,7 @@ from external_llm.context_builder import (
 
 # ── fixtures / helpers ───────────────────────────────────────────────────────
 
+
 @pytest.fixture(autouse=True)
 def isolated_caches():
     """Both process-wide TTL caches must not leak between tests."""
@@ -51,25 +53,24 @@ def isolated_caches():
 @pytest.fixture
 def builder(tmp_path):
     (tmp_path / "helper.py").write_text("H = 1\n", encoding="utf-8")
-    (tmp_path / "targetmod.py").write_text(
-        "import helper\nfrom other import y\n", encoding="utf-8"
-    )
+    (tmp_path / "targetmod.py").write_text("import helper\nfrom other import y\n", encoding="utf-8")
     (tmp_path / "other.py").write_text("Y = 2\n", encoding="utf-8")
     return EnhancedContextBuilder(str(tmp_path))
 
 
 def _patch_preferred(monkeypatch, selected=None, exc=False):
     """Control the context_collector preferred path of _find_related_files."""
+
     def fake(_root, _target):
         if exc:
             raise RuntimeError("context_collector forced failure")
         return (list(selected or []), {"reason": "forced"})
-    monkeypatch.setattr(
-        "context_collector.collect_related_files_shallow", fake, raising=True
-    )
+
+    monkeypatch.setattr("context_collector.collect_related_files_shallow", fake, raising=True)
 
 
 # ── CB-1 (RED): fallback must exclude a "./"-prefixed target ────────────────
+
 
 def test_fallback_excludes_prefixed_target(builder, tmp_path, monkeypatch):
     """'./pkg/__init__.py' importing its own package must NOT list itself.
@@ -92,6 +93,7 @@ def test_fallback_excludes_prefixed_target(builder, tmp_path, monkeypatch):
 
 # ── CB-2 (RED): related snippets need the same output line cap ──────────────
 
+
 def test_related_snippet_line_capped(builder, tmp_path, monkeypatch):
     """A 5001-line related file (<1 MiB) must be line-capped like the target.
 
@@ -99,9 +101,7 @@ def test_related_snippet_line_capped(builder, tmp_path, monkeypatch):
     snippets embedded the raw head with no line cap — ~1 MiB of prompt per
     related file, dwarfing the target's own ~70-90 KB output bound."""
     long_rel = tmp_path / "bigrel.py"
-    long_rel.write_text(
-        "\n".join(f"LINE_{i}" for i in range(1, 5002)) + "\n", encoding="utf-8"
-    )
+    long_rel.write_text("\n".join(f"LINE_{i}" for i in range(1, 5002)) + "\n", encoding="utf-8")
     assert long_rel.stat().st_size < cb._FILE_CONTEXT_MAX_BYTES  # bytes-bound OK
 
     _patch_preferred(monkeypatch, selected=["bigrel.py"])
@@ -109,38 +109,38 @@ def test_related_snippet_line_capped(builder, tmp_path, monkeypatch):
 
     assert "...[more lines omitted" in ctx
     assert f"showing first {cb._FILE_CONTEXT_MAX_LINES}" in ctx
-    assert "LINE_5001" not in ctx          # beyond the cap: dropped
-    assert "LINE_4999" in ctx              # inside the cap: kept
+    assert "LINE_5001" not in ctx  # beyond the cap: dropped
+    assert "LINE_4999" in ctx  # inside the cap: kept
 
 
 # ── CB-3 (RED): truncation footer must state the true cause ────────────────
 
+
 def test_file_context_line_cap_marker_accurate(builder, tmp_path):
     """Line-cap-only truncation (file < 1 MiB) must NOT claim 'exceeds 1 MiB'."""
     big = tmp_path / "many.py"
-    big.write_text("\n".join(f"x{i} = {i}" for i in range(1, 5002)) + "\n",
-                   encoding="utf-8")
+    big.write_text("\n".join(f"x{i} = {i}" for i in range(1, 5002)) + "\n", encoding="utf-8")
     assert big.stat().st_size < cb._FILE_CONTEXT_MAX_BYTES
 
     ctx = builder._build_file_context("many.py")
 
     assert "more lines omitted" in ctx
-    assert "exceeds 1 MiB" not in ctx      # the false claim (old behavior)
-    assert "5000" in ctx                   # the true cause: the line cap
+    assert "exceeds 1 MiB" not in ctx  # the false claim (old behavior)
+    assert "5000" in ctx  # the true cause: the line cap
 
 
 # ── build_context assembly ──────────────────────────────────────────────────
 
+
 def _seed_git(builder_root: Path, status=True, log=True) -> None:
     if status:
-        cb._git_log_cache[(str(builder_root), 3)] = (
-            "abc1234 fix thing", time.monotonic() + 999.0
-        )
+        cb._git_log_cache[(str(builder_root), 3)] = ("abc1234 fix thing", time.monotonic() + 999.0)
 
 
 def test_build_context_full_assembly(builder, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        cb, "get_git_snapshot",
+        cb,
+        "get_git_snapshot",
         lambda _r: {"status": "M targetmod.py", "branch": "main"},
     )
     _seed_git(builder.repo_root)
@@ -152,10 +152,15 @@ def test_build_context_full_assembly(builder, tmp_path, monkeypatch):
     )
     assert isinstance(out, str)
     # ordered sections
-    assert out.index("# PROJECT CONTEXT FOR CODE EDITING") < out.index("## Git Status") \
-        < out.index("## Target File: `targetmod.py`") < out.index("## Related Files") \
-        < out.index("## Project Structure") < out.index("## User Request") \
+    assert (
+        out.index("# PROJECT CONTEXT FOR CODE EDITING")
+        < out.index("## Git Status")
+        < out.index("## Target File: `targetmod.py`")
+        < out.index("## Related Files")
+        < out.index("## Project Structure")
+        < out.index("## User Request")
         < out.index("## Instructions")
+    )
     assert "M targetmod.py" in out
     assert "abc1234 fix thing" in out
     assert "fix the bug" in out
@@ -165,17 +170,13 @@ def test_build_context_full_assembly(builder, tmp_path, monkeypatch):
 
 def test_build_context_without_git(builder, monkeypatch):
     _patch_preferred(monkeypatch, selected=["helper.py"])
-    out = builder.build_context(
-        user_request="r", target_file="targetmod.py", include_git_context=False
-    )
+    out = builder.build_context(user_request="r", target_file="targetmod.py", include_git_context=False)
     assert "## Git Status" not in out
     assert "## Target File" in out
 
 
 def test_build_context_without_related(builder, monkeypatch):
-    out = builder.build_context(
-        user_request="r", target_file="targetmod.py", include_related_files=False
-    )
+    out = builder.build_context(user_request="r", target_file="targetmod.py", include_related_files=False)
     assert "## Related Files" not in out
     assert "## Target File" in out
 
@@ -195,9 +196,7 @@ def test_build_context_missing_target(builder):
 
 def test_build_context_max_related_cap(builder, monkeypatch):
     _patch_preferred(monkeypatch, selected=["helper.py", "other.py"])
-    out = builder.build_context(
-        user_request="r", target_file="targetmod.py", max_related_files=1
-    )
+    out = builder.build_context(user_request="r", target_file="targetmod.py", max_related_files=1)
     assert "### 1. `helper.py`" in out
     assert "### 2." not in out
 
@@ -208,11 +207,10 @@ def test_context_builder_alias():
 
 # ── _build_git_context ──────────────────────────────────────────────────────
 
+
 def test_git_context_status_and_commits(builder, monkeypatch):
     monkeypatch.setattr(cb, "get_git_snapshot", lambda _r: {"status": "M f"})
-    cb._git_log_cache[(str(builder.repo_root), 3)] = (
-        "deadbee commit", time.monotonic() + 999.0
-    )
+    cb._git_log_cache[(str(builder.repo_root), 3)] = ("deadbee commit", time.monotonic() + 999.0)
     ctx = builder._build_git_context()
     assert "M f" in ctx and "deadbee commit" in ctx and "**Recent Changes**:" in ctx
 
@@ -231,6 +229,7 @@ def test_git_context_empty(builder, monkeypatch):
 
 # ── _fetch_recent_commits (real subprocess) ─────────────────────────────────
 
+
 def test_fetch_recent_commits_real_repo(tmp_path):
     for args in (
         ["git", "init", "-q"],
@@ -242,7 +241,9 @@ def test_fetch_recent_commits_real_repo(tmp_path):
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "-q", "-m", "init commit"],
-        cwd=tmp_path, check=True, capture_output=True,
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
     )
     b = EnhancedContextBuilder(str(tmp_path))
     log = b._fetch_recent_commits(count=3)
@@ -257,6 +258,7 @@ def test_fetch_recent_commits_non_repo(tmp_path):
 def test_fetch_recent_commits_subprocess_exception(builder, monkeypatch):
     def boom(*_a, **_k):
         raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+
     monkeypatch.setattr(cb.subprocess, "run", boom)
     assert builder._fetch_recent_commits(count=3) == ""
 
@@ -267,6 +269,7 @@ def test_cached_git_log_caches_empty_failure_sentinel(builder, monkeypatch):
     def fetch(_count):
         calls["n"] += 1
         return ""
+
     out1 = cb._cached_git_log(builder.repo_root, 3, fetch)
     out2 = cb._cached_git_log(builder.repo_root, 3, fetch)
     assert out1 == "" and out2 == ""
@@ -274,6 +277,7 @@ def test_cached_git_log_caches_empty_failure_sentinel(builder, monkeypatch):
 
 
 # ── _bounded_file_text ──────────────────────────────────────────────────────
+
 
 def test_bounded_small_utf8(tmp_path):
     p = tmp_path / "s.py"
@@ -311,6 +315,7 @@ def test_bounded_big_latin1_fallback(tmp_path):
 
 # ── _build_file_context ─────────────────────────────────────────────────────
 
+
 def test_file_context_numbered_lines(builder):
     ctx = builder._build_file_context("helper.py")
     assert ctx.startswith("```python\n   1 | H = 1\n")
@@ -331,6 +336,7 @@ def test_file_context_missing_file(builder):
 def test_file_context_oserror(builder, monkeypatch):
     def boom(_p, _m=None):
         raise OSError("disk gone")
+
     monkeypatch.setattr(cb, "_bounded_file_text", boom)
     assert builder._build_file_context("helper.py") == ""
 
@@ -338,6 +344,7 @@ def test_file_context_oserror(builder, monkeypatch):
 def test_file_context_broad_exception(builder, monkeypatch):
     def boom(_fn):
         raise RuntimeError("unexpected")
+
     monkeypatch.setattr(builder, "_detect_language", boom)
     assert builder._build_file_context("helper.py") == ""
 
@@ -351,6 +358,7 @@ def test_file_context_byte_truncation_footer(builder, tmp_path):
 
 
 # ── _build_related_files_context ────────────────────────────────────────────
+
 
 def test_related_none(builder, monkeypatch):
     monkeypatch.setattr(builder, "_find_related_files", lambda _t, _m: [])
@@ -369,6 +377,7 @@ def test_related_read_failure_skipped(builder, tmp_path, monkeypatch):
         if Path(p).name == "other.py":
             raise OSError("unreadable")
         return real(p)
+
     monkeypatch.setattr(cb, "_bounded_file_text", flaky)
     _patch_preferred(monkeypatch, selected=["helper.py", "other.py"])
     ctx = builder._build_related_files_context("targetmod.py", max_files=3)
@@ -377,9 +386,7 @@ def test_related_read_failure_skipped(builder, tmp_path, monkeypatch):
 
 
 def test_related_truncated_marker(builder, tmp_path, monkeypatch):
-    (tmp_path / "bigrel2.py").write_text(
-        "z" * (cb._FILE_CONTEXT_MAX_BYTES + 100), encoding="utf-8"
-    )
+    (tmp_path / "bigrel2.py").write_text("z" * (cb._FILE_CONTEXT_MAX_BYTES + 100), encoding="utf-8")
     _patch_preferred(monkeypatch, selected=["bigrel2.py"])
     ctx = builder._build_related_files_context("targetmod.py", max_files=3)
     assert "...[TRUNCATED — head only]..." in ctx
@@ -388,11 +395,13 @@ def test_related_truncated_marker(builder, tmp_path, monkeypatch):
 def test_related_broad_exception(builder, monkeypatch):
     def boom(_t, _m):
         raise RuntimeError("finder broke")
+
     monkeypatch.setattr(builder, "_find_related_files", boom)
     assert builder._build_related_files_context("targetmod.py", max_files=3) == ""
 
 
 # ── _find_related_files: fallback import parsing ────────────────────────────
+
 
 def test_fallback_resolves_imports(builder, monkeypatch):
     _patch_preferred(monkeypatch, selected=[])
@@ -436,6 +445,7 @@ def test_fallback_unsupported_extension(builder, tmp_path, monkeypatch):
 def test_fallback_unreadable_target(builder, monkeypatch):
     def boom(_p, _m=None):
         raise UnicodeDecodeError("utf-8", b"", 0, 1, "bad")
+
     monkeypatch.setattr(cb, "_bounded_file_text", boom)
     _patch_preferred(monkeypatch, selected=[])
     assert builder._find_related_files("targetmod.py", 3) == []
@@ -447,9 +457,7 @@ def test_fallback_max_files_cap(builder, monkeypatch):
 
 
 def test_fallback_dedup(builder, tmp_path, monkeypatch):
-    (tmp_path / "dup.py").write_text(
-        "import helper\nimport helper\nfrom helper import z\n", encoding="utf-8"
-    )
+    (tmp_path / "dup.py").write_text("import helper\nimport helper\nfrom helper import z\n", encoding="utf-8")
     _patch_preferred(monkeypatch, selected=[])
     assert builder._find_related_files("dup.py", 3) == ["helper.py"]
 
@@ -462,12 +470,14 @@ def test_fallback_after_preferred_exception(builder, monkeypatch):
 def test_fallback_broad_exception(builder, monkeypatch):
     def boom(_root, _rel):
         raise RuntimeError("resolve broke")
+
     monkeypatch.setattr(cb, "resolve_inside_repo", boom)
     _patch_preferred(monkeypatch, selected=[])
     assert builder._find_related_files("targetmod.py", 3) == []
 
 
 # ── _get_project_structure_hints ────────────────────────────────────────────
+
 
 def test_hints_skip_dotfiles(builder, tmp_path):
     hidden = tmp_path / ".hidden"
@@ -499,10 +509,11 @@ def test_hints_stale_current_key_rebuilt(builder, tmp_path):
 
 # ── _detect_language / _get_llm_instructions / enhance_user_request ─────────
 
+
 def test_detect_language_map(builder):
     m = builder._detect_language
     assert m("a.py") == "python"
-    assert m("a.JS") == "javascript"     # suffix lower-cased
+    assert m("a.JS") == "javascript"  # suffix lower-cased
     assert m("a.tsx") == "tsx"
     assert m("a.go") == "go"
     assert m("a.rs") == "rust"
@@ -527,9 +538,7 @@ def test_enhance_no_hints_returns_original():
 
 
 def test_enhance_target_and_hints():
-    out = enhance_user_request(
-        "do it  \n", target_file="m.py", extra_hints=["a", "", "b"]
-    )
+    out = enhance_user_request("do it  \n", target_file="m.py", extra_hints=["a", "", "b"])
     assert out.startswith("do it\n\n[HINTS]\n")
     assert "- Target file: m.py" in out
     assert "- a" in out and "- b" in out

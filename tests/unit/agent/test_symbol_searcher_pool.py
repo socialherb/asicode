@@ -86,9 +86,7 @@ def test_salvage_anchor_uses_symbol_search(tmp_path):
     from external_llm.patch_engine import PatchEngine
 
     engine = PatchEngine(str(proj))
-    out = engine._salvage_small_model_output(
-        "+def foo():\n+    return 3\n", "mod.py"
-    )
+    out = engine._salvage_small_model_output("+def foo():\n+    return 3\n", "mod.py")
     assert out is not None
     assert "+def foo():" in out
     # Symbol anchor at line 4: the "import os" context line precedes the
@@ -104,9 +102,7 @@ def test_salvage_anchor_falls_back_to_top_when_symbol_missing(tmp_path):
     from external_llm.patch_engine import PatchEngine
 
     engine = PatchEngine(str(proj))
-    out = engine._salvage_small_model_output(
-        "+def nosuch():\n+    return 3\n", "mod.py"
-    )
+    out = engine._salvage_small_model_output("+def nosuch():\n+    return 3\n", "mod.py")
     assert out is not None
     assert "+def nosuch():" in out
     # Unknown symbol -> fallback anchor 0: the insertion precedes everything.

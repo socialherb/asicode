@@ -13,9 +13,11 @@ The validator enforces the system-prompt rules structurally (character-class
 based — no keyword/regex heuristics). These tests lock that behavior and serve
 as mutation guards: remove any guard and the corresponding test fails.
 """
+
 import asi
 
 # ─── _text_has_hangul ────────────────────────────────────────────────────────
+
 
 def test_text_has_hangul_detects_syllables():
     assert asi._text_has_hangul("개선하자")
@@ -36,15 +38,14 @@ def test_text_has_hangul_rejects_ascii_and_cjk():
 
 # ─── accepted (no false positives) ───────────────────────────────────────────
 
+
 def test_validate_accepts_korean_imperative_for_korean_request():
-    text = asi._validate_next_suggestion(
-        "실패한 테스트 로그를 확인한다", "개선 필요성이 있다면 개선하자")
+    text = asi._validate_next_suggestion("실패한 테스트 로그를 확인한다", "개선 필요성이 있다면 개선하자")
     assert text == "실패한 테스트 로그를 확인한다"
 
 
 def test_validate_accepts_english_for_english_request():
-    text = asi._validate_next_suggestion(
-        "run the failing tests", "refactor the validator")
+    text = asi._validate_next_suggestion("run the failing tests", "refactor the validator")
     assert text == "run the failing tests"
 
 
@@ -56,28 +57,27 @@ def test_validate_accepts_none_for_none_request():
 
 # ─── rejected — the observed bug class ───────────────────────────────────────
 
+
 def test_validate_rejects_english_preamble_for_korean_request():
     """THE regression: the exact ghost sentence observed in the wild must be
     suppressed (returns None) — English reply to a Korean request."""
-    bug = ("First, the user said: '개선 필요성이 있다면 개선하자' "
-           "which is Korean for 'improve if needed.'")
+    bug = "First, the user said: '개선 필요성이 있다면 개선하자' which is Korean for 'improve if needed.'"
     assert asi._validate_next_suggestion(bug, "개선 필요성이 있다면 개선하자") is None
 
 
 def test_validate_rejects_all_ascii_for_hangul_request():
-    assert asi._validate_next_suggestion(
-        "The user wants me to improve the code", "코드를 개선해줘") is None
+    assert asi._validate_next_suggestion("The user wants me to improve the code", "코드를 개선해줘") is None
 
 
 def test_validate_rejects_verbatim_echo_same_language():
     """Same-language guard: a suggestion that quotes the user's request back
     is a past-restatement, not a next step."""
     echo = "다음으로 '개선 필요성이 있다면 개선하자'를 처리합니다"
-    assert asi._validate_next_suggestion(
-        echo, "개선 필요성이 있다면 개선하자") is None
+    assert asi._validate_next_suggestion(echo, "개선 필요성이 있다면 개선하자") is None
 
 
 # ─── rejected — sentinel / shape ─────────────────────────────────────────────
+
 
 def test_validate_rejects_none_sentinel_variants():
     for s in ("NONE", "none", "None.", "NONE!", "none?"):

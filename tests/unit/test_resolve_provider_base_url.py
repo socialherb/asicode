@@ -15,8 +15,11 @@ from external_llm.client import resolve_provider_base_url
 def clean_env(monkeypatch):
     """Strip every base_url-related env var so each test starts from scratch."""
     for k in (
-        "EXTERNAL_LLM_BASE_URL", "EXTERNAL_LLM_PROVIDER",
-        "ZAI_BASE_URL", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL",
+        "EXTERNAL_LLM_BASE_URL",
+        "EXTERNAL_LLM_PROVIDER",
+        "ZAI_BASE_URL",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_BASE_URL",
         "OPENCODE_BASE_URL",
     ):
         monkeypatch.delenv(k, raising=False)
@@ -78,6 +81,7 @@ class TestServiceFactoryDoesNotLeak:
         monkeypatch.setenv("ZAI_API_KEY", "dummy-key")
 
         from external_llm.intelligent_service import create_intelligent_service_from_env
+
         svc = create_intelligent_service_from_env(provider="zai", model="glm-5.2")
         client = svc.llm_service.client if hasattr(svc, "llm_service") else svc.client
         assert type(client).__name__ == "ZAIAnthropicClient"
@@ -93,6 +97,7 @@ class TestServiceFactoryDoesNotLeak:
         monkeypatch.setenv("OPENAI_API_KEY", "dummy-key")
 
         from external_llm.intelligent_service import create_intelligent_service_from_env
+
         svc = create_intelligent_service_from_env(provider="openai", model="deepseek-chat")
         client = svc.llm_service.client if hasattr(svc, "llm_service") else svc.client
         # The matching provider keeps the configured global base_url.

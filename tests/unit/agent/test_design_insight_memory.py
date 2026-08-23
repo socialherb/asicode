@@ -1,4 +1,5 @@
 """Tests for design chat insight memory (save_insight tool + context injection)."""
+
 from __future__ import annotations
 
 import os
@@ -120,18 +121,18 @@ class TestLoadInsights:
         distinguishes Layer 3 by its dedicated header and a unique body tail
         that never fits in the 70-char index line.
         """
-        _BODY = (
-            "FileLockManager uses WeakValueDictionary for lock identity "
-            "cross-request UNIQUE-TAIL-MARKER-ZZZ"
-        )
+        _BODY = "FileLockManager uses WeakValueDictionary for lock identity cross-request UNIQUE-TAIL-MARKER-ZZZ"
         _save_insight_to_file(tmp_repo, "active insight body", "architecture")
-        append_entries_to_archive(tmp_repo, [
-            InsightEntry(
-                lines=["### [architecture] 2026-06-30 13:18\n", _BODY + "\n\n"],
-                header_line="### [architecture] 2026-06-30 13:18",
-                category="architecture",
-            )
-        ])
+        append_entries_to_archive(
+            tmp_repo,
+            [
+                InsightEntry(
+                    lines=["### [architecture] 2026-06-30 13:18\n", _BODY + "\n\n"],
+                    header_line="### [architecture] 2026-06-30 13:18",
+                    category="architecture",
+                )
+            ],
+        )
         stable = load_design_insights(tmp_repo)
         # Active body + Layer 2 index present ...
         assert "active insight body" in stable
@@ -146,20 +147,24 @@ class TestLoadInsights:
         Returns the promoted body when the task overlaps an archived entry, and
         "" (so the message list stays byte-identical / cache-safe) otherwise.
         """
-        append_entries_to_archive(tmp_repo, [
-            InsightEntry(
-                lines=["### [architecture] 2026-06-30 13:18\n",
-                       "FileLockManager uses WeakValueDictionary for lock identity\n\n"],
-                header_line="### [architecture] 2026-06-30 13:18",
-                category="architecture",
-            )
-        ])
+        append_entries_to_archive(
+            tmp_repo,
+            [
+                InsightEntry(
+                    lines=[
+                        "### [architecture] 2026-06-30 13:18\n",
+                        "FileLockManager uses WeakValueDictionary for lock identity\n\n",
+                    ],
+                    header_line="### [architecture] 2026-06-30 13:18",
+                    category="architecture",
+                )
+            ],
+        )
         # No query / non-overlapping → "" (cache-safe: nothing injected).
         assert load_promoted_insights(tmp_repo, "") == ""
         assert load_promoted_insights(tmp_repo, "zzzz totally unrelated qwx") == ""
         # Overlapping query → promoted body with its header.
-        promoted = load_promoted_insights(
-            tmp_repo, "FileLockManager lock identity WeakValueDictionary")
+        promoted = load_promoted_insights(tmp_repo, "FileLockManager lock identity WeakValueDictionary")
         assert "PROMOTED FROM ARCHIVE" in promoted
         assert "WeakValueDictionary" in promoted
 
@@ -181,8 +186,16 @@ class TestFindEntryByMatch:
 
     def test_finds_single_match(self):
         entries = [
-            InsightEntry(lines=["### [arch] 2026-01-01 10:00\n", "body\n\n"], header_line="### [arch] 2026-01-01 10:00", category="arch"),
-            InsightEntry(lines=["### [bug] 2026-01-02 11:00\n", "body\n\n"], header_line="### [bug] 2026-01-02 11:00", category="bug"),
+            InsightEntry(
+                lines=["### [arch] 2026-01-01 10:00\n", "body\n\n"],
+                header_line="### [arch] 2026-01-01 10:00",
+                category="arch",
+            ),
+            InsightEntry(
+                lines=["### [bug] 2026-01-02 11:00\n", "body\n\n"],
+                header_line="### [bug] 2026-01-02 11:00",
+                category="bug",
+            ),
         ]
         idx, err = _find_entry_by_match(entries, "2026-01-02")
         assert idx == 1
@@ -190,7 +203,11 @@ class TestFindEntryByMatch:
 
     def test_no_match(self):
         entries = [
-            InsightEntry(lines=["### [arch] 2026-01-01 10:00\n", "body\n\n"], header_line="### [arch] 2026-01-01 10:00", category="arch"),
+            InsightEntry(
+                lines=["### [arch] 2026-01-01 10:00\n", "body\n\n"],
+                header_line="### [arch] 2026-01-01 10:00",
+                category="arch",
+            ),
         ]
         idx, err = _find_entry_by_match(entries, "2027-01-01")
         assert idx is None
@@ -198,8 +215,16 @@ class TestFindEntryByMatch:
 
     def test_multiple_matches(self):
         entries = [
-            InsightEntry(lines=["### [arch] 2026-01-01 10:00\n", "body\n\n"], header_line="### [arch] 2026-01-01 10:00", category="arch"),
-            InsightEntry(lines=["### [bug] 2026-01-01 10:00\n", "body\n\n"], header_line="### [bug] 2026-01-01 10:00", category="bug"),
+            InsightEntry(
+                lines=["### [arch] 2026-01-01 10:00\n", "body\n\n"],
+                header_line="### [arch] 2026-01-01 10:00",
+                category="arch",
+            ),
+            InsightEntry(
+                lines=["### [bug] 2026-01-01 10:00\n", "body\n\n"],
+                header_line="### [bug] 2026-01-01 10:00",
+                category="bug",
+            ),
         ]
         idx, err = _find_entry_by_match(entries, "2026-01-01")
         assert idx is None
@@ -214,10 +239,16 @@ class TestFindEntryByMatch:
         recover the category, which raised IndexError on such headers.
         """
         entries = [
-            InsightEntry(lines=["### hand-written note one\n", "first body\n\n"],
-                         header_line="### hand-written note one", category=""),
-            InsightEntry(lines=["### hand-written note two\n", "second body\n\n"],
-                         header_line="### hand-written note two", category=""),
+            InsightEntry(
+                lines=["### hand-written note one\n", "first body\n\n"],
+                header_line="### hand-written note one",
+                category="",
+            ),
+            InsightEntry(
+                lines=["### hand-written note two\n", "second body\n\n"],
+                header_line="### hand-written note two",
+                category="",
+            ),
         ]
         idx, err = _find_entry_by_match(entries, "hand-written")
         assert idx is None
@@ -370,8 +401,7 @@ class TestInsightsWriteLockConcurrency:
             t.join()
 
         assert max_active[0] == 1, (
-            f"insights_write_lock allowed {max_active[0]} concurrent holders; "
-            "writers must be serialized"
+            f"insights_write_lock allowed {max_active[0]} concurrent holders; writers must be serialized"
         )
 
     def test_lock_is_reentrant_for_nested_calls(self, tmp_repo):
@@ -413,9 +443,7 @@ class TestInsightsWriteLockConcurrency:
             local: list[str] = []
             for i in range(15):
                 marker = f"UNIQUE_KEEP_{i:03d}"
-                _save_insight_to_file(
-                    tmp_repo, f"body {marker} durable", "architecture"
-                )
+                _save_insight_to_file(tmp_repo, f"body {marker} durable", "architecture")
                 local.append(marker)
             with mlock:
                 saved_markers.extend(local)

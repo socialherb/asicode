@@ -1,6 +1,7 @@
 """
 Tests for ClaudeSession event handling and SessionEvent/SessionResult.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -174,10 +175,12 @@ class TestStreamEventHandling:
         """A raw dict event (no .event attribute) is handled directly."""
         s = ClaudeSession()
         s._events = []
-        s._handle_stream_event({
-            "type": "content_block_delta",
-            "delta": {"type": "text_delta", "text": "hi"},
-        })
+        s._handle_stream_event(
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "hi"},
+            }
+        )
         assert len(s._events) == 1
         assert s._events[0].type == "text"
         assert s._events[0].content == "hi"
@@ -186,10 +189,11 @@ class TestStreamEventHandling:
         """An event object whose .event is a dict is unwrapped correctly."""
         s = ClaudeSession()
         s._events = []
-        s._handle_stream_event(SimpleNamespace(
-            event={"type": "content_block_delta",
-                   "delta": {"type": "text_delta", "text": "x"}},
-        ))
+        s._handle_stream_event(
+            SimpleNamespace(
+                event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}},
+            )
+        )
         assert len(s._events) == 1
         assert s._events[0].content == "x"
 
@@ -232,8 +236,7 @@ class TestQueryTimeout:
         assert "timed out" in (result.error or "").lower()
         assert interrupted["called"] is True
         # interrupt() emits a status event into the failure result
-        assert any(e.type == "status" and e.content == "INTERRUPTED"
-                   for e in result.events)
+        assert any(e.type == "status" and e.content == "INTERRUPTED" for e in result.events)
 
     def test_completes_normally_with_timeout_set(self):
         """A fast stream must complete normally even with a timeout configured.
@@ -298,9 +301,11 @@ class TestEventRetentionCap:
         s = ClaudeSession()
         s._events = []
         for i in range(_MAX_RETAINED_EVENTS + 30):
-            s._handle_stream_event({
-                "type": "content_block_delta",
-                "delta": {"type": "text_delta", "text": f"t{i}"},
-            })
+            s._handle_stream_event(
+                {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": f"t{i}"},
+                }
+            )
         assert len(s._events) == _MAX_RETAINED_EVENTS
         assert s._events[-1].content == f"t{_MAX_RETAINED_EVENTS + 29}"

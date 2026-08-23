@@ -74,9 +74,9 @@ def test_pytest_cmd_detection():
         "py.test foo",
     ]
     negative = [
-        "echo 'pytest' | grep",   # not a head segment
+        "echo 'pytest' | grep",  # not a head segment
         "python3 test_runner.py",  # not pytest
-        "pip install pytest",      # pytest token but not -m pytest
+        "pip install pytest",  # pytest token but not -m pytest
     ]
     for cmd in positive:
         assert _PYTEST_CMD_RE.search(cmd), f"should match: {cmd}"
@@ -164,9 +164,7 @@ def test_user_declines_appends_hint_no_install():
 def test_pip_install_failure_returns_override_error():
     """A failed pip install returns an _override error result."""
     reg = _FakeReg(ask_answer="yes")
-    reg._fake_subprocess_run = lambda cmd, **kw: _RunResult(
-        returncode=1, stdout="", stderr="permission denied"
-    )
+    reg._fake_subprocess_run = lambda cmd, **kw: _RunResult(returncode=1, stdout="", stderr="permission denied")
     with _PatchedRun(lambda *a, **kw: reg._fake_subprocess_run(a[0], **kw)):
         r = reg._maybe_recover_pytest_missing_plugin(
             command="python3 -m pytest --timeout=60",

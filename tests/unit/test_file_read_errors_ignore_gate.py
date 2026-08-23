@@ -14,6 +14,7 @@ gated — stderr/stdout rendering for humans is standard practice there
 (patch_engine error surfaces), and read_bytes().decode() sites carry their
 own documented rationale (patch_synth._read_text_lines).
 """
+
 from __future__ import annotations
 
 import ast
@@ -38,11 +39,7 @@ def _scan_src(src: str, name: str) -> list[str]:
         if not is_file_read:
             continue
         for kw in node.keywords:
-            if (
-                kw.arg == "errors"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value == "ignore"
-            ):
+            if kw.arg == "errors" and isinstance(kw.value, ast.Constant) and kw.value.value == "ignore":
                 out.append(f"{name}:{node.lineno}")
                 break
     return out
@@ -52,9 +49,7 @@ def _production_py_files() -> list[pathlib.Path]:
     files = []
     for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        files.extend(
-            pathlib.Path(dirpath) / f for f in filenames if f.endswith(".py")
-        )
+        files.extend(pathlib.Path(dirpath) / f for f in filenames if f.endswith(".py"))
     return files
 
 
@@ -62,19 +57,18 @@ def test_no_file_read_with_errors_ignore():
     offenders: list[str] = []
     for path in _production_py_files():
         offenders.extend(
-            f"{path.relative_to(_REPO_ROOT)}::{loc}"
-            for loc in _scan_src(path.read_text(encoding="utf-8"), path.name)
+            f"{path.relative_to(_REPO_ROOT)}::{loc}" for loc in _scan_src(path.read_text(encoding="utf-8"), path.name)
         )
     assert not offenders, (
         "open()/read_text() with errors='ignore' silently deletes invalid "
         "UTF-8 bytes, merging adjacent characters (b'pack\\xffage' → "
         "'package') and corrupting prompt context / guard-regex verdicts. "
-        "Use errors='replace' (P23-1/P26-1). Offenders:\n"
-        + "\n".join(offenders)
+        "Use errors='replace' (P23-1/P26-1). Offenders:\n" + "\n".join(offenders)
     )
 
 
 # --- precision: the scanner must flag/pass the right shapes -----------------
+
 
 def test_flags_open_with_errors_ignore():
     assert _scan_src("x = open(p, errors='ignore', encoding='utf-8')\n", "f.py") == ["f.py:1"]

@@ -8,6 +8,7 @@ already used it). The two workers walk the AST read-only — GraphVisitor is an
 ``ast.NodeVisitor`` and _index_file keeps its ``class_names`` map in a side
 table keyed by ``id(node)`` — so sharing one tree object is safe.
 """
+
 import ast
 import sys
 import threading
@@ -57,9 +58,7 @@ def test_extract_file_and_index_file_share_one_parse(tmp_path, monkeypatch):
     after_cgi = len(parses)
 
     assert after_rg == 1, f"extract_file parsed {after_rg} times"
-    assert after_cgi == 1, (
-        f"CGI re-parsed ({after_cgi} total) instead of sharing parse_cache"
-    )
+    assert after_cgi == 1, f"CGI re-parsed ({after_cgi} total) instead of sharing parse_cache"
 
 
 def test_extract_file_results_unchanged_by_routing(tmp_path):
@@ -105,9 +104,7 @@ def test_non_utf8_py_decodes_lossily_and_produces_symbols(tmp_path):
     # parse_cache is the shared decoder — it must not raise and must parse.
     tree = parse_cache.parse_ast(str(f))
     assert tree is not None, "lossy decode must still parse"
-    names = sorted(
-        node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef))
-    )
+    names = sorted(node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef)))
     assert names == ["f"], names
 
     # RepositoryGraph.extract_file agrees (its payload is what gets persisted).

@@ -21,7 +21,6 @@ the first line that catches anything it flags.
 
 What it does NOT cover
 ----------------------
-- ``ruff format``: ~982 format violations remain, not yet gated.
 - Preview rules: the gate runs the STABLE default set only — no ``--select``
   override, because an override would silently disable everything else (the
   RUF100 audit trap: ``ruff check --select RUF100`` re-enables only RUF100 and
@@ -90,21 +89,84 @@ def _get_current_errors(paths: list[str] | None = None) -> list[str]:
     return [line for line in result.stdout.splitlines() if ": " in line]
 
 
+def _get_format_errors(paths: list[str] | None = None) -> list[str]:
+    """Check ``ruff format --check`` — zero-tolerance, no baseline.
+
+    Formatting is now a hard gate: the 848-file backlog was cleared in one
+    round (commits 3de8992d..dfa61d1a), so any file that would be reformatted
+    is a NEW drift.  ``--diff`` output is reported so the developer sees
+    exactly what would change, matching the ``ruff check`` concise-report
+    philosophy.  Like ``_get_current_errors``, this runs with a hard timeout
+    and fails closed.
+    """
+    try:
+        result = subprocess.run(
+            ["ruff", "format", "--check", "--diff"] + (paths or ["."]),
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            "❌ ruff format check timed out after 180s — failing closed rather than risk a silent pass.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except FileNotFoundError:
+        print("❌ ruff not found on PATH — failing closed rather than silently passing.", file=sys.stderr)
+        sys.exit(1)
+    # --diff output: diff body goes to stdout; a nonzero exit code means at
+    # least one file would be reformatted.  The per-file summary line on
+    # stderr ("N file(s) would be reformatted") varies in wording between
+    # single-file and full-repo modes, so key off returncode + the diff
+    # headers ("+++ path") instead of parsing the summary text.
+    if result.returncode == 0:
+        return []
+    out = []
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ "):
+            out.append("Would reformat: " + line[4:].strip())
+    if not out:
+        # No diff headers (e.g. an empty diff) — fall back to the summary.
+        for line in result.stderr.splitlines():
+            if "would be reformatted" in line:
+                out.append(line.strip())
+    return out
+
+
 def main() -> int:
     paths = _resolve_scan_paths([a for a in sys.argv[1:] if not a.startswith("--")])
     errors = _get_current_errors(paths)
-    if not errors:
+    fmt_errors = _get_format_errors(paths)
+    if not errors and not fmt_errors:
         print("✅ ruff check . — 0 violations under the full default rule set (no baseline)")
+        if paths:
+            print("✅ ruff format --check — 0 files would be reformatted")
+        else:
+            print("✅ ruff format --check (full repo) — 0 files would be reformatted")
         return 0
 
-    print(f"❌ {len(errors)} violation(s) under the full default rule set:\n")
-    for err in errors:
-        print(f"  {err}")
-    print(
-        "\nThis gate has NO baseline — the default select set in pyproject.toml is the floor."
-        "\nA violation here means code slipped past review AND the baseline-diff hooks."
-        "\nFix the code — do NOT add an ignore entry or a --select override."
-    )
+    if errors:
+        print(f"❌ {len(errors)} violation(s) under the full default rule set:\n")
+        for err in errors:
+            print(f"  {err}")
+        print(
+            "\nThis gate has NO baseline — the default select set in pyproject.toml is the floor."
+            "\nA violation here means code slipped past review AND the baseline-diff hooks."
+            "\nFix the code — do NOT add an ignore entry or a --select override."
+        )
+    if fmt_errors:
+        print(f"\n❌ {len(fmt_errors)} file(s) would be reformatted by `ruff format` (zero-tolerance):\n")
+        for f in fmt_errors[:50]:
+            print(f"  {f}")
+        if len(fmt_errors) > 50:
+            print(f"  … and {len(fmt_errors) - 50} more")
+        print(
+            "\nThe 848-file format backlog was cleared in one round; any drift is NEW."
+            "\nRun `ruff format <file>` (or `ruff format .` for the whole repo) and commit."
+        )
     return 1
 
 

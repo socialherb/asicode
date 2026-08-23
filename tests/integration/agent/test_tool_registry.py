@@ -1,6 +1,7 @@
 """
 Integration tests for ToolRegistry.
 """
+
 import threading
 from unittest.mock import patch
 
@@ -44,6 +45,8 @@ def test_tool_registry_parallel_dispatch_enabled(tool_registry, agent_config):
     results = registry.dispatch_parallel(tool_calls)
     assert len(results) == 3
     assert all(r.ok for r in results)
+
+
 def test_dispatch_parallel_serializes_ask_user(tool_registry, agent_config):
     """ask_user must NEVER run in parallel — it blocks on human input and relies
     on one-question-at-a-time invariants (unique question_id, atomic question-
@@ -54,6 +57,7 @@ def test_dispatch_parallel_serializes_ask_user(tool_registry, agent_config):
     their millisecond question_id and raced the question counter.
     """
     import time as _time
+
     agent_config.parallel_tool_execution_enabled = True
     registry = ToolRegistry(tool_registry.repo_root, agent_config)
 
@@ -88,8 +92,7 @@ def test_dispatch_parallel_serializes_ask_user(tool_registry, agent_config):
 
     assert len(results) == 3
     # Sequential execution → never more than one tool in flight at once.
-    assert concurrency["max"] == 1, (
-        f"ask_user-containing batch ran concurrently (max={concurrency['max']})")
+    assert concurrency["max"] == 1, f"ask_user-containing batch ran concurrently (max={concurrency['max']})"
 
 
 def test_dispatch_parallel_runs_pure_reads_concurrently(tool_registry, agent_config):
@@ -98,6 +101,7 @@ def test_dispatch_parallel_runs_pure_reads_concurrently(tool_registry, agent_con
     everything.
     """
     import time as _time
+
     agent_config.parallel_tool_execution_enabled = True
     registry = ToolRegistry(tool_registry.repo_root, agent_config)
 
@@ -125,8 +129,7 @@ def test_dispatch_parallel_runs_pure_reads_concurrently(tool_registry, agent_con
         results = registry.dispatch_parallel(tool_calls)
 
     assert len(results) == 3
-    assert concurrency["max"] >= 2, (
-        f"pure-read batch did not parallelize (max={concurrency['max']})")
+    assert concurrency["max"] >= 2, f"pure-read batch did not parallelize (max={concurrency['max']})"
 
 
 def test_dispatch_parallel_job_list_runs_concurrently(tool_registry, agent_config):
@@ -136,6 +139,7 @@ def test_dispatch_parallel_job_list_runs_concurrently(tool_registry, agent_confi
     regardless of action, needlessly collapsing read batches to sequential.
     """
     import time as _time
+
     agent_config.parallel_tool_execution_enabled = True
     registry = ToolRegistry(tool_registry.repo_root, agent_config)
 
@@ -163,14 +167,14 @@ def test_dispatch_parallel_job_list_runs_concurrently(tool_registry, agent_confi
         results = registry.dispatch_parallel(tool_calls)
 
     assert len(results) == 3
-    assert concurrency["max"] >= 2, (
-        f"job-list batch did not parallelize (max={concurrency['max']})")
+    assert concurrency["max"] >= 2, f"job-list batch did not parallelize (max={concurrency['max']})"
 
 
 def test_dispatch_parallel_serializes_job_kill(tool_registry, agent_config):
     """job kill must still force the whole batch sequential — it races with
     concurrent job output on the same job_id."""
     import time as _time
+
     agent_config.parallel_tool_execution_enabled = True
     registry = ToolRegistry(tool_registry.repo_root, agent_config)
 
@@ -201,8 +205,7 @@ def test_dispatch_parallel_serializes_job_kill(tool_registry, agent_config):
         results = registry.dispatch_parallel(tool_calls)
 
     assert len(results) == 2
-    assert concurrency["max"] == 1, (
-        f"job-kill batch ran concurrently (max={concurrency['max']})")
+    assert concurrency["max"] == 1, f"job-kill batch ran concurrently (max={concurrency['max']})"
 
 
 @pytest.mark.xfail(reason="invalid_patch may be transformed into a valid patch by _clean_diff")
@@ -259,7 +262,7 @@ def test_tool_registry_write_plan(tool_registry):
                 "path": "test.txt",
                 "content": "hello world\n",
             }
-        ]
+        ],
     }
     result = tool_registry.dispatch("write_plan", {"plan": full_plan})
     assert result.ok
@@ -306,10 +309,7 @@ def test_tool_registry_apply_patch_hunk_only(tool_registry, sample_patch):
     assert "path" in result.error.lower() or "hunk" in result.error.lower()
 
     # Should succeed with path
-    result = tool_registry.dispatch("apply_patch", {
-        "patch": hunk_only,
-        "path": "sample.py"
-    })
+    result = tool_registry.dispatch("apply_patch", {"patch": hunk_only, "path": "sample.py"})
     assert result.ok
     # Verify the patch was applied
     read_result = tool_registry.dispatch("read_file", {"path": "sample.py"})
@@ -345,19 +345,13 @@ def test_tool_registry_apply_patch_hunk_only_invalid(tool_registry):
  def hello() -> str:
      return "world"
 """
-    result = tool_registry.dispatch("apply_patch", {
-        "patch": hunk_only,
-        "path": "../outside.py"
-    })
+    result = tool_registry.dispatch("apply_patch", {"patch": hunk_only, "path": "../outside.py"})
     assert not result.ok
     # Patch application should reject path traversal
     assert "error:" in result.error or "outside" in result.error
 
     # Invalid: hunk-only with empty path
-    result = tool_registry.dispatch("apply_patch", {
-        "patch": hunk_only,
-        "path": ""
-    })
+    result = tool_registry.dispatch("apply_patch", {"patch": hunk_only, "path": ""})
     assert not result.ok
     # Should complain about missing path
 
@@ -382,9 +376,10 @@ def test_diff_apply_hunk_only(temp_repo_root):
     """Test diff_apply.apply_patch with hunk-only diffs."""
     from unittest.mock import patch
 
-    with patch('config.STRICT_CLEAN', False):
+    with patch("config.STRICT_CLEAN", False):
         # Debug: print file content
         import os
+
         sample_path = os.path.join(temp_repo_root, "sample.py")
         with open(sample_path) as f:
             content = f.read()
@@ -409,6 +404,7 @@ def test_diff_apply_hunk_only(temp_repo_root):
 
         # Reset file (git checkout)
         import subprocess
+
         subprocess.run(["git", "checkout", "--", "sample.py"], cwd=temp_repo_root, capture_output=True, check=False)
 
         # Hunk-only patch (no headers)
@@ -433,7 +429,9 @@ def test_diff_apply_hunk_only(temp_repo_root):
         assert ok, f"Hunk-only patch failed: {msg}"
 
         # Verify the patch was applied
-        diff_proc = subprocess.run(["git", "diff", "sample.py"], cwd=temp_repo_root, capture_output=True, text=True, check=False)
+        diff_proc = subprocess.run(
+            ["git", "diff", "sample.py"], cwd=temp_repo_root, capture_output=True, text=True, check=False
+        )
         assert "def __init__" in diff_proc.stdout
         assert "self.memory = 0" in diff_proc.stdout
 
@@ -447,10 +445,12 @@ class TestBashOutputCap:
 
     def _reg(self, tmp_path):
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+
         return ToolRegistry(repo_root=str(tmp_path), config=AgentConfig())
 
     def _cap(self):
         from external_llm.agent.config.thresholds import config
+
         return config.tokens.BASH_OUTPUT_MAX_CHARS
 
     def test_small_output_not_truncated(self, tmp_path):
@@ -461,18 +461,14 @@ class TestBashOutputCap:
 
     def test_large_ascii_output_capped_at_threshold(self, tmp_path):
         cap = self._cap()
-        r = self._reg(tmp_path)._tool_shell_exec(
-            {"command": f"python3 -c \"print('a'*{cap*3})\""}
-        )
+        r = self._reg(tmp_path)._tool_shell_exec({"command": f"python3 -c \"print('a'*{cap * 3})\""})
         assert r.ok
         assert "truncated" in r.content
         assert cap <= len(r.content) <= cap + 400
 
     def test_cjk_output_capped_below_ascii_threshold(self, tmp_path):
         cap = self._cap()
-        r = self._reg(tmp_path)._tool_shell_exec(
-            {"command": f"python3 -c \"print(chr(44032)*{cap*3})\""}
-        )
+        r = self._reg(tmp_path)._tool_shell_exec({"command": f'python3 -c "print(chr(44032)*{cap * 3})"'})
         assert r.ok
         assert "truncated" in r.content
         assert len(r.content) < cap
@@ -494,6 +490,7 @@ class TestBashShellAutocorrectQuoteAware:
 
     def _reg(self, tmp_path):
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+
         return ToolRegistry(repo_root=str(tmp_path), config=AgentConfig())
 
     def test_sort_V_inside_single_quoted_pattern_not_rewritten(self, tmp_path):
@@ -552,6 +549,7 @@ class TestBashShellAutocorrectQuoteAware:
         assert "a.txt" in r.content
         assert "b.py" in r.content
 
+
 class TestBashShellAutocorrectHeredocAware:
     """Shell-dialect auto-corrections must NEVER rewrite inside a heredoc body.
 
@@ -568,6 +566,7 @@ class TestBashShellAutocorrectHeredocAware:
 
     def _reg(self, tmp_path):
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+
         return ToolRegistry(repo_root=str(tmp_path), config=AgentConfig())
 
     def test_heredoc_body_with_find_comment_runs_unchanged(self, tmp_path):
@@ -583,29 +582,19 @@ class TestBashShellAutocorrectHeredocAware:
         )
         r = self._reg(tmp_path)._tool_shell_exec({"command": cmd})
         assert r.ok, f"heredoc command failed (body was mangled?): {r.error}"
-        assert "OK_END" in r.content          # script ran to completion
+        assert "OK_END" in r.content  # script ran to completion
         assert "-not -path" not in r.content  # no find-exclusion injection
 
     def test_heredoc_body_python_token_not_rewritten(self, tmp_path):
         # `python3` inside the heredoc body (here, echoed) must stay `python3`,
         # not be rewritten to `python3`.
-        cmd = (
-            "python3 << 'PYEOF'\n"
-            "s = 'launch python subprocess'\n"
-            "print('has_python=' + str('python' in s))\n"
-            "PYEOF"
-        )
+        cmd = "python3 << 'PYEOF'\ns = 'launch python subprocess'\nprint('has_python=' + str('python' in s))\nPYEOF"
         r = self._reg(tmp_path)._tool_shell_exec({"command": cmd})
         assert r.ok, f"command failed: {r.error}"
         assert "has_python=True" in r.content
 
     def test_heredoc_body_sort_V_not_rewritten(self, tmp_path):
-        cmd = (
-            "python3 << 'PYEOF'\n"
-            "print('mentions sort -V here')\n"
-            "print('done')\n"
-            "PYEOF"
-        )
+        cmd = "python3 << 'PYEOF'\nprint('mentions sort -V here')\nprint('done')\nPYEOF"
         r = self._reg(tmp_path)._tool_shell_exec({"command": cmd})
         assert r.ok, f"command failed: {r.error}"
         assert "done" in r.content
@@ -614,12 +603,7 @@ class TestBashShellAutocorrectHeredocAware:
 
     def test_bare_delimiter_heredoc_protected(self, tmp_path):
         # `<<EOF` (unquoted delimiter) body must also be protected.
-        cmd = (
-            "python3 << EOF\n"
-            "# find python files\n"
-            "print('BARE_OK')\n"
-            "EOF"
-        )
+        cmd = "python3 << EOF\n# find python files\nprint('BARE_OK')\nEOF"
         r = self._reg(tmp_path)._tool_shell_exec({"command": cmd})
         assert r.ok, f"command failed: {r.error}"
         assert "BARE_OK" in r.content
@@ -646,6 +630,7 @@ class TestHeredocBodyIntervals:
 
     def test_quoted_delimiter(self):
         from external_llm.agent.tool_handlers.git_tools import _heredoc_body_intervals as h
+
         cmd = "python3 << 'PYEOF'\nbody1\nbody2\nPYEOF"
         spans = h(cmd)
         assert len(spans) == 1
@@ -655,20 +640,23 @@ class TestHeredocBodyIntervals:
 
     def test_bare_delimiter(self):
         from external_llm.agent.tool_handlers.git_tools import _heredoc_body_intervals as h
+
         cmd = "cat <<EOF\nhello\nEOF"
         spans = h(cmd)
         assert len(spans) == 1
-        assert "hello" in cmd[spans[0][0]:spans[0][1]]
+        assert "hello" in cmd[spans[0][0] : spans[0][1]]
 
     def test_dash_delimiter_strips_leading_tabs(self):
         from external_llm.agent.tool_handlers.git_tools import _heredoc_body_intervals as h
+
         cmd = "cat <<-DONE\n\tindented\n\tDONE"
         spans = h(cmd)
         assert len(spans) == 1, f"expected 1 span, got {spans}"
-        assert "indented" in cmd[spans[0][0]:spans[0][1]]
+        assert "indented" in cmd[spans[0][0] : spans[0][1]]
 
     def test_unterminated_protects_to_end(self):
         from external_llm.agent.tool_handlers.git_tools import _heredoc_body_intervals as h
+
         cmd = "python3 << 'EOF'\nprint(1)\n# no closer"
         spans = h(cmd)
         assert len(spans) == 1
@@ -676,6 +664,7 @@ class TestHeredocBodyIntervals:
 
     def test_nested_opener_inside_body_treated_as_literal(self):
         from external_llm.agent.tool_handlers.git_tools import _heredoc_body_intervals as h
+
         # A '<<' that appears inside the first heredoc's body is literal text,
         # not a second heredoc opener -> only ONE span.
         cmd = "python3 << 'OUTER'\ns = 'a << INNER'\nprint(s)\nOUTER"
@@ -689,6 +678,7 @@ class TestHeredocBodyIntervals:
         from external_llm.agent.tool_handlers.git_tools import (
             _match_in_quotes,
         )
+
         cmd = "find . -name x << 'EOF'\nbody\nEOF"
         spans = h(cmd)
         # The `find` before the heredoc opener is NOT in the body.
@@ -705,6 +695,7 @@ class TestHeredocBodyIntervals:
 # source of truth shared by cache invalidation, dispatch_parallel's gate, and
 # DesignChatLoop's read/write phase partition.
 
+
 def test_tool_call_mutates_single_source_classifier(tool_registry):
     """_tool_call_mutates is the shared predicate. It must classify every tool
     the same way the cache-invalidation path does (it replaced that path's
@@ -715,17 +706,32 @@ def test_tool_call_mutates_single_source_classifier(tool_registry):
     assert reg._tool_call_mutates("edit_text", {}) is True
     assert reg._tool_call_mutates("write_plan", {}) is True
     # Mutating bash → True (write tokens / git state change / redirection).
-    for cmd in ["rm -rf build", "git commit -am x", "echo hi > out.txt",
-                "sed -i 's/a/b/' f.py", "mkdir newdir", "touch f",
-                "git checkout -b feat", "pip install x", "tar -xf a.tgz"]:
+    for cmd in [
+        "rm -rf build",
+        "git commit -am x",
+        "echo hi > out.txt",
+        "sed -i 's/a/b/' f.py",
+        "mkdir newdir",
+        "touch f",
+        "git checkout -b feat",
+        "pip install x",
+        "tar -xf a.tgz",
+    ]:
         assert reg._tool_call_mutates("bash", {"command": cmd}) is True, cmd
     # Read-only bash → False (stays in the parallel read phase).
-    for cmd in ["ls -la", "git status", "git diff", "git log", "grep foo .",
-                "cat f.py", "find . -name x", "wc -l f.py"]:
+    for cmd in [
+        "ls -la",
+        "git status",
+        "git diff",
+        "git log",
+        "grep foo .",
+        "cat f.py",
+        "find . -name x",
+        "wc -l f.py",
+    ]:
         assert reg._tool_call_mutates("bash", {"command": cmd}) is False, cmd
     # Pure read tools → False.
-    for name in ("read_file", "find_symbol", "grep", "get_file_outline",
-                 "find_references", "get_project_info"):
+    for name in ("read_file", "find_symbol", "grep", "get_file_outline", "find_references", "get_project_info"):
         assert reg._tool_call_mutates(name, {}) is False, name
     # Empty/missing command → not mutating (no write token).
     assert reg._tool_call_mutates("bash", {}) is False
@@ -737,6 +743,7 @@ def test_dispatch_parallel_sequential_for_mutating_bash(tool_registry, agent_con
     execution — it would race with concurrent reads/other bash if
     parallelized."""
     import time as _time
+
     agent_config.parallel_tool_execution_enabled = True
     registry = ToolRegistry(tool_registry.repo_root, agent_config)
 
@@ -764,14 +771,14 @@ def test_dispatch_parallel_sequential_for_mutating_bash(tool_registry, agent_con
         results = registry.dispatch_parallel(tool_calls)
 
     assert len(results) == 3
-    assert concurrency["max"] == 1, (
-        f"mutating-bash batch ran concurrently (max={concurrency['max']})")
+    assert concurrency["max"] == 1, f"mutating-bash batch ran concurrently (max={concurrency['max']})"
 
 
 def test_dispatch_parallel_keeps_readonly_bash_parallel(tool_registry, agent_config):
     """Guard against over-serialization: read-only bash (ls, git status) has no
     side effects and MUST still parallelize."""
     import time as _time
+
     agent_config.parallel_tool_execution_enabled = True
     registry = ToolRegistry(tool_registry.repo_root, agent_config)
 
@@ -799,8 +806,7 @@ def test_dispatch_parallel_keeps_readonly_bash_parallel(tool_registry, agent_con
         results = registry.dispatch_parallel(tool_calls)
 
     assert len(results) == 3
-    assert concurrency["max"] >= 2, (
-        f"read-only-bash batch did not parallelize (max={concurrency['max']})")
+    assert concurrency["max"] >= 2, f"read-only-bash batch did not parallelize (max={concurrency['max']})"
 
 
 def test_dispatch_parallel_cancel_during_wait_propagates(tool_registry, agent_config):

@@ -25,6 +25,7 @@ from external_llm.client import LLMMessage
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
+
 def make_msg(role: str, content: str, **kwargs) -> LLMMessage:
     return LLMMessage(role=role, content=content, **kwargs)
 
@@ -51,6 +52,7 @@ def _bare_manager(model: str = "test") -> ContextBudgetManager:
 def _tiny_limit(limit: int):
     """Force a tiny LIVE context limit for the duration of a with-block."""
     from unittest.mock import patch
+
     return patch("external_llm.agent.context_budget._resolve_context_limit", return_value=limit)
 
 
@@ -63,6 +65,7 @@ def _clear_overrides() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. _resolve_context_limit (dynamic Ollama API query + 1M fallback)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestResolveContextLimit:
     def test_gpt4o_returns_128k(self):
@@ -196,6 +199,7 @@ class TestResolveContextLimit:
 # 1b. _record_context_overflow (reactive backstop override)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestContextOverflowOverride:
     """Verify the reactive backstop: context-length 400 → reduced limit."""
 
@@ -247,8 +251,10 @@ class TestContextOverflowOverride:
         # And the message cap at that floor is actually usable, not the 512
         # collapse: floor - max reserve - tool schemas == MIN_USABLE_MESSAGE_BUDGET.
         from external_llm.agent._shared_utils import MIN_USABLE_MESSAGE_BUDGET, context_message_cap
+
         cap = context_message_cap(
-            limit, 1024,
+            limit,
+            1024,
             tool_tokens=_structural_window_floor() - 4096 - MIN_USABLE_MESSAGE_BUDGET,
         )
         assert cap >= MIN_USABLE_MESSAGE_BUDGET
@@ -300,6 +306,7 @@ class TestContextBudgetManagerLiveLimits:
 # 2. estimate_tokens (ContextBudgetManager)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestEstimateTokens:
     def test_empty_string_returns_zero(self):
         assert ContextBudgetManager.estimate_tokens("") == 0
@@ -335,6 +342,7 @@ class TestEstimateTokens:
 # 3. estimate_messages_tokens
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestEstimateMessagesTokens:
     def setup_method(self):
         self.mgr = make_manager()
@@ -348,9 +356,9 @@ class TestEstimateMessagesTokens:
 
     def test_multiple_messages_sum(self):
         msgs = [
-            make_msg("system", "a" * 350),   # 176
-            make_msg("user", "a" * 700),      # max(700//3, 700//2)+1 = 351
-            make_msg("assistant", "a" * 350), # 176
+            make_msg("system", "a" * 350),  # 176
+            make_msg("user", "a" * 700),  # max(700//3, 700//2)+1 = 351
+            make_msg("assistant", "a" * 350),  # 176
         ]
         assert self.mgr.estimate_messages_tokens(msgs) == 703
 
@@ -385,6 +393,7 @@ class TestEstimateMessagesTokens:
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. fit_messages
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestFitMessages:
     def _make_manager_with_tiny_budget(self) -> ContextBudgetManager:
@@ -516,7 +525,7 @@ class TestFitMessages:
             result = mgr.fit_messages(msgs)
         # All messages preserved — tool message kept alongside assistant
         assert len(result) == 4
-        assert any(getattr(m, 'role', '') == 'tool' and getattr(m, 'content', '') == 'tool result' for m in result)
+        assert any(getattr(m, "role", "") == "tool" and getattr(m, "content", "") == "tool result" for m in result)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -527,6 +536,7 @@ class TestFitMessages:
 # This is intentional: truncating tool results causes the LLM to re-issue the
 # same tool calls, wasting more tokens than the truncation saves.
 # SlidingWindowContext handles context management via summarisation.
+
 
 class TestNoTruncation:
     """Verify that fit_messages does NOT truncate any content."""
@@ -574,11 +584,10 @@ class TestNoTruncation:
         assert len(result) == 100
 
 
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. ContextBudgetManager initialisation
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestContextBudgetManagerInit:
     def test_total_budget_equals_limit_minus_reserve(self):
@@ -606,6 +615,7 @@ class TestContextBudgetManagerInit:
 # ══════════════════════════════════════════════════════════════════════════════
 # 9. repair_tool_message_sequence
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestRepairToolMessageSequence:
     """repair_tool_message_sequence enforces the tool-call → tool-response invariant."""
@@ -707,6 +717,7 @@ class TestRepairToolMessageSequence:
 # 10. SlidingWindowContext hysteresis cadence
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestSlidingWindowHysteresis:
     """Verify that SlidingWindowContext hysteresis prevents cache thrashing.
 
@@ -739,8 +750,7 @@ class TestSlidingWindowHysteresis:
         # Without hysteresis, every turn past 60 would trim = ~140 trims.
         naive_events = 200 - 60  # what would happen without hysteresis
         assert len(trim_events) <= 16, (
-            f"Hysteresis cadence broken: {len(trim_events)} trims "
-            f"(naive = {naive_events}), expected ≤ 16"
+            f"Hysteresis cadence broken: {len(trim_events)} trims (naive = {naive_events}), expected ≤ 16"
         )
         assert len(trim_events) >= 1, "No trim ever fired — hysteresis too aggressive?"
 
@@ -766,9 +776,6 @@ class TestSlidingWindowHysteresis:
         assert remaining[-1].content == "msg_99"
 
 
-
-
-
 class TestIsContextLengthError:
     """Verify _is_context_length_error pattern matching.
 
@@ -781,95 +788,65 @@ class TestIsContextLengthError:
 
     def test_openai_style_max_context(self):
         """OpenAI: 'maximum context length is X tokens, but you sent Y'"""
-        assert _is_context_length_error(Exception(
-            "maximum context length is 128000 tokens, but you sent 145000"
-        ))
+        assert _is_context_length_error(Exception("maximum context length is 128000 tokens, but you sent 145000"))
 
     def test_deepseek_context_exceeded(self):
         """DeepSeek: 'context length exceeded'"""
-        assert _is_context_length_error(Exception(
-            "context length exceeded: prompt has N tokens, limit M"
-        ))
+        assert _is_context_length_error(Exception("context length exceeded: prompt has N tokens, limit M"))
 
     def test_deepseek_too_large_with_token(self):
         """DeepSeek: 'too large' when near 'token'"""
-        assert _is_context_length_error(Exception(
-            "Input token limit exceeded: request too large"
-        ))
+        assert _is_context_length_error(Exception("Input token limit exceeded: request too large"))
 
     def test_glm_context_window_too_small(self):
         """GLM/ZAI: code 1305 'context window is too small'"""
-        assert _is_context_length_error(Exception(
-            "1305: context window is too small"
-        ))
+        assert _is_context_length_error(Exception("1305: context window is too small"))
 
     def test_anthropic_prompt_too_long(self):
         """Anthropic: 'prompt is too long'"""
-        assert _is_context_length_error(Exception(
-            "prompt is too long: your prompt of N tokens exceeds M"
-        ))
+        assert _is_context_length_error(Exception("prompt is too long: your prompt of N tokens exceeds M"))
 
     def test_max_length_alone_not_matched(self):
         """'max_length' alone (pydantic/JSON-schema validation 400) must NOT match."""
-        assert not _is_context_length_error(Exception(
-            "String should have at most 4096 characters (max_length)"
-        ))
+        assert not _is_context_length_error(Exception("String should have at most 4096 characters (max_length)"))
 
     def test_reduce_length(self):
         """Generic: 'reduce length' in error message"""
-        assert _is_context_length_error(Exception(
-            "Please reduce length: prompt exceeds context window"
-        ))
+        assert _is_context_length_error(Exception("Please reduce length: prompt exceeds context window"))
 
     def test_prompt_length_narrow(self):
         """'prompt length' in error message"""
-        assert _is_context_length_error(Exception(
-            "Prompt length exceeds model capacity"
-        ))
+        assert _is_context_length_error(Exception("Prompt length exceeds model capacity"))
 
     def test_context_window_narrow(self):
         """'context window' in error message"""
-        assert _is_context_length_error(Exception(
-            "The context window is full"
-        ))
+        assert _is_context_length_error(Exception("The context window is full"))
 
     # ── True negatives: non-context errors must NOT match ─────────────────────
 
     def test_image_too_large_not_matched(self):
         """Image size 400: 'image too large' must NOT match (no context term)."""
-        assert not _is_context_length_error(Exception(
-            "image too large: maximum image size is 20MB"
-        ))
+        assert not _is_context_length_error(Exception("image too large: maximum image size is 20MB"))
 
     def test_request_entity_too_large_not_matched(self):
         """413/400: 'request entity too large' must NOT match."""
-        assert not _is_context_length_error(Exception(
-            "request entity too large: payload exceeds maximum"
-        ))
+        assert not _is_context_length_error(Exception("request entity too large: payload exceeds maximum"))
 
     def test_filename_too_long_not_matched(self):
         """400: 'filename too long' must NOT match."""
-        assert not _is_context_length_error(Exception(
-            "filename too long: path exceeds 255 characters"
-        ))
+        assert not _is_context_length_error(Exception("filename too long: path exceeds 255 characters"))
 
     def test_auth_error_not_matched(self):
         """Auth 401: no context terms."""
-        assert not _is_context_length_error(Exception(
-            "Incorrect API key provided"
-        ))
+        assert not _is_context_length_error(Exception("Incorrect API key provided"))
 
     def test_rate_limit_not_matched(self):
         """Rate limit 429: no context terms."""
-        assert not _is_context_length_error(Exception(
-            "Rate limit exceeded: too many requests"
-        ))
+        assert not _is_context_length_error(Exception("Rate limit exceeded: too many requests"))
 
     def test_malformed_json_not_matched(self):
         """Malformed payload 400: no context terms."""
-        assert not _is_context_length_error(Exception(
-            "Invalid JSON in request body"
-        ))
+        assert not _is_context_length_error(Exception("Invalid JSON in request body"))
 
     def test_empty_exception_not_matched(self):
         """Empty or very short message should not match."""
@@ -877,16 +854,12 @@ class TestIsContextLengthError:
         assert not _is_context_length_error(Exception("ok"))
 
     def test_too_large_orphan_not_matched(self):
-        """"too large" without context/token/prompt nearby must NOT match."""
-        assert not _is_context_length_error(Exception(
-            "Payload too large"
-        ))
+        """ "too large" without context/token/prompt nearby must NOT match."""
+        assert not _is_context_length_error(Exception("Payload too large"))
 
     def test_too_long_orphan_not_matched(self):
-        """"too long" without context/token/prompt nearby must NOT match."""
-        assert not _is_context_length_error(Exception(
-            "Value too long for column"
-        ))
+        """ "too long" without context/token/prompt nearby must NOT match."""
+        assert not _is_context_length_error(Exception("Value too long for column"))
 
 
 class TestContextOverflowOverrideExtended:
@@ -936,9 +909,11 @@ class TestContextOverflowOverrideExtended:
         _record_context_overflow("gpt-4o", estimated_prompt_tokens=None)
         assert _resolve_context_limit("gpt-4o") == max(8192, base * 3 // 4)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. Override TTL, reduction cap, and meta integrity
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestOverrideTTLAndCap:
     """Verify TTL expiry, reduction cap, and override metadata."""
@@ -991,6 +966,7 @@ class TestOverrideTTLAndCap:
 # 8. End-to-end wiring: override → resolve → context_message_cap → trim
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestOverrideEndToEndWiring:
     """Verify the full pipeline: override → resolve → cap computation.
 
@@ -1004,6 +980,7 @@ class TestOverrideEndToEndWiring:
     def test_override_affects_cap(self):
         """After override, the hard cap returned by context_message_cap changes."""
         from external_llm.agent._shared_utils import context_message_cap
+
         model = "gpt-4o"
         base_limit = _resolve_base_context_limit(model)
         safety = 4096
@@ -1035,18 +1012,19 @@ class TestContextMessageCapImpossibleBudget:
             _IMPOSSIBLE_BUDGET_WARNED,
             context_message_cap,
         )
+
         _IMPOSSIBLE_BUDGET_WARNED.clear()
         with caplog.at_level(logging.ERROR, logger="external_llm.agent._shared_utils"):
             cap = context_message_cap(8192, 1024, tool_tokens=21_737)
         assert cap == 512  # floor preserved — behavior unchanged
         assert any(
-            "structurally impossible" in r.getMessage()
-            and "8192" in r.getMessage() and "21737" in r.getMessage()
+            "structurally impossible" in r.getMessage() and "8192" in r.getMessage() and "21737" in r.getMessage()
             for r in caplog.records
         ), "impossible budget was not diagnosed"
 
     def test_no_log_when_budget_usable(self, caplog):
         from external_llm.agent._shared_utils import context_message_cap
+
         with caplog.at_level(logging.ERROR, logger="external_llm.agent._shared_utils"):
             cap = context_message_cap(128_000, 4096, tool_tokens=21_737)
         assert cap == 128_000 - 4096 - 21_737
@@ -1057,6 +1035,7 @@ class TestContextMessageCapImpossibleBudget:
 # 9. P1/P2/P3 regression: proportional headroom, stale-estimate convergence,
 #    no-progress detection at reduction cap
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestOverrideRegression:
     """Regression tests for reactive backstop edge cases (P1/P2/P3/P5)."""
@@ -1143,16 +1122,18 @@ class TestOverrideRegression:
 # fix, tool_use.input and tool_result.content were silently counted as 0
 # tokens, defeating the pre-trim guard for those providers.
 
+
 class TestEstimateTokensFromMsgsNativeToolPayload:
     """Verify that estimate_tokens_from_msgs counts native tool payloads."""
 
     def test_tool_use_input_dict_counted(self):
         """tool_use block with dict input contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="",
-            raw_content=[{"type": "tool_use", "name": "bash",
-                          "input": {"command": "ls -la /very/long/path"}}],
+            role="assistant",
+            content="",
+            raw_content=[{"type": "tool_use", "name": "bash", "input": {"command": "ls -la /very/long/path"}}],
         )
         est = estimate_tokens_from_msgs([msg])
         # content="" → 0; tool_use "bash" name ~3 tokens; input dict JSON ~30 chars → ~10 tokens
@@ -1162,11 +1143,12 @@ class TestEstimateTokensFromMsgsNativeToolPayload:
     def test_tool_use_input_str_counted(self):
         """tool_use block with string input contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         large_input = "x" * 5000
         msg = LLMMessage(
-            role="assistant", content="",
-            raw_content=[{"type": "tool_use", "name": "read_file",
-                          "input": large_input}],
+            role="assistant",
+            content="",
+            raw_content=[{"type": "tool_use", "name": "read_file", "input": large_input}],
         )
         est = estimate_tokens_from_msgs([msg])
         # content="" → 0; name "read_file" ~4 tokens; large_input: CJK-aware: max(5000//3, 5000//2)+1 = 5000//2+1 = 2501
@@ -1175,9 +1157,11 @@ class TestEstimateTokensFromMsgsNativeToolPayload:
     def test_tool_result_content_str_counted(self):
         """tool_result block with string content contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         large_content = "Y" * 10000
         msg = LLMMessage(
-            role="user", content="",
+            role="user",
+            content="",
             raw_content=[{"type": "tool_result", "content": large_content}],
         )
         est = estimate_tokens_from_msgs([msg])
@@ -1187,15 +1171,19 @@ class TestEstimateTokensFromMsgsNativeToolPayload:
     def test_tool_result_content_list_counted(self):
         """tool_result block with list of text sub-blocks contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="user", content="",
-            raw_content=[{
-                "type": "tool_result",
-                "content": [
-                    {"type": "text", "text": "line1"},
-                    {"type": "text", "text": "line2 " * 500},
-                ],
-            }],
+            role="user",
+            content="",
+            raw_content=[
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {"type": "text", "text": "line1"},
+                        {"type": "text", "text": "line2 " * 500},
+                    ],
+                }
+            ],
         )
         est = estimate_tokens_from_msgs([msg])
         # "line1" (5 chars) + "line2 " * 500 (3000 chars) = 3005 chars
@@ -1205,8 +1193,10 @@ class TestEstimateTokensFromMsgsNativeToolPayload:
     def test_tool_use_without_input_zero_impact(self):
         """tool_use block without input does not add arbitrary tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="hi",
+            role="assistant",
+            content="hi",
             raw_content=[{"type": "tool_use", "name": "bash"}],  # no 'input' key
         )
         est = estimate_tokens_from_msgs([msg])
@@ -1217,8 +1207,10 @@ class TestEstimateTokensFromMsgsNativeToolPayload:
     def test_content_skipped_when_raw_content_present(self):
         """Plain .content is NOT counted when raw_content exists (avoids double-count)."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="Hello world",
+            role="assistant",
+            content="Hello world",
             raw_content=[{"type": "tool_use", "name": "bash", "input": {"cmd": "ls"}}],
         )
         est = estimate_tokens_from_msgs([msg])
@@ -1237,21 +1229,22 @@ class TestEstimateTokensFromMsgsNativeToolPayload:
     def test_estimate_messages_tokens_matches_shared(self):
         """ContextBudgetManager.estimate_messages_tokens delegates to shared function."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs as shared_est
+
         msg = LLMMessage(
-            role="assistant", content="test",
+            role="assistant",
+            content="test",
             raw_content=[{"type": "tool_use", "name": "bash", "input": {"cmd": "echo 1"}}],
         )
         mgr = make_manager()
         delegate = mgr.estimate_messages_tokens([msg])
         direct = shared_est([msg])
-        assert delegate == direct, (
-            f"estimate_messages_tokens ({delegate}) != estimate_tokens_from_msgs ({direct})"
-        )
+        assert delegate == direct, f"estimate_messages_tokens ({delegate}) != estimate_tokens_from_msgs ({direct})"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 12. P5: TTL-aware reduction cap — expired meta resets reductions counter
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestOverrideTTLAwareReductionCap:
     """Verify that _record_context_overflow resets reductions when TTL expired.
@@ -1308,6 +1301,7 @@ class TestOverrideTTLAwareReductionCap:
 # 13. P4: Force cache save (skip debounce)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 @pytest.fixture
 def cache_file():
     """The override-cache path, emptied first so existence is a real signal.
@@ -1321,6 +1315,7 @@ def cache_file():
     import pathlib
 
     import external_llm.agent.context_budget as cb
+
     path = pathlib.Path(cb._OVERRIDE_CACHE_FILE)
     if path.exists():
         path.unlink()
@@ -1342,6 +1337,7 @@ def _enter_debounce_window(monkeypatch):
     in the same domain or the diff sign flips.
     """
     import external_llm.agent.context_budget as cb
+
     monkeypatch.setattr(cb, "_last_cache_save", time.monotonic())
 
 
@@ -1355,6 +1351,7 @@ class TestOverrideCacheForceSave:
         """force=True writes to disk even within the debounce window."""
         import external_llm.agent.context_budget as cb
         from external_llm.agent.context_budget import _save_override_cache
+
         _enter_debounce_window(monkeypatch)
         cb._override_dirty = True  # dirty process — a flush is legitimate
         _save_override_cache(force=True)
@@ -1370,6 +1367,7 @@ class TestOverrideCacheForceSave:
         """
         import external_llm.agent.context_budget as cb
         from external_llm.agent.context_budget import _save_override_cache
+
         _enter_debounce_window(monkeypatch)
         cb._override_dirty = True  # dirty process — the guard must not suppress these
         _save_override_cache(force=False)
@@ -1381,9 +1379,8 @@ class TestOverrideCacheForceSave:
         """force=False DOES write once the interval has passed — otherwise the
         test above would also pass against a save that never writes at all."""
         import external_llm.agent.context_budget as cb
-        monkeypatch.setattr(
-            cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1
-        )
+
+        monkeypatch.setattr(cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1)
         cb._override_dirty = True  # dirty process — write is legitimate
         cb._save_override_cache(force=False)
         assert cache_file.exists()
@@ -1399,22 +1396,22 @@ class TestOverrideCacheForceSave:
         still fire because the debounce elapsed in the monotonic domain.
         """
         import external_llm.agent.context_budget as cb
+
         # Pin wall-clock to the distant past (simulated NTP backward step).
         monkeypatch.setattr(cb.time, "time", lambda: 0.0)
         # Place _last_cache_save one interval ago in the MONOTONIC domain.
-        monkeypatch.setattr(
-            cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1
-        )
+        monkeypatch.setattr(cb, "_last_cache_save", time.monotonic() - cb._CACHE_SAVE_INTERVAL - 1)
         cb._override_dirty = True  # dirty process — write is legitimate
         cb._save_override_cache(force=False)
         assert cache_file.exists(), (
-            "wall-clock backward jump suppressed a force=False save; "
-            "debounce must use time.monotonic()"
+            "wall-clock backward jump suppressed a force=False save; debounce must use time.monotonic()"
         )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 13. P2: Override cache snapshot under lock (thread safety)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestOverrideCacheSnapshotSafety:
     """Verify _save_override_cache snapshots _override_meta under the lock."""
@@ -1442,6 +1439,7 @@ class TestOverrideCacheSnapshotSafety:
         t.join(timeout=2)
         # Also call from inside the lock (as _record_context_overflow does)
         from external_llm.agent.context_budget import _override_lock
+
         with _override_lock:
             _save_override_cache(force=True)
         # No file cleanup: the cache_file fixture points at tmp_path.
@@ -1452,19 +1450,21 @@ class TestOverrideCacheSnapshotSafety:
 # 14. P3: Per-message token estimate caching
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestMsgTokenCache:
     """Verify _estimate_single_message_tokens caches per-message results."""
 
     def test_cache_reuses_estimate(self):
         """Same LLMMessage returns cached value on second call."""
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
+
         msg = LLMMessage(role="user", content="Hello world test message")
         first = _estimate_single_message_tokens(msg)
         # Second call should use cache
         second = _estimate_single_message_tokens(msg)
         assert first == second
         # Verify cache attribute was set
-        assert getattr(msg, '_msg_token_estimate', None) == first
+        assert getattr(msg, "_msg_token_estimate", None) == first
 
     def test_plain_dict_does_not_cache(self):
         """Plain dict messages are handled without caching (no __dict__).
@@ -1475,19 +1475,21 @@ class TestMsgTokenCache:
         correctly estimated while caching remains opt-in for LLMMessage objects.
         """
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
+
         msg = {"role": "user", "content": "hello"}
         est = _estimate_single_message_tokens(msg)
         assert est > 0  # dict content is now correctly estimated
         # Plain dict should NOT have the cache attribute (no __dict__)
-        assert not hasattr(msg, '_msg_token_estimate')
+        assert not hasattr(msg, "_msg_token_estimate")
 
     def test_estimate_tokens_from_msgs_uses_cache(self):
         """estimate_tokens_from_msgs benefits from cached per-message estimates."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="",
-            raw_content=[{"type": "tool_use", "name": "read_file",
-                          "input": {"path": "/very/long/path/to/file.txt"}}],
+            role="assistant",
+            content="",
+            raw_content=[{"type": "tool_use", "name": "read_file", "input": {"path": "/very/long/path/to/file.txt"}}],
         )
         # First call computes and caches
         est1 = estimate_tokens_from_msgs([msg])
@@ -1501,6 +1503,7 @@ class TestMsgTokenCache:
         on copy-on-write; this pins the fingerprint guard added to close that
         latent landmine."""
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
+
         msg = LLMMessage(role="user", content="short message")
         before = _estimate_single_message_tokens(msg)
         # Mutate in-place — no copy-on-write, simulating a future mutator that
@@ -1509,12 +1512,13 @@ class TestMsgTokenCache:
         after = _estimate_single_message_tokens(msg)
         assert after > before, "stale cached estimate returned after in-place mutation"
         # And the cached value was refreshed (matches the recomputed count).
-        assert getattr(msg, '_msg_token_estimate', None) == after
+        assert getattr(msg, "_msg_token_estimate", None) == after
 
     def test_cache_survives_unchanged_message(self):
         """The fingerprint guard must NOT spuriously invalidate an unchanged
         message — otherwise the cache is useless and json.dumps runs every call."""
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
+
         msg = LLMMessage(role="user", content="stable content")
         first = _estimate_single_message_tokens(msg)
         # Touch an unrelated attribute; must not bust the cache.
@@ -1527,6 +1531,7 @@ class TestMsgTokenCache:
 # 15. P4: ContextBudgetManager tool-schema accounting
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestContextBudgetManagerToolSchemas:
     """Verify ContextBudgetManager deducts tool-schema tokens from budget."""
 
@@ -1534,8 +1539,7 @@ class TestContextBudgetManagerToolSchemas:
         """With tool_schemas, total_budget is lower than without."""
         mgr_no_ts = ContextBudgetManager("gpt-4o", reserve_for_output=4096)
         schemas = [{"name": "read_file", "description": "x" * 500}]
-        mgr_ts = ContextBudgetManager("gpt-4o", reserve_for_output=4096,
-                                      tool_schemas=schemas)
+        mgr_ts = ContextBudgetManager("gpt-4o", reserve_for_output=4096, tool_schemas=schemas)
         assert mgr_ts.total_budget < mgr_no_ts.total_budget
 
     def test_tool_schemas_none_same_budget(self):
@@ -1557,6 +1561,7 @@ class TestContextBudgetManagerToolSchemas:
 # 16. P6a: Environment variable overrides for TTL / max reductions
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestEnvOverrideConstants:
     """Verify CONTEXT_OVERRIDE_TTL / CONTEXT_MAX_REDUCTIONS env vars work.
 
@@ -1568,11 +1573,13 @@ class TestEnvOverrideConstants:
     def test_ttl_default_is_1800(self):
         """CONTEXT_OVERRIDE_TTL defaults to 1800 seconds."""
         from external_llm.agent.context_budget import _OVERRIDE_TTL_SECONDS
+
         assert _OVERRIDE_TTL_SECONDS == 1800
 
     def test_max_reductions_default_is_3(self):
         """CONTEXT_MAX_REDUCTIONS defaults to 3."""
         from external_llm.agent.context_budget import _MAX_OVERRIDE_REDUCTIONS
+
         assert _MAX_OVERRIDE_REDUCTIONS == 3
 
     # NOTE: the predecessor of the tests below re-implemented the parse *in the
@@ -1594,14 +1601,14 @@ class TestEnvOverrideConstants:
         import sys
 
         r = subprocess.run(
-            [sys.executable, "-c",
-             f"import external_llm.agent.context_budget as m; print(m.{const})"],
-            capture_output=True, text=True, timeout=120,
+            [sys.executable, "-c", f"import external_llm.agent.context_budget as m; print(m.{const})"],
+            capture_output=True,
+            text=True,
+            timeout=120,
             check=False,  # returncode asserted below for a stderr-rich failure message
             env={**os.environ, env_name: value},
         )
-        assert r.returncode == 0, (
-            f"import aborted with {env_name}={value!r}:\n{r.stderr[-600:]}")
+        assert r.returncode == 0, f"import aborted with {env_name}={value!r}:\n{r.stderr[-600:]}"
         return r.returncode, r.stdout.strip()
 
     @pytest.mark.parametrize("bad", ["", " ", "abc", "1800.5", "0", "-5"])
@@ -1645,18 +1652,21 @@ class TestEnvOverrideConstants:
 # 17. P6b: _is_context_length_error error_code attribute detection
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestIsContextLengthErrorExtended:
     """Verify _is_context_length_error checks error_code attribute."""
 
     def test_error_code_1305_with_context_text(self):
         """error_code=1305 with 'context window' text is detected."""
         from external_llm.agent.context_budget import _is_context_length_error
+
         err = Exception("1305: context window is too small")
         assert _is_context_length_error(err)
 
     def test_error_code_1305_too_small_narrow_pattern(self):
-        """"too small" narrow pattern catches GLM context errors."""
+        """ "too small" narrow pattern catches GLM context errors."""
         from external_llm.agent.context_budget import _is_context_length_error
+
         err = Exception("context window is too small")
         assert _is_context_length_error(err)
 
@@ -1664,6 +1674,7 @@ class TestIsContextLengthErrorExtended:
         """error_code=1305 on exception with context terms is detected."""
         from external_llm.agent.context_budget import _is_context_length_error
         from external_llm.client import LLMRateLimitError
+
         err = LLMRateLimitError(
             "too small context window",
             error_code=1305,
@@ -1678,6 +1689,7 @@ class TestIsContextLengthErrorExtended:
         # This test uses "overloaded" text which has no context-related terms.
         from external_llm.agent.context_budget import _is_context_length_error
         from external_llm.client import LLMRateLimitError
+
         err = LLMRateLimitError(
             "server overloaded, please retry",
             error_code=1305,
@@ -1687,11 +1699,13 @@ class TestIsContextLengthErrorExtended:
         # context-related terms — none present → False.
         assert not _is_context_length_error(err)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 14. P1/P2: Reasoning content, thinking blocks, Gemini native tool payloads
 # ══════════════════════════════════════════════════════════════════════════════
 # These fields were silently counted as 0 prior to the fix, repeating the same
 # under-count pattern as tool_use/tool_result blocks in the previous P1 round.
+
 
 class TestEstimatorReasoningAndThinking:
     """Verify that non-text fields (reasoning_content, thinking, functionCall) are counted."""
@@ -1699,8 +1713,10 @@ class TestEstimatorReasoningAndThinking:
     def test_reasoning_content_counted(self):
         """reasoning_content attribute (DeepSeek reasoner) contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="summary",
+            role="assistant",
+            content="summary",
             reasoning_content="Step 1: think deeply... " * 300,  # ~7200 chars
         )
         est = estimate_tokens_from_msgs([msg])
@@ -1711,6 +1727,7 @@ class TestEstimatorReasoningAndThinking:
     def test_reasoning_content_none_is_noop(self):
         """LLMMessage without reasoning_content does not add spurious tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(role="assistant", content="short")
         est = estimate_tokens_from_msgs([msg])
         # "short"(5 chars) → max(5//3, 5//2)+1 = max(1,2)+1 = 3
@@ -1719,8 +1736,10 @@ class TestEstimatorReasoningAndThinking:
     def test_thinking_block_counted(self):
         """Anthropic/zai 'thinking' block in raw_content contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="final answer",
+            role="assistant",
+            content="final answer",
             raw_content=[
                 {"type": "thinking", "thinking": "Let me reason step by step... " * 100},  # ~3000 chars
                 {"type": "text", "text": "final answer"},
@@ -1737,8 +1756,10 @@ class TestEstimatorReasoningAndThinking:
     def test_redacted_thinking_block_counted(self):
         """Anthropic/zai 'redacted_thinking' block with data contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="",
+            role="assistant",
+            content="",
             raw_content=[
                 {"type": "redacted_thinking", "data": "opaque_signature_payload_here " * 50},  # ~1500 chars
             ],
@@ -1750,11 +1771,15 @@ class TestEstimatorReasoningAndThinking:
     def test_function_call_block_counted(self):
         """Gemini-native functionCall block in raw_content contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="assistant", content="",
-            raw_content=[{
-                "functionCall": {"name": "bash", "args": {"command": "ls -la /"}},
-            }],
+            role="assistant",
+            content="",
+            raw_content=[
+                {
+                    "functionCall": {"name": "bash", "args": {"command": "ls -la /"}},
+                }
+            ],
         )
         est = estimate_tokens_from_msgs([msg])
         # functionCall JSON: {"name":"bash","args":{"command":"ls -la /"}}
@@ -1765,19 +1790,25 @@ class TestEstimatorReasoningAndThinking:
     def test_function_response_block_counted(self):
         """Gemini-native functionResponse block in raw_content contributes tokens."""
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         msg = LLMMessage(
-            role="user", content="",
-            raw_content=[{
-                "functionResponse": {"name": "bash", "response": {"content": "ls output here " * 200}},
-            }],
+            role="user",
+            content="",
+            raw_content=[
+                {
+                    "functionResponse": {"name": "bash", "response": {"content": "ls output here " * 200}},
+                }
+            ],
         )
         est = estimate_tokens_from_msgs([msg])
         # functionResponse JSON ~3500 chars → 3500//3 + 1 = 1167
         assert est > 1000, f"Expected >1000 tokens for functionResponse block, got {est}"
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 12. P1/P2/P3 regression tests from external analysis
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestP1TooSmallPattern:
     """P1 regression: 'too small' without context terms must NOT match."""
@@ -1854,12 +1885,12 @@ class TestEstimateToolSchemasCache:
             _tool_schema_token_cache,
             estimate_tokens_from_tool_schemas,
         )
+
         schemas = [{"name": "test", "description": "a tool"}]
         # Clear any prior cache entries
         _tool_schema_token_cache.clear()
 
-        with patch.object(_su.json, "dumps",
-                          wraps=_su.json.dumps) as mock_dumps:
+        with patch.object(_su.json, "dumps", wraps=_su.json.dumps) as mock_dumps:
             first = estimate_tokens_from_tool_schemas(schemas)
             second = estimate_tokens_from_tool_schemas(schemas)
 
@@ -1872,14 +1903,13 @@ class TestEstimateToolSchemasCache:
             _tool_schema_token_cache,
             estimate_tokens_from_tool_schemas,
         )
+
         _tool_schema_token_cache.clear()
         # Create 12 unique list objects (cache max is 8)
         lists = [[{"n": i}] for i in range(12)]
         for lst in lists:
             estimate_tokens_from_tool_schemas(lst)
-        assert len(_tool_schema_token_cache) <= 8, (
-            f"Cache must be bounded, got {len(_tool_schema_token_cache)}"
-        )
+        assert len(_tool_schema_token_cache) <= 8, f"Cache must be bounded, got {len(_tool_schema_token_cache)}"
 
 
 class TestRawContentTypeGuard:
@@ -1888,12 +1918,14 @@ class TestRawContentTypeGuard:
     def test_non_list_raw_content_counts_content(self):
         """raw_content=str should NOT skip content (type violation guard)."""
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
+
         msg = LLMMessage(role="user", content="Hello world test message")
         # Inject a string raw_content (type violation — should be list | None)
         msg.raw_content = "stray string, not a list"  # type: ignore[assignment]
         est = _estimate_single_message_tokens(msg)
         # Content should still be counted (~3 chars/token → 24/3=8)
         assert est >= 4, f"Content must be counted, got {est}"
+
 
 class TestToolRegistryMemo:
     """P1: Non-Python lang_filter must return same object across calls (memoized).
@@ -1906,22 +1938,20 @@ class TestToolRegistryMemo:
     def test_get_tool_schemas_memoizes_filtered_list(self):
         """Same lang_filter returns the SAME list object (memoized)."""
         from external_llm.agent.tool_registry import LanguageId, ToolRegistry
+
         reg = object.__new__(ToolRegistry)
         r1 = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
         r2 = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
-        assert r1 is r2, (
-            "Filtered tool schemas must be the same object (id() stability for cache)"
-        )
+        assert r1 is r2, "Filtered tool schemas must be the same object (id() stability for cache)"
 
     def test_get_tool_names_memoizes_filtered_set(self):
         """Same lang_filter returns the SAME frozenset (memoized)."""
         from external_llm.agent.tool_registry import LanguageId, ToolRegistry
+
         reg = object.__new__(ToolRegistry)
         n1 = reg.get_tool_names(lang_filter=LanguageId.TYPESCRIPT)
         n2 = reg.get_tool_names(lang_filter=LanguageId.TYPESCRIPT)
-        assert n1 is n2, (
-            "Filtered tool names must be the same object (id() stability)"
-        )
+        assert n1 is n2, "Filtered tool names must be the same object (id() stability)"
 
     def test_no_filter_still_uses_a_shared_constant(self):
         """lang_filter=None returns a shared module-level list, not a per-call copy.
@@ -1938,6 +1968,7 @@ class TestToolRegistryMemo:
             DESIGN_CHAT_ONLY_TOOL_NAMES,
             TOOL_SCHEMA_VARIANTS,
         )
+
         reg = object.__new__(ToolRegistry)
         result = reg.get_tool_schemas(lang_filter=None)
         assert result is TOOL_SCHEMA_VARIANTS[(True, False)]
@@ -1956,6 +1987,7 @@ class TestToolRegistryMemo:
         object per variant instead of one per registry.
         """
         from external_llm.agent.tool_registry import LanguageId, ToolRegistry
+
         reg = object.__new__(ToolRegistry)
         reg._repo_language = LanguageId.TYPESCRIPT
         parent_result = reg.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT)
@@ -1975,6 +2007,7 @@ class TestEstimatorReasoningContentNonStr:
     def test_non_str_reasoning_uses_cjk_aware(self):
         """Non-string reasoning_content (e.g. bytes) should go through _cjk_aware_tokens."""
         from external_llm.agent._shared_utils import _cjk_aware_tokens, _estimate_single_message_tokens
+
         # Create a message with non-str reasoning_content (e.g. bytes)
         msg = LLMMessage(role="user", content="hello")
         # bytes object is not str — hits the fallback branch
@@ -1987,13 +2020,13 @@ class TestEstimatorReasoningContentNonStr:
         expected = _cjk_aware_tokens(str(msg.reasoning_content))
         # The estimate should be close to the CJK-aware count (not //3 under-count)
         assert est >= expected * 0.8, (
-            f"Non-str reasoning_content must use CJK-aware estimator, "
-            f"got {est}, _cjk_aware_tokens(expected)={expected}"
+            f"Non-str reasoning_content must use CJK-aware estimator, got {est}, _cjk_aware_tokens(expected)={expected}"
         )
 
     def test_str_reasoning_unaffected(self):
         """String reasoning_content continues to use _cjk_aware_tokens directly."""
         from external_llm.agent._shared_utils import _cjk_aware_tokens, _estimate_single_message_tokens
+
         msg = LLMMessage(role="user", content="hello")
         msg.reasoning_content = "This is a reasoning trace with 한글 text"
         est = _estimate_single_message_tokens(msg)
@@ -2017,6 +2050,7 @@ class TestToolSchemaTokenCacheEviction:
             _tool_schema_token_cache,
             estimate_tokens_from_tool_schemas,
         )
+
         _tool_schema_token_cache.clear()
         # Distinct-content schemas (distinct name-sets) are required now that the
         # key is a content fingerprint (len, names) rather than id(): nameless or
@@ -2065,6 +2099,7 @@ class TestEstimatorImageOcrAccounting:
 
     def test_cache_invalidated_when_ocr_text_written_in_place(self):
         from external_llm.agent._shared_utils import _estimate_single_message_tokens
+
         msg = LLMMessage(role="user", content="")
         msg.images = [{"data": "x", "media_type": "image/png"}]
         before = _estimate_single_message_tokens(msg)
@@ -2081,6 +2116,7 @@ class TestEstimatorImageOcrAccounting:
             _IMAGE_BLOCK_TOKEN_ESTIMATE,
             _estimate_single_message_tokens,
         )
+
         msg = LLMMessage(role="user", content="")
         msg.images = [{"data": "x", "ocr_text": "hi"}]
         assert _estimate_single_message_tokens(msg) == _IMAGE_BLOCK_TOKEN_ESTIMATE
@@ -2091,6 +2127,7 @@ class TestEstimatorImageOcrAccounting:
             _IMAGE_BLOCK_TOKEN_ESTIMATE,
             _estimate_single_message_tokens,
         )
+
         msg = LLMMessage(role="user", content="")
         msg.images = [{"data": "x"}, "not-a-dict", None]
         assert _estimate_single_message_tokens(msg) == 3 * _IMAGE_BLOCK_TOKEN_ESTIMATE
@@ -2112,16 +2149,24 @@ class TestImagesStayInMemory:
         # Any dump/serialize call whose argument mentions `.images` or an
         # images key would show up as these two tokens on one line.
         hits = subprocess.run(
-            ["git", "grep", "-nE",
-             r"(json\.dump|asdict|pickle\.dump|\.model_dump).*images",
-             "--", "external_llm", "webapp"],
-            cwd=repo, capture_output=True, text=True, timeout=30,
+            [
+                "git",
+                "grep",
+                "-nE",
+                r"(json\.dump|asdict|pickle\.dump|\.model_dump).*images",
+                "--",
+                "external_llm",
+                "webapp",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
             check=False,
         )
         assert hits.stdout == "", (
             "LLMMessage.images may now be persisted — see the invariant note on "
-            "LLMMessage.images in external_llm/client.py before allowing this:\n"
-            + hits.stdout
+            "LLMMessage.images in external_llm/client.py before allowing this:\n" + hits.stdout
         )
 
 
@@ -2144,6 +2189,7 @@ def test_resolve_context_limit_delegates_to_base(monkeypatch):
 # 14. Cross-process safety: dirty guard + merge-on-write
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestOverrideCacheCrossProcessSafety:
     """Verify the two cross-process mechanisms on the shared override cache:
 
@@ -2159,6 +2205,7 @@ class TestOverrideCacheCrossProcessSafety:
 
     def teardown_method(self):
         import external_llm.agent.context_budget as cb
+
         _clear_overrides()
         cb._override_dirty = False
 
@@ -2166,6 +2213,7 @@ class TestOverrideCacheCrossProcessSafety:
     def _write_disk(cache_file, data: dict) -> None:
         """Simulate another process having persisted ``data`` to disk."""
         import json
+
         cache_file.write_text(json.dumps(data), encoding="utf-8")
 
     def test_clean_process_force_flush_writes_nothing(self, cache_file, monkeypatch):
@@ -2174,6 +2222,7 @@ class TestOverrideCacheCrossProcessSafety:
         import json
 
         import external_llm.agent.context_budget as cb
+
         _entry = {"limit": 64_000, "ts": time.time(), "reductions": 1}
         self._write_disk(cache_file, {"other-model": _entry})
         cb._override_dirty = False  # clean process
@@ -2186,6 +2235,7 @@ class TestOverrideCacheCrossProcessSafety:
         import json
 
         import external_llm.agent.context_budget as cb
+
         _entry = {"limit": 64_000, "ts": time.time(), "reductions": 1}
         self._write_disk(cache_file, {"other-model": _entry})
         cb._override_dirty = False
@@ -2198,6 +2248,7 @@ class TestOverrideCacheCrossProcessSafety:
         import json
 
         import external_llm.agent.context_budget as cb
+
         _disk_entry = {"limit": 100_000, "ts": time.time(), "reductions": 0}
         self._write_disk(cache_file, {"disk-model": _disk_entry})
         _enter_debounce_window(monkeypatch)  # keep dirty=True until the flush
@@ -2214,6 +2265,7 @@ class TestOverrideCacheCrossProcessSafety:
         import json
 
         import external_llm.agent.context_budget as cb
+
         _disk_ts = time.time() + 3600  # written after our in-memory entry
         self._write_disk(cache_file, {"gpt-4o": {"limit": 32_000, "ts": _disk_ts, "reductions": 3}})
         _enter_debounce_window(monkeypatch)
@@ -2230,6 +2282,7 @@ class TestOverrideCacheCrossProcessSafety:
         import json
 
         import external_llm.agent.context_budget as cb
+
         _stale_ts = time.time() - 100  # valid TTL, but older than ours
         self._write_disk(cache_file, {"gpt-4o": {"limit": 32_000, "ts": _stale_ts, "reductions": 3}})
         _enter_debounce_window(monkeypatch)
@@ -2243,6 +2296,7 @@ class TestOverrideCacheCrossProcessSafety:
         """R2: the (model, server) pair must reach the base-limit resolver so
         the /api/show lookup hits the SAME server that returned the 400."""
         import external_llm.agent.context_budget as cb
+
         seen: list = []
 
         def _fake_base(model, base_url=None):
@@ -2257,6 +2311,7 @@ class TestOverrideCacheCrossProcessSafety:
         """Legacy call sites (no known server) pass None — the resolver's
         default-server path is preserved."""
         import external_llm.agent.context_budget as cb
+
         seen: list = []
 
         def _fake_base(model, base_url=None):
@@ -2271,6 +2326,7 @@ class TestOverrideCacheCrossProcessSafety:
 # ══════════════════════════════════════════════════════════════════════════════
 # RED→GREEN: 오버라이드 캐시 예외/ollama num_ctx/에러코드/repair 시퀀스 잔여
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestOverrideCacheFailurePaths:
     """_read_override_cache/_save_override_cache의 best-effort 예외 브랜치."""
@@ -2304,10 +2360,14 @@ class TestOverrideCacheFailurePaths:
 
         f = tmp_path / "cache.json"
         # ts가 문자열 → _now - ts TypeError → 개별 항목 스킵 (나머지는 보존)
-        f.write_text(json.dumps({
-            "bad": {"limit": 1000, "ts": "yesterday"},
-            "good": {"limit": 2000, "ts": time.time()},
-        }))
+        f.write_text(
+            json.dumps(
+                {
+                    "bad": {"limit": 1000, "ts": "yesterday"},
+                    "good": {"limit": 2000, "ts": time.time()},
+                }
+            )
+        )
         monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(f))
         out = cb._read_override_cache()
         assert "bad" not in out
@@ -2397,10 +2457,14 @@ class TestRepairAnthropicRemaining:
     def test_orphan_anthropic_tool_result_text_blocks_preserved(self):
         msgs = [
             make_msg("user", "task"),
-            make_msg("user", "", raw_content=[
-                {"type": "tool_result", "tool_use_id": "tu1", "content": "out"},
-                {"type": "text", "text": "keep me"},
-            ]),
+            make_msg(
+                "user",
+                "",
+                raw_content=[
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "out"},
+                    {"type": "text", "text": "keep me"},
+                ],
+            ),
             make_msg("assistant", "done"),
         ]
         result = repair_tool_message_sequence(msgs)
@@ -2413,9 +2477,13 @@ class TestRepairAnthropicRemaining:
     def test_orphan_anthropic_tool_result_without_text_dropped(self):
         msgs = [
             make_msg("user", "task"),
-            make_msg("user", "", raw_content=[
-                {"type": "tool_result", "tool_use_id": "tu1", "content": "out"},
-            ]),
+            make_msg(
+                "user",
+                "",
+                raw_content=[
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "out"},
+                ],
+            ),
         ]
         result = repair_tool_message_sequence(msgs)
         assert len(result) == 1
@@ -2425,12 +2493,22 @@ class TestRepairAnthropicRemaining:
         import logging
 
         msgs = [
-            make_msg("assistant", "", tool_calls=[{"id": "tc1"}], raw_content=[
-                {"type": "tool_use", "id": "tc2", "name": "read_file"},
-            ]),
-            make_msg("tool", "r1", tool_call_id="tc1", raw_content=[
-                {"type": "tool_result", "tool_use_id": "tc3", "content": "x"},
-            ]),
+            make_msg(
+                "assistant",
+                "",
+                tool_calls=[{"id": "tc1"}],
+                raw_content=[
+                    {"type": "tool_use", "id": "tc2", "name": "read_file"},
+                ],
+            ),
+            make_msg(
+                "tool",
+                "r1",
+                tool_call_id="tc1",
+                raw_content=[
+                    {"type": "tool_result", "tool_use_id": "tc3", "content": "x"},
+                ],
+            ),
             make_msg("user", "follow-up"),
         ]
         with caplog.at_level(logging.WARNING):
@@ -2443,9 +2521,14 @@ class TestRepairAnthropicRemaining:
     def test_expected_ids_from_raw_content_tool_use_blocks(self):
         # 표준 tool_calls + Anthropic tool_use 블록이 모두 expected에 포함
         msgs = [
-            make_msg("assistant", "", tool_calls=[{"id": "tc1"}], raw_content=[
-                {"type": "tool_use", "id": "tu1", "name": "bash"},
-            ]),
+            make_msg(
+                "assistant",
+                "",
+                tool_calls=[{"id": "tc1"}],
+                raw_content=[
+                    {"type": "tool_use", "id": "tu1", "name": "bash"},
+                ],
+            ),
             make_msg("tool", "r1", tool_call_id="tc1"),
             make_msg("tool", "r2", tool_call_id="tu1"),
         ]
@@ -2465,9 +2548,13 @@ class TestEnsureOverrideCacheLoaded:
         import external_llm.agent.context_budget as cb
 
         f = tmp_path / "cache.json"
-        f.write_text(json.dumps({
-            "m1": {"limit": 12345, "ts": time.time()},
-        }))
+        f.write_text(
+            json.dumps(
+                {
+                    "m1": {"limit": 12345, "ts": time.time()},
+                }
+            )
+        )
         monkeypatch.setattr(cb, "_OVERRIDE_CACHE_FILE", str(f))
         _clear_overrides()
         cb._ensure_override_cache_loaded()

@@ -37,11 +37,13 @@ _FP = {"common", "utils", "external_llm", "asi"}
 
 class TestThirdPartySkipClassifier:
     def test_pure_third_party_missing_is_skipped(self):
-        err = "\n".join([
-            "Traceback (most recent call last):",
-            '  File "<string>", line 1, in <module>',
-            "ModuleNotFoundError: No module named 'requests'",
-        ])
+        err = "\n".join(
+            [
+                "Traceback (most recent call last):",
+                '  File "<string>", line 1, in <module>',
+                "ModuleNotFoundError: No module named 'requests'",
+            ]
+        )
         assert g._third_party_only_missing(err, _FP) == {"requests"}
 
     def test_dotted_third_party_reduces_to_top_segment(self):
@@ -62,15 +64,16 @@ class TestThirdPartySkipClassifier:
         # Imports run top-down and the FIRST failure wins, so a first-party
         # miss anywhere in the chain must surface, never be masked by an
         # earlier/better-known third-party one.
-        err = "\n".join([
-            "ModuleNotFoundError: No module named 'requests'",
-            "ModuleNotFoundError: No module named 'common'",
-        ])
+        err = "\n".join(
+            [
+                "ModuleNotFoundError: No module named 'requests'",
+                "ModuleNotFoundError: No module named 'common'",
+            ]
+        )
         assert g._third_party_only_missing(err, _FP) is None
 
     def test_cannot_import_name_is_real_failure(self):
-        err = ("ImportError: cannot import name 'resolve_inside_repo' "
-               "from 'path_security'")
+        err = "ImportError: cannot import name 'resolve_inside_repo' from 'path_security'"
         assert g._third_party_only_missing(err, _FP) is None
 
     def test_non_module_errors_are_real_failures(self):
@@ -82,14 +85,12 @@ class TestThirdPartySkipClassifier:
 class TestIndexMaterializationIncludesSiblingModules:
     """End-to-end guard for the v0.2.21~24 phantom failures (Fix A)."""
 
-    def test_tmp_copy_carries_root_siblings_and_resolves_imports(
-            self, monkeypatch, tmp_path):
+    def test_tmp_copy_carries_root_siblings_and_resolves_imports(self, monkeypatch, tmp_path):
         repo = tmp_path / "repo"
         (repo / "external_llm").mkdir(parents=True)
         (repo / "common.py").write_text("NAME = 'common'\n", encoding="utf-8")
         (repo / "external_llm" / "__init__.py").write_text("", encoding="utf-8")
-        (repo / "external_llm" / "svc.py").write_text(
-            "from common import NAME\nVALUE = NAME\n", encoding="utf-8")
+        (repo / "external_llm" / "svc.py").write_text("from common import NAME\nVALUE = NAME\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
         monkeypatch.setattr(g, "REPO", repo)
@@ -102,7 +103,9 @@ class TestIndexMaterializationIncludesSiblingModules:
             # the root-level sibling WAS materialized next to it
             assert (tmp / "common.py").exists()
             proc = subprocess.run(
-                [sys.executable, "-c",
-                 "import external_llm.svc as m; assert m.VALUE == 'common'"],
-                cwd=tmp, capture_output=True, check=False)
+                [sys.executable, "-c", "import external_llm.svc as m; assert m.VALUE == 'common'"],
+                cwd=tmp,
+                capture_output=True,
+                check=False,
+            )
             assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")

@@ -187,6 +187,7 @@ class TestRunBoundedSubprocess:
 
 # ── source-level guard: the bare-subprocess.run regression must not return ──
 
+
 def test_no_timeoutless_subprocess_run_in_target_files():
     """Static guard: no target file may reintroduce a bare blocking subprocess call.
 
@@ -205,8 +206,10 @@ def test_no_timeoutless_subprocess_run_in_target_files():
         "diff_apply.py",
     ]
     blocking = {
-        "subprocess.run", "subprocess.check_output",
-        "subprocess.check_call", "subprocess.call",
+        "subprocess.run",
+        "subprocess.check_output",
+        "subprocess.check_call",
+        "subprocess.call",
     }
     offenders = []
     for path in targets:
@@ -221,16 +224,13 @@ def test_no_timeoutless_subprocess_run_in_target_files():
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if not (isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "subprocess"):
+            if not (
+                isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "subprocess"
+            ):
                 continue
             call = f"subprocess.{func.attr}"
             if call not in blocking:
                 continue
             if not any(kw.arg == "timeout" for kw in node.keywords):
                 offenders.append(f"{path}:{node.lineno} ({call})")
-    assert not offenders, (
-        "timeout-less blocking subprocess call reintroduced (hang risk): "
-        + ", ".join(offenders)
-    )
+    assert not offenders, "timeout-less blocking subprocess call reintroduced (hang risk): " + ", ".join(offenders)

@@ -8,17 +8,14 @@ walk (external_llm/analysis/scan_walk.py) and the other workers already
 skipped ``vendor`` — this aligns the graph with the rest of the repo's
 walkers.
 """
+
 from external_llm.graph.repository_graph import RepositoryGraph
 
 
 def test_build_skips_vendor_dir_and_minified_bundles(tmp_path, monkeypatch):
     (tmp_path / "vendor").mkdir()
-    (tmp_path / "vendor" / "dep.js").write_text(
-        "export function dep() {}\n", encoding="utf-8"
-    )
-    (tmp_path / "bundle.min.js").write_text(
-        "export function minfn() {}\n", encoding="utf-8"
-    )
+    (tmp_path / "vendor" / "dep.js").write_text("export function dep() {}\n", encoding="utf-8")
+    (tmp_path / "bundle.min.js").write_text("export function minfn() {}\n", encoding="utf-8")
     (tmp_path / "app.js").write_text("export function app() {}\n", encoding="utf-8")
 
     g = RepositoryGraph(str(tmp_path))
@@ -31,9 +28,7 @@ def test_build_skips_vendor_dir_and_minified_bundles(tmp_path, monkeypatch):
 
 def test_vendor_dir_skipped_for_python_too(tmp_path):
     (tmp_path / "vendor").mkdir()
-    (tmp_path / "vendor" / "vendored.py").write_text(
-        "def dead():\n    pass\n", encoding="utf-8"
-    )
+    (tmp_path / "vendor" / "vendored.py").write_text("def dead():\n    pass\n", encoding="utf-8")
     (tmp_path / "real.py").write_text("def real():\n    pass\n", encoding="utf-8")
 
     g = RepositoryGraph(str(tmp_path))
@@ -65,9 +60,7 @@ def test_reparse_file_honors_walk_skip(tmp_path):
     # Write tool reports the pruned paths as touched -> reparse must skip them.
     g.reparse_file(str(pkg / "m.py"))
     g.reparse_file(str(tmp_path / "lib.min.js"))
-    assert {s.name for s in g.symbols.values()} == build_symbols, (
-        "incremental path diverged from build"
-    )
+    assert {s.name for s in g.symbols.values()} == build_symbols, "incremental path diverged from build"
 
     # A full rebuild must be a no-op against the already-correct state.
     g.build()

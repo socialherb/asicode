@@ -7,6 +7,7 @@ mutation happens in place (the same response is returned), a dict subclass
 that rejects the key is left untouched, and a response object without a
 settable ``tool_calls`` attribute degrades silently instead of raising.
 """
+
 from __future__ import annotations
 
 from external_llm.agent._response_utils import replace_tool_calls

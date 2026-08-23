@@ -5,6 +5,7 @@ of the missing surface (lines ~787-1518). Strategy: fake LLM client (chat
 capture + scripted responses) + config-driven fake PatchEngine / ASTRewriter /
 symbol searcher / SemanticPatchEngine / SuperContextBuilder.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ _FILE_BLOCK = "FILE: x.txt\n```python\nold\nnew\n```\n"
 # fakes
 # ---------------------------------------------------------------------------
 
+
 class _FakeClient:
     """Scripted LLM client. chat() pops the next response (last one repeats)."""
 
@@ -31,14 +33,24 @@ class _FakeClient:
         self.responses = list(responses)
         self.chat_calls: list[dict] = []
 
-    def chat(self, messages, model=None, temperature=None, max_tokens=None,
-             thinking_mode=False, reasoning_effort=None, reasoning_callback=None):
-        self.chat_calls.append({
-            "messages": messages,
-            "model": model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        })
+    def chat(
+        self,
+        messages,
+        model=None,
+        temperature=None,
+        max_tokens=None,
+        thinking_mode=False,
+        reasoning_effort=None,
+        reasoning_callback=None,
+    ):
+        self.chat_calls.append(
+            {
+                "messages": messages,
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
         if not self.responses:
             raise AssertionError("no scripted response left")
         return self.responses.pop(0)
@@ -47,13 +59,13 @@ class _FakeClient:
 class _FakePatchEngine:
     """Config-driven stand-in for patch_engine.PatchEngine (module name)."""
 
-    synth_result = None                      # SimpleNamespace(success, patch_applied, metadata, error)
-    synth_raise = None                       # exception to raise from synthesize_and_apply
-    repair_raise = None                      # exception to raise from repair_patch
-    file_blocks = ("", None)                 # (patch, reason) from _try_synthesize_diff_from_file_blocks
-    git_check = (True, None)                 # (ok, err); callable allowed for sequencing
-    repair_result = None                     # SimpleNamespace(success, patch) or None
-    normalize = None                         # (norm, err); None -> identity
+    synth_result = None  # SimpleNamespace(success, patch_applied, metadata, error)
+    synth_raise = None  # exception to raise from synthesize_and_apply
+    repair_raise = None  # exception to raise from repair_patch
+    file_blocks = ("", None)  # (patch, reason) from _try_synthesize_diff_from_file_blocks
+    git_check = (True, None)  # (ok, err); callable allowed for sequencing
+    repair_result = None  # SimpleNamespace(success, patch_applied) or None
+    normalize = None  # (norm, err); None -> identity
     instances: ClassVar[list] = []
 
     def __init__(self, *a, **kw):
@@ -196,6 +208,7 @@ def _setup_target(tmp_path, content="old\n"):
 # early returns / argument normalization
 # ---------------------------------------------------------------------------
 
+
 def test_generate_patch_empty_repo_root(svc):
     svc_obj, _ = svc
     out = svc_obj.generate_patch("", "fix")
@@ -240,6 +253,7 @@ def svc_fx(monkeypatch):
 # success paths
 # ---------------------------------------------------------------------------
 
+
 def test_generate_patch_noop_llm_output_low_trust(svc, tmp_path):
     svc_obj, fake = svc
     rr, tgt = _setup_target(tmp_path)
@@ -264,8 +278,10 @@ def test_generate_patch_fast_path_success(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp("whatever")]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is True
@@ -278,8 +294,10 @@ def test_generate_patch_fast_path_metadata_reason(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp("whatever")]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "fast_apply", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "fast_apply", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["meta"]["synth_reason"] == "patch_engine_auto:fast_apply"
@@ -290,7 +308,10 @@ def test_generate_patch_fast_path_failure_falls_to_legacy(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_FILE_BLOCK)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=False, patch_applied="", metadata={}, error="boom",
+        success=False,
+        patch_applied="",
+        metadata={},
+        error="boom",
     )
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     out = svc_obj.generate_patch(rr, "change it", tgt)
@@ -421,12 +442,16 @@ def test_generate_patch_file_block_diff_fallback(svc, tmp_path):
 # failure paths / finalize
 # ---------------------------------------------------------------------------
 
+
 def test_generate_patch_validate_failure(svc, tmp_path):
     svc_obj, fake = svc
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp("this is not a diff at all")]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=False, patch_applied="", metadata={}, error="boom",
+        success=False,
+        patch_applied="",
+        metadata={},
+        error="boom",
     )
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is False
@@ -441,7 +466,7 @@ def test_generate_patch_repair_success(svc, tmp_path):
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     # first apply-check fails -> repair -> re-check succeeds
     _FakePatchEngine.git_check = [lambda: (False, "hunk mismatch"), lambda: (True, None)]
-    _FakePatchEngine.repair_result = SimpleNamespace(success=True, patch=_DIFF)
+    _FakePatchEngine.repair_result = SimpleNamespace(success=True, patch_applied=_DIFF)
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is True  # repaired patch passes the re-check
 
@@ -454,7 +479,7 @@ def test_generate_patch_repair_failure(svc, tmp_path):
     fake.responses = [_resp(_FILE_BLOCK), _resp(_FILE_BLOCK)]
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     _FakePatchEngine.git_check = (False, "hunk mismatch")
-    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch=None)
+    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch_applied=None)
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is False
     assert out["meta"]["reason"] == "git_apply_check_failed"
@@ -503,13 +528,14 @@ def test_generate_patch_unexpected_exception(svc, tmp_path):
 # retry path
 # ---------------------------------------------------------------------------
 
+
 def test_generate_patch_retry_success(svc, tmp_path):
     svc_obj, fake = svc
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_FILE_BLOCK), _resp(_FILE_BLOCK)]
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     _FakePatchEngine.git_check = [lambda: (False, "boom"), lambda: (True, None)]
-    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch=None)
+    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch_applied=None)
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is True
     assert out["meta"]["retry_used"] is True
@@ -524,7 +550,7 @@ def test_generate_patch_retry_tokens_sum(svc, tmp_path):
     fake.responses = [_resp(_FILE_BLOCK, tokens=10), _resp(_FILE_BLOCK, tokens=20)]
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     _FakePatchEngine.git_check = [lambda: (False, "boom"), lambda: (True, None)]
-    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch=None)
+    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch_applied=None)
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["tokens_used"] == 30
     assert out["meta"]["tokens_used_first"] == 10
@@ -537,7 +563,7 @@ def test_generate_patch_retry_failure_second_round(svc, tmp_path):
     fake.responses = [_resp(_FILE_BLOCK), _resp(_FILE_BLOCK)]
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     _FakePatchEngine.git_check = (False, "boom")
-    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch=None)
+    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch_applied=None)
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is False
     assert out["meta"]["retry_used"] is True
@@ -550,7 +576,10 @@ def test_generate_patch_retry_invalid_diff_trigger(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_FILE_BLOCK), _resp(_FILE_BLOCK)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=False, patch_applied="", metadata={}, error="boom",
+        success=False,
+        patch_applied="",
+        metadata={},
+        error="boom",
     )
     # legacy semantic fallback produces a non-diff patch -> validate fails ->
     # invalid_diff triggers the FILE-block retry (2nd round succeeds).
@@ -567,7 +596,7 @@ def test_generate_patch_retry_gate_large_file(svc, tmp_path):
     fake.responses = [_resp(_FILE_BLOCK)]
     _FakePatchEngine.file_blocks = (_DIFF, "file_block_synth")
     _FakePatchEngine.git_check = (False, "boom")
-    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch=None)
+    _FakePatchEngine.repair_result = SimpleNamespace(success=False, patch_applied=None)
     out = svc_obj.generate_patch(rr, "change it", tgt)
     assert out["success"] is False
     assert out["meta"]["retry_used"] is False
@@ -587,6 +616,7 @@ def test_generate_patch_tokens_none_fallback(svc, tmp_path):
 # ---------------------------------------------------------------------------
 # context variants / progress / modes
 # ---------------------------------------------------------------------------
+
 
 def test_generate_patch_full_file_mode(svc, tmp_path):
     svc_obj, fake = svc
@@ -615,8 +645,10 @@ def test_generate_patch_hybrid_mode(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt, context_variant="hybrid")
     assert out["success"] is True
@@ -633,8 +665,10 @@ def test_generate_patch_hybrid_super_fallback_not_appended(svc, tmp_path):
     _FakeSuperBuilder.text = ""  # super builder returns empty -> no appendix
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt, context_variant="hybrid")
     assert out["success"] is True
@@ -647,8 +681,10 @@ def test_generate_patch_super_variant(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt, context_variant="super")
     assert out["success"] is True
@@ -660,8 +696,10 @@ def test_generate_patch_context_variant_invalid(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt, context_variant="bogus")
     assert out["success"] is True
@@ -673,8 +711,10 @@ def test_generate_patch_extra_context_provided(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "change it", tgt, extra_context="USER CTX HERE")
     assert out["success"] is True
@@ -690,8 +730,10 @@ def test_generate_patch_trivial_uses_focused_snippet(svc, tmp_path):
     svc_obj, fake = svc
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "fix the typo in _my_target", tgt)
     assert out["success"] is True
@@ -704,8 +746,10 @@ def test_generate_patch_non_trivial_builds_context(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "Refactor the module to use async everywhere", tgt)
     assert out["success"] is True
@@ -717,8 +761,10 @@ def test_generate_patch_progress_callback_stages(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     stages: list[tuple[str, int, int]] = []
 
@@ -728,7 +774,10 @@ def test_generate_patch_progress_callback_stages(svc, tmp_path):
     out = svc_obj.generate_patch(rr, "add a comment", tgt, progress_callback=cb)
     assert out["success"] is True
     assert [s[0] for s in stages] == [
-        "building_context", "sending_to_llm", "parsing_response", "finalizing",
+        "building_context",
+        "sending_to_llm",
+        "parsing_response",
+        "finalizing",
     ]
     assert all(s[2] == 4 for s in stages)
 
@@ -738,8 +787,10 @@ def test_generate_patch_success_meta_shape(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path)
     fake.responses = [_resp(_DIFF)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=True, patch_applied=_DIFF,
-        metadata={"synth_reason": "auto", "mode": "auto"}, error=None,
+        success=True,
+        patch_applied=_DIFF,
+        metadata={"synth_reason": "auto", "mode": "auto"},
+        error=None,
     )
     out = svc_obj.generate_patch(rr, "add a comment", tgt)
     assert out["success"] is True
@@ -758,6 +809,7 @@ def test_generate_patch_success_meta_shape(svc, tmp_path):
 # ---------------------------------------------------------------------------
 # exception / edge paths (100% completion)
 # ---------------------------------------------------------------------------
+
 
 def test_generate_patch_full_file_no_target_auto_prompt(svc, tmp_path):
     """full_file mode without a target falls back to the AUTO system prompt."""
@@ -810,9 +862,7 @@ def test_generate_patch_symbol_search_named_symbol(svc, tmp_path, monkeypatch):
             calls.append((name, kind))
             return _FakeSearcher.found
 
-    monkeypatch.setattr(
-        "external_llm.agent.symbol_search.get_symbol_searcher", lambda rr: _CapSearcher(rr)
-    )
+    monkeypatch.setattr("external_llm.agent.symbol_search.get_symbol_searcher", lambda rr: _CapSearcher(rr))
     # new_code's first line is a real function header -> symbol_name path
     llm_out = "FILE: x.txt\n```python\ndef foo():\n    pass\n```\n"
     fake.responses = [_resp(llm_out)]
@@ -853,7 +903,10 @@ def test_generate_patch_invalid_diff_failure_no_retry(svc, tmp_path):
     rr, tgt = _setup_target(tmp_path, content="x" * 200_000)
     fake.responses = [_resp(_FILE_BLOCK)]
     _FakePatchEngine.synth_result = SimpleNamespace(
-        success=False, patch_applied="", metadata={}, error="boom",
+        success=False,
+        patch_applied="",
+        metadata={},
+        error="boom",
     )
     _FakeSemantic.patch = "this is not a unified diff"
     out = svc_obj.generate_patch(rr, "change it", tgt)

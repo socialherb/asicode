@@ -20,6 +20,7 @@ re-renders every turn, so the prompt-cache prefix must not churn.
 Result-item shape (design_chat_loop.py):
     {"tool": str, "args": Any, "content": str, "ok": bool}
 """
+
 from __future__ import annotations
 
 import json
@@ -87,9 +88,5 @@ def render_interrupt_tool_results(
 
     if not parts:  # pragma: no cover — 첫 항목은 spent=0으로 항상 append되므로 parts는 비어있을 수 없음
         return ""
-    head = (
-        f"{_HEADER}\n"
-        f"[{len(parts)} of {len(tool_results)} tool call(s) shown; "
-        f"budget {spent}/{total_chars} chars]"
-    )
+    head = f"{_HEADER}\n[{len(parts)} of {len(tool_results)} tool call(s) shown; budget {spent}/{total_chars} chars]"
     return head + "\n" + "\n".join(parts)

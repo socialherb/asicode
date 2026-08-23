@@ -8,9 +8,11 @@ document exactly where behavior diverges from the legacy inline chains, so a
 future "simplification" cannot silently reintroduce the trailing-space bug or
 un-document the persisted-key caveat.
 """
+
 from external_llm.languages._normalize import normalize_key, strip_lower
 
 # ─── core semantics ──────────────────────────────────────────────────────────
+
 
 def test_basic_normalization():
     assert normalize_key("Hello-World") == "hello_world"
@@ -40,11 +42,12 @@ def test_empty_and_whitespace_only():
 
 # ─── documented divergence from the legacy chains ────────────────────────────
 
+
 def test_diverges_from_legacy_trailing_space_chain():
     # Legacy variant (replace-then-strip) left a trailing underscore —
     # normalize_key deliberately fixes this. Locks the bug-fix direction.
     legacy = "read only ".lower().replace("-", "_").replace(" ", "_").strip()
-    assert legacy == "read_only_"          # the legacy bug
+    assert legacy == "read_only_"  # the legacy bug
     assert normalize_key("read only ") == "read_only"  # the fix
 
 
@@ -66,6 +69,7 @@ def test_equivalent_to_strip_first_legacy_chain():
 
 
 # ─── strip_lower ─────────────────────────────────────────────────────────────
+
 
 def test_strip_lower_no_internal_transformation():
     assert strip_lower("  Hello World  ") == "hello world"

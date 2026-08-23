@@ -18,31 +18,31 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class TriggerKind(Enum):
-    FILE_MODIFIED       = "file_modified"       # .py/.js/.ts saved
-    TEST_FAILED         = "test_failed"          # pytest failure
-    TEST_RECOVERED      = "test_recovered"       # failure → pass
-    AGENT_STALL         = "agent_stall"          # fail_loop_detected (N consecutive fails)
-    AGENT_COMPLETED     = "agent_completed"      # run finished successfully
-    AGENT_FAILED        = "agent_failed"         # run finished with error
-    IMPORT_ERROR        = "import_error"         # py_compile failure
+    FILE_MODIFIED = "file_modified"  # .py/.js/.ts saved
+    TEST_FAILED = "test_failed"  # pytest failure
+    TEST_RECOVERED = "test_recovered"  # failure → pass
+    AGENT_STALL = "agent_stall"  # fail_loop_detected (N consecutive fails)
+    AGENT_COMPLETED = "agent_completed"  # run finished successfully
+    AGENT_FAILED = "agent_failed"  # run finished with error
+    IMPORT_ERROR = "import_error"  # py_compile failure
     INTEGRATION_MISSING = "integration_missing"  # GSG: unlinked new module
-    SCHEDULE            = "schedule"             # periodic cron event
+    SCHEDULE = "schedule"  # periodic cron event
 
 
 @dataclass
 class TriggerEvent:
     kind: TriggerKind
     repo_root: str
-    source_file: Optional[str] = None
+    source_file: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
-    severity: int = 0   # 0=info  1=warning  2=error  3=critical
+    severity: int = 0  # 0=info  1=warning  2=error  3=critical
 
 
 class TriggerEngine:
@@ -104,39 +104,47 @@ class TriggerEngine:
         Called by make_stream_callback_interceptor in proactive_runner.py.
         """
         if event_name == "fail_loop_detected":
-            self.emit(TriggerEvent(
-                kind=TriggerKind.AGENT_STALL,
-                repo_root=self.repo_root,
-                severity=2,
-                metadata=data,
-            ))
-        elif event_name == "complete":
-            status = data.get("status", "")
-            if status in ("error", "max_turns"):
-                self.emit(TriggerEvent(
-                    kind=TriggerKind.AGENT_FAILED,
+            self.emit(
+                TriggerEvent(
+                    kind=TriggerKind.AGENT_STALL,
                     repo_root=self.repo_root,
                     severity=2,
                     metadata=data,
-                ))
+                )
+            )
+        elif event_name == "complete":
+            status = data.get("status", "")
+            if status in ("error", "max_turns"):
+                self.emit(
+                    TriggerEvent(
+                        kind=TriggerKind.AGENT_FAILED,
+                        repo_root=self.repo_root,
+                        severity=2,
+                        metadata=data,
+                    )
+                )
             else:
-                self.emit(TriggerEvent(
-                    kind=TriggerKind.AGENT_COMPLETED,
-                    repo_root=self.repo_root,
-                    severity=0,
-                    metadata=data,
-                ))
+                self.emit(
+                    TriggerEvent(
+                        kind=TriggerKind.AGENT_COMPLETED,
+                        repo_root=self.repo_root,
+                        severity=0,
+                        metadata=data,
+                    )
+                )
 
     # ── Test result hooks ─────────────────────────────────────────────────────
 
     def notify_test_result(self, ok: bool, details: dict[str, Any]) -> None:
         """Called after test runs. ok=True → TEST_RECOVERED, False → TEST_FAILED."""
-        self.emit(TriggerEvent(
-            kind=TriggerKind.TEST_RECOVERED if ok else TriggerKind.TEST_FAILED,
-            repo_root=self.repo_root,
-            severity=0 if ok else 2,
-            metadata=details,
-        ))
+        self.emit(
+            TriggerEvent(
+                kind=TriggerKind.TEST_RECOVERED if ok else TriggerKind.TEST_FAILED,
+                repo_root=self.repo_root,
+                severity=0 if ok else 2,
+                metadata=details,
+            )
+        )
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
 
@@ -144,18 +152,20 @@ class TriggerEngine:
         """Register a periodic SCHEDULE trigger (fires every interval_seconds)."""
 
         # holder[0] tracks the currently active timer so _fire can remove it on re-arm
-        holder: list[Optional[threading.Timer]] = [None]
+        holder: list[threading.Timer | None] = [None]
 
         def _fire():
             epoch = self._epoch  # captured before emit — stop() during emit bumps it
             if not self._running:
                 return
-            self.emit(TriggerEvent(
-                kind=TriggerKind.SCHEDULE,
-                repo_root=self.repo_root,
-                severity=0,
-                metadata={"label": label, "interval": interval_seconds},
-            ))
+            self.emit(
+                TriggerEvent(
+                    kind=TriggerKind.SCHEDULE,
+                    repo_root=self.repo_root,
+                    severity=0,
+                    metadata={"label": label, "interval": interval_seconds},
+                )
+            )
             # Re-arm: remove completed timer from list, register the new one.
             # stop() may have run during emit() (e.g. from a callback) — the
             # unlocked check above cannot see that, so re-check under the lock:

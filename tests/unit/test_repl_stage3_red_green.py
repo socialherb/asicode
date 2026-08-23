@@ -420,25 +420,25 @@ class TestSpawnedReplStage3:
         sess.send(b"\r")
 
     def _send_canonical(self, sess, text):
-            """Answer a CANONICAL-mode product prompt (builtin input()/readline()).
+        """Answer a CANONICAL-mode product prompt (builtin input()/readline()).
 
-            SpawnPtySession clears ICRNL on the child's tty (CR-submit race seal
-            - see pty_driver._disable_cr_translation), so a bare "\r" no longer
-            completes a canonical line: the kernel holds it untranslated in the
-            input queue and input()/readline() blocks forever. "\n" IS the
-            canonical line terminator - it completes the line directly, exactly
-            as the ICRNL-translated Enter does on a real user's terminal (real
-            terminals keep ICRNL on). Use for: auth-retry key entry
-            (asi._prompt_auth_retry_key), undo/compact y/N confirmations
-            (repl_impl input() sites). NOT for /model key entry or insights
-            prune confirms - those go through _collect_input (prompt_toolkit)
-            and need the "\r" Enter binding.
-            """
-            data = text if isinstance(text, bytes) else text.encode()
-            sess.clear()
-            sess.send(data)
-            sess.wait_for(data, timeout=30)
-            sess.send(b"\n")
+        SpawnPtySession clears ICRNL on the child's tty (CR-submit race seal
+        - see pty_driver._disable_cr_translation), so a bare "\r" no longer
+        completes a canonical line: the kernel holds it untranslated in the
+        input queue and input()/readline() blocks forever. "\n" IS the
+        canonical line terminator - it completes the line directly, exactly
+        as the ICRNL-translated Enter does on a real user's terminal (real
+        terminals keep ICRNL on). Use for: auth-retry key entry
+        (asi._prompt_auth_retry_key), undo/compact y/N confirmations
+        (repl_impl input() sites). NOT for /model key entry or insights
+        prune confirms - those go through _collect_input (prompt_toolkit)
+        and need the "\r" Enter binding.
+        """
+        data = text if isinstance(text, bytes) else text.encode()
+        sess.clear()
+        sess.send(data)
+        sess.wait_for(data, timeout=30)
+        sess.send(b"\n")
 
     def _wait_prompt(self, sess):
         sess.wait_for(b"asicode", timeout=60)

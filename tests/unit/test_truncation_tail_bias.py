@@ -12,6 +12,7 @@ Three bugs shared a common root cause: truncation that preserved only the
    pytest summary (``short test summary info``, ``N failed``, FAILED list)
    that ``failure_context._try_parse_pytest`` keys on.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -79,9 +80,7 @@ def test_bash_truncation_preserves_tail():
     out = _truncate_bash_output(payload, cap)
 
     assert head_marker in out, "head marker should be preserved"
-    assert tail_marker in out, (
-        "tail pytest summary must be preserved (the bug dropped it)"
-    )
+    assert tail_marker in out, "tail pytest summary must be preserved (the bug dropped it)"
     assert "truncated" in out, "should report that truncation happened"
     # head + tail (each ~cap/2) + fixed marker → much shorter than payload.
     assert len(out) < len(payload)
@@ -120,9 +119,7 @@ def test_bash_truncation_cjk_output_more_aggressive():
     assert "TAIL_MARKER_ascii" in ascii_out
     # The CJK effective cap is halved, so its result retains less *body*
     # content than the ASCII result (both minus the same fixed marker).
-    assert len(cjk_out) < len(ascii_out), (
-        "CJK output should be more aggressively truncated (halved cap)"
-    )
+    assert len(cjk_out) < len(ascii_out), "CJK output should be more aggressively truncated (halved cap)"
 
 
 def _write_py(root: Path, rel: str, content: str) -> None:

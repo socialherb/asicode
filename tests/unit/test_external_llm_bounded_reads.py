@@ -17,6 +17,7 @@ Fix under test:
 - needle search: streaming — a needle at the very END of a >1 MiB file is
   still found (a head-bounded read would miss it and cause a spurious re-add)
 """
+
 from __future__ import annotations
 
 from external_llm.service import _SNIPPET_READ_MAX_BYTES, ExternalLLMService
@@ -30,17 +31,13 @@ def _write(tmp_path, name: str, data: bytes):
 
 def test_snippet_small_file_full_content(tmp_path):
     _write(tmp_path, "a.txt", b"line1\nline2\n")
-    out = ExternalLLMService._read_target_file_snippet_best_effort(
-        None, str(tmp_path), "a.txt"
-    )
+    out = ExternalLLMService._read_target_file_snippet_best_effort(None, str(tmp_path), "a.txt")
     assert out == "line1\nline2\n"
 
 
 def test_snippet_huge_file_bounded_with_marker(tmp_path):
     _write(tmp_path, "big.txt", b"0123456789abcdef\n" * 100_000)  # 1.7 MiB
-    out = ExternalLLMService._read_target_file_snippet_best_effort(
-        None, str(tmp_path), "big.txt"
-    )
+    out = ExternalLLMService._read_target_file_snippet_best_effort(None, str(tmp_path), "big.txt")
     assert "TRUNCATED" in out
     assert out.count("TRUNCATED") == 1
     assert len(out) < _SNIPPET_READ_MAX_BYTES + 200
@@ -48,9 +45,7 @@ def test_snippet_huge_file_bounded_with_marker(tmp_path):
 
 def test_snippet_custom_max_bytes(tmp_path):
     _write(tmp_path, "a.txt", b"x" * 10_000)
-    out = ExternalLLMService._read_target_file_snippet_best_effort(
-        None, str(tmp_path), "a.txt", max_bytes=100
-    )
+    out = ExternalLLMService._read_target_file_snippet_best_effort(None, str(tmp_path), "a.txt", max_bytes=100)
     assert "TRUNCATED" in out
     assert len(out) < 500
 
@@ -59,18 +54,14 @@ def test_snippet_utf8_boundary_no_replacement_char(tmp_path):
     # 1 MiB cut lands inside a 3-byte Hangul char (1 MiB % 3 == 1) — the cut
     # must drop the incomplete tail, never emit U+FFFD at the boundary.
     _write(tmp_path, "ko.txt", ("가" * 400_000).encode())  # 1.2 MiB
-    out = ExternalLLMService._read_target_file_snippet_best_effort(
-        None, str(tmp_path), "ko.txt"
-    )
+    out = ExternalLLMService._read_target_file_snippet_best_effort(None, str(tmp_path), "ko.txt")
     assert "TRUNCATED" in out
     head = out[: out.index("TRUNCATED")]
     assert "\ufffd" not in head
 
 
 def test_snippet_missing_file(tmp_path):
-    out = ExternalLLMService._read_target_file_snippet_best_effort(
-        None, str(tmp_path), "nope.txt"
-    )
+    out = ExternalLLMService._read_target_file_snippet_best_effort(None, str(tmp_path), "nope.txt")
     assert out == ""
 
 
@@ -113,13 +104,12 @@ def test_needle_search_no_match(tmp_path):
 
 # ── P22-2 / P22-4: containment + stat-based size gate ────────────────────────
 
+
 def test_snippet_rejects_escape_path(tmp_path):
     """P22-2: repo-relative resolution must not escape the repo (../SECRET.txt)."""
     secret = tmp_path.parent / "SECRET.txt"
     secret.write_text("TOP_SECRET_TOKEN=abc123\n")
-    out = ExternalLLMService._read_target_file_snippet_best_effort(
-        None, str(tmp_path), "../SECRET.txt"
-    )
+    out = ExternalLLMService._read_target_file_snippet_best_effort(None, str(tmp_path), "../SECRET.txt")
     assert out == ""
 
 

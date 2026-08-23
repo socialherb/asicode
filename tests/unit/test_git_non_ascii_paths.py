@@ -18,6 +18,7 @@ Two distinct damages follow, and they need different fixes:
 exactly this reason; the language-detection and display layers were simply never
 swept. The last test here is that sweep, as a gate.
 """
+
 from __future__ import annotations
 
 import ast
@@ -38,9 +39,10 @@ _KR_TS = "한글컴포넌트.ts"
 @pytest.fixture
 def kr_repo(tmp_path):
     """A real git repo whose source files have Korean names."""
+
     def _git(*args):
-        subprocess.run(["git", *args], cwd=tmp_path, check=True,
-                       capture_output=True, timeout=15)
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, timeout=15)
+
     _git("init", "-q")
     _git("config", "user.email", "t@example.com")
     _git("config", "user.name", "t")
@@ -56,13 +58,15 @@ def test_git_really_does_c_quote_without_the_flag(kr_repo):
     """Pin the upstream behaviour the rest of this file defends against — if a
     future git stops quoting, these tests should say so rather than pass
     vacuously."""
-    raw = subprocess.run(["git", "ls-files"], cwd=kr_repo, capture_output=True,
-                         text=True, timeout=15, check=False).stdout
-    assert '\\355' in raw, "git no longer C-quotes; this suite's premise changed"
+    raw = subprocess.run(
+        ["git", "ls-files"], cwd=kr_repo, capture_output=True, text=True, timeout=15, check=False
+    ).stdout
+    assert "\\355" in raw, "git no longer C-quotes; this suite's premise changed"
     assert _KR_PY not in raw
 
 
 # ── parsed output ─────────────────────────────────────────────────────────
+
 
 def test_repo_files_ssot_returns_usable_paths(kr_repo):
     paths = git_list_repo_files(str(kr_repo))
@@ -94,6 +98,7 @@ def test_detection_survives_a_non_git_directory(tmp_path):
 
 
 # ── displayed output ──────────────────────────────────────────────────────
+
 
 def test_status_shown_to_the_model_keeps_real_filenames(kr_repo):
     """`_run_git_raw` feeds `_build_session_context`'s "Modified files (git
@@ -158,8 +163,7 @@ def test_no_shipping_git_call_prints_paths_unprotected():
         for node in ast.walk(tree):
             if not isinstance(node, ast.List):
                 continue
-            elts = [e.value for e in node.elts
-                    if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            elts = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
             if not elts or elts[0] != "git":
                 continue
             sub = next((e for e in elts[1:] if not e.startswith("-")), None)

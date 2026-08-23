@@ -5,6 +5,7 @@ HTTP-date Retry-After parsing, SSE line/stream edge cases, guard_sse_iteration
 failure conversion, the default chat_with_tools implementation, close(), and
 every create_llm_client factory branch.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from external_llm.client import (
 
 # ── effective_content ────────────────────────────────────────────────────────
 
+
 class _Resp:
     def __init__(self, content, raw_response=None):
         self.content = content
@@ -54,6 +56,7 @@ def test_effective_content_ignores_non_dict_raw_response():
 
 # ── parse_retry_after ────────────────────────────────────────────────────────
 
+
 def test_parse_retry_after_none_headers():
     assert parse_retry_after(None) is None
 
@@ -70,6 +73,7 @@ def test_parse_retry_after_http_date_future_clamped():
 
 
 # ── _parse_sse_line ──────────────────────────────────────────────────────────
+
 
 def test_parse_sse_line_strips_carriage_return():
     assert _parse_sse_line(b'data: {"a": 1}\r') == {"a": 1}
@@ -96,6 +100,7 @@ def test_parse_sse_line_done_sentinel():
 
 
 # ── iter_sse_data_events ─────────────────────────────────────────────────────
+
 
 class _BytesResp:
     def __init__(self, chunks):
@@ -134,6 +139,7 @@ def test_iter_sse_multiline_chunk_split():
 
 # ── guard_sse_iteration ──────────────────────────────────────────────────────
 
+
 def test_guard_sse_passes_typed_errors_through():
     def _gen():
         raise LLMRateLimitError("rl")
@@ -158,6 +164,7 @@ def test_raise_sse_iteration_failure_wraps():
 
 
 # ── LLMClient base ───────────────────────────────────────────────────────────
+
 
 class _MiniLLM(LLMClient):
     def chat(self, messages, model="", temperature=0.0, max_tokens=None, **kwargs):
@@ -192,6 +199,7 @@ def test_close_no_session_is_noop():
 
 # ── create_llm_client factory ────────────────────────────────────────────────
 
+
 def test_create_ollama_uses_extended_timeout_by_default():
     client = create_llm_client("ollama", "k")
     assert client.timeout == cc.OLLAMA_LLM_TIMEOUT
@@ -204,26 +212,31 @@ def test_create_ollama_explicit_timeout_respected():
 
 def test_create_anthropic():
     from external_llm.anthropic_client import AnthropicClient
+
     assert isinstance(create_llm_client("anthropic", "k"), AnthropicClient)
 
 
 def test_create_google():
     from external_llm.providers import GoogleClient
+
     assert isinstance(create_llm_client("google", "k"), GoogleClient)
 
 
 def test_create_deepseek():
     from external_llm.providers import DeepSeekClient
+
     assert isinstance(create_llm_client("deepseek", "k"), DeepSeekClient)
 
 
 def test_create_ollama_client():
     from external_llm.providers import OllamaClient
+
     assert isinstance(create_llm_client("ollama", "k"), OllamaClient)
 
 
 def test_create_opencode_defaults_base_url():
     from external_llm.openai_client import OpenAIClient
+
     client = create_llm_client("opencode", "k")
     assert isinstance(client, OpenAIClient)
     assert client.base_url == "https://opencode.ai/zen/go/v1"
@@ -240,6 +253,7 @@ def test_create_unknown_provider_raises():
 
 
 # ── remaining branch coverage ────────────────────────────────────────────────
+
 
 def test_effective_content_returns_non_empty_content():
     assert effective_content(_Resp("hello")) == "hello"

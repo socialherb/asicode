@@ -21,6 +21,7 @@ drops the console script into a user ``bin`` dir that is usually not on
 path intentionally keeps a plain ``--break-system-packages`` (system tree, so
 the script lands on ``$PATH``).
 """
+
 from __future__ import annotations
 
 import logging
@@ -62,6 +63,7 @@ def ensure_user_site_importable() -> None:
     """
     try:
         import site
+
         user_site = site.getusersitepackages()
     except Exception:
         logger.debug("site.getusersitepackages failed", exc_info=True)

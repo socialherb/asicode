@@ -6,6 +6,7 @@ derived from it, and ``snake_case`` was returned with zero evidence). The fixes
 are: language detection + language-gated framework scoring, a minimum-evidence
 score floor, and honest "unknown" naming when nothing recognizable is scanned.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -152,19 +153,23 @@ def test_pyproject_deps_drive_framework_detection(tmp_path: Path):
     under external_llm/ and the fixed 50-file sample never reached it, while the
     manifest always declared them. pyproject.toml is the authoritative signal.
     """
-    _write(tmp_path, "pyproject.toml", (
-        "[project]\n"
-        'name = "demo"\n'
-        "dependencies = [\n"
-        '  "fastapi>=0.110",\n'
-        '  "pydantic>=2.0",\n'
-        "]\n"
-        "\n"
-        "[project.optional-dependencies]\n"
-        'tree-sitter = [\n'
-        '  "tree-sitter>=0.23",\n'
-        "]\n"
-    ))
+    _write(
+        tmp_path,
+        "pyproject.toml",
+        (
+            "[project]\n"
+            'name = "demo"\n'
+            "dependencies = [\n"
+            '  "fastapi>=0.110",\n'
+            '  "pydantic>=2.0",\n'
+            "]\n"
+            "\n"
+            "[project.optional-dependencies]\n"
+            "tree-sitter = [\n"
+            '  "tree-sitter>=0.23",\n'
+            "]\n"
+        ),
+    )
     # NOTE: no `from fastapi` / `import tree_sitter` anywhere — only manifest.
     _write(tmp_path, "main.py", "x = 1\n")
 
@@ -184,11 +189,7 @@ def test_py_dep_detects_fastapi_without_import_in_sample(tmp_path: Path):
     pyproject.toml was reported as `argparse`-only because the import usage sat
     beyond the 50-file sample.
     """
-    _write(tmp_path, "pyproject.toml", (
-        "[project]\n"
-        'name = "demo"\n'
-        'dependencies = ["fastapi>=0.110"]\n'
-    ))
+    _write(tmp_path, "pyproject.toml", ('[project]\nname = "demo"\ndependencies = ["fastapi>=0.110"]\n'))
     # Many root-level files so the import-sample window is "used up" before…
     for i in range(60):
         _write(tmp_path, f"mod_{i:02d}.py", "z = 1\n")
@@ -205,15 +206,14 @@ def test_tree_sitter_detected_via_manifest_not_self_wrapped_import(tmp_path: Pat
     """tree-sitter wrapped behind a local module (e.g. ``tree_sitter_utils``)
     is detected from the manifest, not from the wrapped import name.
     """
-    _write(tmp_path, "pyproject.toml", (
-        "[project]\n"
-        'name = "demo"\n'
-        'dependencies = ["tree-sitter>=0.23", "tree-sitter-python>=0.23"]\n'
-    ))
+    _write(
+        tmp_path,
+        "pyproject.toml",
+        ('[project]\nname = "demo"\ndependencies = ["tree-sitter>=0.23", "tree-sitter-python>=0.23"]\n'),
+    )
     # The package is only ever imported via a self-wrapping helper — a bare
     # `import tree_sitter` never appears. Manifest detection must still fire.
-    _write(tmp_path, "ts_utils.py",
-           "from external_llm.languages.tree_sitter_utils import parse\n")
+    _write(tmp_path, "ts_utils.py", "from external_llm.languages.tree_sitter_utils import parse\n")
 
     s = ProjectAnalyzer(str(tmp_path)).analyze()
 
@@ -222,13 +222,17 @@ def test_tree_sitter_detected_via_manifest_not_self_wrapped_import(tmp_path: Pat
 
 def test_setup_py_install_requires_detected(tmp_path: Path):
     """setup.py install_requires is parsed for manifest-declared frameworks."""
-    _write(tmp_path, "setup.py", (
-        "from setuptools import setup\n"
-        "setup(\n"
-        '    name="demo",\n'
-        '    install_requires=["flask>=3.0", "rich>=13"],\n'
-        ")\n"
-    ))
+    _write(
+        tmp_path,
+        "setup.py",
+        (
+            "from setuptools import setup\n"
+            "setup(\n"
+            '    name="demo",\n'
+            '    install_requires=["flask>=3.0", "rich>=13"],\n'
+            ")\n"
+        ),
+    )
     _write(tmp_path, "app.py", "x = 1\n")
 
     s = ProjectAnalyzer(str(tmp_path)).analyze()
@@ -256,9 +260,7 @@ def test_normalize_dep_name_is_alias_immune():
 def test_argparse_is_stdlib_not_framework(tmp_path: Path):
     """argparse (Python stdlib) must never appear in the framework list, even
     when directly imported — but it still classifies the project as a CLI."""
-    _write(tmp_path, "cli.py",
-           "import argparse\n"
-           "if __name__ == '__main__':\n    argparse.ArgumentParser()\n")
+    _write(tmp_path, "cli.py", "import argparse\nif __name__ == '__main__':\n    argparse.ArgumentParser()\n")
 
     s = ProjectAnalyzer(str(tmp_path)).analyze()
 
@@ -269,11 +271,11 @@ def test_argparse_is_stdlib_not_framework(tmp_path: Path):
 def test_multi_framework_polyglot_project(tmp_path: Path):
     """A project using several distinct declared frameworks surfaces all of
     them (multi-framework support, not just the top scorer)."""
-    _write(tmp_path, "pyproject.toml", (
-        "[project]\n"
-        'name = "demo"\n'
-        'dependencies = ["fastapi>=0.110", "typer>=0.12", "rich>=13", "libcst>=1.4"]\n'
-    ))
+    _write(
+        tmp_path,
+        "pyproject.toml",
+        ('[project]\nname = "demo"\ndependencies = ["fastapi>=0.110", "typer>=0.12", "rich>=13", "libcst>=1.4"]\n'),
+    )
     _write(tmp_path, "main.py", "x = 1\n")
 
     s = ProjectAnalyzer(str(tmp_path)).analyze()
@@ -297,35 +299,50 @@ def test_android_app_with_version_catalog(tmp_path: Path):
     """An Android app declaring plugins via a Gradle version catalog is
     detected as kotlin / android / jetpack-compose, project type 'mobile',
     and PascalCase naming."""
-    _write(tmp_path, "settings.gradle.kts",
-           'pluginManagement {\n  repositories { google(); mavenCentral() }\n}\n'
-           'rootProject.name = "AsRecord"\n')
-    _write(tmp_path, "build.gradle.kts",
-           "plugins {\n"
-           "    alias(libs.plugins.android.application) apply false\n"
-           "    alias(libs.plugins.kotlin.android) apply false\n"
-           "}\n")
-    _write(tmp_path, "app/build.gradle.kts",
-           "plugins {\n"
-           "    alias(libs.plugins.android.application)\n"
-           "    alias(libs.plugins.kotlin.compose)\n"
-           "}\n"
-           "android {\n"
-           '    namespace = "com.asrecord"\n'
-           '    defaultConfig { applicationId = "com.asrecord.app" }\n'
-           "}\n")
-    _write(tmp_path, "gradle/libs.versions.toml",
-           '[versions]\nagp = "8.5.0"\nkotlin = "2.0.21"\n'
-           "[plugins]\n"
-           'android-application = { id = "com.android.application", version.ref = "agp" }\n'
-           'kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }\n'
-           'kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }\n')
-    _write(tmp_path, "app/src/main/java/com/asrecord/ProofManager.kt",
-           "package com.asrecord\n\n"
-           "import androidx.compose.runtime.Composable\n\n"
-           "class ProofManager\n")
-    _write(tmp_path, "app/src/main/java/com/asrecord/ProofManagerSha256HexTest.kt",
-           "package com.asrecord\n\nclass ProofManagerSha256HexTest\n")
+    _write(
+        tmp_path,
+        "settings.gradle.kts",
+        'pluginManagement {\n  repositories { google(); mavenCentral() }\n}\nrootProject.name = "AsRecord"\n',
+    )
+    _write(
+        tmp_path,
+        "build.gradle.kts",
+        "plugins {\n"
+        "    alias(libs.plugins.android.application) apply false\n"
+        "    alias(libs.plugins.kotlin.android) apply false\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "app/build.gradle.kts",
+        "plugins {\n"
+        "    alias(libs.plugins.android.application)\n"
+        "    alias(libs.plugins.kotlin.compose)\n"
+        "}\n"
+        "android {\n"
+        '    namespace = "com.asrecord"\n'
+        '    defaultConfig { applicationId = "com.asrecord.app" }\n'
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "gradle/libs.versions.toml",
+        '[versions]\nagp = "8.5.0"\nkotlin = "2.0.21"\n'
+        "[plugins]\n"
+        'android-application = { id = "com.android.application", version.ref = "agp" }\n'
+        'kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }\n'
+        'kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }\n',
+    )
+    _write(
+        tmp_path,
+        "app/src/main/java/com/asrecord/ProofManager.kt",
+        "package com.asrecord\n\nimport androidx.compose.runtime.Composable\n\nclass ProofManager\n",
+    )
+    _write(
+        tmp_path,
+        "app/src/main/java/com/asrecord/ProofManagerSha256HexTest.kt",
+        "package com.asrecord\n\nclass ProofManagerSha256HexTest\n",
+    )
 
     s = ProjectAnalyzer(str(tmp_path)).analyze()
 
@@ -341,8 +358,7 @@ def test_android_not_detected_in_non_jvm_repo(tmp_path: Path):
     mentioning com.android.application must NOT report android (no kotlin/java
     present), so a stray/vendor gradle file can't cross-contaminate."""
     _write(tmp_path, "app.py", "from flask import Flask\napp = Flask(__name__)\n")
-    _write(tmp_path, "build.gradle.kts",
-           'plugins { id("com.android.application") }\n')
+    _write(tmp_path, "build.gradle.kts", 'plugins { id("com.android.application") }\n')
 
     s = ProjectAnalyzer(str(tmp_path)).analyze()
 
@@ -369,6 +385,7 @@ def test_neutral_filenames_reported_unknown(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # P23-3: bounded gradle reads (per-file 1 MiB / total 8 MiB)
 # ---------------------------------------------------------------------------
+
 
 def test_read_gradle_text_skips_oversized_single_file(tmp_path: Path):
     """A single gradle file larger than the per-file cap is skipped entirely

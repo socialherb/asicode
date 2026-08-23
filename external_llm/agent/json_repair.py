@@ -11,6 +11,7 @@ Usage::
     text = llm_response_content
     obj = try_parse_json(text)
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -162,21 +163,21 @@ def repair_truncated_json(text: str) -> str | None:
         # If inside an operations array, return empty operations array
         # rather than giving up entirely.
         if _in_ops_array:
-            return _t[:_array_start + 1] + "]}"
+            return _t[: _array_start + 1] + "]}"
         return None
 
     # Only repair if the JSON was genuinely truncated — i.e. the
     # operations array is NOT already properly closed after the last
     # complete operation object.  Check if there's a closing ``]``
     # within 3 chars after _last_complete_end (allowing for whitespace).
-    _tail = _t[_last_complete_end + 1:].lstrip()
+    _tail = _t[_last_complete_end + 1 :].lstrip()
     if _tail and _tail[0] == "]":
         # Already properly closed — no truncation.
         return None
 
     # Truncate to just after the last complete operation object
     # and close the operations array + outer object.
-    repaired = _t[:_last_complete_end + 1] + "]}"
+    repaired = _t[: _last_complete_end + 1] + "]}"
 
     # Validate: the result is at least structurally balanced.
     # (도달 불가: 107행에서 _t.startswith("{") 보장 → repaired도 항상 "{"로 시작)
@@ -226,7 +227,7 @@ def _isolate_outermost_json(text: str) -> str:
         elif ch in "}]":
             depth -= 1
             if depth == 0:
-                return text[start:i + 1]
+                return text[start : i + 1]
     # Unbalanced (truncated) — return original so repair_truncated_json can try.
     return text
 

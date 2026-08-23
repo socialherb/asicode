@@ -3,6 +3,7 @@
 Covers the regression where "Mark as done (pretend installed)" / "skip"
 decisions were ephemeral and the prompt recurred on every launch.
 """
+
 from __future__ import annotations
 
 import json
@@ -79,9 +80,7 @@ def test_save_is_valid_json_with_version(isolated_state):
 # ── _check_tools_with_state integration ──────────────────────────────────────
 
 
-def test_persisted_pretend_suppresses_prompt(
-    isolated_state, stub_resolution, non_interactive, monkeypatch
-):
+def test_persisted_pretend_suppresses_prompt(isolated_state, stub_resolution, non_interactive, monkeypatch):
     # kotlinc not on PATH, but user previously chose "pretend installed".
     stub_resolution["kotlinc"] = False
     dc._save_tool_state({"kotlinc": "pretend"})
@@ -92,14 +91,12 @@ def test_persisted_pretend_suppresses_prompt(
     tools = dc._check_tools_with_state({LanguageId.KOTLIN}, no_prompt=False)
 
     t = next(x for x in tools if x.cmd == "kotlinc")
-    assert t.found is True                 # pretend → reported as found
+    assert t.found is True  # pretend → reported as found
     assert t.pretend_installed is True
-    assert prompted == []                  # NOT re-prompted
+    assert prompted == []  # NOT re-prompted
 
 
-def test_persisted_skip_suppresses_prompt(
-    isolated_state, stub_resolution, non_interactive, monkeypatch
-):
+def test_persisted_skip_suppresses_prompt(isolated_state, stub_resolution, non_interactive, monkeypatch):
     stub_resolution["go"] = False
     dc._save_tool_state({"go": "skip"})
 
@@ -113,9 +110,7 @@ def test_persisted_skip_suppresses_prompt(
     assert prompted == []
 
 
-def test_genuine_availability_beats_persisted_dismissal(
-    isolated_state, stub_resolution, non_interactive, monkeypatch
-):
+def test_genuine_availability_beats_persisted_dismissal(isolated_state, stub_resolution, non_interactive, monkeypatch):
     # Previously dismissed, but now actually installed → found truthfully.
     stub_resolution["kotlinc"] = True
     dc._save_tool_state({"kotlinc": "pretend"})
@@ -124,7 +119,7 @@ def test_genuine_availability_beats_persisted_dismissal(
     tools = dc._check_tools_with_state({LanguageId.KOTLIN}, no_prompt=False)
     t = next(x for x in tools if x.cmd == "kotlinc")
     assert t.found is True
-    assert t.pretend_installed is False    # genuinely found, not pretend
+    assert t.pretend_installed is False  # genuinely found, not pretend
 
 
 def test_stale_dismissal_cleared_when_tool_becomes_available(
@@ -140,9 +135,7 @@ def test_stale_dismissal_cleared_when_tool_becomes_available(
     assert dc._load_tool_state() == {}
 
 
-def test_new_pretend_decision_persisted_after_prompt(
-    isolated_state, stub_resolution, monkeypatch
-):
+def test_new_pretend_decision_persisted_after_prompt(isolated_state, stub_resolution, monkeypatch):
     stub_resolution["kotlinc"] = False
 
     def _simulate_pretend(t):
@@ -156,9 +149,7 @@ def test_new_pretend_decision_persisted_after_prompt(
     assert dc._load_tool_state() == {"kotlinc": "pretend"}
 
 
-def test_new_skip_decision_persisted_after_prompt(
-    isolated_state, stub_resolution, monkeypatch
-):
+def test_new_skip_decision_persisted_after_prompt(isolated_state, stub_resolution, monkeypatch):
     stub_resolution["go"] = False
 
     def _simulate_skip(t):
@@ -171,25 +162,21 @@ def test_new_skip_decision_persisted_after_prompt(
     assert dc._load_tool_state() == {"go": "skip"}
 
 
-def test_successful_install_not_recorded_as_dismissal(
-    isolated_state, stub_resolution, monkeypatch
-):
+def test_successful_install_not_recorded_as_dismissal(isolated_state, stub_resolution, monkeypatch):
     # User picks "Install now" and it succeeds → NOT a dismissal.
-    stub_resolution["pyright"] = False    # missing initially
+    stub_resolution["pyright"] = False  # missing initially
 
     def _simulate_install(t):
-        t.found = True                    # installed successfully (not pretend)
+        t.found = True  # installed successfully (not pretend)
 
     monkeypatch.setattr(dc, "_prompt_and_install", _simulate_install)
     monkeypatch.setattr(dc, "_is_interactive", lambda: True)
 
     dc._check_tools_with_state({LanguageId.PYTHON}, no_prompt=False)
-    assert dc._load_tool_state() == {}    # nothing dismissed
+    assert dc._load_tool_state() == {}  # nothing dismissed
 
 
-def test_no_prompt_does_not_touch_state(
-    isolated_state, stub_resolution, non_interactive, monkeypatch
-):
+def test_no_prompt_does_not_touch_state(isolated_state, stub_resolution, non_interactive, monkeypatch):
     # In no_prompt/non-interactive mode the persisted state is applied but
     # never rewritten (no decisions can be made non-interactively).
     stub_resolution["kotlinc"] = False
@@ -200,11 +187,9 @@ def test_no_prompt_does_not_touch_state(
     assert not isolated_state.exists()
 
 
-def test_pretend_installed_flag_reset_per_call(
-    isolated_state, stub_resolution, non_interactive, monkeypatch
-):
+def test_pretend_installed_flag_reset_per_call(isolated_state, stub_resolution, non_interactive, monkeypatch):
     # Fresh instances must not leak pretend_installed from a previous run.
-    stub_resolution["kotlinc"] = True     # genuinely available now
+    stub_resolution["kotlinc"] = True  # genuinely available now
     dc._save_tool_state({"kotlinc": "pretend"})
 
     tools = dc._check_tools_with_state({LanguageId.KOTLIN}, no_prompt=False)
@@ -234,7 +219,7 @@ def test_dismissal_preserved_when_language_absent_from_repo(
     dc._save_tool_state({"kotlinc": "pretend"})
 
     # Now open a *Python-only* repo — kotlinc is not in its tool set at all.
-    stub_resolution["pyright"] = True      # genuinely available → not dismissed
+    stub_resolution["pyright"] = True  # genuinely available → not dismissed
     monkeypatch.setattr(dc, "_prompt_and_install", lambda t: None)
 
     dc._check_tools_with_state({LanguageId.PYTHON}, no_prompt=False)
@@ -244,9 +229,7 @@ def test_dismissal_preserved_when_language_absent_from_repo(
     assert dc._load_tool_state() == {"kotlinc": "pretend"}
 
 
-def test_dismissals_merged_across_disjoint_language_repos(
-    isolated_state, stub_resolution, monkeypatch
-):
+def test_dismissals_merged_across_disjoint_language_repos(isolated_state, stub_resolution, monkeypatch):
     # Two repos with disjoint language sets; dismissals accumulate, not clobber.
     monkeypatch.setattr(dc, "_is_interactive", lambda: True)
 

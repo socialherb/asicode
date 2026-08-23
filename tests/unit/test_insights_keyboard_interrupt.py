@@ -15,6 +15,7 @@ These tests lock in BOTH the language invariant and the presence of the
 removes the handler — e.g. on the mistaken belief that ``except Exception``
 covers it — is caught at test time.
 """
+
 import ast
 from pathlib import Path
 
@@ -25,9 +26,11 @@ from external_llm.repl import repl_impl
 # Language invariant — the load-bearing reason the fix is needed
 # ═══════════════════════════════════════════════════════════════
 
+
 def test_except_exception_does_not_catch_keyboard_interrupt():
     """If this ever becomes False, the except-keyboardinterrupt handlers become
     dead code and can be removed. Until then they are load-bearing."""
+
     def _inner():
         try:
             raise KeyboardInterrupt
@@ -48,6 +51,7 @@ def test_except_exception_does_not_catch_keyboard_interrupt():
 # ═══════════════════════════════════════════════════════════════
 # Fix pattern — except KeyboardInterrupt + finally still runs
 # ═══════════════════════════════════════════════════════════════
+
 
 def test_keyboard_interrupt_handler_runs_finally_and_returns_false():
     """Mirror the exact try/except Exception/except KeyboardInterrupt/finally
@@ -79,9 +83,7 @@ def test_keyboard_interrupt_handler_runs_finally_and_returns_false():
 # ═══════════════════════════════════════════════════════════════
 
 _TREE = ast.parse(
-    Path(asi.__file__).read_text(encoding="utf-8")
-    + "\n"
-    + Path(repl_impl.__file__).read_text(encoding="utf-8")
+    Path(asi.__file__).read_text(encoding="utf-8") + "\n" + Path(repl_impl.__file__).read_text(encoding="utf-8")
 )
 
 
@@ -130,4 +132,5 @@ def test_verify_insights_interactive_has_keyboard_interrupt_handler():
 
 if __name__ == "__main__":
     import pytest
+
     pytest.main([__file__])

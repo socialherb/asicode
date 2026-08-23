@@ -16,6 +16,7 @@ Testing strategy: every stub's ``chat_with_tools`` returns a tool-call request s
 the tool loop runs until max_iterations, then ``respond()`` enters the final-response
 block where ``chat()`` is tested.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -38,12 +39,19 @@ _MAX_TOOL_ITERS = 1  # minimum — tool loop runs once, then final response
 def _tool_calling_response(model: str) -> ToolCallResponse:
     """Return a ToolCallResponse that requests a single tool call."""
     return ToolCallResponse(
-        content="", model=model, provider="test_stub", tokens_used=5,
-        finish_reason="tool_calls", raw_response=None,
-        tool_calls=[ToolCallRequest(
-            call_id="c1", name="read_file",
-            args={"file_path": "README.md"},
-        )],
+        content="",
+        model=model,
+        provider="test_stub",
+        tokens_used=5,
+        finish_reason="tool_calls",
+        raw_response=None,
+        tool_calls=[
+            ToolCallRequest(
+                call_id="c1",
+                name="read_file",
+                args={"file_path": "README.md"},
+            )
+        ],
     )
 
 
@@ -51,6 +59,7 @@ def _tool_calling_response(model: str) -> ToolCallResponse:
 def _repo(tmp_path):
     """Set up a minimal git repo for ToolRegistry."""
     import subprocess
+
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     (tmp_path / "README.md").write_text("hello\n")
     return str(tmp_path)
@@ -68,11 +77,14 @@ def _respond(loop: DesignChatLoop):
     return loop.respond(
         messages=[LLMMessage(role="user", content="hello")],
         max_tool_iterations=_MAX_TOOL_ITERS,
-        stream_callback=None, reasoning_callback=None, token_callback=None,
+        stream_callback=None,
+        reasoning_callback=None,
+        token_callback=None,
     )
 
 
 # ── Stub implementations ──────────────────────────────────────────────────────
+
 
 class _AlwaysToolCallStub:
     """Base: chat_with_tools always requests a tool call (drives max-iter path)."""
@@ -98,12 +110,19 @@ class _EmptyFirstStub(_AlwaysToolCallStub):
         self.call_count += 1
         if self.call_count == 1:
             return LLMResponse(
-                content="", model=model, provider="test_stub",
-                tokens_used=10, prompt_tokens=5, completion_tokens=5,
+                content="",
+                model=model,
+                provider="test_stub",
+                tokens_used=10,
+                prompt_tokens=5,
+                completion_tokens=5,
             )
         return LLMResponse(
-            content="Here is the final answer.", model=model,
-            provider="test_stub", tokens_used=20, prompt_tokens=10,
+            content="Here is the final answer.",
+            model=model,
+            provider="test_stub",
+            tokens_used=20,
+            prompt_tokens=10,
             completion_tokens=10,
         )
 
@@ -117,8 +136,12 @@ class _AlwaysEmptyStub(_AlwaysToolCallStub):
     def chat(self, messages, model, **kw):
         self.call_count += 1
         return LLMResponse(
-            content="", model=model, provider="test_stub",
-            tokens_used=10, prompt_tokens=5, completion_tokens=5,
+            content="",
+            model=model,
+            provider="test_stub",
+            tokens_used=10,
+            prompt_tokens=5,
+            completion_tokens=5,
         )
 
 
@@ -127,8 +150,12 @@ class _OkStub(_AlwaysToolCallStub):
 
     def chat(self, messages, model, **kw):
         return LLMResponse(
-            content="Final answer.", model=model, provider="test_stub",
-            tokens_used=5, prompt_tokens=2, completion_tokens=3,
+            content="Final answer.",
+            model=model,
+            provider="test_stub",
+            tokens_used=5,
+            prompt_tokens=2,
+            completion_tokens=3,
         )
 
 
@@ -146,6 +173,7 @@ class _CancellingStub(_AlwaysToolCallStub):
 
     def chat(self, messages, model, **kw):
         from external_llm.agent.agent_loop_types import AgentCancelled
+
         raise AgentCancelled("cancelled by user")
 
 
@@ -159,7 +187,10 @@ class _FirstEmptyThenFailStub(_AlwaysToolCallStub):
         self.call_count += 1
         if self.call_count == 1:
             return LLMResponse(
-                content="", model=model, provider="test_stub", tokens_used=5,
+                content="",
+                model=model,
+                provider="test_stub",
+                tokens_used=5,
             )
         raise LLMClientError("Retry also failed")
 
@@ -174,13 +205,18 @@ class _FirstEmptyThenCancelStub(_AlwaysToolCallStub):
         self.call_count += 1
         if self.call_count == 1:
             return LLMResponse(
-                content="", model=model, provider="test_stub", tokens_used=5,
+                content="",
+                model=model,
+                provider="test_stub",
+                tokens_used=5,
             )
         from external_llm.agent.agent_loop_types import AgentCancelled
+
         raise AgentCancelled("cancelled during retry")
 
 
 # ── Test classes ──────────────────────────────────────────────────────────────
+
 
 class TestTotalLlmCallsRetry:
     """Bug 2: retry path must increment total_llm_calls."""
@@ -191,8 +227,7 @@ class TestTotalLlmCallsRetry:
         result = _respond(loop)
         # 1 tool-loop call + 1 initial final-attempt + 1 retry = 3
         assert result.total_llm_calls == 3, (
-            f"Expected 3 LLM calls (tool-loop + initial + retry), "
-            f"got {result.total_llm_calls}"
+            f"Expected 3 LLM calls (tool-loop + initial + retry), got {result.total_llm_calls}"
         )
         assert result.content.strip() == "Here is the final answer."
 
@@ -202,8 +237,7 @@ class TestTotalLlmCallsRetry:
         result = _respond(loop)
         # 1 tool-loop + 1 initial + 1 retry = 3
         assert result.total_llm_calls == 3, (
-            f"Expected 3 LLM calls (tool-loop + initial + retry), "
-            f"got {result.total_llm_calls}"
+            f"Expected 3 LLM calls (tool-loop + initial + retry), got {result.total_llm_calls}"
         )
 
 
@@ -213,39 +247,41 @@ class TestFailureRecording:
     def test_llm_client_error_records_and_propagates(self, _repo):
         """LLMClientError: failed=True recorded in metrics, result.is_error=True."""
         from external_llm.agent.performance_metrics import get_global_collector
+
         calls = []
         original_record = get_global_collector().record_llm_call
         try:
+
             def _spy(*args, **kw):
                 calls.append(kw)
                 return original_record(*args, **kw)
+
             get_global_collector().record_llm_call = _spy
             loop = _make_loop(_FailingStub(), _repo)
             result = _respond(loop)
             assert result.is_error is True, "LLMClientError must produce is_error result"
             failures = [c for c in calls if c.get("failed", False)]
-            assert len(failures) >= 1, (
-                f"Expected ≥1 failure recording for LLMClientError, got {len(failures)}"
-            )
+            assert len(failures) >= 1, f"Expected ≥1 failure recording for LLMClientError, got {len(failures)}"
         finally:
             get_global_collector().record_llm_call = original_record
 
     def test_ok_path_no_spurious_failure(self, _repo):
         """Normal (no retry) path: no failure recordings for final response."""
         from external_llm.agent.performance_metrics import get_global_collector
+
         calls = []
         original_record = get_global_collector().record_llm_call
         try:
+
             def _spy(*args, **kw):
                 calls.append(kw)
                 return original_record(*args, **kw)
+
             get_global_collector().record_llm_call = _spy
             loop = _make_loop(_OkStub(), _repo)
             _respond(loop)
             failures = [c for c in calls if c.get("failed", False)]
-            assert len(failures) == 0, (
-                f"Expected 0 failure recordings, got {len(failures)}: {failures}"
-            )
+            assert len(failures) == 0, f"Expected 0 failure recordings, got {len(failures)}: {failures}"
         finally:
             get_global_collector().record_llm_call = original_record
 
@@ -257,6 +293,7 @@ class TestCancellationGuard:
         """AgentCancelled in final-response chat() must propagate to respond()."""
         loop = _make_loop(_CancellingStub(), _repo)
         from external_llm.agent.agent_loop_types import AgentCancelled
+
         with pytest.raises(AgentCancelled):
             _respond(loop)
 
@@ -270,6 +307,7 @@ class TestCancellationGuard:
         """AgentCancelled in retry chat() must propagate via inner except guard."""
         loop = _make_loop(_FirstEmptyThenCancelStub(), _repo)
         from external_llm.agent.agent_loop_types import AgentCancelled
+
         with pytest.raises(AgentCancelled):
             _respond(loop)
 
@@ -293,12 +331,15 @@ class TestFinalRecordedGuard:
     def test_guard_prevents_double_failure_recording(self, _repo):
         """Only 1 failed=True recording (from inner except), not 2 (outer)."""
         from external_llm.agent.performance_metrics import get_global_collector
+
         calls: list[dict] = []
         original_record = get_global_collector().record_llm_call
         try:
+
             def _spy(*args, **kw):
                 calls.append(kw)
                 return original_record(*args, **kw)
+
             get_global_collector().record_llm_call = _spy
 
             loop = _make_loop(_FirstEmptyThenFailStub(), _repo)
@@ -309,12 +350,10 @@ class TestFinalRecordedGuard:
             successes = [c for c in calls if not c.get("failed", True)]
 
             assert len(failures) == 1, (
-                f"Expected exactly 1 failed=True recording (from inner except), "
-                f"got {len(failures)}: {failures}"
+                f"Expected exactly 1 failed=True recording (from inner except), got {len(failures)}: {failures}"
             )
             assert len(successes) >= 1, (
-                f"Expected at least 1 failed=False recording (tool-loop + final), "
-                f"got {len(successes)}: {successes}"
+                f"Expected at least 1 failed=False recording (tool-loop + final), got {len(successes)}: {successes}"
             )
         finally:
             get_global_collector().record_llm_call = original_record

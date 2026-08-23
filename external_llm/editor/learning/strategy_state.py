@@ -15,13 +15,14 @@ Namespaces
     adaptive_hub/{model}   dict    AdaptiveLearnerHub state (model-keyed)
     fallback_scores        dict    FallbackScoreStore strategy scores
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.common.atomic_io import (
     atomic_write_json,
@@ -45,7 +46,10 @@ logger = logging.getLogger(__name__)
 # experience_store sidecar was rewritten, losing 17 of its FIFO-capped 200
 # records to make room for 15 test ones.
 _STRATEGY_STATE_PATH = os.environ.get("ASICODE_STRATEGY_STATE") or os.path.join(
-    os.path.expanduser("~"), ".asicode", "learning", "strategy_state.json",
+    os.path.expanduser("~"),
+    ".asicode",
+    "learning",
+    "strategy_state.json",
 )
 
 # Namespaces that live in their OWN file instead of the consolidated one.
@@ -154,8 +158,7 @@ def _migrate_split_namespaces() -> None:
             except (json.JSONDecodeError, ValueError):
                 _warn_corrupt(_STRATEGY_STATE_PATH)
                 return
-            moved = {k: data[k] for k in list(data)
-                     if k.split("/", 1)[0] in _NAMESPACE_FILES}
+            moved = {k: data[k] for k in list(data) if k.split("/", 1)[0] in _NAMESPACE_FILES}
             if not moved:
                 return
             for ns, value in moved.items():
@@ -174,11 +177,9 @@ def _migrate_split_namespaces() -> None:
                         # corrupt file we just handled. Same semantics (merge
                         # + atomic replace, default=str).
                         existing[ns] = value
-                        atomic_write_json(target, existing, indent=2,
-                                          ensure_ascii=False, default=str)
+                        atomic_write_json(target, existing, indent=2, ensure_ascii=False, default=str)
                 data.pop(ns, None)
-            atomic_write_json(_STRATEGY_STATE_PATH, data, indent=2,
-                              ensure_ascii=False, default=str)
+            atomic_write_json(_STRATEGY_STATE_PATH, data, indent=2, ensure_ascii=False, default=str)
         logger.info(
             "strategy_state: moved %s out of the consolidated file",
             ", ".join(sorted(moved)),
@@ -187,7 +188,7 @@ def _migrate_split_namespaces() -> None:
         logger.debug("strategy_state: split migration failed", exc_info=True)
 
 
-def read_namespace(namespace: str, path: str = "") -> Optional[Any]:
+def read_namespace(namespace: str, path: str = "") -> Any | None:
     """Read a single namespace from the consolidated strategy state file.
 
     Args:
@@ -209,7 +210,7 @@ def read_namespace(namespace: str, path: str = "") -> Optional[Any]:
     return value
 
 
-def _read_from(file_path: str, namespace: str) -> Optional[Any]:
+def _read_from(file_path: str, namespace: str) -> Any | None:
     try:
         data = _read_json_dict(file_path)
     except (json.JSONDecodeError, ValueError, TypeError):

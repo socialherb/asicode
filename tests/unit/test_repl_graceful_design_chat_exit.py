@@ -12,6 +12,7 @@ handler calls: it sets the worker's cancel_event (the worker unwinds at its
 next checkpoint via AgentCancelled) and joins with a bounded timeout so Ctrl+C
 stays snappy. A second Ctrl+C during the wait skips it.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -90,12 +91,12 @@ def test_keyboard_interrupt_handler_calls_graceful_join():
     src = pathlib.Path(repl_impl.__file__).read_text(encoding="utf-8")
     trio = (
         '            _print("", "")\n'
-        '            _print_session_summary(_session_tokens, _session_t0)\n'
+        "            _print_session_summary(_session_tokens, _session_t0)\n"
         '            _print("session ended.", "")\n'
-        "            return \"break\""
+        '            return "break"'
     )
     assert trio in src
     idx = src.index(trio)
-    window = src[max(0, idx - 800):idx]
+    window = src[max(0, idx - 800) : idx]
     assert "except KeyboardInterrupt:" in window
     assert "_graceful_join_design_chat(_dc_thread, _dc_cancel)" in window

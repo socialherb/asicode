@@ -50,13 +50,17 @@ def _get_current_errors(paths: list[str] | None = None) -> set[str]:
     # helper swallows timeouts into returncode=-9, a fail-open semantic).
     try:
         result = subprocess.run(
-            ["ruff", "check", "--select=F821", "--output-format=concise"]
-            + (paths or ["."]),
-            capture_output=True, text=True, cwd=REPO, timeout=180,
+            ["ruff", "check", "--select=F821", "--output-format=concise"] + (paths or ["."]),
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            timeout=180,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        print("❌ ruff F821 scan timed out after 180s — failing closed rather than risk a silent pass.", file=sys.stderr)
+        print(
+            "❌ ruff F821 scan timed out after 180s — failing closed rather than risk a silent pass.", file=sys.stderr
+        )
         sys.exit(1)
     # ruff outputs lines like:  file.py:line:col: F821 Undefined name `blah`
     errors: set[str] = set()

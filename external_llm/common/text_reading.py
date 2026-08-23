@@ -8,11 +8,11 @@ which escaped the ``except OSError`` guard and fell into the outer
 (``ok:True``/``skipped:True`` with no observable reason).  This module is
 the single reader both mixins use so the fallback chain cannot diverge again.
 """
+
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ _DEFAULT_ENCODINGS: tuple[str, ...] = ("utf-8", "latin-1")
 def read_text_with_encoding_fallback(
     abs_path: str,
     encodings: tuple[str, ...] = _DEFAULT_ENCODINGS,
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """Read a text file trying each encoding in order.
 
     Returns ``(content, encoding)`` on success.  Returns ``(None, None)``

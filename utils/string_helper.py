@@ -6,8 +6,6 @@ Provides common string manipulation functions that can be used across the projec
 
 from __future__ import annotations
 
-from typing import Optional
-
 
 def utf8_trailing_incomplete_len(raw: bytes) -> int:
     """Number of trailing bytes in ``raw`` that form an INCOMPLETE multibyte
@@ -164,7 +162,7 @@ def is_palindrome(s: str) -> bool:
     return cleaned == cleaned[::-1]
 
 
-def extract_json(text: str) -> Optional[dict]:
+def extract_json(text: str) -> dict | None:
     """Extract the first JSON object from text, handling code fences and braces.
 
     Tries: 1) code-fenced JSON, 2) bare JSON object, 3) first dict-like substring.
@@ -229,7 +227,7 @@ def extract_json(text: str) -> Optional[dict]:
     return None
 
 
-def parse_json(text: str) -> Optional[dict]:
+def parse_json(text: str) -> dict | None:
     """Alias for extract_json. Thin wrapper for renamed import compatibility."""
     return extract_json(text)
 

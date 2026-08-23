@@ -13,9 +13,11 @@ turn's instruction, so its safety rests on three pure decisions locked here:
      longer max_len; the display-hint contract keeps the original 140 so a
      rule-ignoring helper model still cannot leak long noise onto the prompt.
 """
+
 import asi
 
 # ─── _parse_auto_arg ─────────────────────────────────────────────────────────
+
 
 def test_parse_auto_empty_toggles():
     assert asi._parse_auto_arg("", cur_on=False) == (True, None, None)
@@ -44,6 +46,7 @@ def test_parse_auto_rejects_garbage():
 
 # ─── _auto_continue_should_arm ───────────────────────────────────────────────
 
+
 def test_should_arm_happy_path():
     assert asi._auto_continue_should_arm(True, 0, 5, "run the tests") == (True, "")
     # last allowed step: depth 4 of cap 5
@@ -69,6 +72,7 @@ def test_should_arm_blocks_at_depth_cap():
 
 # ─── _validate_next_suggestion max_len budget ────────────────────────────────
 
+
 def test_validator_default_budget_rejects_long_auto_style_instruction():
     # 141+ chars: fine as a self-contained auto instruction, too long for the
     # display-hint contract — default budget must still reject it.
@@ -78,24 +82,28 @@ def test_validator_default_budget_rejects_long_auto_style_instruction():
 
 def test_validator_auto_budget_accepts_self_contained_instruction():
     long_text = "run pytest tests/unit and then " + "x" * 120
-    assert asi._validate_next_suggestion(
-        long_text, "fix the bug", max_len=asi._AUTO_SUGGESTION_MAX_LEN) == long_text
+    assert asi._validate_next_suggestion(long_text, "fix the bug", max_len=asi._AUTO_SUGGESTION_MAX_LEN) == long_text
 
 
 def test_validator_auto_budget_still_rejects_none_and_language_mismatch():
     # NONE stays the stop signal regardless of budget.
-    assert asi._validate_next_suggestion(
-        "NONE", "fix the bug", max_len=asi._AUTO_SUGGESTION_MAX_LEN) is None
+    assert asi._validate_next_suggestion("NONE", "fix the bug", max_len=asi._AUTO_SUGGESTION_MAX_LEN) is None
     # Script guard survives the budget change: Korean request → ASCII reply suppressed.
-    assert asi._validate_next_suggestion(
-        "verify the previous fix then run tests", "버그를 고치자",
-        max_len=asi._AUTO_SUGGESTION_MAX_LEN) is None
+    assert (
+        asi._validate_next_suggestion(
+            "verify the previous fix then run tests", "버그를 고치자", max_len=asi._AUTO_SUGGESTION_MAX_LEN
+        )
+        is None
+    )
 
 
 def test_validator_auto_budget_has_a_ceiling_too():
-    assert asi._validate_next_suggestion(
-        "y" * (asi._AUTO_SUGGESTION_MAX_LEN + 1), "fix the bug",
-        max_len=asi._AUTO_SUGGESTION_MAX_LEN) is None
+    assert (
+        asi._validate_next_suggestion(
+            "y" * (asi._AUTO_SUGGESTION_MAX_LEN + 1), "fix the bug", max_len=asi._AUTO_SUGGESTION_MAX_LEN
+        )
+        is None
+    )
 
 
 # ─── _AUTO_CONTINUE_DELAY env parsing (misconfig → default, incl. non-finite) ─
@@ -105,7 +113,11 @@ import external_llm.repl.repl_impl as _repl_impl
 
 def test_auto_continue_delay_parse_valid_values(monkeypatch):
     for raw, expected in [
-        ("8", 8.0), ("3", 3.0), ("1.5", 2.0), ("0", 2.0), ("600", 600.0),
+        ("8", 8.0),
+        ("3", 3.0),
+        ("1.5", 2.0),
+        ("0", 2.0),
+        ("600", 600.0),
     ]:
         monkeypatch.setenv("ASICODE_AUTO_CONTINUE_DELAY", raw)
         assert _repl_impl._parse_auto_continue_delay() == expected

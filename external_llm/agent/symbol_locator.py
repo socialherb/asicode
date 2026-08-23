@@ -17,7 +17,6 @@ from __future__ import annotations
 import ast
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,23 +63,33 @@ class PythonAstLocator:
                 spans.append(self._span(node, node.name, "function", True))
             elif isinstance(node, ast.ClassDef):
                 spans.append(self._span(node, node.name, "class", True))
-                spans.extend(self._span(
-                                item, f"{node.name}.{item.name}", "method", False,
-                                bare=item.name,
-                            ) for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
+                spans.extend(
+                    self._span(
+                        item,
+                        f"{node.name}.{item.name}",
+                        "method",
+                        False,
+                        bare=item.name,
+                    )
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                )
         return spans
 
     @staticmethod
-    def _span(node: ast.AST, qualname: str, kind: str, top_level: bool,
-              bare: Optional[str] = None) -> SymbolSpan:
+    def _span(node: ast.AST, qualname: str, kind: str, top_level: bool, bare: str | None = None) -> SymbolSpan:
         start = node.lineno  # type: ignore[attr-defined]
         for deco in getattr(node, "decorator_list", []):
             start = min(start, deco.lineno)
         end = getattr(node, "end_lineno", None) or node.lineno  # type: ignore[attr-defined]
         name = bare if bare is not None else getattr(node, "name", qualname)
         return SymbolSpan(
-            name=name, qualname=qualname,
-            start_line=start, end_line=end, kind=kind, top_level=top_level,
+            name=name,
+            qualname=qualname,
+            start_line=start,
+            end_line=end,
+            kind=kind,
+            top_level=top_level,
         )
 
 
@@ -109,9 +118,14 @@ class ProviderLocator:
             except (ValueError, TypeError):
                 logger.debug("symbol span unpack failed", exc_info=True)
                 continue
-            spans.append(SymbolSpan(
-                name=name, qualname=name,
-                start_line=int(start), end_line=int(end),
-                kind=str(kind), top_level=True,
-            ))
+            spans.append(
+                SymbolSpan(
+                    name=name,
+                    qualname=name,
+                    start_line=int(start),
+                    end_line=int(end),
+                    kind=str(kind),
+                    top_level=True,
+                )
+            )
         return spans

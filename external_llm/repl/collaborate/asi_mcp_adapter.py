@@ -8,6 +8,7 @@ browser, web) become in-process MCP tools that Claude Code Agent can call.
 Async bridge: ToolRegistry.dispatch() is sync, SDK @tool handlers must be
 async — uses asyncio.get_running_loop().run_in_executor() under the hood.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -16,7 +17,7 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from typing import Any, Optional
+from typing import Any
 
 from config import CLAUDE_MCP_TOOL_TIMEOUT, CLAUDE_SDK_MAX_TURNS
 from external_llm.agent.cancel_scope import call_cancel_scope
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def claude_sdk_missing_error(
-    original: Optional[BaseException] = None,
+    original: BaseException | None = None,
 ) -> ImportError:
     """Build an actionable ImportError for the missing claude_agent_sdk optional dep.
 
@@ -119,6 +120,8 @@ def build_collaborate_install_spec() -> list[str]:
     except Exception:  # distribution scan failed — fall back to PyPI name
         logger.debug("collaborate install: distribution scan failed", exc_info=True)
     return ["asicode[collaborate]"]
+
+
 def build_collaborate_install_command() -> list[str]:
     """Full ``pip install`` command (interpreter + ``-m pip install`` + spec).
 
@@ -179,37 +182,48 @@ _INNER_TIMEOUT_RERUNS: dict[str, int] = {
     "bash": 2,  # first run + missing-plugin recovery re-run
     "job": 1,
 }
-_MCP_TIMEOUT_GRACE: int = 30    # bg transition + result formatting headroom
+_MCP_TIMEOUT_GRACE: int = 30  # bg transition + result formatting headroom
 
 _EXCLUDED_TOOLS: set[str] = {
-    "delegate_to_helper",       # internal sub-agent delegation
-    "update_memory",            # asicode internal memory
-    "read_image",               # LLM sees OCR text via system; schema overhead not worth it
-    "grep",                     # overlaps native Grep; low MCP added value (but Bash is now MCP-exposed since native Bash is disallowed)
-    "glob",                     # overlaps native Glob; same reasoning as grep
-    "search_web",              # Claude Code has native web search
-    "web_fetch",               # Claude Code has native web fetch
-    "browser_action",          # Claude Code has native browser automation
-    "update_plan",             # asicode internal planner — not useful for Claude Code agent
-    "save_insight",            # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
-    "delete_insight",          # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
-    "edit_insight",            # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
-    "search_design_history",   # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
+    "delegate_to_helper",  # internal sub-agent delegation
+    "update_memory",  # asicode internal memory
+    "read_image",  # LLM sees OCR text via system; schema overhead not worth it
+    "grep",  # overlaps native Grep; low MCP added value (but Bash is now MCP-exposed since native Bash is disallowed)
+    "glob",  # overlaps native Glob; same reasoning as grep
+    "search_web",  # Claude Code has native web search
+    "web_fetch",  # Claude Code has native web fetch
+    "browser_action",  # Claude Code has native browser automation
+    "update_plan",  # asicode internal planner — not useful for Claude Code agent
+    "save_insight",  # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
+    "delete_insight",  # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
+    "edit_insight",  # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
+    "search_design_history",  # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
 }
 
 # Categorised tool lists for MCP annotations
 _READ_ONLY_TOOLS: set[str] = {
-    "read_file", "find_symbol", "find_references",
-    "find_relevant_files", "get_file_outline",
-    "query_dependency_graph", "analyze_change_impact", "run_structural_scan",
-    "read_symbol", "get_project_info",
+    "read_file",
+    "find_symbol",
+    "find_references",
+    "find_relevant_files",
+    "get_file_outline",
+    "query_dependency_graph",
+    "analyze_change_impact",
+    "run_structural_scan",
+    "read_symbol",
+    "get_project_info",
 }
 
 _OPEN_WORLD_TOOLS: set[str] = set()
 
 _DESTRUCTIVE_TOOLS: set[str] = {
-    "apply_patch", "modify_symbol", "write_plan", "edit_ast",
-    "anchor_edit", "edit_text", "edit_file",
+    "apply_patch",
+    "modify_symbol",
+    "write_plan",
+    "edit_ast",
+    "anchor_edit",
+    "edit_text",
+    "edit_file",
 }
 
 # Not strictly read-only, but safe to expose to analysis sessions.
@@ -218,7 +232,7 @@ _DESTRUCTIVE_TOOLS: set[str] = {
 # misclassified, write tools leak into the analysis session.
 _ANALYSIS_SAFE_TOOLS: set[str] = {
     "ask_user",
-    "bash",              # shell command execution — needed in analysis mode for file lookup/search/stats etc.
+    "bash",  # shell command execution — needed in analysis mode for file lookup/search/stats etc.
 }
 
 # ─── Read-tool executor isolation ─────────────────────────────────────────
@@ -230,10 +244,15 @@ _ANALYSIS_SAFE_TOOLS: set[str] = {
 # timeout. Reproduced: read_symbol latency 0.01s -> 7.86s under 10 concurrent
 # heavy blockers. Routing always-fast read tools to a dedicated pool keeps
 # them responsive regardless of background load.
-_FAST_READ_TOOLS: frozenset[str] = frozenset({
-    "read_symbol", "read_file", "find_symbol",
-    "get_file_outline", "get_project_info",
-})
+_FAST_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_symbol",
+        "read_file",
+        "find_symbol",
+        "get_file_outline",
+        "get_project_info",
+    }
+)
 
 _FAST_READ_EXECUTOR = ThreadPoolExecutor(
     max_workers=4,
@@ -294,13 +313,14 @@ def get_excluded_tools(allow_write: bool = False) -> set[str]:
     return excluded
 
 
-def _get_tool_annotations(tool_name: str) -> Optional[Any]:
+def _get_tool_annotations(tool_name: str) -> Any | None:
     """Build MCP ToolAnnotations for a given tool name.
 
     Returns None for neutral tools, or a ToolAnnotations instance.
     """
     with suppress(ImportError):
         from claude_agent_sdk import ToolAnnotations
+
         return ToolAnnotations(
             readOnlyHint=tool_name in _READ_ONLY_TOOLS,
             destructiveHint=tool_name in _DESTRUCTIVE_TOOLS,
@@ -328,7 +348,7 @@ def _convert_schema_to_input_type(schema: dict) -> dict:
 def build_asr_mcp_server(
     registry: ToolRegistry,
     server_name: str = "asicode",
-    excluded_tools: Optional[set[str]] = None,
+    excluded_tools: set[str] | None = None,
     version: str = "1.0.0",
     read_only: bool = False,
 ) -> Any:
@@ -369,13 +389,10 @@ def build_asr_mcp_server(
         if tool_name in excluded:
             continue
 
-        if (
-            read_only
-            and tool_name not in _READ_ONLY_TOOLS
-            and tool_name not in _ANALYSIS_SAFE_TOOLS
-        ):
+        if read_only and tool_name not in _READ_ONLY_TOOLS and tool_name not in _ANALYSIS_SAFE_TOOLS:
             logger.info(
-                "Read-only session: skipping unclassified tool %s", tool_name,
+                "Read-only session: skipping unclassified tool %s",
+                tool_name,
             )
             continue
 
@@ -397,17 +414,21 @@ def build_asr_mcp_server(
         # Create the async handler with closure capture via factory
         handler = _make_async_handler(registry, tool_name)
 
-        sdk_tools.append(SdkMcpTool(
-            name=tool_name,
-            description=description,
-            input_schema=input_schema,
-            handler=handler,
-            annotations=annotations,
-        ))
+        sdk_tools.append(
+            SdkMcpTool(
+                name=tool_name,
+                description=description,
+                input_schema=input_schema,
+                handler=handler,
+                annotations=annotations,
+            )
+        )
 
     logger.info(
         "Built asicode MCP server '%s' with %d tools (excluded %d)",
-        server_name, len(sdk_tools), len(excluded),
+        server_name,
+        len(sdk_tools),
+        len(excluded),
     )
 
     return create_sdk_mcp_server(
@@ -478,7 +499,9 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
             if result.ok:
                 logger.info(
                     "MCP tool %s ok (%.2fs, %d chars)",
-                    tool_name, elapsed, len(result.content or ""),
+                    tool_name,
+                    elapsed,
+                    len(result.content or ""),
                 )
                 return {
                     "content": [
@@ -487,7 +510,10 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
                 }
             error_msg = result.error or "Unknown error"
             logger.warning(
-                "MCP tool %s failed (%.2fs): %s", tool_name, elapsed, error_msg,
+                "MCP tool %s failed (%.2fs): %s",
+                tool_name,
+                elapsed,
+                error_msg,
             )
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - t0
@@ -510,16 +536,16 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
             )
             logger.exception(
                 "MCP tool %s timed out after %.1fs (limit %ss)%s",
-                tool_name, elapsed, timeout, pool_note,
+                tool_name,
+                elapsed,
+                timeout,
+                pool_note,
             )
             return {
                 "content": [
                     {
                         "type": "text",
-                        "text": (
-                            f"TOOL_TIMEOUT: {tool_name} exceeded "
-                            f"{timeout}s limit"
-                        ),
+                        "text": (f"TOOL_TIMEOUT: {tool_name} exceeded {timeout}s limit"),
                     }
                 ],
                 "isError": True,
@@ -527,7 +553,9 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
         except Exception as ex:
             elapsed = time.monotonic() - t0
             logger.exception(
-                "MCP tool %s raised exception (%.2fs)", tool_name, elapsed,
+                "MCP tool %s raised exception (%.2fs)",
+                tool_name,
+                elapsed,
             )
             return {
                 "content": [
@@ -559,10 +587,10 @@ def _make_async_handler(registry: ToolRegistry, tool_name: str):
 
 def get_restricted_options(
     mcp_server_config: Any,
-    system_prompt: Optional[str] = None,
+    system_prompt: str | None = None,
     max_turns: int = CLAUDE_SDK_MAX_TURNS,
     permission_mode: str = "bypassPermissions",
-    model: Optional[str] = None,
+    model: str | None = None,
     allow_write: bool = False,
 ) -> Any:
     """Build ClaudeAgentOptions that restrict Claude Code Agent to asicode tools only.
@@ -587,11 +615,23 @@ def get_restricted_options(
     # the CLI abort ("Permission deny rule 'advisor' matches no known tool").
     # Disable it by not inheriting advisorModel (setting_sources), not here.
     disallowed = [
-        "Read", "Write", "Bash", "Grep", "Glob", "Edit",
-        "WebFetch", "WebSearch", "TodoWrite",
-        "NotebookEdit", "TaskCreate", "TaskUpdate", "TaskGet",
-        "KillBash", "ExitPlanMode",
-        "Task", "Agent",
+        "Read",
+        "Write",
+        "Bash",
+        "Grep",
+        "Glob",
+        "Edit",
+        "WebFetch",
+        "WebSearch",
+        "TodoWrite",
+        "NotebookEdit",
+        "TaskCreate",
+        "TaskUpdate",
+        "TaskGet",
+        "KillBash",
+        "ExitPlanMode",
+        "Task",
+        "Agent",
     ]
 
     # Wrap schema in SDK's expected json_schema format
@@ -614,7 +654,7 @@ def get_restricted_options(
         allowed_tools=["mcp__asr__*"],  # glob pattern for all ASR tools
         disallowed_tools=disallowed,
         max_turns=max_turns,
-        permission_mode=permission_mode,
+        permission_mode=permission_mode,  # type: ignore[arg-type]  # SDK PermissionMode literal; str values match
         # SDK isolation: do NOT inherit ~/.claude/settings.json. This drops
         # `advisorModel` (so the advisor server-side tool stays OFF) and
         # `autoCompactEnabled:false` (so the CLI's default auto-compaction is

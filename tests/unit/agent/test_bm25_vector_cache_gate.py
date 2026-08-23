@@ -71,7 +71,7 @@ class TestVectorCacheGate:
             assert not from_cache
             assert isinstance(sig, tuple)
             assert len(sig) == 3
-            assert sig[0] == "s1"           # sid
+            assert sig[0] == "s1"  # sid
             assert isinstance(sig[1], int)  # size
             assert isinstance(sig[2], int)  # mtime_ns
             # Same archive → same sig (deterministic)
@@ -91,10 +91,10 @@ class TestVectorCacheGate:
             r1, sig1, fc1 = _archived_bm25_entries(mgr, "s1", archived)
             r2, sig2, fc2 = _archived_bm25_entries(mgr, "s1", archived)
 
-            assert fc1 is False       # miss (build)
-            assert fc2 is True        # hit (reuse)
+            assert fc1 is False  # miss (build)
+            assert fc2 is True  # hit (reuse)
             assert sig1 == sig2
-            assert r1 is r2           # object identity — BM25 cache worked
+            assert r1 is r2  # object identity — BM25 cache worked
         finally:
             os.unlink(p)
 
@@ -109,9 +109,9 @@ class TestVectorCacheGate:
             _r1, s1, fc1 = _archived_bm25_entries(m1, "s1", archived)
             _r2, s2, fc2 = _archived_bm25_entries(m2, "s2", archived)
 
-            assert s1 != s2          # different file sizes → different sigs
+            assert s1 != s2  # different file sizes → different sigs
             assert fc1 is False
-            assert fc2 is False      # different sig → cache miss
+            assert fc2 is False  # different sig → cache miss
         finally:
             for p in (p1, p2):
                 os.unlink(p)

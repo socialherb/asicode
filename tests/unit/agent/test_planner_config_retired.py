@@ -19,6 +19,7 @@ The tripwire has a NEGATIVE CONTROL, because a silent instrument and a silent
 code path are indistinguishable: the same probe is placed on ``helper_enabled``,
 which ``AgentLoop.__init__`` demonstrably reads, and must fire there.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -83,20 +84,34 @@ class _StubClient:
             calls = self.script[self.i]
             self.i += 1
             return ToolCallResponse(
-                content="", model="stub", provider="openai", tokens_used=150,
-                finish_reason="tool_calls", raw_response=None,
-                tool_calls=calls, is_final=False,
-                prompt_tokens=100, completion_tokens=50,
+                content="",
+                model="stub",
+                provider="openai",
+                tokens_used=150,
+                finish_reason="tool_calls",
+                raw_response=None,
+                tool_calls=calls,
+                is_final=False,
+                prompt_tokens=100,
+                completion_tokens=50,
             )
         return ToolCallResponse(
-            content="Done.", model="stub", provider="openai", tokens_used=150,
-            finish_reason="stop", raw_response=None, tool_calls=[], is_final=True,
-            prompt_tokens=100, completion_tokens=50,
+            content="Done.",
+            model="stub",
+            provider="openai",
+            tokens_used=150,
+            finish_reason="stop",
+            raw_response=None,
+            tool_calls=[],
+            is_final=True,
+            prompt_tokens=100,
+            completion_tokens=50,
         )
 
     def chat(self, messages, model="", **kw):
-        return LLMResponse(content="ok", model="stub", provider="openai",
-                           tokens_used=10, finish_reason="stop", raw_response=None)
+        return LLMResponse(
+            content="ok", model="stub", provider="openai", tokens_used=10, finish_reason="stop", raw_response=None
+        )
 
 
 @pytest.fixture
@@ -108,18 +123,24 @@ def repo(tmp_path):
 
 def _run(repo, config):
     script = [
-        [ToolCallRequest(call_id="c1", name="read_file",
-                         args={"path": "app.py", "start_line": 1, "end_line": 5})],
-        [ToolCallRequest(call_id="c2", name="edit_text",
-                         args={"file_path": "app.py", "old_string": "x = 1",
-                               "new_string": "x = 2"})],
+        [ToolCallRequest(call_id="c1", name="read_file", args={"path": "app.py", "start_line": 1, "end_line": 5})],
+        [
+            ToolCallRequest(
+                call_id="c2",
+                name="edit_text",
+                args={"file_path": "app.py", "old_string": "x = 1", "new_string": "x = 2"},
+            )
+        ],
     ]
     registry = ToolRegistry(str(repo), config)
-    loop = AgentLoop(llm_client=_StubClient(script), registry=registry,
-                     config=config, model="stub-model")
+    loop = AgentLoop(llm_client=_StubClient(script), registry=registry, config=config, model="stub-model")
     loop.config.route_decision = SimpleNamespace(
-        lane=Lane.MAIN_AGENT, confidence=0.9, task_kind="general",
-        reasoning="", complexity=None, target_specificity_score=0.5,
+        lane=Lane.MAIN_AGENT,
+        confidence=0.9,
+        task_kind="general",
+        reasoning="",
+        complexity=None,
+        target_specificity_score=0.5,
     )
     return loop.run("tripwire probe")
 
@@ -155,4 +176,3 @@ def test_the_tripwire_fires_for_a_field_that_is_read(repo):
 
     assert accesses, "tripwire never fired on a field known to be read"
     assert any("helper_enabled" in a for a in accesses)
-

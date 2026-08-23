@@ -60,9 +60,7 @@ def test_batch_adaptive_signals_is_reentrant():
             store.record_tool_usage("MAIN_AGENT", "semantic_edit", True)
         total = spy.call_count
 
-    assert inner_exit_calls == 0, (
-        f"inner block flushed and ended the outer batch ({inner_exit_calls} saves)"
-    )
+    assert inner_exit_calls == 0, f"inner block flushed and ended the outer batch ({inner_exit_calls} saves)"
     assert total == 1, f"expected a single flush at outer exit, got {total}"
 
 
@@ -94,10 +92,7 @@ def test_batch_adaptive_signals_is_thread_local():
         release.set()
         t.join(5)
 
-    assert main_writes == 4, (
-        f"main thread wrote {main_writes}/4 signals — another thread's batch "
-        "leaked across threads"
-    )
+    assert main_writes == 4, f"main thread wrote {main_writes}/4 signals — another thread's batch leaked across threads"
 
 
 def test_batch_adaptive_signals_debounces_instead_of_suspending():
@@ -110,10 +105,7 @@ def test_batch_adaptive_signals_debounces_instead_of_suspending():
                 store.record_tool_usage("MAIN_AGENT", "apply_patch", True)
         calls = spy.call_count
 
-    assert calls >= 3, (
-        f"{n} signals produced only {calls} flush(es); a crash would discard "
-        "the whole batch"
-    )
+    assert calls >= 3, f"{n} signals produced only {calls} flush(es); a crash would discard the whole batch"
     assert calls < n, f"debounce did nothing: {calls} flushes for {n} signals"
 
 

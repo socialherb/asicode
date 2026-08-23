@@ -12,6 +12,7 @@ Covers the miss regions from the 33% baseline (1735 stmts / 1165 miss):
 
 Source-free: asi.py is not modified here.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -28,6 +29,7 @@ import pytest
 import asi
 
 # ─── color / shimmer helpers ───────────────────────────────────────────────────
+
 
 class TestLerpColor:
     def test_t0_returns_first(self):
@@ -90,6 +92,7 @@ class TestRenderShimmerText:
 
 
 # ─── seq pad / MarginIO ────────────────────────────────────────────────────────
+
 
 class TestSeqPad:
     def test_fills_to_fixed_width(self):
@@ -160,6 +163,7 @@ class TestMarginIO:
 
 # ─── bracketed paste / drain stdin ────────────────────────────────────────────
 
+
 class TestBracketedPaste:
     def test_enable_writes_escape(self, monkeypatch, capsys):
         monkeypatch.setattr(asi.sys.stdout, "isatty", lambda: True)
@@ -187,6 +191,7 @@ class TestDrainStdin:
 
 
 # ─── history rotation ──────────────────────────────────────────────────────────
+
 
 class TestRotateCliHistory:
     def test_missing_file_noop(self, tmp_path):
@@ -221,6 +226,7 @@ class TestRotateCliHistory:
 
 
 # ─── strip ansi / diff stats / elapsed / tokens ───────────────────────────────
+
 
 class TestStripAnsi:
     def test_strips_sgr(self):
@@ -270,6 +276,7 @@ class TestAbbrevTokens:
 
 # ─── session summary ───────────────────────────────────────────────────────────
 
+
 class TestPrintSessionSummary:
     def test_silent_when_no_usage(self, monkeypatch):
         calls = []
@@ -286,6 +293,7 @@ class TestPrintSessionSummary:
 
 
 # ─── model resolution ──────────────────────────────────────────────────────────
+
 
 class TestModelCandidates:
     def test_prefix_scan(self, monkeypatch):
@@ -316,13 +324,17 @@ class TestResolveModelArg:
         assert asi._resolve_model_arg("claude") == ("anthropic", "claude-sonnet-4-6")
 
     def test_exact_name_wins(self, monkeypatch):
-        monkeypatch.setattr(asi, "_model_candidates", lambda p, ollama_timeout=3: [
-            ("anthropic", "claude-sonnet-4-6"), ("ollama", "claude-x")])
+        monkeypatch.setattr(
+            asi,
+            "_model_candidates",
+            lambda p, ollama_timeout=3: [("anthropic", "claude-sonnet-4-6"), ("ollama", "claude-x")],
+        )
         assert asi._resolve_model_arg("claude-sonnet-4-6") == ("anthropic", "claude-sonnet-4-6")
 
     def test_ambiguous_returns_none(self, monkeypatch):
-        monkeypatch.setattr(asi, "_model_candidates", lambda p, ollama_timeout=3: [
-            ("anthropic", "m1"), ("openai", "m2")])
+        monkeypatch.setattr(
+            asi, "_model_candidates", lambda p, ollama_timeout=3: [("anthropic", "m1"), ("openai", "m2")]
+        )
         assert asi._resolve_model_arg("m") is None
 
 
@@ -371,8 +383,10 @@ class TestResolveModelInteractive:
 
     def test_multi_candidate_eof(self, monkeypatch):
         monkeypatch.setattr(asi, "_model_candidates", lambda p: [("a", "m1"), ("b", "m2")])
+
         def _eof(p=""):
             raise EOFError
+
         monkeypatch.setattr(asi, "_collect_input", _eof)
         assert asi._resolve_model_interactive("m") is None
 
@@ -398,6 +412,7 @@ class TestResolveModelInteractive:
 
 
 # ─── think suggestions ─────────────────────────────────────────────────────────
+
 
 class TestGetThinkSuggestions:
     def test_openai_o_series(self):
@@ -438,6 +453,7 @@ class TestGetThinkSuggestions:
 
 # ─── group / help / status / banner ────────────────────────────────────────────
 
+
 class TestGroupedSlashCommands:
     def test_sections_and_other(self):
         groups = asi._grouped_slash_commands()
@@ -468,7 +484,16 @@ class TestRenderStatus:
     def test_plain_branch(self, monkeypatch, capsys):
         monkeypatch.setattr(asi, "_RICH", False)
         monkeypatch.setattr(asi, "_out_console", None)
-        asi._render_status("/repo", "openai", "gpt-4o", "code", {"prompt": 100}, thinking_state=True, reasoning_effort="high", helper="h")
+        asi._render_status(
+            "/repo",
+            "openai",
+            "gpt-4o",
+            "code",
+            {"prompt": 100},
+            thinking_state=True,
+            reasoning_effort="high",
+            helper="h",
+        )
         out = capsys.readouterr().out
         assert "openai / gpt-4o" in out
         assert "thinking ON (high)" in out
@@ -499,11 +524,14 @@ class TestBarBoxPanel:
 
     def test_bar_panel(self, monkeypatch):
         panels = []
+
         class FakePanel:
             def __init__(self, *a, **k):
                 panels.append((a, k))
+
         monkeypatch.setattr(asi, "_BAR_BOX", object())
         import rich.panel as rp
+
         monkeypatch.setattr(rp, "Panel", FakePanel)
         asi._bar_panel("content", title="t", color="red")
         assert panels and panels[0][1]["title"] == "t"
@@ -518,10 +546,13 @@ class TestPrint:
 
     def test_rich_branch(self, monkeypatch):
         printed = []
+
         class FakeOut:
             file = None
+
             def print(self, *a, **k):
                 printed.append((a, k))
+
         fake = FakeOut()
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", fake)
@@ -540,11 +571,14 @@ class TestPrintBanner:
     def test_no_color_rich(self, monkeypatch):
         monkeypatch.setattr(asi, "_RICH", True)
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
             def rule(self, *a, **k):
                 pass
+
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         monkeypatch.setenv("NO_COLOR", "1")
         asi._print_banner("/repo")
@@ -553,11 +587,13 @@ class TestPrintBanner:
 
 # ─── dep status ────────────────────────────────────────────────────────────────
 
+
 class TestCheckDepStatus:
     def test_tool_states(self, monkeypatch):
         class T:
             def __init__(self, cmd, found, skipped):
                 self.cmd, self.found, self.skipped = cmd, found, skipped
+
         tools = [T("eslint", True, False), T("black", False, False), T("mypy", False, True)]
         monkeypatch.setattr(asi, "_is_embedding_model_cached", lambda m: False)
         status = asi._check_dep_status(tools)
@@ -571,6 +607,7 @@ class TestCheckDepStatus:
 class TestGitLsFiles:
     def test_delegates(self, monkeypatch):
         from external_llm.common.repo_files import git_list_repo_files as real
+
         monkeypatch.setattr(asi, "_git_ls_files", lambda r: real(r) or [])
         files = asi._git_ls_files("/tmp")
         assert isinstance(files, list)
@@ -587,6 +624,7 @@ class TestPrintDepStatus:
     def _patch_dep_modules(self, monkeypatch, files=(), langs=()):
         import external_llm.languages.dependency_checker as dc
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(dc, "detect_repo_languages", lambda r: [])
         monkeypatch.setattr(dc, "_check_tools_with_state", lambda d, no_prompt=False: [])
         monkeypatch.setattr(asi, "_git_ls_files", lambda r: list(files))
@@ -626,6 +664,7 @@ class TestPrintDepStatus:
 
 # ─── git baseline / changed files / undo (via _git mock) ──────────────────────
 
+
 class TestGitBaseline:
     def test_not_a_repo(self, monkeypatch):
         monkeypatch.setattr(asi, "_git", lambda r, *a, **k: (128, ""))
@@ -633,6 +672,7 @@ class TestGitBaseline:
 
     def test_stash_create_ref(self, monkeypatch):
         calls = []
+
         def fake_git(r, *args, **kw):
             calls.append(args)
             if args[0] == "rev-parse":
@@ -644,6 +684,7 @@ class TestGitBaseline:
             if args[0] == "ls-files":
                 return 0, "new1.py\x00new2.py\x00"
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         bl = asi._git_baseline("/x")
         assert bl == {"ref": "abc123", "untracked": frozenset({"new1.py", "new2.py"})}
@@ -659,6 +700,7 @@ class TestGitBaseline:
             if args[0] == "ls-files":
                 return 0, ""
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         assert asi._git_baseline("/x")["ref"] == "headref"
 
@@ -667,6 +709,7 @@ class TestGitBaseline:
             if args[0] == "rev-parse" and args[1] == "--is-inside-work-tree":
                 return 0, "true"
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         assert asi._git_baseline("/x") is None
 
@@ -679,6 +722,7 @@ class TestChangedFilesSince:
             if args[0] == "ls-files":
                 return 0, "c.py\x00d.py\x00"
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         baseline = {"ref": "r", "untracked": frozenset({"d.py"})}
         assert asi._changed_files_since("/x", baseline) == ["a.py", "b.py", "c.py"]
@@ -686,7 +730,9 @@ class TestChangedFilesSince:
 
 class TestFileDiffText:
     def test_tracked_diff(self, monkeypatch):
-        monkeypatch.setattr(asi, "_git", lambda r, *a, **k: (0, "+++ b/x\n+1\n") if a[0] == "diff" and a[1] == "--no-color" else (0, ""))
+        monkeypatch.setattr(
+            asi, "_git", lambda r, *a, **k: (0, "+++ b/x\n+1\n") if a[0] == "diff" and a[1] == "--no-color" else (0, "")
+        )
         body, is_new = asi._file_diff_text("/x", {"ref": "r"}, "x")
         assert is_new is False and body
 
@@ -695,6 +741,7 @@ class TestFileDiffText:
             if "--no-index" in args:
                 return 0, "+new\n"
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         body, is_new = asi._file_diff_text("/x", {"ref": "r"}, "new.py")
         assert is_new is True and body
@@ -702,16 +749,7 @@ class TestFileDiffText:
 
 class TestBuildFileDiffRenderable:
     def _body(self):
-        return (
-            "diff --git a/x b/x\n"
-            "index 111..222 100644\n"
-            "--- a/x\n"
-            "+++ b/x\n"
-            "@@ -1,2 +1,2 @@\n"
-            "-old\n"
-            "+new\n"
-            " context\n"
-        )
+        return "diff --git a/x b/x\nindex 111..222 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n"
 
     def test_render(self):
         out = asi._build_file_diff_renderable("x", self._body(), False)
@@ -751,6 +789,7 @@ class TestRunChangedStats:
             if args[0] == "ls-files":
                 return 0, ""
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         baseline = {"ref": "r", "untracked": frozenset()}
         stats = asi._run_changed_stats("/x", baseline)
@@ -778,12 +817,14 @@ class TestPrintRunChangeSummary:
 class TestUndoRunChanges:
     def test_restore_and_delete(self, monkeypatch, tmp_path):
         (tmp_path / "new.py").write_text("x")
+
         def fake_git(r, *args, **kw):
             if args[0] == "cat-file":
                 return (0, "") if args[2].endswith(":a.py") else (1, "")
             if args[0] == "restore":
                 return 0, ""
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         baseline = {"ref": "r", "untracked": frozenset()}
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py", "new.py"])
@@ -801,6 +842,7 @@ class TestUndoRunChanges:
             if args[0] == "checkout":
                 return 0, ""
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py"])
         undone, _failed = asi._undo_run_changes("/x", {"ref": "r"})
@@ -811,6 +853,7 @@ class TestUndoRunChanges:
             if args[0] == "cat-file":
                 return 0, ""
             return 1, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py"])
         _undone, failed = asi._undo_run_changes("/x", {"ref": "r"})
@@ -821,6 +864,7 @@ class TestUndoRunChanges:
             if args[0] == "cat-file":
                 return 1, ""
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py"])
         monkeypatch.setattr(os, "remove", lambda p: (_ for _ in ()).throw(OSError("no")))
@@ -847,11 +891,14 @@ class TestRenderRunDiff:
 
     def test_rich_branch(self, monkeypatch):
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
             def rule(self, *a, **k):
                 pass
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py", "b.py"])
@@ -861,11 +908,14 @@ class TestRenderRunDiff:
 
     def test_extra_files_note(self, monkeypatch):
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
             def rule(self, *a, **k):
                 pass
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: [f"f{i}.py" for i in range(25)])
@@ -875,6 +925,7 @@ class TestRenderRunDiff:
 
 
 # ─── checkpoint helpers (mock store) ───────────────────────────────────────────
+
 
 class _FakeStore:
     def __init__(self, entries=None):
@@ -893,15 +944,19 @@ class TestCheckpointHelpers:
     def test_load_store_failure(self, monkeypatch):
         def _boom(*a, **k):
             raise ImportError("no checkpoint_store")
+
         monkeypatch.setattr(asi, "CheckpointStore", _boom) if hasattr(asi, "CheckpointStore") else None
         monkeypatch.setitem(sys.modules, "external_llm.agent.checkpoint_store", None)
         # force the lazy import path to fail
         import builtins
+
         real_import = builtins.__import__
+
         def fake_import(name, *a, **k):
             if name == "external_llm.agent.checkpoint_store":
                 raise ImportError("nope")
             return real_import(name, *a, **k)
+
         monkeypatch.setattr(builtins, "__import__", fake_import)
         assert asi._load_checkpoint_store("/x") is None
 
@@ -917,6 +972,7 @@ class TestCheckpointHelpers:
         class Bad(_FakeStore):
             def list(self):
                 raise OSError("nope")
+
         monkeypatch.setattr(asi, "_load_checkpoint_store", lambda r: Bad())
         assert asi._newest_checkpoint_id("/x") is None
 
@@ -952,6 +1008,7 @@ class TestCheckpointHelpers:
 
 # ─── clipboard ─────────────────────────────────────────────────────────────────
 
+
 class TestCopyToClipboard:
     def test_empty_text(self):
         assert asi._copy_to_clipboard("") == ""
@@ -959,10 +1016,12 @@ class TestCopyToClipboard:
     def test_darwin_pbcopy(self, monkeypatch):
         monkeypatch.setattr(asi.sys, "platform", "darwin")
         calls = []
+
         def fake_run(cmd, **kw):
             calls.append(cmd)
             if cmd == ["pbcopy"]:
                 raise OSError("no")
+
         monkeypatch.setattr(asi.subprocess, "run", fake_run)
         assert asi._copy_to_clipboard("x") == ""
 
@@ -974,17 +1033,21 @@ class TestCopyToClipboard:
     def test_linux_success(self, monkeypatch):
         monkeypatch.setattr(asi.sys, "platform", "linux")
         calls = []
+
         def fake_run(cmd, **kw):
             calls.append(cmd)
             if cmd[0] == "wl-copy":
                 raise OSError("no wl-copy")
+
         monkeypatch.setattr(asi.subprocess, "run", fake_run)
         assert asi._copy_to_clipboard("x") == "xclip"
 
     def test_osc52_fallback(self, monkeypatch, capsys):
         monkeypatch.setattr(asi.sys, "platform", "linux")
+
         def fake_run(cmd, **kw):
             raise OSError("none available")
+
         monkeypatch.setattr(asi.subprocess, "run", fake_run)
         monkeypatch.setattr(asi.sys.stdout, "isatty", lambda: True)
         assert asi._copy_to_clipboard("hi") == "OSC 52"
@@ -998,6 +1061,7 @@ class TestCopyToClipboard:
 
 
 # ─── relativize / extract / preview ────────────────────────────────────────────
+
 
 class TestRelativizeRepoPaths:
     def test_strips_cd_prefix(self, monkeypatch):
@@ -1086,6 +1150,7 @@ class TestSelectPreviewLines:
 
 # ─── interrupt note ────────────────────────────────────────────────────────────
 
+
 class TestBuildInterruptNote:
     def test_tool_results_count(self):
         note = asi._build_interrupt_note(type("R", (), {"content": "partial", "tool_results": [1, 2, 3]})())
@@ -1104,6 +1169,7 @@ class TestBuildInterruptNote:
 
 # ─── dotenv ────────────────────────────────────────────────────────────────────
 
+
 class TestLoadDotenv:
     def test_sets_keys(self, tmp_path, monkeypatch):
         (tmp_path / ".env").write_text("KEY1=val1\nKEY2 = val2\n")
@@ -1118,7 +1184,8 @@ class TestLoadDotenv:
 
     def test_export_and_comments(self, tmp_path):
         (tmp_path / ".env").write_text(
-            "# comment\nexport ASI_EXPORT_KEY=exported\nASI_COMMENT_KEY=value # trailing\n\n")
+            "# comment\nexport ASI_EXPORT_KEY=exported\nASI_COMMENT_KEY=value # trailing\n\n"
+        )
         for k in ("ASI_EXPORT_KEY", "ASI_COMMENT_KEY"):
             os.environ.pop(k, None)
         asi._load_dotenv(str(tmp_path))
@@ -1149,6 +1216,7 @@ class TestLoadDotenv:
 
 
 # ─── logging classes ───────────────────────────────────────────────────────────
+
 
 class TestFsyncedFileHandler:
     def test_flush_close(self, tmp_path):
@@ -1262,6 +1330,7 @@ class TestHandleTerminalResize:
         class C:
             def __init__(self):
                 self.width = 100
+
         cons = C()
         monkeypatch.setattr(asi, "_console", cons)
         monkeypatch.setattr(asi, "_log_console", C())
@@ -1273,13 +1342,16 @@ class TestHandleTerminalResize:
 
     def test_resize_error_suppressed(self, monkeypatch):
         import shutil
+
         def _boom(*a, **k):
             raise OSError("bad tty")
+
         monkeypatch.setattr(shutil, "get_terminal_size", _boom)
         asi._handle_terminal_resize()  # must not raise
 
 
 # ─── embedding cache helpers ───────────────────────────────────────────────────
+
 
 class TestEmbeddingHelpers:
     def test_model_folder(self):
@@ -1320,12 +1392,15 @@ class TestEmbeddingHelpers:
 
 # ─── update notice ─────────────────────────────────────────────────────────────
 
+
 class TestMaybeShowUpdateNotice:
     def _patch_vc(self, monkeypatch, notice):
         import utils.version_check as vc
+
         class H:
             def collect(self, wait_s=0.0):
                 return notice
+
         monkeypatch.setattr(vc, "start_update_check", lambda: H())
 
     def test_no_notice(self, monkeypatch):
@@ -1339,13 +1414,16 @@ class TestMaybeShowUpdateNotice:
 
     def test_failure_swallowed(self, monkeypatch):
         import utils.version_check as vc
+
         def _boom(*a, **k):
             raise RuntimeError("network down")
+
         monkeypatch.setattr(vc, "start_update_check", _boom)
         asi._maybe_show_update_notice()  # must not raise
 
 
 # ─── _git itself ───────────────────────────────────────────────────────────────
+
 
 class TestGit:
     def test_success(self):

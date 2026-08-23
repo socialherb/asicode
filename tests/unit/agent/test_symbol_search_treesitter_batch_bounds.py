@@ -9,6 +9,7 @@ minified ``dist/*.js`` (tens of MB is common) was read and parsed in full.
 P26-4 adds: a per-file stat gate (skip oversized), a cumulative byte budget
 (stop when spent), and a file-count cap — all reusing the sibling constants.
 """
+
 from __future__ import annotations
 
 import os
@@ -38,6 +39,7 @@ def _ts_grammar_available(lang: str) -> bool:
     """True when the tree-sitter binding for ``lang`` is installed."""
     try:
         from external_llm.languages.tree_sitter_utils import get_available_languages
+
         return lang in get_available_languages()
     except Exception:
         return False
@@ -56,11 +58,20 @@ def _fake_stat_size(monkeypatch, fake: dict[str, int]) -> None:
     def _stat(self):
         st = real_stat(self)
         if self.name in fake:
-            st = os.stat_result((
-                st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
-                st.st_uid, st.st_gid, fake[self.name],
-                st.st_atime, st.st_mtime, st.st_ctime,
-            ))
+            st = os.stat_result(
+                (
+                    st.st_mode,
+                    st.st_ino,
+                    st.st_dev,
+                    st.st_nlink,
+                    st.st_uid,
+                    st.st_gid,
+                    fake[self.name],
+                    st.st_atime,
+                    st.st_mtime,
+                    st.st_ctime,
+                )
+            )
         return st
 
     monkeypatch.setattr(Path, "stat", _stat)
@@ -98,9 +109,7 @@ class TestTreesitterBatchBounds:
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "server.go").write_text(_GO_SRC, encoding="utf-8")
-        (repo / "extra.go").write_text(
-            "package main\n\nfunc Extra() int { return 1 }\n", encoding="utf-8"
-        )
+        (repo / "extra.go").write_text("package main\n\nfunc Extra() int { return 1 }\n", encoding="utf-8")
         searcher = SymbolSearcher(str(repo))
         # Each file faked to ~4MiB+1: the per-file gate passes (4MiB+1 < 8MiB)
         # but the cumulative 8MiB budget breaks the walk after the first file.

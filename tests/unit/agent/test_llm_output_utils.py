@@ -24,11 +24,11 @@ class TestStripMarkdownFences:
         assert result == "hello"
 
     def test_inline_fence_with_lang(self):
-        result = strip_markdown_fences("```json{\"key\": \"value\"}```")
+        result = strip_markdown_fences('```json{"key": "value"}```')
         assert result == '{"key": "value"}'
 
     def test_inline_fence_with_lang_newline(self):
-        result = strip_markdown_fences("```json\n{\"key\": \"value\"}\n```")
+        result = strip_markdown_fences('```json\n{"key": "value"}\n```')
         assert result == '{"key": "value"}'
 
     # ── Line-based fences ────────────────────────────────────────────
@@ -39,12 +39,12 @@ class TestStripMarkdownFences:
         assert result == "def foo():\n    pass"
 
     def test_line_based_fence_json(self):
-        text = "```json\n{\"key\": 42}\n```"
+        text = '```json\n{"key": 42}\n```'
         result = strip_markdown_fences(text)
         assert result == '{"key": 42}'
 
     def test_line_based_fence_capital_json(self):
-        text = "```JSON\n{\"key\": 42}\n```"
+        text = '```JSON\n{"key": 42}\n```'
         result = strip_markdown_fences(text)
         assert result == '{"key": 42}'
 

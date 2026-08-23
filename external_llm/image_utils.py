@@ -95,9 +95,11 @@ def _check_clipboard_image() -> list[dict[str, str]]:
         # NB: ``-l JavaScript`` runs JXA — AppleScript syntax silently fails to
         # parse here, so the ObjC bridge must use the JS form (ObjC.import, $.).
         _result = _sp.run(
-            ["osascript", "-l", "JavaScript", "-e",
-             _build_clipboard_probe_script(_CLIPBOARD_IMAGE_UTIS)],
-            capture_output=True, text=True, timeout=3.0, check=False,
+            ["osascript", "-l", "JavaScript", "-e", _build_clipboard_probe_script(_CLIPBOARD_IMAGE_UTIS)],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
         )
         if _result.returncode != 0:
             return []
@@ -124,9 +126,18 @@ def _check_clipboard_image() -> list[dict[str, str]]:
 # "[Image Attached]" placeholder. The webapp upload route already rejects
 # image/svg+xml (test_svg_media_type_rejected_by_whitelist), so the CLI drag
 # path was an inconsistency. SVG is XML text, so it is inlined instead.
-_IMAGE_EXTENSIONS = frozenset((
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif",
-))
+_IMAGE_EXTENSIONS = frozenset(
+    (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".tiff",
+        ".tif",
+    )
+)
 
 # Text-format attachments that are *not* raster images. They are read as UTF-8
 # and inlined into the prompt so the model can read them directly — the same
@@ -199,7 +210,9 @@ def _classify_attachment(path):
                 # the prompt.
                 logger.debug(
                     "attachment image %s too large (%d bytes > %d), keeping path in prompt",
-                    path, path.stat().st_size, _IMAGE_MAX_BYTES,
+                    path,
+                    path.stat().st_size,
+                    _IMAGE_MAX_BYTES,
                 )
                 return None
             raw = path.read_bytes()
@@ -232,16 +245,16 @@ def _extract_images_from_input(text: str) -> tuple[str, list[dict[str, str]]]:
     import re as _re
     from pathlib import Path as _Path
 
-    #--- 1st pass: shell-escaped blank/space (\ ) processing ---
-    _MARKER = "\x00_IMG_ESC_SP_\x00"
-    _escaped = text.replace("\\ ", _MARKER)
+    # --- 1st pass: shell-escaped blank/space (\ ) processing ---
+    _esc_marker = "\x00_IMG_ESC_SP_\x00"
+    _escaped = text.replace("\\ ", _esc_marker)
     words = _escaped.split()
     cleaned_words = []
     images: list[dict[str, str]] = []
     inline_blocks: list[str] = []
 
     for w in words:
-        w_restored = w.replace(_MARKER, " ")
+        w_restored = w.replace(_esc_marker, " ")
         p = _Path(w_restored.strip("'\""))
         kind = _classify_attachment(p)
         if kind is None:
@@ -258,8 +271,8 @@ def _extract_images_from_input(text: str) -> tuple[str, list[dict[str, str]]]:
     if not images and not inline_blocks:
         # If starts with a quote, extract up to the closing quote and verify file
         _q = None
-        if result.startswith("\""):
-            _q = "\""
+        if result.startswith('"'):
+            _q = '"'
         elif result.startswith("'"):
             _q = "'"
         if _q:
@@ -273,16 +286,16 @@ def _extract_images_from_input(text: str) -> tuple[str, list[dict[str, str]]]:
                         images.append(kind[1])
                     else:  # "text"
                         inline_blocks.append(kind[1])
-                    result = result[_end + 1:].strip()
+                    result = result[_end + 1 :].strip()
 
     # --- 3rd pass: data URL detection (base64-encoded images) ---
-    #"data:image/png;base64,iVBOR..." form processing
-    _DATA_URL_RE = _re.compile(
-        r'data:image/(?P<fmt>\w+);base64,(?P<b64>[A-Za-z0-9+/=]+)',
+    # "data:image/png;base64,iVBOR..." form processing
+    _data_url_re = _re.compile(
+        r"data:image/(?P<fmt>\w+);base64,(?P<b64>[A-Za-z0-9+/=]+)",
     )
     _new_result_parts = []
     _last_end = 0
-    for _m in _DATA_URL_RE.finditer(result):
+    for _m in _data_url_re.finditer(result):
         _fmt = _m.group("fmt")
         _b64_data = _m.group("b64")
         _mt = f"image/{_fmt}"
@@ -291,7 +304,7 @@ def _extract_images_from_input(text: str) -> tuple[str, list[dict[str, str]]]:
         elif _fmt in {"jpg", "jpeg"}:
             _mt = "image/jpeg"
         images.append({"media_type": _mt, "data": _b64_data})
-        _new_result_parts.append(result[_last_end:_m.start()])
+        _new_result_parts.append(result[_last_end : _m.start()])
         _last_end = _m.end()
     _new_result_parts.append(result[_last_end:])
     result = "".join(_new_result_parts).strip()

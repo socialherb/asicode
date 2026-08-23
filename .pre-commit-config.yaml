@@ -30,8 +30,10 @@
 # impossible (see the staged `ignore` list in pyproject.toml). That backlog was
 # cleared rule-by-rule; on 2026-08-07 only 2 violations remained and both were
 # fixed, so `ruff check .` is now gated (full-lint hook / check_lint_full.py,
-# zero-tolerance, no baseline). `ruff format` (~982 violations) and pyright
-# remain ungated — re-enable those only after their backlogs are cleared.
+# zero-tolerance, no baseline). `ruff format` is ALSO gated — the 848-file
+# backlog was cleared 2026-08-23 (commits 3de8992d..dfa61d1a) and
+# check_lint_full.py now runs `ruff format --check` with the same
+# zero-tolerance, no-baseline semantics. pyright remains ungated.
 # `language: system` uses the host `python3`/`ruff` — the same binaries the
 # check scripts call via subprocess — so the result is identical to
 # `python3 scripts/check_*.py`.

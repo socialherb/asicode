@@ -1,4 +1,5 @@
 """Unit tests for CheckpointStore — CRUD + scan + error paths."""
+
 import json
 import os
 import shutil
@@ -29,7 +30,8 @@ def stored_bytes(store: CheckpointStore, cid: str, rel: str) -> bytes:
         content = inline[rel]
         if content.startswith("__asr_binary_b64__:"):
             import base64 as _b64
-            return _b64.b64decode(content[len("__asr_binary_b64__:"):])
+
+            return _b64.b64decode(content[len("__asr_binary_b64__:") :])
         return content.encode("utf-8")
     return (store.checkpoint_dir / f"{cid}.files" / data["file_hashes"][rel]).read_bytes()
 
@@ -41,6 +43,7 @@ def stored_paths(store: CheckpointStore, cid: str) -> set:
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def repo_root(tmp_path: Path) -> Path:
@@ -73,6 +76,7 @@ def store(repo_root: Path, store_dir: Path) -> CheckpointStore:
 
 # ── _scan_files ───────────────────────────────────────────────────────────
 
+
 class TestScanFiles:
     def test_returns_path_keys(self, store):
         """_scan_files() returns PosixPath keys."""
@@ -94,19 +98,20 @@ class TestScanFiles:
         assert not any(k.startswith(".git") for k in keys_s)
         assert not any(k.startswith("__pycache__") for k in keys_s)
         assert not any(k.startswith(".asicode") for k in keys_s)
+
     def test_excludes_dot_dirs_like_ruff_cache(self, store, repo_root):
-            """Dot-dirs are pruned wholesale — a single .ruff_cache held 26k files
-            (95% of scan time). Regression guard against re-introducing the brittle
-            allowlist that missed cache/tool dot-dirs."""
-            cache_dir = repo_root / ".ruff_cache" / "0"
-            cache_dir.mkdir(parents=True)
-            (cache_dir / "junk.py").write_text("x")
-            (repo_root / ".sometool").mkdir()
-            (repo_root / ".sometool" / "data.json").write_text("{}")
-            hashes = store._scan_files()
-            keys_s = [str(k) for k in hashes]
-            assert not any(".ruff_cache" in k for k in keys_s)
-            assert not any(".sometool" in k for k in keys_s)
+        """Dot-dirs are pruned wholesale — a single .ruff_cache held 26k files
+        (95% of scan time). Regression guard against re-introducing the brittle
+        allowlist that missed cache/tool dot-dirs."""
+        cache_dir = repo_root / ".ruff_cache" / "0"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "junk.py").write_text("x")
+        (repo_root / ".sometool").mkdir()
+        (repo_root / ".sometool" / "data.json").write_text("{}")
+        hashes = store._scan_files()
+        keys_s = [str(k) for k in hashes]
+        assert not any(".ruff_cache" in k for k in keys_s)
+        assert not any(".sometool" in k for k in keys_s)
 
     def test_excludes_pyc_extensions(self, store):
         hashes = store._scan_files()
@@ -138,6 +143,7 @@ class TestScanFiles:
 
 # ── Create ────────────────────────────────────────────────────────────────
 
+
 class TestResolveRepoRelative:
     """Direct contract of the shared _resolve_repo_relative helper (R1)."""
 
@@ -161,6 +167,8 @@ class TestResolveRepoRelative:
         outside = repo_root.parent / "outside.py"
         outside.write_text("x = 1")
         assert store._resolve_repo_relative(str(outside)) is None
+
+
 class TestCreate:
     def test_returns_id(self, store):
         cid = store.create("first")
@@ -222,6 +230,7 @@ class TestCreate:
 
 # ── List ──────────────────────────────────────────────────────────────────
 
+
 class TestList:
     def test_empty(self, store):
         assert store.list() == []
@@ -247,6 +256,7 @@ class TestList:
 
 # ── Restore ───────────────────────────────────────────────────────────────
 
+
 class TestRestore:
     def test_restores_file_content(self, store, repo_root):
         (repo_root / "file_a.py").write_text("modified")
@@ -260,12 +270,14 @@ class TestRestore:
         cid = store.create("atomic_restore")
         (repo_root / "file_a.py").write_text("modified")
         from external_llm.agent import checkpoint_store as cs_mod
+
         calls = []
         real = cs_mod.atomic_write_bytes
 
         def _spy(path, data, **kw):
             calls.append((str(path), data))
             return real(path, data, **kw)
+
         monkeypatch.setattr(cs_mod, "atomic_write_bytes", _spy)
         assert store.restore(cid) is True
         assert calls, "restore must write through atomic_write_bytes"
@@ -308,6 +320,7 @@ class TestRestore:
 
 # ── Delete ────────────────────────────────────────────────────────────────
 
+
 class TestDelete:
     def test_removes_entry(self, store):
         cid = store.create("del")
@@ -341,6 +354,7 @@ class TestDelete:
 
 # ── Init ──────────────────────────────────────────────────────────────────
 
+
 class TestInit:
     def test_reloads_persisted(self, repo_root, store_dir):
         cid = CheckpointStore(str(repo_root), str(store_dir)).create("persist")
@@ -367,6 +381,7 @@ class TestInit:
 
 
 # ── Error paths for inline coverage ───────────────────────────────────────
+
 
 class TestScanFilesErrorPaths:
     """Coverage for _scan_files error paths: excluded extension (80), checkpoint dir (84)."""
@@ -418,12 +433,14 @@ class TestRestoreErrorPaths:
         cid = store.create("restore_io")
         (repo_root / "file_a.py").write_text("modified")
         from external_llm.agent import checkpoint_store as cs_mod
+
         real = cs_mod.atomic_write_bytes
 
         def _fake(path, data, **kw):
             if str(path).endswith("file_a.py"):
                 raise OSError("denied")
             return real(path, data, **kw)
+
         monkeypatch.setattr(cs_mod, "atomic_write_bytes", _fake)
         assert store.restore(cid) is False
 
@@ -433,12 +450,14 @@ class TestRestoreErrorPaths:
         cid = store.create("partial")
         (repo_root / "extra.py").write_text("modified extra")
         from external_llm.agent import checkpoint_store as cs_mod
+
         real = cs_mod.atomic_write_bytes
 
         def _fake(path, data, **kw):
             if str(path).endswith("extra.py"):
                 raise OSError("denied")
             return real(path, data, **kw)
+
         monkeypatch.setattr(cs_mod, "atomic_write_bytes", _fake)
         result = store.restore(cid)
         assert result is False
@@ -452,11 +471,19 @@ class TestDeleteErrorPaths:
     def test_oserror_deleting_checkpoint_file(self, store):
         """Lines 263-265: OSError when unlinking checkpoint file returns False."""
         cid = store.create("del_oserror")
-        with patch.object(Path, 'unlink', side_effect=OSError("Permission denied")):
+        with patch.object(Path, "unlink", side_effect=OSError("Permission denied")):
             result = store.delete(cid)
             assert result is False
         # Verify checkpoint still exists (not removed from list)
-        assert any(cp['id'] == cid for cp in store.checkpoints)
+        assert any(cp["id"] == cid for cp in store.checkpoints)
+
+    def test_delete_unknown_id_on_empty_store(self, repo_root, store_dir):
+        """delete() on a store with no checkpoints must return False, not
+        raise UnboundLocalError from a loop that never binds checkpoint_index."""
+        s = CheckpointStore(str(repo_root), str(store_dir))
+        assert s.checkpoints == []
+        assert s.delete("ghost") is False
+        assert s.checkpoints == []
 
 
 class TestSaveCheckpointsErrorPaths:
@@ -474,6 +501,7 @@ class TestSaveCheckpointsErrorPaths:
         cid = store.create("save_io")
         # Patch os.replace (used inside checkpoint_store) to raise OSError.
         import external_llm.agent.checkpoint_store as csm
+
         with (
             patch.object(csm.os, "replace", side_effect=OSError("replace blocked")),
             pytest.raises(OSError, match="replace blocked"),
@@ -493,20 +521,14 @@ class TestSaveCheckpointsDurability:
         from external_llm.agent import checkpoint_store as csm
 
         cid = store.create("durability")
-        with patch.object(
-            csm, "atomic_write_json", wraps=csm.atomic_write_json
-        ) as spy:
+        with patch.object(csm, "atomic_write_json", wraps=csm.atomic_write_json) as spy:
             store.delete(cid)  # triggers _save_checkpoints on the index
-        index_calls = [
-            ca for ca in spy.call_args_list
-            if str(ca.args[0]) == str(store.checkpoint_file)
-        ]
-        assert index_calls, (
-            "index write did not go through atomic_write_json (no fsync)"
-        )
+        index_calls = [ca for ca in spy.call_args_list if str(ca.args[0]) == str(store.checkpoint_file)]
+        assert index_calls, "index write did not go through atomic_write_json (no fsync)"
 
 
 # ── Edge cases ────────────────────────────────────────────────────────────
+
 
 class TestEdgeCases:
     def test_empty_repo(self, tmp_path):
@@ -542,6 +564,7 @@ class TestEdgeCases:
 
 # ── Binary round-trip + eviction + concurrency ────────────────────────────
 
+
 class TestBinaryRoundTrip:
     """F4 fix: binary files survive a create→restore cycle byte-for-byte."""
 
@@ -573,6 +596,7 @@ class TestMaxCheckpointsEviction:
             # Ensure strictly increasing timestamps so eviction order is
             # deterministic (otherwise same-second ties make sort unstable).
             import time as _t
+
             _t.sleep(0.005)
         # Only the 3 newest should remain.
         remaining = {cp["id"] for cp in s.checkpoints}
@@ -611,13 +635,19 @@ class TestConcurrentSaveMerge:
         import json as _json
 
         from external_llm.common.file_lock import cross_process_flock
-        lock_path = store.checkpoint_file.with_suffix('.json.lock')
+
+        lock_path = store.checkpoint_file.with_suffix(".json.lock")
         with cross_process_flock(lock_path):
             disk = _json.loads(store.checkpoint_file.read_text())
-            disk.append({
-                'id': cid_b, 'timestamp': 9999999999.0, 'description': 'B',
-                'file_count': 1, 'path': f'{cid_b}.json',
-            })
+            disk.append(
+                {
+                    "id": cid_b,
+                    "timestamp": 9999999999.0,
+                    "description": "B",
+                    "file_count": 1,
+                    "path": f"{cid_b}.json",
+                }
+            )
             store.checkpoint_file.write_text(_json.dumps(disk))
         # Now process A creates another — must preserve cid_b.
         cid_a2 = store.create("A2")
@@ -628,6 +658,7 @@ class TestConcurrentSaveMerge:
 
 
 # ── os.walk pruning ──────────────────────────────────────────────────────────
+
 
 def test_scan_files_prunes_vendor_dirs(tmp_path: Path):
     """_scan_files() prunes node_modules/.venv/etc via os.walk dirs[:] instead
@@ -645,13 +676,12 @@ def test_scan_files_prunes_vendor_dirs(tmp_path: Path):
     hashes = s._scan_files()
 
     assert Path("src/main.py") in hashes
-    assert not any("node_modules" in str(k) for k in hashes), \
-        "node_modules should be pruned"
-    assert not any(".venv" in str(k) for k in hashes), \
-        ".venv should be pruned"
+    assert not any("node_modules" in str(k) for k in hashes), "node_modules should be pruned"
+    assert not any(".venv" in str(k) for k in hashes), ".venv should be pruned"
 
 
 # ── Scoped (file-list) checkpoints ───────────────────────────────────────────
+
 
 class TestScopedCheckpoint:
     def test_scan_listed_files_only_hashes_given_paths(self, store, repo_root):
@@ -711,6 +741,7 @@ class TestScopedCheckpoint:
 
 
 # ── Blob storage: per-write cost must not grow with what is already captured ──
+
 
 class TestBlobStorage:
     """extend() must not rewrite captured CONTENT on every write.
@@ -787,9 +818,7 @@ class TestBlobStorage:
             _t.sleep(0.005)
         for evicted in ids[:2]:
             assert not (s.checkpoint_dir / f"{evicted}.json").exists()
-            assert not (s.checkpoint_dir / f"{evicted}.files").exists(), (
-                "evicted checkpoint left its blobs behind"
-            )
+            assert not (s.checkpoint_dir / f"{evicted}.files").exists(), "evicted checkpoint left its blobs behind"
         for kept in ids[2:]:
             assert (s.checkpoint_dir / f"{kept}.files").is_dir()
 
@@ -863,6 +892,7 @@ class TestBlobStorage:
 
 # ── Index recovery: a corrupt index must not silently lose the timeline ──────
 
+
 class TestIndexRecovery:
     """_load_checkpoints treats an unreadable index as a REBUILD trigger, not
     as an authoritative empty store. Every checkpoint's payload file survives
@@ -922,6 +952,7 @@ class TestIndexRecovery:
 
 # ── Retention cap holds across the save-merge ────────────────────────────────
 
+
 class TestMergeRetentionCap:
     """The save-merge resurrects concurrent additions; the max_checkpoints
     cap must be re-applied AFTER the merge, not only before it (a concurrent
@@ -934,16 +965,22 @@ class TestMergeRetentionCap:
         # Process B commits two NEWER entries directly to disk, with payload
         # files present so the merge resurrects them.
         from external_llm.common.file_lock import cross_process_flock
-        lock_path = s.checkpoint_file.with_suffix('.json.lock')
+
+        lock_path = s.checkpoint_file.with_suffix(".json.lock")
         with cross_process_flock(lock_path):
             disk = json.loads(s.checkpoint_file.read_text())
             for i in range(2):
                 cid_b = f"checkpoint_concurrent_b{i}"
                 (s.checkpoint_dir / f"{cid_b}.json").write_text(f'{{"id": "{cid_b}"}}')
-                disk.append({
-                    'id': cid_b, 'timestamp': 9999999999.0 + i, 'description': f'B{i}',
-                    'file_count': 1, 'path': f'{cid_b}.json',
-                })
+                disk.append(
+                    {
+                        "id": cid_b,
+                        "timestamp": 9999999999.0 + i,
+                        "description": f"B{i}",
+                        "file_count": 1,
+                        "path": f"{cid_b}.json",
+                    }
+                )
             s.checkpoint_file.write_text(json.dumps(disk))
         s.create("A3")  # triggers merge + save
         ids = {cp["id"] for cp in s.checkpoints}
@@ -953,6 +990,7 @@ class TestMergeRetentionCap:
 
 
 # ── Index path/id hardening (tampered index must not escape the store) ───────
+
 
 class TestIndexPathGuard:
     """Index entries are read from disk; a tampered 'path' must not turn into
@@ -967,8 +1005,7 @@ class TestIndexPathGuard:
         s.checkpoints[0]["path"] = "../../victim.json"
         assert s.delete(cid) is False
         assert victim.read_text() == "precious"
-        assert any(cp["id"] == cid for cp in s.checkpoints), \
-            "refused delete must not drop the entry"
+        assert any(cp["id"] == cid for cp in s.checkpoints), "refused delete must not drop the entry"
 
     def test_restore_refuses_tampered_path(self, repo_root, store_dir, tmp_path):
         s = CheckpointStore(str(repo_root), str(store_dir))
@@ -990,8 +1027,7 @@ class TestIndexPathGuard:
         s.checkpoints[0]["path"] = "../../victim.json"
         s.create("second")  # evicts the tampered entry
         assert victim.read_text() == "precious"
-        assert all(cp["id"] != cid for cp in s.checkpoints), \
-            "entry still evicted from the index"
+        assert all(cp["id"] != cid for cp in s.checkpoints), "entry still evicted from the index"
 
     def test_delete_refuses_suspicious_id_blob_removal(self, repo_root, store_dir, tmp_path):
         """A tampered 'id' must not turn _remove_blobs into a path outside the
@@ -1007,6 +1043,7 @@ class TestIndexPathGuard:
 
 
 # ── Blob copy streams (bounded memory for huge artifacts) ────────────────────
+
 
 class TestStreamingBlobCopy:
     """_copy_file_to_blob streams in 64 KiB chunks so a captured file costs
@@ -1025,13 +1062,13 @@ class TestStreamingBlobCopy:
 
 # ── P27-4: byte-cap retention + per-file blob gate ─────────────────────────
 
+
 class TestRetentionBytes:
     def test_byte_cap_evicts_oldest(self, repo_root, store_dir):
         """A 5 KB file per checkpoint blows a 10 KB store cap at 2 checkpoints —
         the OLDEST are evicted until the store fits (count cap disabled)."""
         (repo_root / "data.txt").write_text("y" * 5000)
-        store = CheckpointStore(str(repo_root), str(store_dir),
-                                max_checkpoints=0, max_bytes=10_000)
+        store = CheckpointStore(str(repo_root), str(store_dir), max_checkpoints=0, max_bytes=10_000)
         store.create("one")
         store.create("two")
         store.create("three")
@@ -1040,8 +1077,7 @@ class TestRetentionBytes:
 
     def test_byte_cap_zero_disables(self, repo_root, store_dir):
         """max_bytes=0 → only the count cap applies (backward compatible)."""
-        store = CheckpointStore(str(repo_root), str(store_dir),
-                                max_checkpoints=2, max_bytes=0)
+        store = CheckpointStore(str(repo_root), str(store_dir), max_checkpoints=2, max_bytes=0)
         store.create("one")
         store.create("two")
         store.create("three")

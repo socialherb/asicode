@@ -1,4 +1,5 @@
 """Unit tests for scanner_registry.py — 100% coverage."""
+
 from __future__ import annotations
 
 import hashlib
@@ -51,6 +52,7 @@ def registry_no_filter() -> ScannerRegistry:
 
 # ── Basic getters (lines 77, 81, 85) ────────────────────────────────────────
 
+
 class TestGetters:
     def test_get_known(self, registry: ScannerRegistry):
         assert registry.get("test_scanner") is not None
@@ -81,6 +83,7 @@ class TestGetters:
 
 # ── is_scanner_implementation_file ───────────────────────────────────────────
 
+
 class TestIsScannerImplementationFile:
     def test_python_file_matches(self, registry: ScannerRegistry):
         assert registry.is_scanner_implementation_file("test_scanner.py") is True
@@ -93,6 +96,7 @@ class TestIsScannerImplementationFile:
 
 
 # ── names_for_spec_target_files (line 118) ───────────────────────────────────
+
 
 class TestNamesForSpecTargetFiles:
     """Coverage for line 118 — matched stem is appended."""
@@ -112,6 +116,7 @@ class TestNamesForSpecTargetFiles:
 
 
 # ── run() method (lines 143-192) ─────────────────────────────────────────────
+
 
 class TestRun:
     """Coverage for ScannerRegistry.run() — all branches."""
@@ -165,9 +170,11 @@ class TestRun:
     def test_truncated_count_non_int(self, registry: ScannerRegistry):
         """Lines 172-174: fn._truncated is not int -> treated as 0."""
         fn = registry.get("test_scanner")
+
         def _set_invalid_truncated(**kwargs):
             fn._truncated = "invalid"
             return []
+
         fn.side_effect = _set_invalid_truncated
         result = registry.run("test_scanner")
         assert result.truncated_count == 0
@@ -287,20 +294,31 @@ class TestRun:
     def test_concurrent_different_scanners_still_parallel(self):
         """The fix serializes same-scanner runs only; different scanners (each
         with its own lock) must still run concurrently. Guards against an
-        accidental global lock that would over-serialize the registry."""
+        accidental global lock that would over-serialize the registry.
+
+        This is a BEHAVIORAL proof, not a wall-clock race: the two scanner
+        bodies handshake through a barrier, so the test asserts actual
+        overlap of the critical sections. A wall-clock bound (e.g. two
+        50ms sleeps finishing <90ms) is scheduler-flaky under full-suite CPU
+        contention and fails on machines where the GIL/yield latency alone
+        exceeds the slack."""
         import threading
-        import time
 
         r = ScannerRegistry()
 
+        entered = threading.Barrier(2)
+        release = threading.Barrier(2)
+
         def _slow(repo_root="", file_paths=None, **kwargs):
-            time.sleep(0.05)
+            # Both scanner bodies must be INSIDE their critical section
+            # simultaneously — impossible if a single global lock serializes
+            # them, guaranteed when each has its own lock.
+            entered.wait(timeout=5)
+            release.wait(timeout=5)
             return []
 
         r.register(ScannerSpec(name="a", description="x", file_filter=""), _slow)
         r.register(ScannerSpec(name="b", description="x", file_filter=""), _slow)
-
-        t0 = time.time()
 
         def _run(n):
             r.run(n)
@@ -311,12 +329,11 @@ class TestRun:
         tb.start()
         ta.join()
         tb.join()
-        elapsed = time.time() - t0
-        # Parallel ~0.05s; serial ~0.10s. Allow scheduler slack.
-        assert elapsed < 0.09, (
-            f"different scanners ran serially ({elapsed:.3f}s) — the per-scanner "
-            "lock must not collapse into a single global lock"
-        )
+        # Barrier counts spent means both bodies overlapped: registrar a's
+        # critical section was live while b's was still waiting on the same
+        # barrier — i.e. they genuinely ran concurrently.
+        assert entered.broken is False
+        assert release.broken is False
 
     # ── Cooperative cancel forwarding (run(cancel_event=...)) ──────────────
 
@@ -375,12 +392,11 @@ class TestRun:
 
         # cancel_event omitted entirely (default None in run()'s signature).
         r.run("opt")
-        assert received["opt"] is _SENTINEL, (
-            "cancel_event=None still injected the kwarg (should be a no-op)"
-        )
+        assert received["opt"] is _SENTINEL, "cancel_event=None still injected the kwarg (should be a no-op)"
 
 
 # ── vulture_dead_code_scanner registration & requires_graph (lines 343-369) ───
+
 
 class TestVultureScannerRegistration:
     """Verify vulture_dead_code_scanner is registered and graph-gated correctly.
@@ -392,12 +408,14 @@ class TestVultureScannerRegistration:
     def test_vulture_registered_in_global_registry(self):
         """The auto-registered global registry must include vulture_dead_code_scanner."""
         from external_llm.agent.scanner_registry import get_registry
+
         names = get_registry().list_names()
         assert "vulture_dead_code_scanner" in names
 
     def test_vulture_spec_requires_graph(self):
         """vulture scanner must declare requires_graph=True so the handler injects repo_graph."""
         from external_llm.agent.scanner_registry import get_registry
+
         spec = get_registry().get_spec("vulture_dead_code_scanner")
         assert spec is not None
         assert spec.requires_graph is True
@@ -406,6 +424,7 @@ class TestVultureScannerRegistration:
     def test_vulture_spec_advertises_input_schema(self):
         """Planner prompt sees min_confidence/max_per_file/exclude_patterns."""
         from external_llm.agent.scanner_registry import get_registry
+
         spec = get_registry().get_spec("vulture_dead_code_scanner")
         assert spec is not None
         assert "min_confidence" in spec.input_schema
@@ -417,6 +436,7 @@ class TestVultureScannerRegistration:
     def test_run_structural_scan_enum_includes_vulture(self):
         """The run_structural_scan tool enum must expose vulture_dead_code_scanner."""
         from external_llm.agent.tool_schemas import AGENT_TOOL_SCHEMAS
+
         for schema in AGENT_TOOL_SCHEMAS:
             if schema["name"] == "run_structural_scan":
                 enum = schema["parameters"]["properties"]["scanner"]["enum"]
@@ -451,11 +471,13 @@ class TestVultureScannerRegistration:
     def test_scan_vulture_dead_code_no_graph_falls_back_to_full_project(self):
         """When repo_graph is unavailable, default to the accurate full_project scan."""
         from external_llm.analysis.vulture_scanner import decide_vulture_scan_scope
+
         assert decide_vulture_scan_scope(None, ["a.py"], 5) == "full_project"
 
 
 # ── _auto_register import error blocks (lines 227-228, 246-247, etc.) ────────
 # Run LAST (after all other tests) because importlib.reload resets module state.
+
 
 class TestAutoRegisterFailFast:
     """_auto_register imports every first-party scanner module unconditionally.
@@ -496,8 +518,10 @@ class TestAutoRegisterFailFast:
         try:
             # Patch sys.modules with None for scanner modules so imports raise
             # ModuleNotFoundError — the failure must propagate, not degrade.
-            with patch.dict(sys.modules, dict.fromkeys(scanner_modules), clear=False), \
-                    pytest.raises(ModuleNotFoundError):
+            with (
+                patch.dict(sys.modules, dict.fromkeys(scanner_modules), clear=False),
+                pytest.raises(ModuleNotFoundError),
+            ):
                 importlib.reload(sr_mod)
         finally:
             # Restore original modules
@@ -622,6 +646,7 @@ class TestSupportedLanguages:
     def test_builtin_py_only_scanners_declare_python(self):
         """Every Python-only built-in must advertise PYTHON."""
         from external_llm.agent.scanner_registry import get_registry
+
         registry = get_registry()
         py_only_names = {
             "unused_import_scanner",
@@ -646,6 +671,7 @@ class TestSupportedLanguages:
     def test_builtin_ts_scanners_declare_six_languages(self):
         """Tree-sitter scanners must advertise all six supported languages."""
         from external_llm.agent.scanner_registry import get_registry
+
         registry = get_registry()
         ts_names = {
             # Only duplicate_definition_scanner stays multi-language: it is NOT
@@ -669,6 +695,7 @@ class TestSupportedLanguages:
         clarity, matching its PYTHON-only supported_languages.
         """
         from external_llm.agent.scanner_registry import get_registry
+
         spec = get_registry().get_spec("unused_import_scanner")
         assert spec.file_filter == ".py"
 
@@ -685,13 +712,19 @@ class TestSourceFreshness:
     """
 
     def _register_fake(
-        self, tmp_path, monkeypatch, mod_name, file_name, source,
+        self,
+        tmp_path,
+        monkeypatch,
+        mod_name,
+        file_name,
+        source,
     ) -> tuple[str, ScannerRegistry]:
         """Register a scanner whose __module__ resolves to a real tmp file."""
         src = tmp_path / file_name
         src.write_text(source, encoding="utf-8")
         monkeypatch.setitem(
-            sys.modules, mod_name,
+            sys.modules,
+            mod_name,
             types.SimpleNamespace(__file__=str(src)),
         )
         reg = ScannerRegistry()
@@ -702,11 +735,16 @@ class TestSourceFreshness:
         return str(src), reg
 
     def test_register_records_fingerprint_and_detects_disk_change(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         src_path, reg = self._register_fake(
-            tmp_path, monkeypatch,
-            "_r12_fake_mod", "fake_scanner_mod.py", "VALUE = 1\n",
+            tmp_path,
+            monkeypatch,
+            "_r12_fake_mod",
+            "fake_scanner_mod.py",
+            "VALUE = 1\n",
         )
         # Loaded code matches disk → clean.
         assert src_path not in reg.verify_loaded_sources()
@@ -717,8 +755,11 @@ class TestSourceFreshness:
 
     def test_verify_reports_deleted_source(self, tmp_path, monkeypatch):
         src_path, reg = self._register_fake(
-            tmp_path, monkeypatch,
-            "_r12_fake_mod2", "fake_scanner_mod2.py", "VALUE = 1\n",
+            tmp_path,
+            monkeypatch,
+            "_r12_fake_mod2",
+            "fake_scanner_mod2.py",
+            "VALUE = 1\n",
         )
         os.remove(src_path)
         assert src_path in reg.verify_loaded_sources()
@@ -727,7 +768,8 @@ class TestSourceFreshness:
         py = tmp_path / "mod.py"
         py.write_text("X = 1\n", encoding="utf-8")
         monkeypatch.setitem(
-            sys.modules, "_r12_fake_pyc_mod",
+            sys.modules,
+            "_r12_fake_pyc_mod",
             types.SimpleNamespace(__file__=str(tmp_path / "mod.pyc")),
         )
         reg = ScannerRegistry()
@@ -742,15 +784,18 @@ class TestSourceFreshness:
     def test_unresolvable_source_skipped(self, tmp_path, monkeypatch):
         """.so suffix and nonexistent .py are not fingerprinted — no crash."""
         monkeypatch.setitem(
-            sys.modules, "_r12_fake_so_mod",
+            sys.modules,
+            "_r12_fake_so_mod",
             types.SimpleNamespace(__file__=str(tmp_path / "m.so")),
         )
         monkeypatch.setitem(
-            sys.modules, "_r12_fake_missing_mod",
+            sys.modules,
+            "_r12_fake_missing_mod",
             types.SimpleNamespace(__file__=str(tmp_path / "missing.py")),
         )
         monkeypatch.setitem(
-            sys.modules, "_r12_fake_nofile_mod",
+            sys.modules,
+            "_r12_fake_nofile_mod",
             types.SimpleNamespace(__file__=None),
         )
         reg = ScannerRegistry()
@@ -763,9 +808,7 @@ class TestSourceFreshness:
             types.SimpleNamespace(__module__="_r12_fake_nofile_mod"),
         )
         versions = reg.source_versions()
-        assert not any(
-            k.endswith(("m.so", "missing.py")) for k in versions
-        )
+        assert not any(k.endswith(("m.so", "missing.py")) for k in versions)
 
     def test_mock_fn_registration_does_not_crash(self):
         """fn.__module__ being a Mock (non-string) is skipped silently."""
@@ -786,8 +829,11 @@ class TestSourceFreshness:
 
     def test_source_versions_expose_short_hash(self, tmp_path, monkeypatch):
         src_path, reg = self._register_fake(
-            tmp_path, monkeypatch,
-            "_r12_fake_mod3", "fake_scanner_mod3.py", "VALUE = 42\n",
+            tmp_path,
+            monkeypatch,
+            "_r12_fake_mod3",
+            "fake_scanner_mod3.py",
+            "VALUE = 42\n",
         )
         expected = hashlib.sha256(b"VALUE = 42\n").hexdigest()[:8]
         assert reg.source_versions()[src_path] == expected
@@ -817,10 +863,14 @@ class TestSourceAutoReload:
         return mod_file, reg
 
     def test_reload_stale_sources_reregisters_fresh_function(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         mod_file, reg = self._register_real_module(
-            tmp_path, monkeypatch, "_p31_reload_mod",
+            tmp_path,
+            monkeypatch,
+            "_p31_reload_mod",
             "def scan(repo_root='', file_paths=None, **kw):\n    return ['v1']\n",
         )
         old_fn = reg.get("_p31_reload_mod")
@@ -842,17 +892,23 @@ class TestSourceAutoReload:
 
     def test_reload_noop_when_clean(self, tmp_path, monkeypatch):
         mod_file, reg = self._register_real_module(
-            tmp_path, monkeypatch, "_p31_clean_mod",
+            tmp_path,
+            monkeypatch,
+            "_p31_clean_mod",
             "def scan(repo_root='', file_paths=None, **kw):\n    return []\n",
         )
         assert reg.reload_stale_sources() == []
         assert str(mod_file) not in reg.verify_loaded_sources()
 
     def test_reload_failure_keeps_old_code_and_reports_stale(
-        self, tmp_path, monkeypatch,
+        self,
+        tmp_path,
+        monkeypatch,
     ):
         mod_file, reg = self._register_real_module(
-            tmp_path, monkeypatch, "_p31_bad_mod",
+            tmp_path,
+            monkeypatch,
+            "_p31_bad_mod",
             "def scan(repo_root='', file_paths=None, **kw):\n    return ['v1']\n",
         )
         mod_file.write_text("this is not valid python !!!\n", encoding="utf-8")
@@ -870,9 +926,7 @@ class TestSourceAutoReload:
         mod_dir.mkdir(exist_ok=True)
         (mod_dir / "_p31_sibling.py").write_text("SHARED = 1\n", encoding="utf-8")
         (mod_dir / "_p31_entry.py").write_text(
-            "from _p31_sibling import SHARED\n"
-            "def scan(repo_root='', file_paths=None, **kw):\n"
-            "    return [SHARED]\n",
+            "from _p31_sibling import SHARED\ndef scan(repo_root='', file_paths=None, **kw):\n    return [SHARED]\n",
             encoding="utf-8",
         )
         monkeypatch.syspath_prepend(str(mod_dir))

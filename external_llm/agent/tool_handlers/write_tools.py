@@ -16,6 +16,7 @@ working. The write-safety 3-layer gate (syntax check → origin-skip → rollbac
 lives once, in the mixin modules, and is shared via ``self`` calls — it is not
 duplicated per tool.
 """
+
 from __future__ import annotations
 
 from .write_tools_ast_mixin import WriteToolsAstMixin

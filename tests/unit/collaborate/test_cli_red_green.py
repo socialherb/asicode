@@ -10,6 +10,7 @@ Covers:
   start mode kwargs + unrestricted_read trust
 - __main__ guard (runpy, behavior only — excluded from coverage report)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,6 +31,7 @@ from external_llm.repl.collaborate import cli
 
 # ── fakes ───────────────────────────────────────────────────────────────
 
+
 class _FakeAgentConfig:
     """Records kwargs (unrestricted_read=True) — no real tool policy init."""
 
@@ -40,7 +42,7 @@ class _FakeAgentConfig:
 class _FakeToolRegistry:
     """Records construction args — real ToolRegistry scans the repo graph."""
 
-    last_instance: "_FakeToolRegistry | None" = None
+    last_instance: _FakeToolRegistry | None = None
 
     def __init__(self, repo_root=None, config=None):
         self.repo_root = repo_root
@@ -51,7 +53,7 @@ class _FakeToolRegistry:
 class _FakeDisplay:
     """Records StreamingDisplay wiring — real one prints ANSI/uses threads."""
 
-    last_instance: "_FakeDisplay | None" = None
+    last_instance: _FakeDisplay | None = None
 
     def __init__(self, verbose: bool = False, output_file=None):
         self.verbose = verbose
@@ -95,7 +97,7 @@ class _FakeSessionResult:
 class _FakeOrchestrator:
     """Async context-manager fake for CollaborationOrchestrator."""
 
-    instances: ClassVar[list["_FakeOrchestrator"]] = []
+    instances: ClassVar[list[_FakeOrchestrator]] = []
     result = None
     run_error: BaseException | None = None
     interrupt_error: Exception | None = None
@@ -160,14 +162,29 @@ def _collab_args(**overrides):
 
 # ── main() ──────────────────────────────────────────────────────────────
 
+
 def test_main_collaborate_routes_all_flags(monkeypatch):
     captured = []
     monkeypatch.setattr(cli, "_run_collaborate", lambda args: captured.append(args))
     monkeypatch.setattr(
-        sys, "argv",
-        ["cli", "collaborate", "--task", "hello", "--context", "ctx",
-         "--model", "claude-sonnet-5", "--max-turns", "7", "--no-digest",
-         "--file", "out.log", "--quiet"],
+        sys,
+        "argv",
+        [
+            "cli",
+            "collaborate",
+            "--task",
+            "hello",
+            "--context",
+            "ctx",
+            "--model",
+            "claude-sonnet-5",
+            "--max-turns",
+            "7",
+            "--no-digest",
+            "--file",
+            "out.log",
+            "--quiet",
+        ],
     )
     cli.main()
     assert len(captured) == 1
@@ -186,7 +203,8 @@ def test_main_collaborate_short_flags(monkeypatch):
     captured = []
     monkeypatch.setattr(cli, "_run_collaborate", lambda args: captured.append(args))
     monkeypatch.setattr(
-        sys, "argv",
+        sys,
+        "argv",
         ["cli", "-v", "collaborate", "-t", "task", "-c", "ctx", "-m", "m", "-f", "f"],
     )
     cli.main()
@@ -225,7 +243,8 @@ def test_main_mcp_start_routes_flags(monkeypatch):
     captured = []
     monkeypatch.setattr(cli, "_run_mcp", lambda args: captured.append(args))
     monkeypatch.setattr(
-        sys, "argv",
+        sys,
+        "argv",
         ["cli", "mcp", "start", "--mode", "http", "--port", "9000", "--host", "0.0.0.0"],
     )
     cli.main()
@@ -266,6 +285,7 @@ def test_main_rejects_unknown_subcommand(monkeypatch, capsys):
 
 # ── _run_collaborate ────────────────────────────────────────────────────
 
+
 def test_run_collaborate_success_quiet(capsys):
     _FakeOrchestrator.result = _FakeSessionResult(_FakeVerdict(status="success", summary="done"))
     cli._run_collaborate(_collab_args(quiet=True))
@@ -300,10 +320,16 @@ def test_run_collaborate_success_quiet(capsys):
 
 def test_run_collaborate_success_streaming(capsys):
     _FakeOrchestrator.result = _FakeSessionResult()
-    cli._run_collaborate(_collab_args(
-        quiet=False, model="claude-opus-4-5", max_turns=3,
-        no_digest=True, context="ctx", file="session.log",
-    ))
+    cli._run_collaborate(
+        _collab_args(
+            quiet=False,
+            model="claude-opus-4-5",
+            max_turns=3,
+            no_digest=True,
+            context="ctx",
+            file="session.log",
+        )
+    )
     display = _FakeDisplay.last_instance
     assert display.verbose is False
     assert display.output_file == "session.log"
@@ -315,7 +341,9 @@ def test_run_collaborate_success_streaming(capsys):
     assert orch.config.event_callback.__self__ is display  # display.handle_event bound
     assert orch.config.event_callback.__func__ is _FakeDisplay.handle_event
     assert orch.run_kwargs == {
-        "task": "t", "context": "ctx", "enable_preprocessing": False,
+        "task": "t",
+        "context": "ctx",
+        "enable_preprocessing": False,
     }
     assert capsys.readouterr().out == ""  # non-quiet: no verdict dict on stdout
 
@@ -346,8 +374,7 @@ def test_run_collaborate_generic_error_exits_1(monkeypatch, capsys, caplog):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(cli, "_run_async", _raise_boom)
-    with caplog.at_level(logging.ERROR, logger="external_llm.repl.collaborate.cli"), \
-            pytest.raises(SystemExit) as ei:
+    with caplog.at_level(logging.ERROR, logger="external_llm.repl.collaborate.cli"), pytest.raises(SystemExit) as ei:
         cli._run_collaborate(_collab_args())
     assert ei.value.code == 1
     assert "Error: boom" in capsys.readouterr().err
@@ -357,13 +384,16 @@ def test_run_collaborate_generic_error_exits_1(monkeypatch, capsys, caplog):
 
 # ── _run_async ──────────────────────────────────────────────────────────
 
+
 def test_run_async_forwards_kwargs():
     _FakeOrchestrator.result = _FakeSessionResult()
     out = asyncio.run(cli._run_async(None, None, _collab_args(no_digest=True)))
     assert out is _FakeOrchestrator.result
     orch = _FakeOrchestrator.instances[-1]
     assert orch.run_kwargs == {
-        "task": "t", "context": None, "enable_preprocessing": False,
+        "task": "t",
+        "context": None,
+        "enable_preprocessing": False,
     }
 
 
@@ -382,8 +412,10 @@ def test_run_async_cancel_interrupt_failure_logged(caplog):
     _FakeOrchestrator.run_error = asyncio.CancelledError()
     _FakeOrchestrator.interrupt_error = RuntimeError("interrupt failed")
     try:
-        with caplog.at_level(logging.DEBUG, logger="external_llm.repl.collaborate.cli"), \
-                pytest.raises(asyncio.CancelledError):
+        with (
+            caplog.at_level(logging.DEBUG, logger="external_llm.repl.collaborate.cli"),
+            pytest.raises(asyncio.CancelledError),
+        ):
             asyncio.run(cli._run_async(None, None, _collab_args()))
         assert "Interrupt on cancel failed" in caplog.text
         assert _FakeOrchestrator.instances[-1].interrupt_calls == 1
@@ -394,14 +426,16 @@ def test_run_async_cancel_interrupt_failure_logged(caplog):
 
 # ── _run_mcp ────────────────────────────────────────────────────────────
 
+
 def test_run_mcp_list_renders_tools(monkeypatch, capsys):
     tools = [
-        {"name": "read_file", "description": "Read a file.",
-         "parameters": {"properties": {"path": {"type": "string"}}}},
-        {"name": "no_params", "description": "Takes nothing.",
-         "parameters": {"properties": {}}},
-        {"name": "long_desc", "description": "x" * 200,
-         "parameters": {"properties": {}}},
+        {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {"properties": {"path": {"type": "string"}}},
+        },
+        {"name": "no_params", "description": "Takes nothing.", "parameters": {"properties": {}}},
+        {"name": "long_desc", "description": "x" * 200, "parameters": {"properties": {}}},
     ]
     monkeypatch.setattr(mcp_mod, "list_mcp_tools", lambda: tools)
     cli._run_mcp(argparse.Namespace(mcp_command="list"))
@@ -432,6 +466,7 @@ def test_run_mcp_start_wires_registry_and_mode(monkeypatch, capsys):
 
 
 # ── __main__ guard (behavior — excluded from coverage report) ───────────
+
 
 def test_main_guard_runs_help(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["cli", "--help"])

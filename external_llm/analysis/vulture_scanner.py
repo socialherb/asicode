@@ -35,7 +35,7 @@ import sys
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Generic, TypeVar
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.analysis import parse_cache
@@ -184,6 +184,12 @@ _HTTP_BASE_NAMES: frozenset[str] = frozenset(
         "BaseHTTPRequestHandler",
         "StreamingHTTPRequestHandler",
         "SimpleHTTPRequestHandler",
+        # Local quiet-disconnect wrapper around BaseHTTPRequestHandler: the
+        # protocol surface (do_VERB / server_version / close_connection) is
+        # equally framework-live on its subclasses, but the inheritance chain
+        # crosses a file boundary (mcp/_session_queue.py), which
+        # _inherits_from (same-file only) cannot resolve.
+        "QuietHttpHandler",
     }
 )
 _HTTP_PROTOCOL_ATTRS: frozenset[str] = frozenset(
@@ -513,8 +519,8 @@ def _scan_vulture_files_with_cache(
     exclude_patterns: list[str],
     repo_root: str,
     cancel_event: Any = None,
-    files_cache: Optional[dict] = None,
-    save_state: Optional[dict] = None,
+    files_cache: dict | None = None,
+    save_state: dict | None = None,
 ) -> bool:
     """Per-file vulture scan with a (mtime_ns, size)-keyed disk cache.
 
@@ -730,7 +736,7 @@ def _visitor_hooks_for_file(path: str) -> frozenset[tuple[str, int]]:
         def visit_ClassDef(self, node):
             self.stack.append(node.name)
             class_bases[node.name] = [
-                b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else None)
+                (b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else None)) or ""
                 for b in node.bases
             ]
             self.generic_visit(node)
@@ -896,14 +902,14 @@ def _framework_live_for_file(path: str) -> frozenset[tuple[int, str]]:
         def _mark_foreign_targets(self, node: ast.AST) -> None:
             targets = getattr(node, "targets", None)
             if targets is None:
-                targets = [node.target]
+                targets = [getattr(node, "target")]  # noqa: B009 — AST node union (Assign/AnnAssign); attribute is node-type-specific
             for t in targets:
                 if not isinstance(t, ast.Attribute):
                     continue
                 is_bare_self = isinstance(t.value, ast.Name) and t.value.id == "self"
                 in_http = bool(self._http_stack) and self._http_stack[-1]
                 if (not is_bare_self) or (in_http and t.attr in _HTTP_PROTOCOL_ATTRS):
-                    live.add((node.lineno, t.attr))
+                    live.add((getattr(node, "lineno"), t.attr))  # noqa: B009 — AST node union; lineno exists on all statement nodes
 
         visit_Assign = _mark_foreign_targets
         visit_AugAssign = _mark_foreign_targets
@@ -1189,7 +1195,7 @@ def _dedup_candidates(candidates: list[VultureCandidate]) -> list[VultureCandida
 
 
 def decide_vulture_scan_scope(
-    graph: object,
+    graph: Any,
     file_paths: list[str],
     threshold: int,
 ) -> str:
@@ -1244,14 +1250,14 @@ def _collect_project_py_files(repo_root: str) -> list[str]:
 def scan_vulture_dead_code(
     *,
     repo_root: str,
-    file_paths: Optional[list[str]] = None,
+    file_paths: list[str] | None = None,
     min_confidence: int = _cfg.counts.SCANNER_VULTURE_MIN_CONFIDENCE,
-    exclude_patterns: Optional[list[str]] = None,
+    exclude_patterns: list[str] | None = None,
     max_per_file: int = _cfg.counts.SCANNER_VULTURE_MAX,
-    repo_graph: object = None,
-    exclude_kinds: Optional[Iterable[str]] = None,
+    repo_graph: Any = None,
+    exclude_kinds: Iterable[str] | None = None,
     cancel_event: Any = None,
-    cross_file_referenced_names: Optional[set] = None,
+    cross_file_referenced_names: set | None = None,
 ) -> list[VultureCandidate]:
     """Run Vulture and return normalized dead-code candidates.
 

@@ -5,6 +5,7 @@ approval-prompt paths (tty + checkpoint), pytest plugin recovery, the
 auto-correction chain (cat -A, find -o, sort -V), shell-exec failure paths,
 and the job tool's error branches.
 """
+
 from __future__ import annotations
 
 import os
@@ -29,6 +30,7 @@ from external_llm.agent.tool_handlers.git_tools import (
 )
 
 # ── module-level helpers ────────────────────────────────────────────────────
+
 
 def test_heredoc_opener_on_final_line_no_span():
     assert _heredoc_body_intervals("cat <<EOF") == []
@@ -122,6 +124,7 @@ def test_blank_heredoc_bodies_preserves_interpreter_receiver():
 
 # ── _capture_bounded failure branches ───────────────────────────────────────
 
+
 class _EofPipe:
     """A real EOF'd pipe fd stand-in (same shape as _InstantPopen)."""
 
@@ -208,6 +211,7 @@ def test_capture_bounded_wait_timeout(monkeypatch):
 
 # ── _cancel_running_command ─────────────────────────────────────────────────
 
+
 def _cancel_host(monkeypatch):
     host = types.SimpleNamespace(_make_result=lambda **kw: kw)
     calls = []
@@ -272,6 +276,7 @@ def test_cancel_running_command_includes_partial_stderr(monkeypatch):
 
 # ── _request_shell_danger_approval ──────────────────────────────────────────
 
+
 class _NoCfg:
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -319,13 +324,12 @@ def test_approval_checkpoint_callback_error_denies(monkeypatch):
     def _boom(q):
         raise RuntimeError("callback gone")
 
-    host = types.SimpleNamespace(
-        config=_NoCfg(user_checkpoint_enabled=True, user_checkpoint_callback=_boom)
-    )
+    host = types.SimpleNamespace(config=_NoCfg(user_checkpoint_enabled=True, user_checkpoint_callback=_boom))
     assert ShellToolsMixin._request_shell_danger_approval(host, "rm", "rm -rf /") is False
 
 
 # ── _maybe_recover_pytest_missing_plugin ────────────────────────────────────
+
 
 class _RunResult:
     def __init__(self, returncode=0, stdout="", stderr=""):
@@ -388,6 +392,7 @@ def test_recover_plugin_execution_exception(monkeypatch):
 
 # ── _tool_shell_exec end-to-end branches ────────────────────────────────────
 
+
 class _InstantPopen:
     def __init__(self, command=None, *a, **kw):
         self.returncode = 0
@@ -407,8 +412,10 @@ def bash_ok(tool_registry, monkeypatch):
     """Approve every gate; record the command that reaches Popen."""
     spawned = []
     monkeypatch.setattr(
-        tool_registry, "_request_shell_danger_approval",
-        lambda *a, **kw: True, raising=True,
+        tool_registry,
+        "_request_shell_danger_approval",
+        lambda *a, **kw: True,
+        raising=True,
     )
 
     class _P(_InstantPopen):
@@ -422,6 +429,7 @@ def bash_ok(tool_registry, monkeypatch):
 
 def test_shell_exec_cancelled_before_start(tool_registry, monkeypatch):
     import threading
+
     ev = threading.Event()
     ev.set()
     monkeypatch.setattr(tool_registry.config, "cancel_event", ev)
@@ -446,7 +454,7 @@ def test_shell_exec_unbalanced_quote_with_heredoc_tolerant_split(bash_ok):
     reg, spawned = bash_ok
     res = reg.dispatch(
         "bash",
-        {"command": "cat <<EOF\nbody text\nEOF\necho \"unclosed"},
+        {"command": 'cat <<EOF\nbody text\nEOF\necho "unclosed'},
     )
     assert res.ok, res.error
     assert "unclosed" in spawned[0]
@@ -544,8 +552,16 @@ def test_shell_exec_pytest_recovery_override(bash_ok, monkeypatch):
 
     monkeypatch.setattr(gt_mod.subprocess, "Popen", _P)
     monkeypatch.setattr(
-        reg, "_maybe_recover_pytest_missing_plugin",
-        lambda **kw: {"_override": {"ok": True, "content": "RE-RUN OK", "error": None, "metadata": {"recovered_pytest_plugin": True}}},
+        reg,
+        "_maybe_recover_pytest_missing_plugin",
+        lambda **kw: {
+            "_override": {
+                "ok": True,
+                "content": "RE-RUN OK",
+                "error": None,
+                "metadata": {"recovered_pytest_plugin": True},
+            }
+        },
     )
     res = reg.dispatch("bash", {"command": "pytest -m unit"})
     assert res.ok
@@ -566,7 +582,8 @@ def test_shell_exec_pytest_recovery_hint(bash_ok, monkeypatch):
 
     monkeypatch.setattr(gt_mod.subprocess, "Popen", _P)
     monkeypatch.setattr(
-        reg, "_maybe_recover_pytest_missing_plugin",
+        reg,
+        "_maybe_recover_pytest_missing_plugin",
         lambda **kw: {"_append_hint": "remove --frobnicate"},
     )
     res = reg.dispatch("bash", {"command": "pytest"})
@@ -596,6 +613,7 @@ def test_shell_exec_outer_timeout_and_exception(bash_ok, monkeypatch):
 
 # ── job tool error branches ─────────────────────────────────────────────────
 
+
 def test_job_action_errors(tool_registry):
     res = tool_registry.dispatch("job", {})
     assert not res.ok
@@ -620,6 +638,7 @@ def test_job_list_empty_and_output_missing(tool_registry):
     # would then be order/flake-dependent. Inject a fresh manager so the
     # emptiness assertion is hermetic (the tool reads self._bg_manager).
     from external_llm.agent.background_job_manager import BackgroundJobManager
+
     tool_registry._bg_manager = BackgroundJobManager(max_jobs=5)
 
     res = tool_registry.dispatch("job", {"action": "list"})

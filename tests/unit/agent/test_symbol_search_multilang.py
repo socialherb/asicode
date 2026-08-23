@@ -1,4 +1,5 @@
 """Tests for multi-language symbol search (TS/JS via TSSemanticTracer)."""
+
 import subprocess
 import textwrap
 from pathlib import Path
@@ -65,8 +66,7 @@ def ts_repo(tmp_path):
     src_dir.mkdir()
     (src_dir / "todoService.ts").write_text(TS_SERVICE_CODE, encoding="utf-8")
     (src_dir / "index.ts").write_text(
-        "import { getTodos } from './todoService';\n"
-        "console.log(getTodos());\n",
+        "import { getTodos } from './todoService';\nconsole.log(getTodos());\n",
         encoding="utf-8",
     )
     return tmp_path
@@ -120,7 +120,8 @@ class TestFindSymbolTS:
     def test_find_with_search_path(self, ts_repo):
         searcher = SymbolSearcher(str(ts_repo))
         results = searcher.find_symbol(
-            "getTodos", kind="function",
+            "getTodos",
+            kind="function",
             search_path=str(ts_repo / "src" / "todoService.ts"),
         )
         assert len(results) >= 1
@@ -217,6 +218,7 @@ class TestLiveSymbolSizeMultilang:
     def test_ts_function_returns_nonzero(self, ts_repo):
         """_live_symbol_size should return >0 for TS functions via SyntaxProvider."""
         from external_llm.languages import LanguageRegistry
+
         registry = LanguageRegistry.instance()
         provider = registry.get("test.ts")
         assert provider is not None
@@ -358,14 +360,14 @@ class TestFileOutlineRipgrepFallback:
 
         monkeypatch.setattr(ss.subprocess, "run", _boom)
         searcher = SymbolSearcher(str(ripgrep_repo))
-        outline = searcher._outline_ripgrep(
-            ripgrep_repo / "src" / "Engine.kt", "src/Engine.kt")
+        outline = searcher._outline_ripgrep(ripgrep_repo / "src" / "Engine.kt", "src/Engine.kt")
         assert outline == []
 
     def test_outline_ripgrep_timeout_skips_only_struck_pattern(self, ripgrep_repo, monkeypatch):
         """A timeout on ONE pattern must not abort the remaining patterns —
         later patterns still run and still match symbols."""
         import external_llm.agent.symbol_search as ss
+
         real_run = ss.subprocess.run
         calls = {"n": 0}
 
@@ -377,17 +379,17 @@ class TestFileOutlineRipgrepFallback:
 
         monkeypatch.setattr(ss.subprocess, "run", _flaky)
         searcher = SymbolSearcher(str(ripgrep_repo))
-        outline = searcher._outline_ripgrep(
-            ripgrep_repo / "src" / "Engine.kt", "src/Engine.kt")
-        assert calls["n"] >= 2            # later patterns were still attempted
+        outline = searcher._outline_ripgrep(ripgrep_repo / "src" / "Engine.kt", "src/Engine.kt")
+        assert calls["n"] >= 2  # later patterns were still attempted
         assert isinstance(outline, list)  # function completed normally
-        assert len(outline) > 0           # remaining patterns still matched symbols
+        assert len(outline) > 0  # remaining patterns still matched symbols
 
 
 def _ts_grammar_available(lang: str) -> bool:
     """True when the tree-sitter binding for ``lang`` is installed."""
     try:
         from external_llm.languages.tree_sitter_utils import get_available_languages
+
         return lang in get_available_languages()
     except Exception:
         return False
@@ -439,8 +441,8 @@ class TestFileOutlineTreeSitter:
         # path was taken.
         by_name = {s.name: s for s in outline}
         assert "Server" in by_name and "Start" in by_name
-        assert by_name["Server"].end_line == 5      # type Server struct { … } → lines 3-5
-        assert by_name["Start"].end_line == 9       # receiver method → lines 7-9
+        assert by_name["Server"].end_line == 5  # type Server struct { … } → lines 3-5
+        assert by_name["Start"].end_line == 9  # receiver method → lines 7-9
         assert by_name["NewServer"].end_line == 13
 
     def test_go_outline_matches_find_all_symbols(self, go_outline_repo):
@@ -448,6 +450,7 @@ class TestFileOutlineTreeSitter:
         if not _ts_grammar_available("go"):
             pytest.skip("tree-sitter-go not installed")
         from external_llm.languages.tree_sitter_utils import find_all_symbols
+
         searcher = SymbolSearcher(str(go_outline_repo))
         outline = searcher.get_file_outline("src/server.go")
         ast_names = {n for n, *_ in find_all_symbols(GO_OUTLINE_CODE, "go")}
@@ -463,6 +466,8 @@ class TestFileOutlineTreeSitter:
         names = [s.name for s in outline]
         assert "AudioRecorderEngine" in names
         assert "allocateNames" in names
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Regression: _is_definition_line language-agnostic detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -471,79 +476,107 @@ class TestIsDefinitionLine:
     Covers every language that has a registered SyntaxProvider — Python, JS/TS, Go,
     Rust, Kotlin, Java — plus the generic fallback for unrecognised extensions.
     """
+
     # ── Python (PythonSyntaxProvider) ──────────────────────────────────────
     def test_python_def(self):
         assert _is_definition_line("foo.py", "def my_func():", "my_func") is True
+
     def test_python_async_def(self):
         assert _is_definition_line("foo.py", "async def my_func():", "my_func") is True
+
     def test_python_class(self):
         assert _is_definition_line("foo.py", "class MyClass:", "MyClass") is True
+
     def test_python_non_definition_call(self):
         assert _is_definition_line("foo.py", "    my_func()", "my_func") is False
+
     def test_python_non_definition_assign(self):
         assert _is_definition_line("foo.py", "x = my_func", "my_func") is False
+
     # ── JS/TS (TypeScriptSyntaxProvider / JavaScriptSyntaxProvider) ────────
     def test_ts_function(self, ts_repo):
         """export function name() — detected as definition."""
         file = str(ts_repo / "src" / "todoService.ts")
         assert _is_definition_line(file, "export function getTodos(): Todo[] {", "getTodos") is True
+
     def test_ts_async_function(self, ts_repo):
         """export async function name() — detected as definition."""
         file = str(ts_repo / "src" / "todoService.ts")
         line = "export async function deleteTodo(id: string): Promise<boolean> {"
         assert _is_definition_line(file, line, "deleteTodo") is True
+
     def test_ts_class(self, ts_repo):
         """export class name { — detected as definition."""
         file = str(ts_repo / "src" / "todoService.ts")
         assert _is_definition_line(file, "export class TodoService {", "TodoService") is True
+
     def test_ts_const_arrow_function(self, ts_repo):
         """const name = (...) => ... — detected as definition."""
         file = str(ts_repo / "src" / "todoService.ts")
         assert _is_definition_line(file, "const getCount = () => todos.length;", "getCount") is True
+
     def test_ts_reference_not_definition(self, ts_repo):
         """import { name } from ... — NOT a definition."""
         file = str(ts_repo / "src" / "index.ts")
         assert _is_definition_line(file, "import { getTodos } from './todoService';", "getTodos") is False
+
     # ── Go (GoSyntaxProvider) ──────────────────────────────────────────────
     def test_go_func_def(self):
         assert _is_definition_line("main.go", "func main() {", "main") is True
+
     def test_go_func_receiver(self):
         """Method on a type: func (r *T) Name(...)."""
-        line = 'func (s *Server) ServeHTTP(w ResponseWriter, r *Request) {'
+        line = "func (s *Server) ServeHTTP(w ResponseWriter, r *Request) {"
         assert _is_definition_line("handler.go", line, "ServeHTTP") is True
+
     def test_go_struct_def(self):
         assert _is_definition_line("server.go", "type Server struct {", "Server") is True
+
     def test_go_non_definition_call(self):
         assert _is_definition_line("main.go", '    fmt.Println("hello")', "fmt") is False
+
     # ── Rust (RustSyntaxProvider) ──────────────────────────────────────────
     def test_rust_fn_def(self):
         assert _is_definition_line("lib.rs", "fn process() -> Result<()> {", "process") is True
+
     def test_rust_struct_def(self):
         assert _is_definition_line("lib.rs", "struct Config {", "Config") is True
+
     def test_rust_non_definition_call(self):
         assert _is_definition_line("lib.rs", "    process()?;", "process") is False
+
     # ── Kotlin (KotlinSyntaxProvider) ──────────────────────────────────────
     def test_kotlin_fun_def(self):
         assert _is_definition_line("Main.kt", "fun main() {", "main") is True
+
     def test_kotlin_class_def(self):
         assert _is_definition_line("Main.kt", "class AudioRecorderEngine(", "AudioRecorderEngine") is True
+
     def test_kotlin_non_definition_call(self):
         assert _is_definition_line("Main.kt", "    main()", "main") is False
+
     # ── Java (JavaSyntaxProvider) ──────────────────────────────────────────
     def test_java_method_def(self):
         assert _is_definition_line("Main.java", "    public void handle() {", "handle") is True
+
     def test_java_non_definition_call(self):
         assert _is_definition_line("Main.java", "        handle();", "handle") is False
+
     # ── Generic fallback (unrecognised extension) ──────────────────────────
     def test_generic_fallback_def(self):
         """Unrecognised .xyz — fallback to Python/JS heuristic."""
         assert _is_definition_line("module.xyz", "def process():", "process") is True
+
     def test_generic_fallback_non_def(self):
         assert _is_definition_line("module.xyz", "    process()  # call", "process") is False
+
     def test_generic_fallback_class(self):
         assert _is_definition_line("module.xyz", "class Manager:", "Manager") is True
+
     def test_generic_fallback_const(self):
         assert _is_definition_line("module.xyz", "const PI = 3.14", "PI") is True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Regression: _resolve_search_root sibling-directory rejection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -553,26 +586,31 @@ class TestResolveSearchRoot:
     allowed sibling directories (``asicode-evil``) to pass through — classic prefix
     trap. Fixed with ``p.is_relative_to(self.repo_root)``.
     """
+
     def test_inside_repo_returns_path(self, tmp_path):
         (tmp_path / "src").mkdir()
         searcher = SymbolSearcher(str(tmp_path))
         result = searcher._resolve_search_root("src")
         assert result is not None
         assert result == (tmp_path / "src").resolve()
+
     def test_none_returns_repo_root(self, tmp_path):
         searcher = SymbolSearcher(str(tmp_path))
         result = searcher._resolve_search_root(None)
         assert result == searcher.repo_root
+
     def test_rejects_sibling_directory(self, tmp_path):
         """Sibling directory (../evil) must be rejected — the original prefix-trap bug."""
         searcher = SymbolSearcher(str(tmp_path))
         result = searcher._resolve_search_root("../evil")
         assert result is None
+
     def test_rejects_absolute_outside_path(self, tmp_path):
         """Absolute path outside repo_root must be rejected."""
         searcher = SymbolSearcher(str(tmp_path))
         result = searcher._resolve_search_root(str(Path("/tmp/evil")))
         assert result is None
+
     def test_rejects_deep_sibling_symlink_name(self, tmp_path):
         """e.g. /Users/.../asicode-evil — the original repro case.
 
@@ -586,6 +624,8 @@ class TestResolveSearchRoot:
         _repo = Path(str(searcher.repo_root)).resolve()
         result = searcher._resolve_search_root(str(_repo.parent / (_repo.name + "-evil")))
         assert result is None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Regression: find_references ValueError resilience
 # ─────────────────────────────────────────────────────────────────────────────
@@ -597,33 +637,41 @@ class TestFindReferencesValueErrorResilience:
     escaped the per-line handler, hit the outer ``except Exception``, and
     returned an empty list — eating all valid results.
     """
+
     def test_bad_path_does_not_eat_valid_results(self, tmp_path, monkeypatch):
         """A line with a path outside the repo (ValueError from relative_to)
         should be skipped; remaining valid lines still produce results."""
         src = tmp_path / "src"
         src.mkdir()
-        (src / "main.py").write_text(textwrap.dedent('''\
+        (src / "main.py").write_text(
+            textwrap.dedent("""\
             import logging
             logger = logging.getLogger(__name__)
             logger.info("hello")
-        '''), encoding="utf-8")
+        """),
+            encoding="utf-8",
+        )
         # Inject fake rg output: first line has a path outside the repo
         # (triggers ValueError on relative_to), remaining lines are valid.
         fake_stdout = (
             "/nonexistent/outside.py:3:  logger = None\n"
             f"{tmp_path}/src/main.py:2:  logger = logging.getLogger(__name__)\n"
-            f"{tmp_path}/src/main.py:3:  logger.info(\"hello\")\n"
+            f'{tmp_path}/src/main.py:3:  logger.info("hello")\n'
         )
         monkeypatch.setattr(
             "subprocess.run",
             lambda *args, **kwargs: subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=fake_stdout, stderr="",
+                args=[],
+                returncode=0,
+                stdout=fake_stdout,
+                stderr="",
             ),
         )
         searcher = SymbolSearcher(str(tmp_path))
         refs = searcher.find_references("logger")
         assert len(refs) >= 1, "One bad line must not discard valid results"
         assert any("main.py" in r.file for r in refs)
+
     def test_bad_lineno_does_not_eat_valid_results(self, tmp_path, monkeypatch):
         """A line with a non-integer "line number" (ValueError from int())
         should be skipped; remaining valid lines survive."""
@@ -637,7 +685,10 @@ class TestFindReferencesValueErrorResilience:
         monkeypatch.setattr(
             "subprocess.run",
             lambda *args, **kwargs: subprocess.CompletedProcess(
-                args=[], returncode=0, stdout=fake_stdout, stderr="",
+                args=[],
+                returncode=0,
+                stdout=fake_stdout,
+                stderr="",
             ),
         )
         searcher = SymbolSearcher(str(tmp_path))
@@ -712,12 +763,15 @@ class TestExtensionWalkerRegression:
     used hardcoded extension literals that drifted from the SSOT. These pin the
     fix end-to-end via find_symbol + get_file_outline."""
 
-    @pytest.mark.parametrize("ext,code,name", [
-        (".mts", "export function mtsFn(x: number): string { return String(x); }\n", "mtsFn"),
-        (".cts", "export function ctsFn(): number { return 1; }\n", "ctsFn"),
-        (".mjs", "export function mjsFn() { return 2; }\n", "mjsFn"),
-        (".cjs", "function cjsFn() { return 3; }\nmodule.exports = { cjsFn };\n", "cjsFn"),
-    ])
+    @pytest.mark.parametrize(
+        "ext,code,name",
+        [
+            (".mts", "export function mtsFn(x: number): string { return String(x); }\n", "mtsFn"),
+            (".cts", "export function ctsFn(): number { return 1; }\n", "ctsFn"),
+            (".mjs", "export function mjsFn() { return 2; }\n", "mjsFn"),
+            (".cjs", "function cjsFn() { return 3; }\nmodule.exports = { cjsFn };\n", "cjsFn"),
+        ],
+    )
     def test_find_symbol_modern_js_ts_extensions(self, tmp_path, ext, code, name):
         searcher = SymbolSearcher(str(tmp_path))
         (tmp_path / f"mod{ext}").write_text(code, encoding="utf-8")
@@ -726,9 +780,7 @@ class TestExtensionWalkerRegression:
 
     def test_find_symbol_pyi_type_stub(self, tmp_path):
         searcher = SymbolSearcher(str(tmp_path))
-        (tmp_path / "stub.pyi").write_text(
-            "class StubClass:\n    def method(self) -> int: ...\n", encoding="utf-8"
-        )
+        (tmp_path / "stub.pyi").write_text("class StubClass:\n    def method(self) -> int: ...\n", encoding="utf-8")
         # directory search
         hits = searcher.find_symbol("StubClass", search_path=str(tmp_path))
         assert any(h.name == "StubClass" for h in hits)
@@ -738,9 +790,7 @@ class TestExtensionWalkerRegression:
 
     def test_outline_pyi_type_stub(self, tmp_path):
         searcher = SymbolSearcher(str(tmp_path))
-        (tmp_path / "stub.pyi").write_text(
-            "class StubClass:\n    def method(self) -> int: ...\n", encoding="utf-8"
-        )
+        (tmp_path / "stub.pyi").write_text("class StubClass:\n    def method(self) -> int: ...\n", encoding="utf-8")
         outline = searcher.get_file_outline("stub.pyi")
         names = [s.name for s in outline]
         assert "StubClass" in names
@@ -753,6 +803,7 @@ class TestExtensionWalkerRegression:
 # test the substitution that _outline_ripgrep / _nonpy_index_for perform), so
 # they guard the fix regardless of whether the lua/scala grammar is installed.
 
+
 class TestProviderFallbackPatterns:
     def test_lua_dotted_function_uses_name_capture(self):
         """Outline substitution must use sp.name_capture, not a hardcoded \\w+.
@@ -764,6 +815,7 @@ class TestProviderFallbackPatterns:
         import re
 
         from external_llm.languages.lua_provider import LuaSyntaxProvider
+
         sp = LuaSyntaxProvider().get_symbol_patterns(kind="any")[0]
         pat = sp.regex.replace("{name}", f"({sp.name_capture})")
         m = re.search(pat, "function M.foo()")
@@ -776,6 +828,7 @@ class TestProviderFallbackPatterns:
         import re
 
         from external_llm.languages.lua_provider import LuaSyntaxProvider
+
         sp = LuaSyntaxProvider().get_symbol_patterns(kind="any")[0]
         pat = sp.regex.replace("{name}", f"({sp.name_capture})")
         m = re.search(pat, "function Account:withdraw(v)")
@@ -789,11 +842,12 @@ class TestProviderFallbackPatterns:
         import re
 
         from external_llm.languages.scala_provider import ScalaSyntaxProvider
+
         sp = ScalaSyntaxProvider().get_symbol_patterns(kind="any")[0]
         cases = [
-            ("size", "def size = xs.length"),        # parameterless, no type
-            ("greet", "def greet(): Unit = ()"),     # empty param list
-            ("name", "def name: Int = 1"),           # parameterless with type
+            ("size", "def size = xs.length"),  # parameterless, no type
+            ("greet", "def greet(): Unit = ()"),  # empty param list
+            ("name", "def name: Int = 1"),  # parameterless with type
             ("apply", "def apply[T](xs: T): T = xs"),  # generic
         ]
         for name, src in cases:
@@ -806,6 +860,7 @@ class TestProviderFallbackPatterns:
 # does not exist AND when the file index was truncated at the cap. The
 # index_was_truncated() method lets callers annotate the empty result so the
 # agent does not wrongly conclude "symbol does not exist" (fail-silent).
+
 
 class TestIndexWasTruncated:
     def test_false_when_full_tree_indexed(self, tmp_path):
@@ -832,9 +887,7 @@ class TestIndexWasTruncated:
 
         searcher = SymbolSearcher(str(tmp_path))
         searcher.find_symbol("missing_symbol")  # forces a walk
-        assert searcher.index_was_truncated() is True, (
-            "walk that hit the cap must report index_was_truncated=True"
-        )
+        assert searcher.index_was_truncated() is True, "walk that hit the cap must report index_was_truncated=True"
 
     def test_unknown_symbol_in_truncated_index_is_flagged(self, tmp_path, monkeypatch):
         """The end-to-end property: a symbol that exists in an UN-indexed file
@@ -857,6 +910,4 @@ class TestIndexWasTruncated:
         # A symbol that DOES exist, but in a file beyond the cap → not found.
         defs = searcher.find_symbol("unique_sym_4")
         assert defs == [], "symbol in un-indexed file must be missed"
-        assert searcher.index_was_truncated() is True, (
-            "miss must be flagged as unreliable (index truncated)"
-        )
+        assert searcher.index_was_truncated() is True, "miss must be flagged as unreliable (index truncated)"

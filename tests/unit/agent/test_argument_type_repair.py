@@ -12,6 +12,7 @@ write tools included.
 The layer is deliberately conservative — see the split between "coerce",
 "drop to the handler's default" and "refuse" pinned below.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -52,10 +53,18 @@ class TestCoercion:
         assert out["max_results"] == 30
         assert errors == []
 
-    @pytest.mark.parametrize("raw,expected", [
-        ("true", True), ("TRUE", True), ("yes", True), ("1", True),
-        ("false", False), ("no", False), ("0", False),
-    ])
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("true", True),
+            ("TRUE", True),
+            ("yes", True),
+            ("1", True),
+            ("false", False),
+            ("no", False),
+            ("0", False),
+        ],
+    )
     def test_boolean_strings(self, repairer, raw, expected):
         out, _, errors = _coerce(repairer, "grep", {"pattern": "x", "ignore_case": raw})
         assert out["ignore_case"] is expected
@@ -170,9 +179,11 @@ class TestDispatchIntegration:
     @pytest.fixture()
     def registry(self, tmp_path):
         import subprocess
+
         (tmp_path / "sample.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+
         return ToolRegistry(str(tmp_path), AgentConfig(rag_enabled=False))
 
     def test_refusal_is_a_clean_tool_result(self, registry):
@@ -203,4 +214,3 @@ class TestDispatchIntegration:
         r = registry.dispatch("read_symbol", {"name": None})
         assert r.ok is False
         assert "required" in (r.error or "").lower()
-

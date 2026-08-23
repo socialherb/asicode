@@ -15,6 +15,7 @@ Environment variables:
     EXTERNAL_LLM_MODEL     = model name (optional)
     ANTHROPIC_API_KEY / OPENAI_API_KEY / ...
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +31,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # The runtime import is lazy (inside _load_checkpoint_store) — this exists
@@ -122,11 +123,11 @@ _silence_socks_dependency_warning()
 # Sub-agent workers are spawned per-process (orchestrator.py), so this saving compounds.
 _PROMPT_TOOLKIT_AVAILABLE = False
 PromptSession = None  # type: ignore[assignment,misc]   # bound by _load_prompt_toolkit()
-Completion = None      # type: ignore[assignment,misc]   # used by _SlashCommandCompleter methods
-KeyBindings = None     # type: ignore[assignment,misc]   # used when configuring _collect_input session
+Completion: Any = None  # used by _SlashCommandCompleter methods; bound by _load_prompt_toolkit()
+KeyBindings = None  # type: ignore[assignment,misc]   # used when configuring _collect_input session
 InMemoryHistory = None  # type: ignore[assignment,misc]
-_PtStyle = None        # type: ignore[assignment,misc]   # (previously missing fallback — latent NameError fixed)
-patch_stdout = None    # type: ignore[assignment,misc]   # used by _collect_input to coordinate background writes with the live prompt
+_PtStyle = None  # type: ignore[assignment,misc]   # (previously missing fallback — latent NameError fixed)
+patch_stdout = None  # type: ignore[assignment,misc]   # used by _collect_input to coordinate background writes with the live prompt
 
 
 def _load_prompt_toolkit() -> bool:
@@ -157,23 +158,25 @@ def _load_prompt_toolkit() -> bool:
     patch_stdout = _PatchStdout
     _PROMPT_TOOLKIT_AVAILABLE = True
     return True
+
+
 # CLI history rotation: FileHistory loads the whole file at startup, so cap it.
 _CLI_HISTORY_ROTATE_AT = 20000  # lines — trigger rotation above this
-_CLI_HISTORY_KEEP = 10000       # lines — how many recent lines to keep after rotation
+_CLI_HISTORY_KEEP = 10000  # lines — how many recent lines to keep after rotation
 
 # ── CLI color theme (Catppuccin Mocha — same as web UI palette) ──────────────────
 _C: dict[str, str] = {
-    "blue":   "#89b4fa",   # primary / read series
-    "sky":    "#89dceb",   # search / git series
-    "mauve":  "#cba6f7",   # plan / PLANNER section
-    "peach":  "#fab387",   # patch / turn indicator
-    "green":  "#a6e3a1",   # success / test
-    "red":    "#f38ba8",   # error / exec series
-    "yellow": "#f9e2af",   # warning / rate-limit
-    "teal":   "#94e2d5",   # teal / misc
-    "text":   "#cdd6f4",   # default text
-    "muted":  "#6c7086",   # secondary / dim info
-    "border": "#313244",   # separator (very fine)
+    "blue": "#89b4fa",  # primary / read series
+    "sky": "#89dceb",  # search / git series
+    "mauve": "#cba6f7",  # plan / PLANNER section
+    "peach": "#fab387",  # patch / turn indicator
+    "green": "#a6e3a1",  # success / test
+    "red": "#f38ba8",  # error / exec series
+    "yellow": "#f9e2af",  # warning / rate-limit
+    "teal": "#94e2d5",  # teal / misc
+    "text": "#cdd6f4",  # default text
+    "muted": "#6c7086",  # secondary / dim info
+    "border": "#313244",  # separator (very fine)
 }
 
 
@@ -191,6 +194,7 @@ def _rotate_cli_history_if_needed(path: str) -> None:
     the full history is used as-is.
     """
     import os as _os
+
     with contextlib.suppress(OSError):  # history rotate is best-effort file I/O
         if not path or not _os.path.exists(path):
             return
@@ -223,9 +227,9 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
 
 
 # ── Claude Code style shimmer (light beam scans left↔right over text) ──────────
-_SHIMMER_BASE = _C.get("text", "#cdd6f4")   # base color outside beam
-_SHIMMER_HI = "#ffffff"                      # beam center (brightest)
-_SHIMMER_SPEED = 7.0                         # beam round-trip speed factor (higher = faster)
+_SHIMMER_BASE = _C.get("text", "#cdd6f4")  # base color outside beam
+_SHIMMER_HI = "#ffffff"  # beam center (brightest)
+_SHIMMER_SPEED = 7.0  # beam round-trip speed factor (higher = faster)
 
 
 def _shimmer_beam(n: int, elapsed: float) -> tuple[int, int]:
@@ -235,7 +239,7 @@ def _shimmer_beam(n: int, elapsed: float) -> tuple[int, int]:
     both ends of the text for a smooth scan. Shared computation between Rich and non-Rich paths."""
     if n < 4:
         return n // 2, 0
-    beam_w = max(3, n // 3)        # beam width (1/3 of text, minimum 3)
+    beam_w = max(3, n // 3)  # beam width (1/3 of text, minimum 3)
     span = n + beam_w
     phase = (elapsed * _SHIMMER_SPEED) % (span * 2)
     # Triangle wave: sweep left→right on the first half, right→left on the second
@@ -248,8 +252,8 @@ def _shimmer_style_for(idx: int, center: int, beam_w: int) -> str:
     d = abs(idx - center)
     if d >= beam_w:
         return _SHIMMER_BASE
-    t = 1.0 - (d / beam_w)        # 1=center(bright), 0=edge(base)
-    return _lerp_color(_SHIMMER_BASE, _SHIMMER_HI, t * t)   # squared for smooth edge falloff
+    t = 1.0 - (d / beam_w)  # 1=center(bright), 0=edge(base)
+    return _lerp_color(_SHIMMER_BASE, _SHIMMER_HI, t * t)  # squared for smooth edge falloff
 
 
 def _render_shimmer_text(text: str, elapsed: float):
@@ -259,6 +263,7 @@ def _render_shimmer_text(text: str, elapsed: float):
     logic with _ShimmerSpinner.render — both call this helper for DRY.
     Short/blank text skips beam calculation and returns base color directly."""
     from rich.text import Text
+
     n = len(text)
     if n < 4 or not text.strip():
         return Text(text, style=_SHIMMER_BASE)
@@ -305,6 +310,7 @@ def _drain_stdin(timeout: float = 0.05) -> None:
     """Drain all remaining bytes from stdin. Switch to non-canonical mode, drain, then restore."""
     import copy as _copy
     import termios as _termios
+
     fd = sys.stdin.fileno()
     if not os.isatty(fd):
         return
@@ -335,7 +341,7 @@ _SEQ_W = 3
 
 
 def _seq_pad(plain_tag: str) -> str:
-    """"[N]"/"[·]" token padding that fills after ']' to keep the icon (✓/✗/○) column at fixed width.
+    """ "[N]"/"[·]" token padding that fills after ']' to keep the icon (✓/✗/○) column at fixed width.
 
     Numbers inside brackets are left untouched (=[1]/[10]/[100]), only the space after "]"
     is padded, avoiding extra spaces around the number. plain_tag is the raw token without
@@ -356,6 +362,7 @@ class _MarginIO:
     for every _print()/log call made from a background thread while a prompt
     is being read.
     """
+
     def __init__(self, stream_name: str, margin: int = _CONSOLE_MARGIN):
         self._stream_name = stream_name
         self._pad = " " * margin
@@ -382,13 +389,22 @@ class _MarginIO:
                 self._bol = True
         return self._s.write("".join(out))
 
-    def flush(self):       self._s.flush()
-    def fileno(self):      return self._s.fileno()
-    def isatty(self):      return getattr(self._s, "isatty", lambda: False)()
+    def flush(self):
+        self._s.flush()
+
+    def fileno(self):
+        return self._s.fileno()
+
+    def isatty(self):
+        return getattr(self._s, "isatty", lambda: False)()
+
     @property
-    def encoding(self):    return getattr(self._s, "encoding", "utf-8")
+    def encoding(self):
+        return getattr(self._s, "encoding", "utf-8")
+
     @property
-    def errors(self):      return getattr(self._s, "errors", "strict")
+    def errors(self):
+        return getattr(self._s, "errors", "strict")
 
 
 # Lazy rich.console import: detect availability WITHOUT loading the ~29-40ms stack.
@@ -429,6 +445,7 @@ def _ensure_console_widths() -> None:
     if _console_widths_ready:
         return
     import shutil as _shutil
+
     _cols = _shutil.get_terminal_size().columns
     _console_width = max(40, _cols - _CONSOLE_MARGIN * 2)
     # _log_console_width: MarginIO only adds left _CONSOLE_MARGIN, so right margin removal is unnecessary.
@@ -437,7 +454,7 @@ def _ensure_console_widths() -> None:
     _console_widths_ready = True
 
 
-def _import_rich_console() -> Optional[type]:
+def _import_rich_console() -> type | None:
     """Import the rich ``Console`` class, or return None when Rich is unavailable.
 
     Single source for the lazy-import ceremony shared by the three
@@ -454,6 +471,7 @@ def _import_rich_console() -> Optional[type]:
     _ensure_console_widths()
     try:
         from rich.console import Console
+
         return Console  # noqa: TRY300
     except ImportError:
         _RICH = False
@@ -517,6 +535,7 @@ class _ShimmerSpinner:
     def __init__(self, text: str, style: str, frames=None, interval: float = 130.0):
         from rich.spinner import Spinner
         from rich.text import Text
+
         self._Text = Text
         self._spinner = Spinner("dots", text=text, style=style)
         self._spinner.frames = frames or ["◴", "◷", "◶", "◵"]
@@ -529,6 +548,7 @@ class _ShimmerSpinner:
 
     def __rich_measure__(self, console, options):
         from rich.measure import Measurement
+
         text = self.render(0)
         return Measurement.get(console, options, text)
 
@@ -538,25 +558,25 @@ class _ShimmerSpinner:
             sp.start_time = time
         frame_no = (time - sp.start_time) / (sp.interval / 1000.0)
         glyph = sp.frames[int(frame_no) % len(sp.frames)]
-        Text = self._Text
+        _rich_text_cls = self._Text
         # ── Rotating glyph + body text ──
-        frame = Text(glyph, style=self._spin_style or "")
+        frame = _rich_text_cls(glyph, style=self._spin_style or "")
         body = sp.text
         if not body:
             return frame
-        plain = body.plain if isinstance(body, Text) else str(body)
+        plain = body.plain if isinstance(body, _rich_text_cls) else str(body)
         if not plain.strip():
-            return Text.assemble(frame, " ", body)
+            return _rich_text_cls.assemble(frame, " ", body)  # type: ignore[arg-type]  # RenderableType includes Text; assemble accepts Text
         # ── Leading spaces go before the glyph ──
         # If the body has indent like "      thinking", move those spaces before the rotating
         # glyph so the glyph aligns with the indent column (the ✓ column of completion lines "  [N] ✓").
         # Shimmer interpolation applies only to the body stripped of leading spaces.
         stripped = plain.lstrip(" ")
-        indent = plain[:len(plain) - len(stripped)]
+        indent = plain[: len(plain) - len(stripped)]
         out = _render_shimmer_text(stripped, time)
         if indent:
-            return Text.assemble(Text(indent), frame, " ", out)
-        return Text.assemble(frame, " ", out)
+            return _rich_text_cls.assemble(_rich_text_cls(indent), frame, " ", out)
+        return _rich_text_cls.assemble(frame, " ", out)
 
     # _update_spinner delegates to update() to preserve start_time while replacing text
     def update(self, *, text: str = "", style=None):
@@ -598,6 +618,7 @@ def _handle_terminal_resize(_signum=None, _frame=None) -> None:
     """
     with contextlib.suppress(OSError):  # get_terminal_size on a broken tty
         import shutil as _sh_wz
+
         cols = _sh_wz.get_terminal_size((80, 24)).columns
         if _console is not None:
             _console.width = max(40, cols - _CONSOLE_MARGIN * 2)
@@ -663,7 +684,7 @@ class _FsyncedFileHandler(logging.handlers.RotatingFileHandler):
         super().close()
 
 
-_LOG_FILE_HANDLER: Optional[logging.FileHandler] = None
+_LOG_FILE_HANDLER: logging.FileHandler | None = None
 
 
 class _ToolRunningFilter(logging.Filter):
@@ -680,6 +701,7 @@ class _ToolRunningFilter(logging.Filter):
     inside _TERM_WRITE_LOCK. Breaking in the filter would let ticker re-rendering slip between
     the newline and the actual log emit, causing WARNING to attach to the spinner row.
     """
+
     def __init__(self) -> None:
         super().__init__()
         self._active: bool = False
@@ -814,6 +836,7 @@ class _SafeRichFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         from rich.markup import escape as _escape
+
         original_msg = record.msg
         original_args = record.args
         if isinstance(record.msg, str):
@@ -823,7 +846,7 @@ class _SafeRichFormatter(logging.Formatter):
         elif isinstance(record.args, dict):
             record.args = {k: (_escape(v) if isinstance(v, str) else v) for k, v in record.args.items()}
         elif isinstance(record.args, str):  # pragma: no cover — logging.LogRecord normalizes args to tuple/dict
-            record.args = _escape(record.args)
+            record.args = _escape(record.args)  # type: ignore[attr-defined]  # LogRecord.args is writeable at runtime
         try:
             result = super().format(record)
             # WARNING+ logs align vertically with tool-call detail lines (Edited/SEMANTIC LINT, etc., col 6 =
@@ -835,7 +858,9 @@ class _SafeRichFormatter(logging.Formatter):
         finally:
             record.msg = original_msg
             record.args = original_args
-def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
+
+
+def _setup_logging(level: str = "INFO", log_file: str | None = None) -> None:
     """Configure the Python root logger.
 
     - Terminal (stderr): always output (RichHandler or StreamHandler)
@@ -857,6 +882,7 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
         except ImportError:
             logging.getLogger(__name__).debug("RichHandler not available — fall back to StreamHandler")
     if _RICH and _log_console and _rh_class is not None:
+
         class _RowSafeRichHandler(_RowSafeEmitMixin, _rh_class):  # type: ignore[name-defined]
             def render_message(self, record, message):  # type: ignore[override]
                 # Terminal logs are always cropped to one line. In narrow terminals, long logs
@@ -865,12 +891,13 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
                 # (separate formatter, no crop) by the file handler. Tracebacks are rendered
                 # through a separate path and are unaffected by this method.
                 text = super().render_message(record, message)
-                text.no_wrap = True  # noqa: V101 — rich.text.Text API attribute, not ours
-                text.overflow = "ellipsis"
+                text.no_wrap = True  # noqa: V101 — rich.text.Text API attribute, not ours  # type: ignore[attr-defined]
+                text.overflow = "ellipsis"  # type: ignore[attr-defined]
                 return text
+
         term_handler = _RowSafeRichHandler(
-            console=_log_console,   # MarginIO-wrapped stderr — aligns col 0 → col _LOG_MARGIN
-            show_time=False,        # Terminal logs omit [HH:MM:SS] timestamps → level/message aligns vertically with body (timestamps preserved by file handler)
+            console=_log_console,  # MarginIO-wrapped stderr — aligns col 0 → col _LOG_MARGIN
+            show_time=False,  # Terminal logs omit [HH:MM:SS] timestamps → level/message aligns vertically with body (timestamps preserved by file handler)
             show_path=False,
             show_level=False,
             markup=True,
@@ -878,8 +905,10 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
         )
         term_handler.setFormatter(_SafeRichFormatter("[dim]%(levelname)-5s %(message)s[/dim]", datefmt="[%X]"))
     else:
+
         class _RowSafeStreamHandler(_RowSafeEmitMixin, logging.StreamHandler):
             pass
+
         term_handler = _RowSafeStreamHandler(sys.stderr)
         term_handler.setFormatter(
             logging.Formatter("  %(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%H:%M:%S")
@@ -891,12 +920,9 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
     # ── File handler ──
     if log_file:
         import datetime
+
         now = datetime.datetime.now()
-        resolved = (
-            log_file
-            .replace("{date}", now.strftime("%Y%m%d"))
-            .replace("{time}", now.strftime("%H%M%S"))
-        )
+        resolved = log_file.replace("{date}", now.strftime("%Y%m%d")).replace("{time}", now.strftime("%H%M%S"))
         log_path = Path(resolved)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         # ── logs/ retention: delete files older than 30 days, keep at most 50 ──
@@ -921,7 +947,7 @@ def _setup_logging(level: str = "INFO", log_file: Optional[str] = None) -> None:
                 while len(_log_files) > 50:
                     _log_files[0].unlink(missing_ok=True)
                     _log_files = _log_files[1:]
-        file_handler = _FsyncedFileHandler(log_path, encoding="utf-8")
+        file_handler = _FsyncedFileHandler(str(log_path), encoding="utf-8")
         file_handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -961,28 +987,36 @@ def _ensure_out_console_imported() -> None:
         # rich.theme is imported by rich.console itself (console.py:57), so this
         # cannot fail once _import_rich_console() succeeded.
         from rich.theme import Theme as _RichTheme
-        _out_console = _console_cls(file=_MarginIO("stdout"), width=_console_width, force_terminal=True, theme=_RichTheme({
-            # headings — blue/sky/teal series, purple removed
-            "markdown.h1":          f"bold {_C['blue']}",
-            "markdown.h1.border":   _C["border"],
-            "markdown.h2":          f"bold {_C['sky']}",
-            "markdown.h3":          f"bold {_C['teal']}",
-            "markdown.h4":          f"bold {_C['text']}",
-            # inline code — sky text, no background
-            "markdown.code":        _C["sky"],
-            # code block
-            "markdown.code_block":  _C["text"],
-            # links
-            "markdown.link":        f"underline {_C['blue']}",
-            "markdown.link_url":    _C["muted"],
-            # bullets/numbers
-            "markdown.item.bullet": _C["peach"],
-            "markdown.item.number": _C["peach"],
-            # horizontal rule
-            "markdown.hr":          _C["border"],
-            # blockquote
-            "markdown.block_quote": f"italic {_C['muted']}",
-        }))
+
+        _out_console = _console_cls(
+            file=_MarginIO("stdout"),
+            width=_console_width,
+            force_terminal=True,
+            theme=_RichTheme(
+                {
+                    # headings — blue/sky/teal series, purple removed
+                    "markdown.h1": f"bold {_C['blue']}",
+                    "markdown.h1.border": _C["border"],
+                    "markdown.h2": f"bold {_C['sky']}",
+                    "markdown.h3": f"bold {_C['teal']}",
+                    "markdown.h4": f"bold {_C['text']}",
+                    # inline code — sky text, no background
+                    "markdown.code": _C["sky"],
+                    # code block
+                    "markdown.code_block": _C["text"],
+                    # links
+                    "markdown.link": f"underline {_C['blue']}",
+                    "markdown.link_url": _C["muted"],
+                    # bullets/numbers
+                    "markdown.item.bullet": _C["peach"],
+                    "markdown.item.number": _C["peach"],
+                    # horizontal rule
+                    "markdown.hr": _C["border"],
+                    # blockquote
+                    "markdown.block_quote": f"italic {_C['muted']}",
+                }
+            ),
+        )
 
 
 def _rich_markdown_cls():
@@ -992,6 +1026,7 @@ def _rich_markdown_cls():
     first actual Markdown render.  Idempotent — cached inside the shared module.
     """
     from external_llm.common.rich_markdown import markdown_cls
+
     return markdown_cls()
 
 
@@ -1001,16 +1036,16 @@ def _strip_ansi(text: str) -> str:
     i = 0
     n = len(text)
     while i < n:
-        if text[i] == '\x1b' and i + 1 < n and text[i + 1] == '[':
+        if text[i] == "\x1b" and i + 1 < n and text[i + 1] == "[":
             j = i + 2
-            while j < n and text[j] in '0123456789;':
+            while j < n and text[j] in "0123456789;":
                 j += 1
-            if j < n and text[j] in 'mABCDEFGHJKSTfilu':
+            if j < n and text[j] in "mABCDEFGHJKSTfilu":
                 i = j + 1
                 continue
         out.append(text[i])
         i += 1
-    return ''.join(out)
+    return "".join(out)
 
 
 # ─── Git-based change (diff) rendering ──────────────────────────────────────────
@@ -1020,12 +1055,15 @@ def _strip_ansi(text: str) -> str:
 #   · ref           = git stash create (freezes tracked modifications as a dangling commit)
 #   · untracked set = pre-execution untracked file list (to distinguish newly created files)
 
+
 def _git(repo_root: str, *args: str, timeout: float = 12.0) -> tuple[int, str]:
     """Run `git -C repo_root <args>`. Returns (returncode, stdout). Never raises."""
     try:
         p = subprocess.run(
             ["git", "-C", repo_root, *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
             check=False,
         )
     except Exception:
@@ -1034,7 +1072,7 @@ def _git(repo_root: str, *args: str, timeout: float = 12.0) -> tuple[int, str]:
         return p.returncode, p.stdout
 
 
-def _git_baseline(repo_root: str) -> Optional[dict]:
+def _git_baseline(repo_root: str) -> dict | None:
     """Snapshot the working tree state before a run. None if not a git repo.
 
     Notes:
@@ -1067,7 +1105,7 @@ def _git_baseline(repo_root: str) -> Optional[dict]:
     return {"ref": ref, "untracked": frozenset(p for p in untracked.split("\x00") if p)}
 
 
-def _load_checkpoint_store(repo_root: str) -> Optional[CheckpointStore]:
+def _load_checkpoint_store(repo_root: str) -> CheckpointStore | None:
     """Instantiate the agent checkpoint store for *repo_root*, or None.
 
     The store is an optional dependency of the CLI (the /undo fallback outside
@@ -1080,13 +1118,11 @@ def _load_checkpoint_store(repo_root: str) -> Optional[CheckpointStore]:
 
         return CheckpointStore(repo_root)
     except Exception:
-        logging.getLogger(__name__).debug(
-            "could not read checkpoint store at %s", repo_root, exc_info=True
-        )
+        logging.getLogger(__name__).debug("could not read checkpoint store at %s", repo_root, exc_info=True)
         return None
 
 
-def _newest_checkpoint_id(repo_root: str) -> Optional[str]:
+def _newest_checkpoint_id(repo_root: str) -> str | None:
     """Id of the most recent Undo checkpoint for *repo_root*, or None.
 
     The CLI's ``/diff`` and ``/undo`` are built on ``_git_baseline``, which
@@ -1108,9 +1144,7 @@ def _newest_checkpoint_id(repo_root: str) -> Optional[str]:
     except Exception:
         # Never fatal: this only decides whether /undo is offered, and a store
         # that cannot be read simply means it is not.
-        logging.getLogger(__name__).debug(
-            "could not read checkpoint store at %s", repo_root, exc_info=True
-        )
+        logging.getLogger(__name__).debug("could not read checkpoint store at %s", repo_root, exc_info=True)
         return None
     return entries[0]["id"] if entries else None
 
@@ -1139,9 +1173,7 @@ def _checkpoint_changed_files(repo_root: str, checkpoint_id: str) -> list[str]:
     if store is None:
         return []
     try:
-        entry = next(
-            (c for c in store.checkpoints if c["id"] == checkpoint_id), None
-        )
+        entry = next((c for c in store.checkpoints if c["id"] == checkpoint_id), None)
         if entry is None:
             return []
         with open(store.checkpoint_dir / entry["path"], encoding="utf-8") as f:
@@ -1160,10 +1192,7 @@ def _changed_files_since(repo_root: str, baseline: dict) -> list[str]:
     _, names = _git(repo_root, "diff", "--no-renames", "--name-only", "-z", baseline["ref"])
     tracked = [p for p in names.split("\x00") if p.strip()]
     _, cur = _git(repo_root, "ls-files", "--others", "--exclude-standard", "-z")
-    new_untracked = [
-        p for p in cur.split("\x00")
-        if p.strip() and p not in baseline["untracked"]
-    ]
+    new_untracked = [p for p in cur.split("\x00") if p.strip() and p not in baseline["untracked"]]
     # stable order, deduped
     seen: dict[str, None] = {}
     for f in tracked + new_untracked:
@@ -1193,13 +1222,27 @@ def _parse_diff_stats(diff_body: str) -> tuple[int, int]:
 
 
 _DIFF_HEADER_PREFIXES = (
-    "diff --git", "index ", "--- ", "+++ ", "new file", "deleted file",
-    "old mode", "new mode", "similarity ", "rename ", "copy ", "Binary files",
+    "diff --git",
+    "index ",
+    "--- ",
+    "+++ ",
+    "new file",
+    "deleted file",
+    "old mode",
+    "new mode",
+    "similarity ",
+    "rename ",
+    "copy ",
+    "Binary files",
 )
 
 
 def _build_file_diff_renderable(
-    rel_path: str, diff_body: str, is_new: bool, *, max_lines: int = 60,
+    rel_path: str,
+    diff_body: str,
+    is_new: bool,
+    *,
+    max_lines: int = 60,
 ):
     """Build a Rich renderable for one file's diff with line numbers + color."""
     from rich.text import Text
@@ -1278,8 +1321,11 @@ def _build_file_diff_renderable(
 
 
 def _render_run_diff(
-    repo_root: str, baseline: Optional[dict], *,
-    max_files: int = 20, max_lines_per_file: int = 60,
+    repo_root: str,
+    baseline: dict | None,
+    *,
+    max_files: int = 20,
+    max_lines_per_file: int = 60,
 ) -> bool:
     """Render colored diffs for every file the run changed. Returns True if shown."""
     _ensure_out_console_imported()
@@ -1317,10 +1363,7 @@ def _render_run_diff(
         _out_console.print()
         _out_console.print(title)
         _out_console.rule(style=_C["border"])
-        blocks = [
-            _build_file_diff_renderable(p, b, n, max_lines=max_lines_per_file)
-            for p, b, n in rendered
-        ]
+        blocks = [_build_file_diff_renderable(p, b, n, max_lines=max_lines_per_file) for p, b, n in rendered]
         _out_console.print(Group(*blocks))
         if extra > 0:
             _out_console.print(f"  [{_C['muted']}]… {extra} more file(s) changed[/{_C['muted']}]")
@@ -1339,7 +1382,9 @@ def _render_run_diff(
 
 
 def _run_changed_stats(
-    repo_root: str, baseline: Optional[dict], max_files: int = 20,
+    repo_root: str,
+    baseline: dict | None,
+    max_files: int = 20,
 ) -> list[tuple[str, int, int, bool]]:
     """Per-file (path, added, removed, is_new) summary stats of what the run changed.
 
@@ -1378,7 +1423,7 @@ def _run_changed_stats(
     return out
 
 
-def _print_run_change_summary(repo_root: str, baseline: Optional[dict]) -> bool:
+def _print_run_change_summary(repo_root: str, baseline: dict | None) -> bool:
     """Print a one-line stat (+N -M) per file the run changed. Returns False if nothing changed.
 
     Prints only this lightweight summary so it's always visible even when the
@@ -1390,6 +1435,7 @@ def _print_run_change_summary(repo_root: str, baseline: Optional[dict]) -> bool:
         return False
     if _RICH and _out_console:
         from rich.text import Text
+
         for path, add, rem, is_new in stats:
             line = Text("  ")
             line.append("A" if is_new else "M", style=_C["peach"])
@@ -1472,25 +1518,45 @@ def _print_session_summary(session_tokens: dict, t0: float) -> None:
 
 # (command, aliases, argument hint, one-line description)
 _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
-    ("/help",    ("/?",),         "",       "show this command list"),
-    ("/diff",    (),              "",       "re-show the last run's file changes"),
-    ("/undo",    (),              "",       "revert files changed by the last run to their pre-run state"),
-    ("/status",  ("/info",),      "",       "repo · model · mode · session usage"),
-    ("/model",   (),              "[name]",  "show or switch model: /model <name> · /model <provider>/<name> · /model <provider> <name>"),
-    ("/helper",  (),              "[name]",  "model for context-compression: /helper <name> or /helper off (= use main model)"),
-    ("/clear",   ("/cls",),       "",       "clear screen + compact conversation into summary"),
+    ("/help", ("/?",), "", "show this command list"),
+    ("/diff", (), "", "re-show the last run's file changes"),
+    ("/undo", (), "", "revert files changed by the last run to their pre-run state"),
+    ("/status", ("/info",), "", "repo · model · mode · session usage"),
+    (
+        "/model",
+        (),
+        "[name]",
+        "show or switch model: /model <name> · /model <provider>/<name> · /model <provider> <name>",
+    ),
+    ("/helper", (), "[name]", "model for context-compression: /helper <name> or /helper off (= use main model)"),
+    ("/clear", ("/cls",), "", "clear screen + compact conversation into summary"),
     # arg hint is concise one-liner — detailed usage printed when command runs alone
     # (e.g., /insights → subcommands in the `/insights` handler, /think → tab completion).
-    ("/insights",(),              "[subcommand]", "manage design_insights.md: list, compact, verify, archive, prune, drop, or edit"),
-    ("/failure-patterns", (),     "[subcommand]", "failure-pattern store: list (default), clear, drop <n>"),
-    ("/copy",    ("/yank",),      "",       "copy the last final message to the clipboard"),
-    ("/code",    (),              "[msg]",  "switch to Code Chat (full context)"),
-    ("/general", (),              "[msg]",  "switch to General Chat (no code context)"),
-    ("/think",   ("/thinking",),  "[mode]", "toggle thinking/reasoning mode (tab for suggestions)"),
-    ("/auto",    (),              "[N|off]", "auto-continue: countdown-run the suggested next step after each turn (N = max consecutive steps)"),
-    ("/claude",  (),              "[--fresh] <task>", "ask Claude Code Agent (--fresh: don't share conversation context)"),
-    ("/orchestrate", ("/orch",), "<task>", "enter Orchestrator mode (persistent — inherits session context; /code to exit)"),
-    ("/quit",    (":q", "/exit"), "",       "end the session"),
+    (
+        "/insights",
+        (),
+        "[subcommand]",
+        "manage design_insights.md: list, compact, verify, archive, prune, drop, or edit",
+    ),
+    ("/failure-patterns", (), "[subcommand]", "failure-pattern store: list (default), clear, drop <n>"),
+    ("/copy", ("/yank",), "", "copy the last final message to the clipboard"),
+    ("/code", (), "[msg]", "switch to Code Chat (full context)"),
+    ("/general", (), "[msg]", "switch to General Chat (no code context)"),
+    ("/think", ("/thinking",), "[mode]", "toggle thinking/reasoning mode (tab for suggestions)"),
+    (
+        "/auto",
+        (),
+        "[N|off]",
+        "auto-continue: countdown-run the suggested next step after each turn (N = max consecutive steps)",
+    ),
+    ("/claude", (), "[--fresh] <task>", "ask Claude Code Agent (--fresh: don't share conversation context)"),
+    (
+        "/orchestrate",
+        ("/orch",),
+        "<task>",
+        "enter Orchestrator mode (persistent — inherits session context; /code to exit)",
+    ),
+    ("/quit", (":q", "/exit"), "", "end the session"),
 ]
 
 # Subcommand lists shared between the completer and the command handler so that
@@ -1503,9 +1569,9 @@ _FAILURE_PATTERNS_SUBCOMMANDS: list[str] = ["list", "clear", "drop", "prune"]
 # are gathered into the "other" section by _render_help, so omissions still display.
 _SLASH_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("session", ("/help", "/status", "/clear", "/quit")),
-    ("model",   ("/model", "/helper", "/think")),
-    ("mode",    ("/code", "/general", "/orchestrate", "/claude", "/auto")),
-    ("output",  ("/diff", "/undo", "/copy")),
+    ("model", ("/model", "/helper", "/think")),
+    ("mode", ("/code", "/general", "/orchestrate", "/claude", "/auto")),
+    ("output", ("/diff", "/undo", "/copy")),
     ("project", ("/insights", "/failure-patterns")),
 ]
 
@@ -1545,7 +1611,9 @@ def _model_candidates(prefix: str, ollama_timeout: int = 3) -> list[tuple[str, s
     candidates: list[tuple[str, str]] = []
     for prov, models in _KNOWN_MODELS.items():
         candidates.extend((prov, m) for m in models if m.lower().startswith(prefix))
-    candidates.extend(("ollama", nm) for nm in _get_ollama_models(timeout=ollama_timeout) if nm.lower().startswith(prefix))
+    candidates.extend(
+        ("ollama", nm) for nm in _get_ollama_models(timeout=ollama_timeout) if nm.lower().startswith(prefix)
+    )
     return candidates
 
 
@@ -1700,9 +1768,7 @@ def _resolve_model_interactive(
     return (new_provider, new_model)
 
 
-def _prompt_auth_retry_key(
-    provider: str, svc, *, error_message: str = ""
-) -> bool:
+def _prompt_auth_retry_key(provider: str, svc, *, error_message: str = "") -> bool:
     """Prompt for a new API key on auth failure; recreate client if provided.
 
     Returns True if a new key was entered and the LLM client was successfully
@@ -1786,9 +1852,7 @@ def _commit_verified_api_key() -> None:
         # Logged rather than swallowed — a persist that fails every time would
         # otherwise look identical to one that works, and the user would just
         # get re-prompted forever with no explanation.
-        logging.getLogger(__name__).warning(
-            "could not persist %s to .env", env_var, exc_info=True
-        )
+        logging.getLogger(__name__).warning("could not persist %s to .env", env_var, exc_info=True)
         return
     if env_var in _SHELL_PROVIDED_ENV_KEYS:
         # .env is only consulted for keys the shell did NOT already export, so
@@ -1837,7 +1901,7 @@ def _handle_insights_archive(repo_root: str, rest: str) -> None:
     )
 
     arch_rest = rest.split(None, 1)[1].strip() if len(rest.split(None, 1)) > 1 else ""
-    arch_sub = (arch_rest.split(None, 1)[0].lower() if arch_rest else "list")
+    arch_sub = arch_rest.split(None, 1)[0].lower() if arch_rest else "list"
     arch_path = _ins_arch_path_fn(repo_root)
     arch_content = _ins_load_arch(repo_root)
     if arch_content.strip():
@@ -1849,7 +1913,10 @@ def _handle_insights_archive(repo_root: str, rest: str) -> None:
         if not arch_ents:
             _print("  no archived insights.", _C["muted"])
         else:
-            _print(f"  archived insights: {len(arch_ents)} (demoted to keep active within budget — NOT deleted):", _C["muted"])
+            _print(
+                f"  archived insights: {len(arch_ents)} (demoted to keep active within budget — NOT deleted):",
+                _C["muted"],
+            )
             for ai, ae in enumerate(arch_ents, 1):
                 acat = f"[{ae.category}]" if ae.category else "[—]"
                 aage = _ins_age(ae)
@@ -1889,12 +1956,17 @@ def _handle_insights_archive(repo_root: str, rest: str) -> None:
                 _print(f"  ✓ restored archive #{arch_n} [{restored.category or '—'}] to active insights.", "dim")
                 new_b = len(_ins_serialize(act_pre, act_ents).encode("utf-8"))
                 if new_b > COMPACT_BUDGET_BYTES:
-                    _print(f"  ⚠ active now over budget ({new_b:,} > {COMPACT_BUDGET_BYTES:,}); next /insights compact re-demotes oldest.", _C["yellow"])
+                    _print(
+                        f"  ⚠ active now over budget ({new_b:,} > {COMPACT_BUDGET_BYTES:,}); next /insights compact re-demotes oldest.",
+                        _C["yellow"],
+                    )
 
     elif arch_sub == "drop":
         arch_toks = rest.split()
         if len(arch_toks) < 3:
-            _print("  usage: /insights archive drop <n>  (PERMANENTLY delete; n from /insights archive list)", _C["yellow"])
+            _print(
+                "  usage: /insights archive drop <n>  (PERMANENTLY delete; n from /insights archive list)", _C["yellow"]
+            )
         else:
             try:
                 arch_n = int(arch_toks[2])
@@ -1920,13 +1992,14 @@ def _create_llm_client_for(provider: str, api_key: str = ""):
     """
     from external_llm.client import create_llm_client as _create_llm
     from external_llm.client import resolve_provider_base_url
+
     if not api_key and provider.lower() != "ollama":
         ak_var = _API_KEY_ENV_MAP.get(provider.lower())
         api_key = os.getenv(ak_var, "") if ak_var else ""
     try:
         return _create_llm(
             provider=provider,
-            api_key=api_key or None,
+            api_key=api_key or "",
             base_url=resolve_provider_base_url(provider),
         )
     except Exception as _exc:
@@ -1938,7 +2011,9 @@ def _create_llm_client_for(provider: str, api_key: str = ""):
         # or partial install missing an optional provider module must degrade
         # gracefully, not abort startup in _get_compress_llm.
         logging.getLogger(__name__).warning(
-            "LLM client creation failed for provider %r: %s", provider, _exc,
+            "LLM client creation failed for provider %r: %s",
+            provider,
+            _exc,
         )
         return None
 
@@ -1962,13 +2037,15 @@ def _copy_to_clipboard(text: str) -> str:
     _payload = text.encode("utf-8")
     for _cmd in _cmds:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(_cmd, input=_payload, check=True, timeout=5,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                _cmd, input=_payload, check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             return _cmd[0]
     # OSC 52 fallback — writes to clipboard if terminal supports it, even without native tools.
     with contextlib.suppress(OSError):  # OSC52 write on broken pipe
         if sys.stdout.isatty():
             import base64
+
             _b64 = base64.b64encode(_payload).decode("ascii")
             sys.stdout.write(f"\x1b]52;c;{_b64}\x07")
             sys.stdout.flush()
@@ -1993,8 +2070,7 @@ def _get_think_suggestions(provider: str, model: str) -> list[str]:
 
     if p == "anthropic":
         # always-thinking models (Fable 5, Mythos 5, Opus 4.8/4.7) cannot be turned off
-        _always = m.startswith(("claude-fable-5", "claude-mythos-5",
-                                "claude-opus-4-8", "claude-opus-4-7"))
+        _always = m.startswith(("claude-fable-5", "claude-mythos-5", "claude-opus-4-8", "claude-opus-4-7"))
         if _always:
             return ["low", "medium", "high"]
         return ["on", "off", "low", "medium", "high"]
@@ -2064,7 +2140,8 @@ class _SlashCommandCompleter:
             for cand in (name, *(a for a in aliases if a.startswith("/"))):
                 if cand.startswith(low):
                     yield Completion(
-                        cand, start_position=-len(text),
+                        cand,
+                        start_position=-len(text),
                         display=f"{cand} {arg}".strip() if cand == name and arg else cand,
                         display_meta=desc,
                     )
@@ -2125,9 +2202,10 @@ class _SlashCommandCompleter:
         # (1) Slot token completion: "dev" / "dev_" / "dev_1" → suggest dev_1..dev_8
         #     Regex ^dev_?\d*$ matches slot prefixes only (avoids collision with model name typos).
         import re as _re
+
         _low = prefix.strip()
         if " " not in prefix and _re.match(r"^dev_?\d*$", _low.lower()):
-            _cfg_slots = (self._get_dev_models() or {})
+            _cfg_slots = self._get_dev_models() or {}
             for _i in range(1, 9):
                 _cand = f"dev_{_i}"
                 if _cand.startswith(_low.lower()):
@@ -2226,11 +2304,13 @@ def _render_help() -> None:
         from rich import box
         from rich.table import Table
         from rich.text import Text as _Txt
+
         _out_console.print()
         for title, cmds in _grouped_slash_commands():
             _out_console.print(f"  [bold {_C['blue']}]{title}[/bold {_C['blue']}]")
-            tbl = Table(box=box.SIMPLE_HEAD, show_header=False, pad_edge=False,
-                        padding=(0, 2, 0, 0), border_style=_C["border"])
+            tbl = Table(
+                box=box.SIMPLE_HEAD, show_header=False, pad_edge=False, padding=(0, 2, 0, 0), border_style=_C["border"]
+            )
             # Fixed width: even when sections split, the description column start column aligns across sections
             tbl.add_column(style=_C["sky"], no_wrap=True, width=30)
             # ratio=1: remaining terminal width all goes to description column → no_wrap label does not monopolize width
@@ -2242,8 +2322,7 @@ def _render_help() -> None:
                 tbl.add_row(_Txt(label), _Txt(desc))
             _out_console.print(tbl)
         _out_console.print(
-            f"  [{_C['muted']}]Enter send · Alt+Enter newline · "
-            f"Ctrl+C exit · drag an image to attach[/{_C['muted']}]"
+            f"  [{_C['muted']}]Enter send · Alt+Enter newline · Ctrl+C exit · drag an image to attach[/{_C['muted']}]"
         )
         _out_console.print()
     else:
@@ -2258,10 +2337,16 @@ def _render_help() -> None:
         print()
 
 
-def _render_status(repo_root: str, provider: str, model: str, mode: str,
-                   session_tokens: dict, thinking_state: Optional[bool] = None,
-                   reasoning_effort: Optional[str] = None,
-                   helper: str = "") -> None:
+def _render_status(
+    repo_root: str,
+    provider: str,
+    model: str,
+    mode: str,
+    session_tokens: dict,
+    thinking_state: bool | None = None,
+    reasoning_effort: str | None = None,
+    helper: str = "",
+) -> None:
     """Render a compact session status block."""
     _ensure_out_console_imported()
     pt = session_tokens.get("prompt", 0)
@@ -2280,12 +2365,13 @@ def _render_status(repo_root: str, provider: str, model: str, mode: str,
         think_label = "thinking (auto)"
     if _RICH and _out_console:
         from rich.text import Text
+
         _out_console.print()
         rows = [
-            ("repo",    repo_root),
-            ("model",   f"{provider} / {model}" if provider else model),
-            ("mode",    mode_label),
-            ("think",   think_label),
+            ("repo", repo_root),
+            ("model", f"{provider} / {model}" if provider else model),
+            ("mode", mode_label),
+            ("think", think_label),
         ]
         if helper:
             rows.append(("helper", helper))
@@ -2317,25 +2403,20 @@ def _bar_box():
     global _BAR_BOX
     if _BAR_BOX is None:
         from rich.box import Box
-        _BAR_BOX = Box(
-            "    \n"
-            "▌   \n"
-            "    \n"
-            "▌   \n"
-            "    \n"
-            "    \n"
-            "▌   \n"
-            "    \n"
-        )
+
+        _BAR_BOX = Box("    \n▌   \n    \n▌   \n    \n    \n▌   \n    \n")
     return _BAR_BOX
 
 
 def _bar_panel(content, title=None, color: str = "", padding=(0, 2)):
     """Gutter-bar panel based on _bar_box — title is left-aligned on the top (barless) line."""
     from rich.panel import Panel
+
     return Panel(
-        content, box=_bar_box(),
-        title=title, title_align="left",
+        content,
+        box=_bar_box(),
+        title=title,
+        title_align="left",
         border_style=color or _C["border"],
         padding=padding,
     )
@@ -2348,9 +2429,10 @@ def _print(msg: str, style: str = "", end: str = "\n") -> None:
         # _out_console writes via _MarginIO(sys.stdout); direct writes bypass it and can
         # leave _bol=False, which would suppress the margin on the next _print() line.
         _f = _out_console.file
-        if hasattr(_f, 'reset_bol'):
+        if hasattr(_f, "reset_bol"):
             _f.reset_bol()
         from rich.text import Text
+
         t = Text(msg)
         if style:
             s = _C.get(style, style)
@@ -2397,17 +2479,21 @@ def _print_banner(repo_root: str = "") -> None:
             _out_console.print(_static_title())
         else:
             try:
-                with Live(_title_at(0.0),
-                          console=_out_console, refresh_per_second=24,
-                          # Rich's redirect_stdout/stderr swaps sys.stdout for a
-                          # FileProxy(_out_console); since _MarginIO (this console's
-                          # file) now resolves sys.stdout dynamically, that proxy
-                          # points straight back here → infinite recursion. Disable
-                          # the redirect: margin-console writes always went to the
-                          # real stream anyway, and log/spinner interleaving is
-                          # coordinated via _TERM_WRITE_LOCK, not Rich's reflow.
-                          redirect_stdout=False, redirect_stderr=False,
-                          transient=False) as live:
+                with Live(
+                    _title_at(0.0),
+                    console=_out_console,
+                    refresh_per_second=24,
+                    # Rich's redirect_stdout/stderr swaps sys.stdout for a
+                    # FileProxy(_out_console); since _MarginIO (this console's
+                    # file) now resolves sys.stdout dynamically, that proxy
+                    # points straight back here → infinite recursion. Disable
+                    # the redirect: margin-console writes always went to the
+                    # real stream anyway, and log/spinner interleaving is
+                    # coordinated via _TERM_WRITE_LOCK, not Rich's reflow.
+                    redirect_stdout=False,
+                    redirect_stderr=False,
+                    transient=False,
+                ) as live:
                     _t0 = _bt.monotonic()
                     while True:
                         el = _bt.monotonic() - _t0
@@ -2421,9 +2507,7 @@ def _print_banner(repo_root: str = "") -> None:
 
         # Literal indent 2 + MarginIO margin(4) = col 6 → bottom status line (zai / ... · /help ...)
         # and input prompt (❯) vertical alignment. Title ▌/separator/body(INFO) stay at col 4.  # noqa: RUF003
-        _help = Text(
-            "  /help for commands  ·  Ctrl+C exit", style=_C["muted"]
-        )
+        _help = Text("  /help for commands  ·  Ctrl+C exit", style=_C["muted"])
         # Append repo path at end of help line in same color (muted), joined by separator (·).
         if repo_root:
             _help.append(f"  ·  {repo_root}", style=_C["muted"])
@@ -2439,6 +2523,7 @@ def _print_banner(repo_root: str = "") -> None:
 
 # ─── Dependency status check ─────────────────────────────────────────────────────
 
+
 def _check_dep_status(tools) -> dict[str, str]:
     """Return a dict of optional dependency → 'ON' / 'OFF' / 'skip'.
 
@@ -2452,6 +2537,7 @@ def _check_dep_status(tools) -> dict[str, str]:
     Always-present infrastructure (tree-sitter, vector) is appended here.
     """
     from external_llm.languages.tree_sitter_utils import is_available
+
     ts = "ON" if is_available() else "OFF"
 
     result: dict[str, str] = {"tree-sitter": ts}
@@ -2476,6 +2562,7 @@ def _check_dep_status(tools) -> dict[str, str]:
         HAS_SENTENCE_TRANSFORMERS,
         get_configured_embedding_model_name,
     )
+
     if not (HAS_FAISS and HAS_NUMPY and HAS_SENTENCE_TRANSFORMERS):
         vector = "OFF"
     else:
@@ -2488,13 +2575,26 @@ def _check_dep_status(tools) -> dict[str, str]:
 
 # tree-sitter language → short display label
 _LANG_LABEL: dict[str, str] = {
-    "python": "py", "typescript": "ts", "javascript": "js",
-    "go": "go", "java": "java", "kotlin": "kt", "html": "html",
-    "rust": "rs", "c": "c", "cpp": "cp",
-    "ruby": "rb", "php": "php", "c_sharp": "cs",
-    "swift": "sw", "scala": "sc", "lua": "lua", "bash": "sh",
+    "python": "py",
+    "typescript": "ts",
+    "javascript": "js",
+    "go": "go",
+    "java": "java",
+    "kotlin": "kt",
+    "html": "html",
+    "rust": "rs",
+    "c": "c",
+    "cpp": "cp",
+    "ruby": "rb",
+    "php": "php",
+    "c_sharp": "cs",
+    "swift": "sw",
+    "scala": "sc",
+    "lua": "lua",
+    "bash": "sh",
     "css": "css",
 }
+
 
 def _git_ls_files(repo_root: str) -> list[str]:
     """Repo-relative file paths in *repo_root*; [] on any failure.
@@ -2512,6 +2612,7 @@ def _git_ls_files(repo_root: str) -> list[str]:
     just-created ``.ts`` file counts. Matches what ``glob`` already lists.
     """
     from external_llm.common.repo_files import git_list_repo_files
+
     return git_list_repo_files(repo_root) or []
 
 
@@ -2545,6 +2646,7 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
         _check_tools_with_state,
         detect_repo_languages,
     )
+
     detected = detect_repo_languages(repo_root)
 
     # ── 2. Single check + interactive install (returns rich _Tool state) ──
@@ -2555,6 +2657,7 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
 
     # ── 4. Tree-sitter status (ON/OFF — 0ms, no grammar import) ──
     from external_llm.languages.tree_sitter_utils import is_available
+
     ts_summary = "ON" if is_available() else "OFF"
 
     # Build dynamic tool status line (only tools relevant to detected langs)
@@ -2567,6 +2670,7 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
     # Merge tree-sitter + tools + vector into a single line
     if _RICH and _out_console:
         from rich.text import Text
+
         # Leading space aligns this status line with the "/insights" nudge
         # continuation line printed above it in run_repl (col 6 = _CONSOLE_MARGIN
         # 4 + 1 literal space; the nudge is split at " /insights" and printed with
@@ -2591,6 +2695,7 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
     repo_langs = _detect_repo_ts_languages(repo_files)
     if repo_langs and is_available():
         from external_llm.languages.tree_sitter_utils import _get_language
+
         ts_available = {lang for lang in repo_langs if _get_language(lang) is not None}
     else:
         ts_available = set()
@@ -2602,6 +2707,7 @@ def _print_dep_status(repo_root: str, *, no_deps_check: bool = False) -> None:
         pkgs = ["tree-sitter-language-pack"]
         if _RICH and _out_console:
             from rich.text import Text
+
             warn = Text("  ⚠ ", style=_C.get("yellow", "yellow"))
             warn.append(
                 f"This repo contains {labels}, but the tree-sitter grammar is "
@@ -2657,13 +2763,12 @@ def _restart_cli() -> None:
         # the newly installed deps simply won't be live this session; the CLI can
         # continue degraded and the user can restart manually when convenient.
         _print(
-            f"  ! auto-restart failed ({_e.strerror or _e}); please restart asi "
-            f"manually to load the new dependencies.",
+            f"  ! auto-restart failed ({_e.strerror or _e}); please restart asi manually to load the new dependencies.",
             _C["yellow"],
         )
 
 
-def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = False, label: "Optional[str]" = None) -> bool:
+def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = False, label: str | None = None) -> bool:
     """pip-install *pkgs* into the current interpreter's env. Returns success.
 
     If the first attempt fails due to PEP 668 (externally-managed-environment),
@@ -2686,6 +2791,7 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
         # externally-managed env this yields --user --break-system-packages;
         # elsewhere it degrades to plain (the retry only fires post-PEP-668).
         from external_llm.pip_env import pip_install_flags
+
         cmd += pip_install_flags() or ["--break-system-packages"]
     if not label:
         label = pkgs[0] + (f" (+{len(pkgs) - 1})" if len(pkgs) > 1 else "")
@@ -2706,7 +2812,7 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
     _spinner = _threading.Thread(target=_spin, daemon=True)
 
     proc = None
-    err: "Optional[BaseException]" = None
+    err: BaseException | None = None
     timed_out = False
     timed_out_tail = ""
     try:
@@ -2743,6 +2849,7 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
     if err is not None:
         _print(f"  ✗ Install failed: {err}", _C.get("yellow", "yellow"))
         return False
+    assert proc is not None  # timed_out/err handled above; subprocess.run succeeded
 
     if proc.returncode != 0:
         combined = (proc.stderr or "") + "\n" + (proc.stdout or "")
@@ -2751,8 +2858,7 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
         # PEP 668: system/Homebrew Python is externally-managed, pip refuses.
         if "externally-managed-environment" in combined and not _force_break:
             _print(
-                "  ↳ Python externally managed (PEP 668) — retrying with "
-                "--break-system-packages …",
+                "  ↳ Python externally managed (PEP 668) — retrying with --break-system-packages …",
                 _C.get("yellow", "yellow"),
             )
             # Thread `label` into the retry so the explicit display label
@@ -2773,6 +2879,7 @@ def _pip_install(pkgs: list[str], *, timeout: int = 600, _force_break: bool = Fa
     import importlib
 
     from external_llm.pip_env import ensure_user_site_importable
+
     # A --user install may land in a user-site dir absent at startup; make it
     # importable before the caller re-imports the just-installed package.
     ensure_user_site_importable()
@@ -2788,6 +2895,7 @@ def _install_tree_sitter_grammars(pkgs: list[str]) -> None:
         return
 
     import external_llm.languages.tree_sitter_utils as _ts_utils
+
     # If core (tree-sitter) is not in this process, installing grammar alone won't work → restart
     if not _ts_utils.is_available():
         _print("  ✓ Installed.", _C.get("green", "green"))
@@ -2801,9 +2909,7 @@ def _install_tree_sitter_grammars(pkgs: list[str]) -> None:
     except Exception:
         now_available = set()
 
-    labels = " ".join(
-        sorted(_LANG_LABEL.get(_item_, _item_) for _item_ in now_available)
-    ) if now_available else "OFF"
+    labels = " ".join(sorted(_LANG_LABEL.get(_item_, _item_) for _item_ in now_available)) if now_available else "OFF"
     _print(f"  ✓ Installed. tree-sitter: {labels}", _C.get("green", "green"))
 
 
@@ -2880,14 +2986,11 @@ def _maybe_prompt_vector_install() -> None:
     # 1) Python package missing → suggest pip install (needs restart to take effect)
     if not deps_ok:
         _print(
-            "  ⚠ Semantic (vector) search is disabled — sentence-transformers is "
-            "not installed.",
+            "  ⚠ Semantic (vector) search is disabled — sentence-transformers is not installed.",
             _C.get("yellow", "yellow"),
         )
         try:
-            answer = _collect_input(
-                f"    Install now? (pip install {' '.join(_VECTOR_PKGS)}) [y/N] "
-            )
+            answer = _collect_input(f"    Install now? (pip install {' '.join(_VECTOR_PKGS)}) [y/N] ")
         except (EOFError, KeyboardInterrupt):
             answer = ""
         if answer.strip().lower() in ("y", "yes"):
@@ -2937,8 +3040,7 @@ def _maybe_prompt_vector_install() -> None:
     if fallback_name:
         try:
             answer = _collect_input(
-                f"    Install the lighter fallback '{fallback_name}' instead? "
-                "(~90MB, English-leaning) [y/N] "
+                f"    Install the lighter fallback '{fallback_name}' instead? (~90MB, English-leaning) [y/N] "
             )
         except (EOFError, KeyboardInterrupt):
             answer = ""
@@ -2991,10 +3093,7 @@ def _download_embedding_model(model_name: str) -> None:
         while not _stop.wait(0.15):
             mb = _embedding_cache_bytes(model_name) / 1_000_000
             el = _time.monotonic() - _t0
-            sys.stderr.write(
-                f"\r\033[K  Downloading embedding model… {frames[i % 4]}  "
-                f"{mb:,.0f}MB  {el:0.0f}s"
-            )
+            sys.stderr.write(f"\r\033[K  Downloading embedding model… {frames[i % 4]}  {mb:,.0f}MB  {el:0.0f}s")
             sys.stderr.flush()
             i += 1
 
@@ -3035,6 +3134,7 @@ def _download_embedding_model(model_name: str) -> None:
             # the preferred→fallback order, so if the user chose fallback, it won't
             # silently download preferred instead.
             from external_llm.agent.vector_cache import set_active_embedding_model
+
             model = set_active_embedding_model(model_name)
             if model is None:
                 _print("  ✗ Could not load the embedding model.", _C.get("yellow", "yellow"))
@@ -3075,6 +3175,7 @@ def _kick_embedding_model_warmup() -> None:
         get_configured_embedding_model_name,
         warmup_embedding_model,
     )
+
     if not (HAS_FAISS and HAS_NUMPY and HAS_SENTENCE_TRANSFORMERS):
         return
     model_name = get_configured_embedding_model_name()
@@ -3082,9 +3183,7 @@ def _kick_embedding_model_warmup() -> None:
     # Only warm up when a model is already on disk — otherwise the background
     # thread would either stall on a network fetch or race the interactive
     # download prompt. The dep prompt above handles fetching.
-    if not _is_embedding_model_cached(model_name) and (
-        not fallback or not _is_embedding_model_cached(fallback)
-    ):
+    if not _is_embedding_model_cached(model_name) and (not fallback or not _is_embedding_model_cached(fallback)):
         return
     t = threading.Thread(target=warmup_embedding_model, name="emb-warmup", daemon=True)
     t.start()
@@ -3093,31 +3192,36 @@ def _kick_embedding_model_warmup() -> None:
 # ─── Stream callback → user-friendly message conversion ────────────────────────────────
 
 _EVENT_LABELS: dict[str, str] = {
-    "routing_intent":          "analyzing",
-    "route_decision":          "routing",
-    "route_applied":           "route applied",
-    "tool_call_preview":       "tool",
-    "tool_call":               "tool done",
-    "tdd_cycle_start":         "running tests",
-    "tdd_cycle_pass":          "tests pass",
-    "tdd_cycle_fail":          "tests fail",
-    "budget_warning":          "context limit warning",
-    "fail_loop_detected":      "fail loop detected",
-    "complete":                "done",
-    "error":                   "error",
-    "cancelled":               "cancelled",
-    "rate_limit_retry":        "rate limit — retrying",
-    "agent_thinking":          "thinking",
-    "turn_start":              "turn",
-    "design_tool_call":        "design tool",
-    "design_thinking":         "design thinking",
-    "self_review":             "self-review",
+    "routing_intent": "analyzing",
+    "route_decision": "routing",
+    "route_applied": "route applied",
+    "tool_call_preview": "tool",
+    "tool_call": "tool done",
+    "tdd_cycle_start": "running tests",
+    "tdd_cycle_pass": "tests pass",
+    "tdd_cycle_fail": "tests fail",
+    "budget_warning": "context limit warning",
+    "fail_loop_detected": "fail loop detected",
+    "complete": "done",
+    "error": "error",
+    "cancelled": "cancelled",
+    "rate_limit_retry": "rate limit — retrying",
+    "agent_thinking": "thinking",
+    "turn_start": "turn",
+    "design_tool_call": "design tool",
+    "design_thinking": "design thinking",
+    "self_review": "self-review",
 }
 
 _SILENT_EVENTS = {
-    "session_start", "session_end", "done", "llm_input", "llm_output",
+    "session_start",
+    "session_end",
+    "done",
+    "llm_input",
+    "llm_output",
     "routing_intent",  # internal classification noise
-    "auto_observation", "performance_metrics",
+    "auto_observation",
+    "performance_metrics",
     "small_model_complexity_warning",
 }
 
@@ -3135,7 +3239,7 @@ def _relativize_repo_paths(text: str) -> str:
     for _q in ("", "'", '"'):
         _pfx = f"cd {_q}{rr}{_q} && "
         if text.startswith(_pfx):
-            text = text[len(_pfx):].lstrip()
+            text = text[len(_pfx) :].lstrip()
             break
     return text.replace(rr + "/", "").replace(rr, ".")
 
@@ -3171,16 +3275,33 @@ def _extract_tool_cmd(args: dict) -> str:
 
 
 # Write tools to show in preview — the [POST-EDIT DIFF] block at the end of results is the key signal
-_WRITE_PREVIEW_TOOLS = frozenset({
-    "apply_patch", "modify_symbol", "edit_text", "anchor_edit", "edit_ast", "write_plan",
-})
+_WRITE_PREVIEW_TOOLS = frozenset(
+    {
+        "apply_patch",
+        "modify_symbol",
+        "edit_text",
+        "anchor_edit",
+        "edit_ast",
+        "write_plan",
+    }
+)
 
 # Read/analysis tools whose result structure is "item listing" — 3 lines is more useful
-_THREE_LINE_PREVIEW_TOOLS = frozenset({
-    "grep", "glob", "find_relevant_files", "find_references", "search_web",
-    "analyze_change_impact", "run_structural_scan", "get_project_info",
-    "query_dependency_graph", "get_file_outline", "find_symbol",
-})
+_THREE_LINE_PREVIEW_TOOLS = frozenset(
+    {
+        "grep",
+        "glob",
+        "find_relevant_files",
+        "find_references",
+        "search_web",
+        "analyze_change_impact",
+        "run_structural_scan",
+        "get_project_info",
+        "query_dependency_graph",
+        "get_file_outline",
+        "find_symbol",
+    }
+)
 
 
 def _select_preview_lines(tool: str, lines: list) -> list:
@@ -3211,7 +3332,7 @@ def _select_preview_lines(tool: str, lines: list) -> list:
         for _i, ln in enumerate(lines):
             if ln.strip().startswith("[POST-EDIT DIFF]"):
                 _head = lines[:1] if _i > 0 else []
-                return (_head + lines[_i + 1:_i + 4])[:4]
+                return (_head + lines[_i + 1 : _i + 4])[:4]
         return lines[:2]
 
     if tool == "update_plan":
@@ -3236,7 +3357,7 @@ _INTERRUPT_RESUME_INSTRUCTION = (
     "If it is an unrelated new request, handle that request instead.)"
 )
 
-_PAUSED_HINT = "⏸ paused — to resume, just ask naturally in your next input (e.g. \"continue\")."
+_PAUSED_HINT = '⏸ paused — to resume, just ask naturally in your next input (e.g. "continue").'
 
 
 def _abbrev_tokens(n: int) -> str:
@@ -3244,8 +3365,8 @@ def _abbrev_tokens(n: int) -> str:
     if n < 1000:
         return str(n)
     if n < 1_000_000:
-        return f"{n/1000:.1f}K"
-    return f"{n/1_000_000:.2f}M"
+        return f"{n / 1000:.1f}K"
+    return f"{n / 1_000_000:.2f}M"
 
 
 def _build_interrupt_note(partial_res) -> str:
@@ -3290,53 +3411,57 @@ def _load_dotenv(repo_root: str) -> None:
     _SHELL_PROVIDED_ENV_KEYS.update(os.environ)
     # .env missing is fine
     with contextlib.suppress(FileNotFoundError), open(dotenv_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key, val = key.strip(), val.strip()
-                if key.startswith("export "):        # export KEY=val format
-                    key = key[7:].strip()
-                # strip inline comment and outer quotes
-                if val.startswith(('"', "'")):
-                    q = val[0]
-                    close = val.find(q, 1)
-                    if close > 0:
-                        after = val[close + 1 :].strip()
-                        if after.startswith("#"):
-                            logging.getLogger(__name__).debug(
-                                "_load_dotenv: inline comment stripped in %s (was %r → %r)",
-                                key, val, val[: close + 1],
-                            )
-                        # strip outer quotes (backslash-escaped quote guard)
-                        _n_bs = 0
-                        _i = close - 1
-                        while _i >= 0 and val[_i] == "\\":
-                            _n_bs += 1
-                            _i -= 1
-                        if _n_bs % 2 == 0:  # closing quote is not escaped
-                            val = val[1:close]
-                    # else: malformed — keep as-is
-                else:
-                    # Inline comment = '#' preceded by whitespace (python-dotenv
-                    # semantics). A '#' without preceding whitespace is part of
-                    # the value — e.g. KEY=https://host/path#frag must keep its
-                    # fragment, not be truncated at it.
-                    _cut = 0 if val.startswith("#") else -1
-                    if _cut < 0:
-                        for _i, _ch in enumerate(val[:-1]):
-                            if _ch in " \t" and val[_i + 1] == "#":
-                                _cut = _i
-                                break
-                    if _cut >= 0:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip()
+            if key.startswith("export "):  # export KEY=val format
+                key = key[7:].strip()
+            # strip inline comment and outer quotes
+            if val.startswith(('"', "'")):
+                q = val[0]
+                close = val.find(q, 1)
+                if close > 0:
+                    after = val[close + 1 :].strip()
+                    if after.startswith("#"):
                         logging.getLogger(__name__).debug(
                             "_load_dotenv: inline comment stripped in %s (was %r → %r)",
-                            key, val, val[:_cut].rstrip(),
+                            key,
+                            val,
+                            val[: close + 1],
                         )
-                        val = val[:_cut].rstrip()
-                if key and key not in os.environ:
-                    os.environ[key] = val
+                    # strip outer quotes (backslash-escaped quote guard)
+                    _n_bs = 0
+                    _i = close - 1
+                    while _i >= 0 and val[_i] == "\\":
+                        _n_bs += 1
+                        _i -= 1
+                    if _n_bs % 2 == 0:  # closing quote is not escaped
+                        val = val[1:close]
+                # else: malformed — keep as-is
+            else:
+                # Inline comment = '#' preceded by whitespace (python-dotenv
+                # semantics). A '#' without preceding whitespace is part of
+                # the value — e.g. KEY=https://host/path#frag must keep its
+                # fragment, not be truncated at it.
+                _cut = 0 if val.startswith("#") else -1
+                if _cut < 0:
+                    for _i, _ch in enumerate(val[:-1]):
+                        if _ch in " \t" and val[_i + 1] == "#":
+                            _cut = _i
+                            break
+                if _cut >= 0:
+                    logging.getLogger(__name__).debug(
+                        "_load_dotenv: inline comment stripped in %s (was %r → %r)",
+                        key,
+                        val,
+                        val[:_cut].rstrip(),
+                    )
+                    val = val[:_cut].rstrip()
+            if key and key not in os.environ:
+                os.environ[key] = val
 
 
 def _maybe_show_update_notice() -> None:
@@ -3362,6 +3487,7 @@ def main() -> None:
     # ── Collaboration subcommands (collaborate/mcp) ────────────────────────
     if len(sys.argv) > 1 and sys.argv[1] in ("collaborate", "mcp"):
         from external_llm.repl.collaborate.cli import main as collaborate_main
+
         collaborate_main()
         return
 
@@ -3371,46 +3497,54 @@ def main() -> None:
         epilog=__doc__,
     )
     from utils.version_check import get_current_version as _get_ver
+
     _ver = _get_ver()
     parser.add_argument(
-        "--version", action="version",
+        "--version",
+        action="version",
         version=(
             f"asicode {_ver}"
             if _ver != "0.0.0"
             else "asicode 0.0.0 (uninstalled source checkout — pip install for a real version)"
         ),
     )
-    parser.add_argument("--repo", "-r", metavar="PATH",
-                        help="Repository root path (default: current directory)")
-    parser.add_argument("--prompt", "-p", metavar="TEXT",
-                        help="Single request text (default: REPL mode)")
-    parser.add_argument("--prompt-file", metavar="FILE",
-                        help="Read request text from file")
-    parser.add_argument("--json", action="store_true",
-                        help="Output result as JSON (for machine consumption / Tenet integration)")
-    parser.add_argument("--json-stream", dest="json_stream", action="store_true",
-                        help="Stream turn/tool events as newline-delimited JSON (NDJSON) during the "
-                             "run, ending with a 'result' event line (for Tenet live progress). "
-                             "Implies machine-readable stdout; the final line carries the same "
-                             "payload as --json.")
-    parser.add_argument("--orchestrate", action="store_true",
-                        help="Run in single-shot multi-agent orchestration mode (F5): decompose the "
-                             "request into sub-tasks and dispatch them to sub-agent workers (IPC), "
-                             "instead of the default single AgentLoop. Combined with --json-stream, "
-                             "subagent_start / subagent_complete / heartbeat progress events stream "
-                             "as NDJSON so automation (Tenet) can watch the multi-agent run live.")
-    parser.add_argument("--prompt-stdin", action="store_true",
-                        help="Read prompt from stdin (for Tenet integration)")
-    parser.add_argument("--provider", metavar="NAME",
-                        help="LLM provider (CLI arg > EXTERNAL_LLM_PROVIDER)")
-    parser.add_argument("--model", "-m", metavar="NAME",
-                        help="LLM model name (CLI arg > EXTERNAL_LLM_MODEL)")
-    parser.add_argument("--api-key", metavar="KEY",
-                        help="API key (CLI arg > env var)")
-    parser.add_argument("--max-turns", type=int, default=_cfg.counts.AGENT_MAX_TURNS_DEFAULT,
-                        help=f"Max agent turns (default: {_cfg.counts.AGENT_MAX_TURNS_DEFAULT})")
+    parser.add_argument("--repo", "-r", metavar="PATH", help="Repository root path (default: current directory)")
+    parser.add_argument("--prompt", "-p", metavar="TEXT", help="Single request text (default: REPL mode)")
+    parser.add_argument("--prompt-file", metavar="FILE", help="Read request text from file")
     parser.add_argument(
-        "--scoped-verification", action="store_true",
+        "--json", action="store_true", help="Output result as JSON (for machine consumption / Tenet integration)"
+    )
+    parser.add_argument(
+        "--json-stream",
+        dest="json_stream",
+        action="store_true",
+        help="Stream turn/tool events as newline-delimited JSON (NDJSON) during the "
+        "run, ending with a 'result' event line (for Tenet live progress). "
+        "Implies machine-readable stdout; the final line carries the same "
+        "payload as --json.",
+    )
+    parser.add_argument(
+        "--orchestrate",
+        action="store_true",
+        help="Run in single-shot multi-agent orchestration mode (F5): decompose the "
+        "request into sub-tasks and dispatch them to sub-agent workers (IPC), "
+        "instead of the default single AgentLoop. Combined with --json-stream, "
+        "subagent_start / subagent_complete / heartbeat progress events stream "
+        "as NDJSON so automation (Tenet) can watch the multi-agent run live.",
+    )
+    parser.add_argument("--prompt-stdin", action="store_true", help="Read prompt from stdin (for Tenet integration)")
+    parser.add_argument("--provider", metavar="NAME", help="LLM provider (CLI arg > EXTERNAL_LLM_PROVIDER)")
+    parser.add_argument("--model", "-m", metavar="NAME", help="LLM model name (CLI arg > EXTERNAL_LLM_MODEL)")
+    parser.add_argument("--api-key", metavar="KEY", help="API key (CLI arg > env var)")
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=_cfg.counts.AGENT_MAX_TURNS_DEFAULT,
+        help=f"Max agent turns (default: {_cfg.counts.AGENT_MAX_TURNS_DEFAULT})",
+    )
+    parser.add_argument(
+        "--scoped-verification",
+        action="store_true",
         help=(
             "After edits, run only tests likely affected by changed files "
             "(naming-convention + call-graph) instead of the full suite. "
@@ -3418,15 +3552,17 @@ def main() -> None:
             "Also set via ASICODE_SCOPED_VERIFICATION=1."
         ),
     )
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Verbose log output")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose log output")
     parser.add_argument(
-        "--log-level", metavar="LEVEL", default="INFO",
+        "--log-level",
+        metavar="LEVEL",
+        default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "NONE"],
         help="Engine log level (DEBUG/INFO/WARNING/ERROR/NONE, default: INFO)",
     )
     parser.add_argument(
-        "--log-file", metavar="PATH",
+        "--log-file",
+        metavar="PATH",
         default="logs/run_{date}_{time}.log",
         help=(
             "Path to save log file. "
@@ -3435,11 +3571,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--no-deps-check", action="store_true",
+        "--no-deps-check",
+        action="store_true",
         help="Skip the interactive semantic-validation tool check at startup",
     )
     parser.add_argument(
-        "--subagent", action="store_true",
+        "--subagent",
+        action="store_true",
         help=(
             "Run as a sub-agent worker: poll .asicode/subagents/<id>/task.json, "
             "execute the task, write result.json back. "
@@ -3448,17 +3586,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--subagent-id", metavar="ID",
-        help="Sub-agent worker ID (used with --subagent). "
-             "Polls .asicode/subagents/<ID>/task.json.",
+        "--subagent-id",
+        metavar="ID",
+        help="Sub-agent worker ID (used with --subagent). Polls .asicode/subagents/<ID>/task.json.",
     )
     parser.add_argument(
-        "--orch-pid", type=int, default=0, metavar="PID",
+        "--orch-pid",
+        type=int,
+        default=0,
+        metavar="PID",
         help="PID of the orchestrator process that spawned this worker (used "
-             "with --subagent). Enables a direct liveness probe for orphan "
-             "self-exit instead of relying on getppid(), which does not "
-             "reflect the orchestrator on the macOS Terminal.app launch path "
-             "(parent there is the login shell, not the orchestrator).",
+        "with --subagent). Enables a direct liveness probe for orphan "
+        "self-exit instead of relying on getppid(), which does not "
+        "reflect the orchestrator on the macOS Terminal.app launch path "
+        "(parent there is the login shell, not the orchestrator).",
     )
 
     args = parser.parse_args()
@@ -3657,82 +3798,82 @@ from external_llm.repl.repl_impl import (  # noqa: E402 — bottom-of-file barre
 )
 
 __all__ = [
-    '_AUTO_CONTINUE_DELAY',
-    '_AUTO_NEXT_SUGGEST_SYSTEM',
-    '_AUTO_SUGGESTION_MAX_LEN',
-    '_NEXT_SUGGEST_SYSTEM',
-    '_REPO_ROOT',
-    '_ProgressPrinter',
-    '_active_spinner_printer',
-    '_auto_continue_should_arm',
-    '_auto_continue_state',
-    '_auto_countdown_active',
-    '_auto_submit_gen',
-    '_auto_submit_now',
-    '_build_engine',
-    '_build_json_output',
-    '_build_orchestrator_digest',
-    '_build_turn_digest',
-    '_cancel_auto_submit',
-    '_cjk_width',
-    '_cli_checkpoint_cb',
-    '_collect_input',
-    '_completer_dev_models',
-    '_completer_model',
-    '_completer_provider',
-    '_ctrlc_armed',
-    '_deliver_next_suggestion',
-    '_dropped_entries',
-    '_esc_watcher_pause',
-    '_eval_ctrlc_armed',
-    '_extract_patched_file',
-    '_finalize_pending_design_chat',
-    '_format_result',
-    '_get_ollama_models',
-    '_init_repl_engine',
-    '_init_session_state',
-    '_input_underline',
-    '_insights_compact_is_noop',
-    '_interactive_provider_setup',
-    '_invalidate_next_suggestion',
-    '_json_error_output',
-    '_json_stream_emit',
-    '_kick_next_prompt_suggestion',
-    '_last_input_was_auto',
-    '_list_provider_model_choices',
-    '_maybe_arm_auto_submit',
-    '_next_prompt_suggestion',
-    '_next_suggestion_gen',
-    '_notify_above_prompt',
-    '_ollama_cache',
-    '_ollama_cache_ts',
-    '_orchestrator_result_to_agent_like',
-    '_parse_auto_arg',
-    '_prompt_history_path',
-    '_prompt_input',
-    '_prompt_session',
-    '_resolve_repo_root',
-    '_result_output_dict',
-    '_retry_create_svc_with_api_key_prompt',
-    '_run_collaborate_session',
-    '_run_esc_watcher',
-    '_run_orchestrate_single_shot',
-    '_run_repl_impl',
-    '_run_with_cancel',
-    '_save_key_to_dotenv',
-    '_seed_terminal_config',
-    '_show_result',
-    '_size_compact_budget',
-    '_split_work_state',
-    '_terminal_config_path',
-    '_text_has_hangul',
-    '_turns_to_int',
-    '_validate_next_suggestion',
-    '_wrap_cjk',
-    '_wrap_preserve_code',
-    'run_once',
-    'run_repl',
-    'run_subagent_worker'
+    "_AUTO_CONTINUE_DELAY",
+    "_AUTO_NEXT_SUGGEST_SYSTEM",
+    "_AUTO_SUGGESTION_MAX_LEN",
+    "_NEXT_SUGGEST_SYSTEM",
+    "_REPO_ROOT",
+    "_ProgressPrinter",
+    "_active_spinner_printer",
+    "_auto_continue_should_arm",
+    "_auto_continue_state",
+    "_auto_countdown_active",
+    "_auto_submit_gen",
+    "_auto_submit_now",
+    "_build_engine",
+    "_build_json_output",
+    "_build_orchestrator_digest",
+    "_build_turn_digest",
+    "_cancel_auto_submit",
+    "_cjk_width",
+    "_cli_checkpoint_cb",
+    "_collect_input",
+    "_completer_dev_models",
+    "_completer_model",
+    "_completer_provider",
+    "_ctrlc_armed",
+    "_deliver_next_suggestion",
+    "_dropped_entries",
+    "_esc_watcher_pause",
+    "_eval_ctrlc_armed",
+    "_extract_patched_file",
+    "_finalize_pending_design_chat",
+    "_format_result",
+    "_get_ollama_models",
+    "_init_repl_engine",
+    "_init_session_state",
+    "_input_underline",
+    "_insights_compact_is_noop",
+    "_interactive_provider_setup",
+    "_invalidate_next_suggestion",
+    "_json_error_output",
+    "_json_stream_emit",
+    "_kick_next_prompt_suggestion",
+    "_last_input_was_auto",
+    "_list_provider_model_choices",
+    "_maybe_arm_auto_submit",
+    "_next_prompt_suggestion",
+    "_next_suggestion_gen",
+    "_notify_above_prompt",
+    "_ollama_cache",
+    "_ollama_cache_ts",
+    "_orchestrator_result_to_agent_like",
+    "_parse_auto_arg",
+    "_prompt_history_path",
+    "_prompt_input",
+    "_prompt_session",
+    "_resolve_repo_root",
+    "_result_output_dict",
+    "_retry_create_svc_with_api_key_prompt",
+    "_run_collaborate_session",
+    "_run_esc_watcher",
+    "_run_orchestrate_single_shot",
+    "_run_repl_impl",
+    "_run_with_cancel",
+    "_save_key_to_dotenv",
+    "_seed_terminal_config",
+    "_show_result",
+    "_size_compact_budget",
+    "_split_work_state",
+    "_terminal_config_path",
+    "_text_has_hangul",
+    "_turns_to_int",
+    "_validate_next_suggestion",
+    "_wrap_cjk",
+    "_wrap_preserve_code",
+    "run_once",
+    "run_repl",
+    "run_subagent_worker",
 ]
 
 

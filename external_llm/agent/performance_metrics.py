@@ -6,6 +6,7 @@ cache hit rates, and other performance metrics for profiling and optimization.
 
 Thread-safe cache hit rate tracking with comprehensive metrics collection.
 """
+
 import bisect
 import logging
 import threading
@@ -15,7 +16,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from .config.thresholds import config as _threshold_config
 
@@ -144,15 +145,12 @@ class CacheHitRateMetrics:
                 "misses": misses,
                 "total": total,
                 "hit_rate": hit_rate,
-                "hit_rate_percentage": hit_rate * 100
+                "hit_rate_percentage": hit_rate * 100,
             }
 
     def get_all_stats(self) -> dict[str, dict[str, Any]]:
         """Get statistics for all cache types"""
-        return {
-            "rag": self.get_stats("rag"),
-            "vector": self.get_stats("vector")
-        }
+        return {"rag": self.get_stats("rag"), "vector": self.get_stats("vector")}
 
     def reset(self):
         """Reset all counters"""
@@ -178,6 +176,7 @@ class ToolMetrics:
     full distribution (percentiles) would need a bounded reservoir sample — add
     one only if/when the summary needs percentiles.
     """
+
     name: str
     total_calls: int = 0
     _time_sum: float = 0.0
@@ -275,7 +274,7 @@ class ToolMetrics:
         return self._time_max if self.total_calls else 0.0
 
     @property
-    def cache_hit_rate(self) -> Optional[float]:
+    def cache_hit_rate(self) -> float | None:
         # Mirrors the SHIPPED summary semantics (get_summary emits None for a zero
         # denominator): None = "not applicable" (write/serial tool, or cache never
         # probed), NOT a fake 0%. A real 0% (1 miss, 0 hits) is still 0.0. Returning
@@ -353,6 +352,7 @@ class LLMMetrics:
     keeps each provider's recent window independent. Constant memory per provider
     regardless of run length.
     """
+
     provider: str = ""
     calls: int = 0
     total_prompt_tokens: int = 0
@@ -455,6 +455,7 @@ class AgentResultMetrics:
     a run being silently cut off shows up in the metrics instead of reading
     as normal traffic.
     """
+
     turns: int = 0
     failed_turns: int = 0
     truncated_turns: int = 0
@@ -509,10 +510,10 @@ class AgentResultMetrics:
 class PerformanceCollector:
     """Performance metrics collector for asicode agent"""
 
-    def __init__(self, session_id: Optional[str] = None):
+    def __init__(self, session_id: str | None = None):
         self.session_id = session_id or f"session_{uuid.uuid4().hex[:8]}"
-        self.start_time: Optional[float] = None
-        self.end_time: Optional[float] = None
+        self.start_time: float | None = None
+        self.end_time: float | None = None
 
         # Thread-safety guard: design_chat_loop dispatches multiple read tools
         # in parallel (shared_pool) which all call record_tool_call / record_llm_call
@@ -551,9 +552,9 @@ class PerformanceCollector:
         # cache no longer masks the parent's hit-rate (last-registered-wins was
         # the pre-WeakSet behavior). weakref auto-drops a cache once the
         # registry/clone holding it is collected, so dead clones don't leak.
-        self._tool_result_cache_refs: "weakref.WeakSet[Any]" = weakref.WeakSet()
+        self._tool_result_cache_refs: weakref.WeakSet[Any] = weakref.WeakSet()
 
-    def register_tool_result_cache(self, cache: Optional[Any]) -> None:
+    def register_tool_result_cache(self, cache: Any | None) -> None:
         """Wire up a ToolResultCache instance so its stats appear in get_summary().
 
         Each clone (clone_for_subagent) gets its own isolated
@@ -586,7 +587,7 @@ class PerformanceCollector:
         self,
         tool_name: str,
         execution_time: float,
-        cache_hit: Optional[bool] = None,
+        cache_hit: bool | None = None,
         failed: bool = False,
     ):
         """Record a tool call with execution time.
@@ -657,8 +658,14 @@ class PerformanceCollector:
         """Record vector cache hit or miss"""
         self.cache_metrics.record_vector_cache(hit)
 
-    def record_llm_call(self, provider: str = "", prompt_tokens: int = 0, completion_tokens: int = 0,
-                       execution_time_ms: float = 0, failed: bool = False):
+    def record_llm_call(
+        self,
+        provider: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        execution_time_ms: float = 0,
+        failed: bool = False,
+    ):
         """Record an LLM call.
 
         ``provider`` is the LLM client's provider name (``get_provider_name()``);
@@ -695,8 +702,9 @@ class PerformanceCollector:
             if failed:
                 m.failures += 1
 
-    def record_agent_result(self, failed: bool = False, execution_time_ms: float = 0.0,
-                            truncated: bool = False) -> None:
+    def record_agent_result(
+        self, failed: bool = False, execution_time_ms: float = 0.0, truncated: bool = False
+    ) -> None:
         """Record the outcome of an agent turn.
 
         The turn-level result channel. Unlike :meth:`record_llm_call` /
@@ -733,8 +741,10 @@ class PerformanceCollector:
             # (production wiring sites are mutually exclusive: truncation fires
             # only when the LLM call itself succeeded).
             _outcome = (
-                AgentResultMetrics._OUTCOME_TRUNCATED if truncated
-                else AgentResultMetrics._OUTCOME_FAILED if failed
+                AgentResultMetrics._OUTCOME_TRUNCATED
+                if truncated
+                else AgentResultMetrics._OUTCOME_FAILED
+                if failed
                 else AgentResultMetrics._OUTCOME_SUCCESS
             )
             _arm._recent_outcomes.append(_outcome)
@@ -785,29 +795,29 @@ class PerformanceCollector:
                 # at emit below, matching avg/min/max keys).
                 _t_p50, _t_p95 = _m.percentiles((50, 95))
                 tool_summary[_name] = {
-                    'call_count': _calls,
-                    'avg_execution_time_ms': (_m._time_sum / _calls * 1000.0) if _calls else 0.0,
-                    'min_execution_time_ms': (_m._time_min * 1000.0) if _calls else 0.0,
-                    'max_execution_time_ms': (_m._time_max * 1000.0) if _calls else 0.0,
+                    "call_count": _calls,
+                    "avg_execution_time_ms": (_m._time_sum / _calls * 1000.0) if _calls else 0.0,
+                    "min_execution_time_ms": (_m._time_min * 1000.0) if _calls else 0.0,
+                    "max_execution_time_ms": (_m._time_max * 1000.0) if _calls else 0.0,
                     # None (not 0.0) when a tool was never probed for cache
                     # (write/serial tools, or cache disabled) — 0.0 would read as
                     # "0% hit rate" and be mistaken for "always misses". None
                     # signals N/A honestly. No card reads this (per-tool detail is
                     # raw-JSON only); future UI should render null as "—"/"N/A".
-                    'cache_hit_rate': (_m.cache_hits / _cm_total) if _cm_total > 0 else None,
-                    'cache_hits': _m.cache_hits,
-                    'cache_misses': _m.cache_misses,
-                    'failures': _m.failures,
+                    "cache_hit_rate": (_m.cache_hits / _cm_total) if _cm_total > 0 else None,
+                    "cache_hits": _m.cache_hits,
+                    "cache_misses": _m.cache_misses,
+                    "failures": _m.failures,
                     # Cumulative rate — DISPLAY only ("how bad overall"). Diluted
                     # by history on a long run; NOT the warn gate.
-                    'failure_rate': (_m.failures / _calls) if _calls > 0 else 0.0,
+                    "failure_rate": (_m.failures / _calls) if _calls > 0 else 0.0,
                     # THE live-health gate. recent_calls = samples in the window
                     # (= min(total_calls, N)); recent_failure_rate = recent_failures
                     # / recent_calls. A currently-broken tool trips the warn gate
                     # off these, regardless of how many successes preceded it.
-                    'recent_calls': _m.recent_calls,
-                    'recent_failures': _m.recent_failures,
-                    'recent_failure_rate': _m.recent_failure_rate,
+                    "recent_calls": _m.recent_calls,
+                    "recent_failures": _m.recent_failures,
+                    "recent_failure_rate": _m.recent_failure_rate,
                     # Latency distribution over the RECENT window — p50 (median)
                     # and p95 (tail). The avg_execution_time above is diluted flat
                     # by fast cache hits; a degrading tool surfaces FIRST in p95.
@@ -819,13 +829,13 @@ class PerformanceCollector:
                     # calls excluded): a fully-failing tool has no samples →
                     # p50/p95 0.0 alongside a high failure_rate, reading "dead,
                     # not slow".
-                    'p50_ms': _t_p50 * 1000.0,
-                    'p95_ms': _t_p95 * 1000.0,
+                    "p50_ms": _t_p50 * 1000.0,
+                    "p95_ms": _t_p95 * 1000.0,
                     # How many successful calls contributed to the latency window
                     # (the denominator for p95). Used by top_slow_tools() for its
                     # min-samples floor — a single slow call does not trip the gate.
-                    'p95_n': _m.latency_samples_count,
-                    'total_calls': _calls,
+                    "p95_n": _m.latency_samples_count,
+                    "total_calls": _calls,
                 }
             # LLM metrics are PER-PROVIDER (dict[str, LLMMetrics], symmetric with
             # tool_metrics). Build the per-provider breakdown (the GATE input for
@@ -859,22 +869,22 @@ class PerformanceCollector:
                 # as-is for p50_ms/p95_ms — no unit conversion.
                 _lp_p50, _lp_p95 = _lm.percentiles((50, 95))
                 llm_provider_summary[_prov] = {
-                    'calls': _lc,
-                    'total_prompt_tokens': _lm.total_prompt_tokens,
-                    'total_completion_tokens': _lm.total_completion_tokens,
-                    'total_tokens': _lm.total_prompt_tokens + _lm.total_completion_tokens,
-                    'avg_time_ms_per_call': (_lm.total_time_ms / _lc) if _lc else 0.0,
-                    'failures': _lm.failures,
-                    'failure_rate': (_lm.failures / _lc) if _lc > 0 else 0.0,
-                    'recent_calls': _rc,
-                    'recent_failures': _rf,
-                    'recent_failure_rate': (_rf / _rc) if _rc > 0 else 0.0,
+                    "calls": _lc,
+                    "total_prompt_tokens": _lm.total_prompt_tokens,
+                    "total_completion_tokens": _lm.total_completion_tokens,
+                    "total_tokens": _lm.total_prompt_tokens + _lm.total_completion_tokens,
+                    "avg_time_ms_per_call": (_lm.total_time_ms / _lc) if _lc else 0.0,
+                    "failures": _lm.failures,
+                    "failure_rate": (_lm.failures / _lc) if _lc > 0 else 0.0,
+                    "recent_calls": _rc,
+                    "recent_failures": _rf,
+                    "recent_failure_rate": (_rf / _rc) if _rc > 0 else 0.0,
                     # Per-provider recent-latency distribution (see ToolMetrics p50/p95).
-                    'p50_ms': _lp_p50,
-                    'p95_ms': _lp_p95,
+                    "p50_ms": _lp_p50,
+                    "p95_ms": _lp_p95,
                     # Latency sample count for the min-samples floor
                     # (symmetric with tool p95_n).
-                    'p95_n': _lm.latency_samples_count,
+                    "p95_n": _lm.latency_samples_count,
                 }
             llm_calls = _agg_calls
             llm_prompt = _agg_pt
@@ -894,18 +904,18 @@ class PerformanceCollector:
             # lock as the tool/llm channels for consistency.
             _arm = self.agent_result_metrics
             agent_result_summary = {
-                'turns': _arm.turns,
-                'failed_turns': _arm.failed_turns,
-                'truncated_turns': _arm.truncated_turns,
-                'failure_rate': _arm.failure_rate,
-                'truncation_rate': _arm.truncation_rate,
-                'avg_time_ms': _arm.avg_time_ms,
-                'total_time_ms': _arm.total_time_ms,
-                'recent_turns': _arm.recent_turns,
-                'recent_failed_turns': _arm.recent_failed_turns,
-                'recent_failure_rate': _arm.recent_failure_rate,
-                'recent_truncated_turns': _arm.recent_truncated_turns,
-                'recent_truncation_rate': _arm.recent_truncation_rate,
+                "turns": _arm.turns,
+                "failed_turns": _arm.failed_turns,
+                "truncated_turns": _arm.truncated_turns,
+                "failure_rate": _arm.failure_rate,
+                "truncation_rate": _arm.truncation_rate,
+                "avg_time_ms": _arm.avg_time_ms,
+                "total_time_ms": _arm.total_time_ms,
+                "recent_turns": _arm.recent_turns,
+                "recent_failed_turns": _arm.recent_failed_turns,
+                "recent_failure_rate": _arm.recent_failure_rate,
+                "recent_truncated_turns": _arm.recent_truncated_turns,
+                "recent_truncation_rate": _arm.recent_truncation_rate,
             }
 
         # Get cache metrics from CacheHitRateMetrics (independently locked)
@@ -937,8 +947,12 @@ class PerformanceCollector:
                 continue
             if tool_result_cache_stats is None:
                 tool_result_cache_stats = {
-                    "hits": 0, "misses": 0, "hit_rate": 0.0,
-                    "size": 0, "max_entries": 0, "instances": 0,
+                    "hits": 0,
+                    "misses": 0,
+                    "hit_rate": 0.0,
+                    "size": 0,
+                    "max_entries": 0,
+                    "instances": 0,
                 }
             tool_result_cache_stats["hits"] += _s.get("hits", 0)
             tool_result_cache_stats["misses"] += _s.get("misses", 0)
@@ -946,9 +960,7 @@ class PerformanceCollector:
             tool_result_cache_stats["max_entries"] += _s.get("max_entries", 0)
             tool_result_cache_stats["instances"] += 1
         if tool_result_cache_stats is not None:
-            _trc_total = (
-                tool_result_cache_stats["hits"] + tool_result_cache_stats["misses"]
-            )
+            _trc_total = tool_result_cache_stats["hits"] + tool_result_cache_stats["misses"]
             tool_result_cache_stats["hit_rate"] = (
                 tool_result_cache_stats["hits"] / _trc_total if _trc_total > 0 else 0.0
             )
@@ -975,14 +987,8 @@ class PerformanceCollector:
         _trc = tool_result_cache_stats
         _trc_hits = _trc["hits"] if _trc else 0
         _trc_total = (_trc["hits"] + _trc["misses"]) if _trc else 0
-        _all_hits = (
-            cache_stats['rag']['hits']
-            + cache_stats['vector']['hits'] + _trc_hits
-        )
-        _all_total = (
-            cache_stats['rag']['total']
-            + cache_stats['vector']['total'] + _trc_total
-        )
+        _all_hits = cache_stats["rag"]["hits"] + cache_stats["vector"]["hits"] + _trc_hits
+        _all_total = cache_stats["rag"]["total"] + cache_stats["vector"]["total"] + _trc_total
         overall_hit_rate = _all_hits / _all_total if _all_total > 0 else 0
 
         # AGGREGATE LLM headline: sums across all
@@ -990,18 +996,18 @@ class PerformanceCollector:
         # (honest as an overall read) — NOT what the gate uses. The gate reads each
         # provider's OWN window via top_failing_llm(llm_provider_summary, ...) below.
         llm_summary = {
-            'calls': llm_calls,
-            'total_prompt_tokens': llm_prompt,
-            'total_completion_tokens': llm_completion,
-            'total_tokens': llm_prompt + llm_completion,
-            'avg_time_ms_per_call': llm_avg_ms,
-            'failures': llm_failures,
+            "calls": llm_calls,
+            "total_prompt_tokens": llm_prompt,
+            "total_completion_tokens": llm_completion,
+            "total_tokens": llm_prompt + llm_completion,
+            "avg_time_ms_per_call": llm_avg_ms,
+            "failures": llm_failures,
             # Cumulative rate — display/context ("how bad overall"), diluted by history.
-            'failure_rate': llm_failure_rate,
+            "failure_rate": llm_failure_rate,
             # THE live-health gate fields (mirror the per-tool recent_* keys).
-            'recent_calls': llm_recent_calls,
-            'recent_failures': llm_recent_failures,
-            'recent_failure_rate': llm_recent_failure_rate,
+            "recent_calls": llm_recent_calls,
+            "recent_failures": llm_recent_failures,
+            "recent_failure_rate": llm_recent_failure_rate,
         }
         # LLM health gate — symmetric with failing_tools but iterates the PER-
         # PROVIDER breakdown so a failing fallback provider is not diluted by a
@@ -1033,61 +1039,51 @@ class PerformanceCollector:
         )
 
         return {
-            'session_id': self.session_id,
-            'total_execution_time_seconds': total_execution_time,
-            'start_time': self.start_time,
-            'end_time': self.end_time,
-
-            'llm_metrics': llm_summary,
-
+            "session_id": self.session_id,
+            "total_execution_time_seconds": total_execution_time,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "llm_metrics": llm_summary,
             # Per-provider LLM breakdown — the gate input for top_failing_llm().
             # One entry per provider (keyed by lower-cased provider name) carrying
             # the same shape as the aggregate llm_metrics above. Empty when no LLM
             # calls yet. Additive to the headline; no existing consumer breaks.
-            'llm_providers': llm_provider_summary,
-
-            'tool_metrics': tool_summary,
-
+            "llm_providers": llm_provider_summary,
+            "tool_metrics": tool_summary,
             # Sorted list of {name, failures, total_calls, failure_rate} for tools
             # exceeding the configured health gates — empty when nothing is failing.
-            'failing_tools': failing_tools,
-
+            "failing_tools": failing_tools,
             # One entry per provider whose recent_failure_rate trips the gate —
             # empty when all providers are healthy / cold. Per-provider isolation
             # means a failing fallback is no longer diluted by a healthy primary.
-            'failing_llm': failing_llm,
-
+            "failing_llm": failing_llm,
             # Sorted list of {name, p50_ms, p95_ms, call_count} for tools whose
             # recent p95_ms exceeds the configured latency threshold — empty when
             # all tools are healthy. The dashboard "Slow Tools" card reads this.
-            'slow_tools': slow_tools,
-
+            "slow_tools": slow_tools,
             # One entry per provider whose recent p95_ms exceeds the configured
             # latency threshold — empty when all providers are healthy / cold.
-            'slow_llm': slow_llm,
-
-            'cache_metrics': {
-                'rag_cache': cache_stats['rag'],
-                'vector_cache': cache_stats['vector'],
-                'tool_result_cache': tool_result_cache_stats,
-                'overall_hit_rate': overall_hit_rate,
+            "slow_llm": slow_llm,
+            "cache_metrics": {
+                "rag_cache": cache_stats["rag"],
+                "vector_cache": cache_stats["vector"],
+                "tool_result_cache": tool_result_cache_stats,
+                "overall_hit_rate": overall_hit_rate,
                 # Aggregate hits/total behind overall_hit_rate — shipped so the UI
                 # derives BOTH the rate AND the Hits/Misses detail from ONE source
                 # (this backend formula) instead of mirroring it client-side and
                 # silently drifting the next time a cache channel is added.
-                'overall_hits': _all_hits,
-                'overall_total': _all_total,
+                "overall_hits": _all_hits,
+                "overall_total": _all_total,
             },
-
-            'rag_metrics': {
-                'searches': rag_searches,
-                'total_search_time_ms': rag_time_ms,
-                'avg_search_time_ms': avg_rag_search_time
+            "rag_metrics": {
+                "searches": rag_searches,
+                "total_search_time_ms": rag_time_ms,
+                "avg_search_time_ms": avg_rag_search_time,
             },
-
             # Turn-level agent outcome channel — see record_agent_result. All
             # zeros until the first outcome event is recorded.
-            'agent_result': agent_result_summary,
+            "agent_result": agent_result_summary,
         }
 
 
@@ -1101,9 +1097,7 @@ class PerformanceCollector:
 # degraded tool without opening the dashboard.
 
 
-def _top_by_metric(
-    entries, *, derive, sort_key, top_n=None
-) -> list[dict]:
+def _top_by_metric(entries, *, derive, sort_key, top_n=None) -> list[dict]:
     """Shared skeleton of the top_* pure derivations: derive → sort → cap.
 
     *entries*: iterable of ``(name, metrics_dict)`` pairs (``.items()`` of a
@@ -1129,9 +1123,7 @@ def _top_by_metric(
     return out[:top_n] if top_n is not None else out
 
 
-def _derive_failing(
-    name, m, threshold: float, min_calls: int, total_key: str
-) -> dict | None:
+def _derive_failing(name, m, threshold: float, min_calls: int, total_key: str) -> dict | None:
     """Gate + build for the failing-* derivations.
 
     *total_key* is the cumulative-count key — ``"total_calls"`` (tool
@@ -1165,9 +1157,7 @@ def _derive_failing(
     }
 
 
-def _derive_slow(
-    name, m, threshold_ms: float, min_samples: int, count_key: str
-) -> dict | None:
+def _derive_slow(name, m, threshold_ms: float, min_samples: int, count_key: str) -> dict | None:
     """Gate + build for the slow-* derivations.
 
     *count_key* is the sample-count output key — ``"call_count"`` (tool
@@ -1337,6 +1327,7 @@ def top_slow_llm(
 # a tool regression, an LLM regression, a slow tool and a slow provider are four
 # independent operator signals (separate re-arm bookkeeping).
 
+
 class _WarnDedup:
     """Dedup + re-arm machinery shared by the warn_* log gates.
 
@@ -1372,7 +1363,7 @@ class _WarnDedup:
         ``log`` receives that ``str``, so any ``(str) -> None`` callable works
         (``logger.warning``, ``list.append``, …).
         """
-        current = {t.get("name") for t in entries if t.get("name")}
+        current = {_n for t in entries if isinstance(_n := t.get("name"), str)}
         with self.lock:
             newly = current - self.warned
             # Rebuild from current: entries no longer present drop out (re-arm);
@@ -1456,9 +1447,7 @@ def warn_failing_tools(summary: dict, *, log=logger.warning) -> int:
     ``top_failing_tools()`` derivation (or ``summary['failing_tools']``) directly —
     those carry no state and are safe to call from anywhere.
     """
-    return _warned_failing_tools.warn(
-        summary.get("failing_tools") or [], _fmt_failing_tool, log
-    )
+    return _warned_failing_tools.warn(summary.get("failing_tools") or [], _fmt_failing_tool, log)
 
 
 def _fmt_failing_llm(t: dict) -> str:
@@ -1476,9 +1465,7 @@ def warn_failing_llm(summary: dict, *, log=logger.warning) -> int:
     per-provider). Single-consumer: intended for the SSE broadcaster ONLY; logic
     consumers read ``summary['failing_llm']`` directly.
     """
-    return _warned_failing_llm.warn(
-        summary.get("failing_llm") or [], _fmt_failing_llm, log
-    )
+    return _warned_failing_llm.warn(summary.get("failing_llm") or [], _fmt_failing_llm, log)
 
 
 def _fmt_slow_tool(t: dict) -> str:
@@ -1499,9 +1486,7 @@ def warn_slow_tools(summary: dict, *, log=logger.warning) -> int:
     Single-consumer contract (SSE broadcaster ONLY). Returns the count of
     newly-warned tools.
     """
-    return _warned_slow_tools.warn(
-        summary.get("slow_tools") or [], _fmt_slow_tool, log
-    )
+    return _warned_slow_tools.warn(summary.get("slow_tools") or [], _fmt_slow_tool, log)
 
 
 def _fmt_slow_llm(t: dict) -> str:
@@ -1522,13 +1507,11 @@ def warn_slow_llm(summary: dict, *, log=logger.warning) -> int:
     message. Single-consumer contract (SSE broadcaster ONLY). Returns the count
     of newly-warned providers.
     """
-    return _warned_slow_llm.warn(
-        summary.get("slow_llm") or [], _fmt_slow_llm, log
-    )
+    return _warned_slow_llm.warn(summary.get("slow_llm") or [], _fmt_slow_llm, log)
 
 
 # Global collector for easy access
-_global_collector: Optional[PerformanceCollector] = None
+_global_collector: PerformanceCollector | None = None
 _global_collector_lock = threading.Lock()
 
 
@@ -1549,7 +1532,7 @@ def get_global_collector() -> PerformanceCollector:
     return _global_collector
 
 
-def reset_global_collector(session_id: Optional[str] = None) -> PerformanceCollector:
+def reset_global_collector(session_id: str | None = None) -> PerformanceCollector:
     """Reset global performance collector.
 
     Takes ``_global_collector_lock`` so a concurrent ``get_global_collector()``

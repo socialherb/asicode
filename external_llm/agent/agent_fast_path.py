@@ -5,7 +5,10 @@ Extracted from agent_loop.py to keep that file manageable.
 AgentLoop inherits FastPathMixin, so all methods have full access to
 self.config, self.registry, etc.
 """
+
 from __future__ import annotations
+
+from typing import Any  # f821-protected
 
 
 def _is_trivial_request(request: str) -> bool:
@@ -28,9 +31,9 @@ def _is_trivial_request(request: str) -> bool:
         return True  # looks like a code reference
 
     # Trivial edit patterns (set-based, no regex)
-    _TRIVIAL_TRIGGERS = {"header", "typo", "spelling", "rename"}
+    _trivial_triggers = {"header", "typo", "spelling", "rename"}
     words = set(req.split())
-    if _TRIVIAL_TRIGGERS & words:
+    if _trivial_triggers & words:
         return True
 
     # "only change X" / "constant" — 2+ word phrases
@@ -49,6 +52,11 @@ class FastPathMixin:
       - AgentTurn / ToolResult types (imported in agent_loop.py)
     """
 
+    # Host-class attributes (provided by AgentLoop, not set here). Pure typing
+    # scaffolding — AgentLoop.__init__ owns the runtime values.
+    config: Any
+    registry: Any
+
     # ------------------------------------------------------------------
     # Trivial / read-only classifiers
     # ------------------------------------------------------------------
@@ -59,8 +67,9 @@ class FastPathMixin:
         Primary: RouteDecision.task_kind == MICRO_EDIT (LLM-based, language-neutral).
         Fallback: regex check when no route decision is available.
         """
-        route = getattr(self.config, 'route_decision', None)
+        route = getattr(self.config, "route_decision", None)
         if route is not None:
             from .task_router import TaskKind
-            return getattr(route, 'task_kind', None) == TaskKind.MICRO_EDIT
+
+            return getattr(route, "task_kind", None) == TaskKind.MICRO_EDIT
         return _is_trivial_request(request)

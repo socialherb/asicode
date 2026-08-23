@@ -52,17 +52,18 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from html.parser import HTMLParser
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from ...client import interruptible_sleep
 from ..agent_loop_types import AgentCancelled
-from ..cancel_scope import call_cancel_scope, current_cancel_event, effective_cancel
+from ..cancel_scope import _CompositeCancel, call_cancel_scope, current_cancel_event, effective_cancel
 
 if TYPE_CHECKING:
     import httpx
 
     from ..tool_registry import ToolResult
 else:
+
     class _LazyHttpx:
         """Defers ``import httpx`` to the first actual attribute access.
 
@@ -88,6 +89,7 @@ else:
             mod = _LazyHttpx._mod
             if mod is None:
                 import httpx as _real_httpx
+
                 mod = _LazyHttpx._mod = _real_httpx
             return getattr(mod, name)
 
@@ -125,7 +127,7 @@ _FETCH_BINARY_CONTENT_PREFIXES = (
     "application/x-tar",
     "application/x-rar-compressed",
     "application/msword",
-    "application/vnd.",          # office formats: docx/xlsx/pptx/…
+    "application/vnd.",  # office formats: docx/xlsx/pptx/…
     "application/octet-stream",
     "image/",
     "audio/",
@@ -205,16 +207,11 @@ def _ip_is_non_public(addr: str) -> bool:
     the embedded IPv4 is judged, not the 6-to-4 wrapper.
     """
     ip = ipaddress.ip_address(addr)
-    if ip.version == 6 and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_unspecified
-        or ip.is_multicast
-    )
+    if ip.version == 6:
+        ipv4_mapped = getattr(ip, "ipv4_mapped", None)
+        if ipv4_mapped is not None:
+            ip = ipv4_mapped
+    return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified or ip.is_multicast
 
 
 def _assert_public_fetch_host(hostname: str) -> None:
@@ -230,9 +227,7 @@ def _assert_public_fetch_host(hostname: str) -> None:
         return
     host = (hostname or "").strip().lower()
     if not host:
-        raise _SSRFBlockedError(
-            f"web_fetch SSRF guard: empty host. Set {_SSRF_ALLOW_ENV}=1 to allow local URLs."
-        )
+        raise _SSRFBlockedError(f"web_fetch SSRF guard: empty host. Set {_SSRF_ALLOW_ENV}=1 to allow local URLs.")
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -251,7 +246,7 @@ def _assert_public_fetch_host(hostname: str) -> None:
         logger.debug("web_fetch SSRF: DNS resolution failed for %s: %s", host, e)
         return  # resolution failure → let the request surface the connect error
     for info in infos:
-        sockaddr = info[4][0]
+        sockaddr = str(info[4][0])  # getaddrinfo host is str; str() narrows the tuple branch
         try:
             is_non_public = _ip_is_non_public(sockaddr)
         except ValueError:
@@ -281,14 +276,16 @@ def _fetch_url_hostname(url: str) -> str:
 # Chrome one), api.reddit.com, and every probed redlib instance returned 403 or a
 # challenge. `.rss` also serves real content but is rate-limited to ~1 request per
 # 60s per IP (x-ratelimit-remaining: 0.0, reset ~58), so it is not a general route.
-_REDDIT_CHALLENGE_HOSTS = frozenset({
-    "reddit.com",
-    "www.reddit.com",
-    "np.reddit.com",
-    "new.reddit.com",
-    "m.reddit.com",
-    "amp.reddit.com",
-})
+_REDDIT_CHALLENGE_HOSTS = frozenset(
+    {
+        "reddit.com",
+        "www.reddit.com",
+        "np.reddit.com",
+        "new.reddit.com",
+        "m.reddit.com",
+        "amp.reddit.com",
+    }
+)
 
 
 def _rewrite_reddit_url(url: str) -> str:
@@ -342,14 +339,18 @@ def _lazy_once(key: str, build) -> Any:
 
 def _transient_http_errors() -> tuple:
     """Transient (retryable) network errors, resolved lazily. See above."""
-    return _lazy_once("transient_http_errors", lambda: (
-        httpx.ConnectError,
-        httpx.RemoteProtocolError,
-        httpx.ReadTimeout,
-        httpx.ReadError,      # parent of ReadTimeout; also covers abrupt stream drops
-        httpx.ConnectTimeout,
-        httpx.PoolTimeout,
-    ))
+    return _lazy_once(
+        "transient_http_errors",
+        lambda: (
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.ReadTimeout,
+            httpx.ReadError,  # parent of ReadTimeout; also covers abrupt stream drops
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+        ),
+    )
+
 
 # Connect-level failures ("host unreachable / TCP handshake blocked"). These are
 # a SUBSET of _transient_http_errors() that must NOT be retried: unlike a slow read
@@ -361,6 +362,7 @@ def _transient_http_errors() -> tuple:
 def _connect_errors() -> tuple:
     """Connect-level failures, resolved lazily. See _transient_http_errors."""
     return _lazy_once("connect_errors", lambda: (httpx.ConnectError, httpx.ConnectTimeout))
+
 
 # Transient HTTP status codes worth retrying: rate-limiting (429) and gateway /
 # overload responses (502/503/504). Shared by every backend routed through
@@ -377,9 +379,16 @@ _RETRYABLE_HTTP_STATUSES = frozenset({429, 502, 503, 504})
 
 def _search_http_timeout():
     """The shared search timeout, resolved lazily. See _transient_http_errors."""
-    return _lazy_once("search_http_timeout", lambda: httpx.Timeout(
-        connect=4.0, read=15.0, write=15.0, pool=15.0,
-    ))
+    return _lazy_once(
+        "search_http_timeout",
+        lambda: httpx.Timeout(
+            connect=4.0,
+            read=15.0,
+            write=15.0,
+            pool=15.0,
+        ),
+    )
+
 
 # Seconds a backend is skipped (session circuit breaker) after a connect-level
 # failure. Long enough that a run of searches does not each re-pay a hard IP
@@ -522,9 +531,7 @@ _SEARXNG_STALE_NOTICE_INTERVAL_DAYS = 7.0
 # measurements are from one IP at one moment — engine health is volatile (mojeek
 # went 10/10 → 0/0 within an hour of testing), which is also why the list is
 # overridable rather than baked in.
-_SEARXNG_DEFAULT_ENGINES = (
-    "google,duckduckgo,brave,bing,naver,yandex,baidu,qwant,yep,zapmeta,mwmbl"
-)
+_SEARXNG_DEFAULT_ENGINES = "google,duckduckgo,brave,bing,naver,yandex,baidu,qwant,yep,zapmeta,mwmbl"
 
 
 def _retry_after_seconds(resp: httpx.Response, default: float) -> float:
@@ -568,7 +575,7 @@ _META_CHARSET_RE = re.compile(
 )
 
 
-def _sniff_html_encoding(body_bytes: bytes) -> Optional[str]:
+def _sniff_html_encoding(body_bytes: bytes) -> str | None:
     """Best-effort HTML encoding sniff from BOM / ``<meta charset>`` (HTML5 prescan).
 
     Returns ``None`` when no declaration is found so the caller falls back to its
@@ -770,9 +777,9 @@ _CHALLENGE_PAGE_MARKERS = (
     "made by a human",
     "verify you are human",
     "are you a robot",
-    "please wait for verification",   # www.reddit.com (2026-08-05)
-    "verifying your browser",         # safereddit.com / libreddit (2026-08-05)
-    "not a bot",                      # Anubis PoW, e.g. redlib.privacyredirect.com
+    "please wait for verification",  # www.reddit.com (2026-08-05)
+    "verifying your browser",  # safereddit.com / libreddit (2026-08-05)
+    "not a bot",  # Anubis PoW, e.g. redlib.privacyredirect.com
     # throttle / JS interstitials
     "wait a moment",
     "just a moment",
@@ -1100,7 +1107,7 @@ def _parse_exa_results(text: str, max_results: int) -> list[dict[str, str]]:
                 continue
             if line.startswith("Highlights:"):
                 in_excerpt = True
-                tail = line[len("Highlights:"):].strip()
+                tail = line[len("Highlights:") :].strip()
                 if tail:
                     excerpt_lines.append(tail)
                 continue
@@ -1120,16 +1127,18 @@ def _parse_exa_results(text: str, max_results: int) -> list[dict[str, str]]:
         # Exa's own elision marker between highlight spans; it carries no
         # information and costs tokens in every excerpt.
         excerpt = "\n".join(ln for ln in excerpt_lines if ln.strip() != "...").strip()
-        results.append({
-            "title": title,
-            "url": url,
-            # Excerpts are page text, not a SERP snippet — keep them in their own
-            # field so the renderer can budget them separately and _merge_search_results
-            # does not treat them as interchangeable with a one-line snippet.
-            "snippet": "",
-            "excerpt": excerpt,
-            "published": fields.get("Published", "") if fields.get("Published") != "N/A" else "",
-        })
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                # Excerpts are page text, not a SERP snippet — keep them in their own
+                # field so the renderer can budget them separately and _merge_search_results
+                # does not treat them as interchangeable with a one-line snippet.
+                "snippet": "",
+                "excerpt": excerpt,
+                "published": fields.get("Published", "") if fields.get("Published") != "N/A" else "",
+            }
+        )
         if len(results) >= max_results:
             break
     return results
@@ -1234,7 +1243,7 @@ class _StartpageResultParser(_ResultParserBase):
     def __init__(self, max_results: int = 10):
         super().__init__(max_results)
         self._in_title = False
-        self._in_raw_text = False   # inside <style>/<script>: never capture
+        self._in_raw_text = False  # inside <style>/<script>: never capture
 
     # ── helpers ──
 
@@ -1568,14 +1577,26 @@ _NAVER_EXTRACT_JS = r"""
 class WebSearchToolsMixin:
     """Mixin providing web search tool implementations for ToolRegistry."""
 
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry (and duck-typed test hosts) own the real
+    # values, so these are pure typing scaffolding.
+    #   _make_result      — ToolRegistry._make_result(**kwargs) -> ToolResult
+    #   _render_and_eval  — browser_tools.BrowserToolsMixin._render_and_eval
+    #   _tool_ask_user    — agent_tools.AgentToolsMixin._tool_ask_user
+    _make_result: Any
+    _render_and_eval: Any
+    _tool_ask_user: Any
+    config: Any
+
     # ── Session-level decision cache: avoid duplicate Checkpoints ──
     # _ask_start_searxng / _ask_install_searxng cache the user's answer
     # for the lifetime of the ToolRegistry. This prevents the same user
     # Checkpoint from being issued twice in one turn when the LLM retries
     # search_web after all backends fail.
     # None = unasked; True = yes (start/install); False = no (skip)
-    _searxng_start_decision: Optional[bool] = None
-    _searxng_install_decision: Optional[bool] = None
+    _searxng_start_decision: bool | None = None
+    _searxng_install_decision: bool | None = None
 
     # ── SearXNG setup serialization ──
     # Only ONE thread may drive the ask→install/start sequence at a time.
@@ -1756,7 +1777,7 @@ class WebSearchToolsMixin:
         logger.info("web_search: %s recovered; wall backoff cleared", name)
         self._persist_wall_state(snapshot)
 
-    def _walled_backend_notice(self) -> Optional[str]:
+    def _walled_backend_notice(self) -> str | None:
         """One-liner naming backends blocked long enough to be degrading results.
 
         Surfaced in the tool CONTENT rather than only the log. A search that
@@ -1805,7 +1826,7 @@ class WebSearchToolsMixin:
         engine: str,
         body: str,
         results: list[dict[str, str]],
-        status: Optional[int] = None,
+        status: int | None = None,
     ) -> None:
         """Raise when an EMPTY result set is really a bot-detection wall.
 
@@ -1837,8 +1858,7 @@ class WebSearchToolsMixin:
             return
         if status is not None and 200 < status < 300:
             raise _BlockWallError(
-                f"{engine} returned HTTP {status} with no results "
-                f"(request acknowledged but not served — bot challenge)"
+                f"{engine} returned HTTP {status} with no results (request acknowledged but not served — bot challenge)"
             )
         if _body_is_block_wall(body):
             raise _BlockWallError(f"{engine} served a bot-detection/block wall (no results parsed)")
@@ -1849,7 +1869,7 @@ class WebSearchToolsMixin:
     # `docker image inspect` behind it costs ~100ms that no search should re-pay.
     _searxng_staleness_checked: ClassVar[bool] = False
 
-    def _searxng_image_age_days(self) -> Optional[float]:
+    def _searxng_image_age_days(self) -> float | None:
         """Age of the LOCAL ``searxng/searxng`` image in days, or None.
 
         Deliberately local-only — no registry round trip. "Is a newer image
@@ -1893,7 +1913,7 @@ class WebSearchToolsMixin:
     def _searxng_stale_state_path(self) -> str:
         return os.path.join(str(getattr(self, "repo_root", ".")), ".asicode", "searxng_image_check.json")
 
-    def _stale_searxng_image_notice(self) -> Optional[str]:
+    def _stale_searxng_image_notice(self) -> str | None:
         """Actionable one-liner when the local SearXNG image is too old, else None.
 
         Rate-limited on disk so it does not reappear every session. Any failure
@@ -1908,7 +1928,7 @@ class WebSearchToolsMixin:
             logger.debug("web_search: staleness check failed (%s); ignoring", e)
             return None
 
-    def _stale_searxng_image_notice_inner(self) -> Optional[str]:
+    def _stale_searxng_image_notice_inner(self) -> str | None:
         """Body of :meth:`_stale_searxng_image_notice` (errors handled there)."""
         if WebSearchToolsMixin._searxng_staleness_checked:
             return None
@@ -2004,8 +2024,11 @@ class WebSearchToolsMixin:
 
         def _run_with_scope(fn):
             def _run():
-                with call_cancel_scope(_caller_scope):
-                    return fn()
+                if _caller_scope is not None:
+                    with call_cancel_scope(_caller_scope):
+                        return fn()
+                return fn()
+
             return _run
 
         try:
@@ -2055,7 +2078,7 @@ class WebSearchToolsMixin:
         collected.sort(key=lambda kv: order.get(kv[0], 0))
         return collected, errors, connect_failed
 
-    def _tool_search_web(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_search_web(self, args: dict[str, Any]) -> ToolResult:
         """Search the web for information relevant to the current task.
 
         Backends in priority order:
@@ -2108,7 +2131,7 @@ class WebSearchToolsMixin:
         # most queries. So a first-wins chain with SearXNG in front would drop
         # Google's index entirely — the two are complements, not substitutes.
         tier1: list[tuple] = []
-        searxng_autosetup: Optional[tuple] = None
+        searxng_autosetup: tuple | None = None
         if searxng_url:
             # Explicitly configured self-hosted instance: the user opted into a
             # private backend, so it participates in the merge.
@@ -2125,9 +2148,7 @@ class WebSearchToolsMixin:
         # query still succeeds in a real browser. Added ONLY in that state: while
         # httpx works there is nothing to recover and a Chromium render is ~3s.
         if self._startpage_browser_available():
-            tier1.append(
-                ("Startpage (browser)", lambda: self._search_startpage_browser(query, max_results))
-            )
+            tier1.append(("Startpage (browser)", lambda: self._search_startpage_browser(query, max_results)))
         # Exa: keyless, unmetered, and the only tier-1 member returning page
         # excerpts instead of SERP snippets. It also covers the gap Startpage's
         # suspension opened — see _EXA_MCP_URL for the 2026-08-03 measurements.
@@ -2177,6 +2198,7 @@ class WebSearchToolsMixin:
 
         # ── Try each tier-2 backend with fallback ──
         results: list[dict[str, str]] = []
+        name = ""
         for name, search_fn in backends:
             # Circuit breaker: skip a backend that recently connect-failed instead
             # of re-paying its connect timeout on every search this session.
@@ -2254,7 +2276,7 @@ class WebSearchToolsMixin:
 
         return self._format_search_results(query, results, [name], notice=self._search_notice(searxng_url))
 
-    def _search_notice(self, searxng_url: str) -> Optional[str]:
+    def _search_notice(self, searxng_url: str) -> str | None:
         """Operational notices for the tool output, newest concern first.
 
         Two independent conditions can degrade a search without changing how its
@@ -2273,8 +2295,8 @@ class WebSearchToolsMixin:
         query: str,
         results: list[dict[str, str]],
         backends: list[str],
-        notice: Optional[str] = None,
-    ) -> "ToolResult":
+        notice: str | None = None,
+    ) -> ToolResult:
         """Render results for the model. Shared by the merged and fallback paths.
 
         A merged result carries a ``sources`` field; it is surfaced only when
@@ -2348,7 +2370,7 @@ class WebSearchToolsMixin:
 
     # ── Shared HTTP retry helper ─────────────────────────────────────
 
-    def _live_cancel_event(self) -> Optional[threading.Event]:
+    def _live_cancel_event(self) -> threading.Event | _CompositeCancel | None:
         """The registry's current cancel events as a cooperative-channel source.
 
         Merges the agent-loop ``config.cancel_event`` (whole-turn ESC) with any
@@ -2361,9 +2383,7 @@ class WebSearchToolsMixin:
         Defensive ``getattr``: the mixin is also mounted on duck-typed test
         hosts that carry no ``config`` attribute.
         """
-        return effective_cancel(
-            getattr(getattr(self, "config", None), "cancel_event", None)
-        )
+        return effective_cancel(getattr(getattr(self, "config", None), "cancel_event", None))
 
     @staticmethod
     def _http_request_with_retry(
@@ -2371,14 +2391,14 @@ class WebSearchToolsMixin:
         method: str,
         url: str,
         *,
-        params: Optional[dict] = None,
-        data: Optional[dict] = None,
-        json_body: Optional[dict] = None,
-        headers: Optional[dict] = None,
+        params: dict | None = None,
+        data: dict | None = None,
+        json_body: dict | None = None,
+        headers: dict | None = None,
         retries: int = 2,
         backoff: float = 1.5,
         retry_statuses: frozenset[int] = _RETRYABLE_HTTP_STATUSES,
-        cancel_event: Optional[threading.Event] = None,
+        cancel_event: Any | None = None,
     ) -> httpx.Response:
         """Execute an HTTP GET/POST with transient-error AND transient-status retry.
 
@@ -2402,8 +2422,8 @@ class WebSearchToolsMixin:
         """
         if cancel_event is not None and cancel_event.is_set():
             raise AgentCancelled("cancelled by user before web_search request")
-        last_err: Optional[Exception] = None
-        resp: Optional[httpx.Response] = None
+        last_err: Exception | None = None
+        resp: httpx.Response | None = None
         for attempt in range(retries):
             try:
                 if method.upper() == "GET":
@@ -2431,9 +2451,7 @@ class WebSearchToolsMixin:
                         backoff,
                     )
                     if interruptible_sleep(backoff, cancel_event):
-                        raise AgentCancelled(
-                            "cancelled by user during web_search retry backoff"
-                        ) from None
+                        raise AgentCancelled("cancelled by user during web_search retry backoff") from None
                     continue
                 raise  # final attempt failed — propagate
 
@@ -2449,9 +2467,7 @@ class WebSearchToolsMixin:
                     wait,
                 )
                 if interruptible_sleep(wait, cancel_event):
-                    raise AgentCancelled(
-                        "cancelled by user during web_search Retry-After wait"
-                    )
+                    raise AgentCancelled("cancelled by user during web_search Retry-After wait")
                 continue
             return resp
 
@@ -2539,7 +2555,9 @@ class WebSearchToolsMixin:
         params = {"query": query}
 
         with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True, headers=headers) as client:
-            resp = self._http_request_with_retry(client, "GET", url, params=params, cancel_event=self._live_cancel_event())
+            resp = self._http_request_with_retry(
+                client, "GET", url, params=params, cancel_event=self._live_cancel_event()
+            )
             resp.raise_for_status()
 
         parser = _StartpageResultParser(max_results=max_results)
@@ -2561,6 +2579,7 @@ class WebSearchToolsMixin:
         if not self._backend_in_cooldown("Startpage"):
             return False
         from .browser_tools import HAS_PLAYWRIGHT, PLAYWRIGHT_BROWSER_AVAILABLE
+
         # Both, and no install prompt: a search must not raise a Checkpoint.
         return bool(HAS_PLAYWRIGHT and PLAYWRIGHT_BROWSER_AVAILABLE)
 
@@ -2658,7 +2677,7 @@ class WebSearchToolsMixin:
         return results
 
     @staticmethod
-    def _parse_mcp_body(resp: "httpx.Response") -> Any:
+    def _parse_mcp_body(resp: httpx.Response) -> Any:
         """Decode an MCP HTTP response body — plain JSON or an SSE ``data:`` frame."""
         if "text/event-stream" in resp.headers.get("content-type", ""):
             last = None
@@ -2690,15 +2709,20 @@ class WebSearchToolsMixin:
         params = {"q": query, "count": max_results}
 
         with httpx.Client(timeout=_search_http_timeout()) as client:
-            resp = self._http_request_with_retry(client, "GET", url, params=params, headers=headers, cancel_event=self._live_cancel_event())
+            resp = self._http_request_with_retry(
+                client, "GET", url, params=params, headers=headers, cancel_event=self._live_cancel_event()
+            )
             resp.raise_for_status()
             data = resp.json()
 
-        results: list[dict[str, str]] = [{
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "snippet": item.get("description", ""),
-                } for item in (data.get("web") or {}).get("results") or []]
+        results: list[dict[str, str]] = [
+            {
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("description", ""),
+            }
+            for item in (data.get("web") or {}).get("results") or []
+        ]
         return results
 
     # ── Naver (browser-rendered, JS-hydrated results) ────────────────
@@ -2744,9 +2768,7 @@ class WebSearchToolsMixin:
             href = str(item.get("url", "")).strip()
             if not title or not href.startswith("http"):
                 continue
-            results.append(
-                {"title": title, "url": href, "snippet": str(item.get("snippet", "")).strip()}
-            )
+            results.append({"title": title, "url": href, "snippet": str(item.get("snippet", "")).strip()})
         return results
 
     # ── SearXNG (self-hosted) ────────────────────────────────────────
@@ -2794,7 +2816,9 @@ class WebSearchToolsMixin:
         # Retry policy is shared with the other backends via _http_request_with_retry
         # (previously SearXNG was the only backend with any retry; DDG/Brave had none).
         with httpx.Client(timeout=_search_http_timeout(), follow_redirects=True) as client:
-            resp = self._http_request_with_retry(client, "GET", url, params=params, cancel_event=self._live_cancel_event())
+            resp = self._http_request_with_retry(
+                client, "GET", url, params=params, cancel_event=self._live_cancel_event()
+            )
             resp.raise_for_status()
             data = resp.json()
 
@@ -2954,7 +2978,9 @@ class WebSearchToolsMixin:
             "start",
         )
 
-    def _wait_for_searxng(self, base_url: str, timeout: float = 15.0, interval: float = 0.5, cancel_event: Optional[threading.Event] = None) -> bool:
+    def _wait_for_searxng(
+        self, base_url: str, timeout: float = 15.0, interval: float = 0.5, cancel_event: Any | None = None
+    ) -> bool:
         """Poll SearXNG /healthz until it responds or ``timeout`` elapses.
 
         Replaces a fixed ``time.sleep(5)``: returns as soon as the service is
@@ -2976,9 +3002,7 @@ class WebSearchToolsMixin:
             except Exception as e:  # ConnectionError, Timeout, etc.
                 last_err = e
             if interruptible_sleep(interval, cancel_event):
-                raise AgentCancelled(
-                    "cancelled by user while waiting for SearXNG readiness"
-                )
+                raise AgentCancelled("cancelled by user while waiting for SearXNG readiness")
         logger.warning("web_search: SearXNG not ready after %.1fs (%s)", timeout, last_err)
         return False
 
@@ -3143,9 +3167,7 @@ class WebSearchToolsMixin:
         os.environ["SEARXNG_BASE_URL"] = base_url
         return self._search_searxng(query, max_results, base_url)
 
-    def _handle_searxng_connect_error(
-        self, error: Exception, searxng_url: str
-    ) -> Optional[str]:
+    def _handle_searxng_connect_error(self, error: Exception, searxng_url: str) -> str | None:
         """Handle SearXNG ConnectError.
 
         Flow:
@@ -3192,7 +3214,7 @@ class WebSearchToolsMixin:
             return "SearXNG: start attempted but failed"
         return f"SearXNG (not running): {error}"
 
-    def _tool_web_fetch(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_web_fetch(self, args: dict[str, Any]) -> ToolResult:
         """Fetch and read content from a URL.
 
         HTML pages are converted to text via ``_HTMLTextExtractor`` (block-aware,
@@ -3240,7 +3262,9 @@ class WebSearchToolsMixin:
             # ── SSRF guard: reject non-public targets before connecting ──
             _assert_public_fetch_host(_fetch_url_hostname(url))
             with httpx.Client(
-                timeout=30.0, follow_redirects=True, headers=headers,
+                timeout=30.0,
+                follow_redirects=True,
+                headers=headers,
                 event_hooks={"request": [_ssrf_request_hook]},
             ) as client:
                 _ce = self._live_cancel_event()
@@ -3248,10 +3272,10 @@ class WebSearchToolsMixin:
                 # Retry loop mirrors _http_request_with_retry: transient network
                 # errors AND transient HTTP status codes (429/5xx) are retried
                 # with backoff (via _retry_after_seconds for status codes).
-                last_err: Optional[Exception] = None
-                body_bytes: Optional[bytes] = None
+                last_err: Exception | None = None
+                body_bytes: bytes | None = None
                 content_type = ""
-                header_charset: Optional[str] = None
+                header_charset: str | None = None
 
                 for attempt in range(3):  # retries=2 → 3 total attempts
                     try:
@@ -3262,9 +3286,7 @@ class WebSearchToolsMixin:
                             # ── Reject clearly-binary content BEFORE reading body ──
                             # Catch PDF/image/archive at the header level so we never
                             # download megabytes of binary just to throw it away.
-                            if content_type and any(
-                                content_type.startswith(p) for p in _FETCH_BINARY_CONTENT_PREFIXES
-                            ):
+                            if content_type and any(content_type.startswith(p) for p in _FETCH_BINARY_CONTENT_PREFIXES):
                                 return self._make_result(
                                     ok=False,
                                     content="",
@@ -3327,14 +3349,13 @@ class WebSearchToolsMixin:
                         last_err = e
                         if attempt < 2:
                             logger.warning(
-                                "web_fetch: transient HTTP error (attempt %d/3: %s), "
-                                "retrying in %.1fs…",
-                                attempt + 1, e, 1.5,
+                                "web_fetch: transient HTTP error (attempt %d/3: %s), retrying in %.1fs…",
+                                attempt + 1,
+                                e,
+                                1.5,
                             )
                             if interruptible_sleep(1.5, _ce):
-                                raise AgentCancelled(
-                                    "cancelled by user during web_fetch retry backoff"
-                                ) from None
+                                raise AgentCancelled("cancelled by user during web_fetch retry backoff") from None
                             continue
                         raise  # final attempt — propagate
 
@@ -3344,12 +3365,12 @@ class WebSearchToolsMixin:
                             wait = _retry_after_seconds(e.response, 1.5)
                             logger.warning(
                                 "web_fetch: HTTP %d (attempt %d/3); retrying in %.1fs…",
-                                code, attempt + 1, wait,
+                                code,
+                                attempt + 1,
+                                wait,
                             )
                             if interruptible_sleep(wait, _ce):
-                                raise AgentCancelled(
-                                    "cancelled by user during web_fetch Retry-After wait"
-                                ) from None
+                                raise AgentCancelled("cancelled by user during web_fetch Retry-After wait") from None
                             continue
                         raise  # non-retryable status or final attempt — propagate
 

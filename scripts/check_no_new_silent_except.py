@@ -92,9 +92,18 @@ BASELINE = REPO / "scripts" / "silent_except_baseline.txt"
 
 # A handler is "observability-bearing" if it raises, or calls a logging-ish
 # function.  Conservative: any such node anywhere in the handler body counts.
-_LOGGING_ATTRS = frozenset({
-    "debug", "info", "warning", "warn", "error", "exception", "critical", "log",
-})
+_LOGGING_ATTRS = frozenset(
+    {
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "exception",
+        "critical",
+        "log",
+    }
+)
 
 # Bodies that are pure suppression (do nothing but swallow).
 _NOOP_STMT_TYPES = (ast.Pass, ast.Continue, ast.Break)
@@ -114,10 +123,22 @@ _ROOT_FILES = (
     "path_security.py",
     "plan_compiler.py",
 )
-_SKIP_DIRS = frozenset({
-    "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules",
-    ".venv", "venv", "env", ".tox", "dist", "build", ".eggs", ".git",
-})
+_SKIP_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        ".git",
+    }
+)
 
 
 def _is_none_expr(node: ast.AST) -> bool:
@@ -146,8 +167,7 @@ def _handler_is_silent(handler: ast.ExceptHandler) -> bool:
     if not body:
         return False  # ast never produces empty handler bodies; defensive.
     return all(
-        isinstance(s, _NOOP_STMT_TYPES)
-        or (isinstance(s, ast.Return) and (s.value is None or _is_none_expr(s.value)))
+        isinstance(s, _NOOP_STMT_TYPES) or (isinstance(s, ast.Return) and (s.value is None or _is_none_expr(s.value)))
         for s in body
     )
 
@@ -165,10 +185,7 @@ def _suppress_call_is_broad(call: ast.Call) -> bool:
     """
     if not call.args:
         return True
-    return any(
-        isinstance(a, ast.Name) and a.id in ("Exception", "BaseException")
-        for a in call.args
-    )
+    return any(isinstance(a, ast.Name) and a.id in ("Exception", "BaseException") for a in call.args)
 
 
 def _return_value_is_empty(node: ast.AST | None) -> bool:
@@ -211,10 +228,7 @@ def _handler_is_broad(handler: ast.ExceptHandler) -> bool:
     if isinstance(t, ast.Name):
         return t.id in ("Exception", "BaseException")
     if isinstance(t, ast.Tuple):
-        return any(
-            isinstance(e, ast.Name) and e.id in ("Exception", "BaseException")
-            for e in t.elts
-        )
+        return any(isinstance(e, ast.Name) and e.id in ("Exception", "BaseException") for e in t.elts)
     return False
 
 
@@ -241,10 +255,7 @@ def _handler_empty_returns(handler: ast.ExceptHandler) -> bool:
                 return False
             if isinstance(f, ast.Name) and f.id == "print":
                 return False
-    return all(
-        isinstance(s, ast.Return) and _return_value_is_empty(s.value)
-        for s in body
-    )
+    return all(isinstance(s, ast.Return) and _return_value_is_empty(s.value) for s in body)
 
 
 class _SilentExceptScanner(ast.NodeVisitor):
@@ -385,11 +396,7 @@ def _in_scope(rel: str) -> bool:
     predicate).
     """
     p = Path(rel)
-    return (
-        p.suffix == ".py"
-        and not _should_skip(p)
-        and (p.parts[0] in _SCAN_ROOTS or p.parts[0] in _ROOT_FILES)
-    )
+    return p.suffix == ".py" and not _should_skip(p) and (p.parts[0] in _SCAN_ROOTS or p.parts[0] in _ROOT_FILES)
 
 
 def _iter_repo_py(paths: list[str] | None = None) -> list[Path]:
@@ -591,7 +598,7 @@ def _write_baseline(keys: set[str]) -> None:
         "# NOTE: the ordinal is the handler's index among ALL except handlers in\n"
         "# the scope (silent or not), so REMOVING any handler shifts later keys.\n"
         "# After a legit removal round (e.g. try/except/pass → suppress), re-run\n"
-        "# `--write-baseline` — index-shifted keys are false \"new\" hits.\n"
+        '# `--write-baseline` — index-shifted keys are false "new" hits.\n'
         "#\n"
     )
     lines = sorted(keys)

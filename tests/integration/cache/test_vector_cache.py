@@ -1,6 +1,7 @@
 """
 Integration tests for vector caching (FAISS-based embedding cache).
 """
+
 import shutil
 import tempfile
 from pathlib import Path
@@ -20,6 +21,7 @@ try:
         get_global_embedding_model,
         reset_global_embedding_model,
     )
+
     VECTOR_CACHE_AVAILABLE = True
 except ImportError:
     VECTOR_CACHE_AVAILABLE = False
@@ -87,7 +89,7 @@ class TestVectorCache:
 
         test_embedding = np.random.randn(manager.dimension).astype(np.float32)
 
-        with patch.object(manager, '_compute_embedding', return_value=test_embedding):
+        with patch.object(manager, "_compute_embedding", return_value=test_embedding):
             manager.add_document("file1.py", "def hello(): return 'world'")
             manager.add_document("file2.py", "class Calculator: pass")
 
@@ -157,7 +159,7 @@ class TestVectorCache:
 
             searcher = RAGSearcher(repo_root)
 
-            has_vector_cache = hasattr(searcher, 'vector_cache_manager')
+            has_vector_cache = hasattr(searcher, "vector_cache_manager")
             if has_vector_cache:
                 assert searcher.vector_cache_manager is not None
 
@@ -194,7 +196,7 @@ class TestVectorCache:
 
         test_embedding = np.random.randn(manager1.dimension).astype(np.float32)
 
-        with patch.object(manager1, '_compute_embedding', return_value=test_embedding):
+        with patch.object(manager1, "_compute_embedding", return_value=test_embedding):
             manager1.add_document("persistent.py", "persistent content")
             manager1._save_index()
 
@@ -207,7 +209,7 @@ class TestVectorCache:
 
     def test_vector_cache_fallback_on_failure(self, temp_cache_dir):
         """Test fallback behavior when vector cache (FAISS) is not available."""
-        with patch('external_llm.agent.vector_cache.HAS_FAISS', False):
+        with patch("external_llm.agent.vector_cache.HAS_FAISS", False):
             manager = VectorCacheManager(temp_cache_dir)
 
             # Should gracefully handle missing FAISS
@@ -234,7 +236,7 @@ class TestVectorCache:
 
         def worker(worker_id: int):
             try:
-                with patch.object(manager, '_compute_embedding', return_value=test_embedding):
+                with patch.object(manager, "_compute_embedding", return_value=test_embedding):
                     manager.add_document(f"file_{worker_id}.py", f"content {worker_id}")
             except Exception as e:
                 errors.append(e)
@@ -253,4 +255,4 @@ class TestVectorCache:
 
         config = AgentConfig()
         # rag_enabled controls vector cache usage
-        assert hasattr(config, 'rag_enabled')
+        assert hasattr(config, "rag_enabled")

@@ -16,6 +16,7 @@ The rollback path (ok=False, disk restored to the pre-write state the caches
 already hold) must NOT run it — pinned here so a refused write never leaves a
 tombstone behind for Undo to act on.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -49,9 +50,7 @@ def registry(tmp_path):
     # edit_file itself. It returns ok=True without touching the file system.
     reg._tool_edit_file = lambda args: ToolResult(ok=True, content="edited")
     # Snapshot stub: one existing target file with pre-write content.
-    reg._snapshot_target_files = lambda tool_name, args: {
-        str(tmp_path / "f.py"): "def foo():\n    pass\n"
-    }
+    reg._snapshot_target_files = lambda tool_name, args: {str(tmp_path / "f.py"): "def foo():\n    pass\n"}
     # Avoid spawning ruff inside the semantic auto-repair phase.
     reg._safety_manager.auto_repair_semantic = lambda snapshots: 0
     return reg
@@ -59,12 +58,8 @@ def registry(tmp_path):
 
 def _instrument(reg):
     calls = []
-    reg._invalidate_cache_after_write = (
-        lambda paths: calls.append(("invalidate", list(paths)))
-    )
-    reg._checkpoint_after_write = (
-        lambda tool_name, args: calls.append(("checkpoint", tool_name, args))
-    )
+    reg._invalidate_cache_after_write = lambda paths: calls.append(("invalidate", list(paths)))
+    reg._checkpoint_after_write = lambda tool_name, args: calls.append(("checkpoint", tool_name, args))
     return calls
 
 
@@ -73,20 +68,14 @@ def _edit_file_args():
 
 
 def _assert_post_success_ran(calls):
-    assert any(c[0] == "invalidate" for c in calls), (
-        "_invalidate_cache_after_write must run on this success path"
-    )
-    assert any(c[0] == "checkpoint" for c in calls), (
-        "_checkpoint_after_write must run on this success path"
-    )
+    assert any(c[0] == "invalidate" for c in calls), "_invalidate_cache_after_write must run on this success path"
+    assert any(c[0] == "checkpoint" for c in calls), "_checkpoint_after_write must run on this success path"
 
 
 class TestIndentRepairParity:
     def test_indent_repair_success_runs_post_write_success(self, registry):
         calls = _instrument(registry)
-        registry._verify_after_write = _SeqVerify(
-            (False, "f.py:1:1: syntax error"), (True, "")
-        )
+        registry._verify_after_write = _SeqVerify((False, "f.py:1:1: syntax error"), (True, ""))
         registry._auto_repair_indent = lambda orig, ops: "fixed\n"
 
         result = registry.dispatch("edit_file", _edit_file_args())

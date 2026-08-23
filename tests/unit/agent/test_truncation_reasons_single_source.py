@@ -14,6 +14,7 @@ reference the single ``_TRUNCATION_REASONS`` constant instead.
 Source-contract tests (file parsing, not import) — importing repl_impl/asi has
 heavy import-time side effects, mirroring test_insights_compact_reasoning_budget.
 """
+
 from __future__ import annotations
 
 import re
@@ -39,7 +40,9 @@ def _compact_source() -> str:
             start = i
             break
     if start is None:
-        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
+        pytest.fail(
+            "_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression"
+        )
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]
@@ -91,9 +94,7 @@ class TestInsightsCompactTruncationGates:
         src = _compact_source()
         # The retry loop must NOT treat "truncated" as success: break only when
         # finish_reason is outside the shared truncation-reason set.
-        assert "_TRUNCATION_REASONS" in src, (
-            "compact path must reference the shared truncation-reasons constant"
-        )
+        assert "_TRUNCATION_REASONS" in src, "compact path must reference the shared truncation-reasons constant"
         assert "if _ci_finish_reason not in _TRUNCATION_REASONS:" in src, (
             "retry gate must break only on non-truncation finish_reason — "
             "finish_reason=truncated must retry with doubled budget like length"

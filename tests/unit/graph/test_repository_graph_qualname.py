@@ -8,6 +8,7 @@ duplicate entries.  Nested symbols must now carry a fully-qualified qualname
 that encodes their scope path (``deco_a.wrapper``), mirroring Python's own
 ``__qualname__`` nesting semantics.
 """
+
 import shutil
 import tempfile
 from pathlib import Path

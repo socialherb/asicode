@@ -5,6 +5,7 @@ Both systems share ToolRegistry, LLMClient, and AgentConfig but previously
 duplicated context building, tool result wrapping, and schema filtering.
 This module consolidates those common patterns.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,7 @@ import threading
 import time as _walk_time
 import warnings
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn  # NoReturn f821-protected
 
 from external_llm.languages.comment_syntax import CommentSyntax, comment_syntax_for
 from external_llm.languages.models import _LANGUAGE_EXTENSION_GROUPS
@@ -56,21 +57,26 @@ def compile_quiet(source: str, filename: str, mode: str = "exec"):
         warnings.simplefilter("ignore", SyntaxWarning)
         return compile(source, filename, mode)
 
+
 # Fail statuses imported by executor modules (replicated from operation_executor.py)
 # WARNING: OpStatus.FAILED was missing until 2026-05-31 — ops with status="failed"
 # were routed to _handle_op_success_path, miscounting failures as completed ops.
 # Keep this set in sync with ALL terminal failure statuses in OpStatus enum.
-_FAIL_STATUSES: frozenset = frozenset({
-    OpStatus.ERROR, OpStatus.NOT_FOUND, OpStatus.FAILED,
-    OpStatus.VERIFICATION_FAILED, OpStatus.EXECUTION_ERROR, OpStatus.PREFLIGHT_FAILED,
-})
+_FAIL_STATUSES: frozenset = frozenset(
+    {
+        OpStatus.ERROR,
+        OpStatus.NOT_FOUND,
+        OpStatus.FAILED,
+        OpStatus.VERIFICATION_FAILED,
+        OpStatus.EXECUTION_ERROR,
+        OpStatus.PREFLIGHT_FAILED,
+    }
+)
 
 # Auto-sync guard: every OpStatus whose name contains "FAIL" or "ERROR"
 # must be in _FAIL_STATUSES.  This catches omissions when new terminal failure
 # statuses are added to OpStatus.
-assert _FAIL_STATUSES.issuperset(
-    s for s in OpStatus if "FAIL" in s.name or "ERROR" in s.name
-), (
+assert _FAIL_STATUSES.issuperset(s for s in OpStatus if "FAIL" in s.name or "ERROR" in s.name), (
     f"_FAIL_STATUSES missing failure status(es): "
     f"{ {s for s in OpStatus if ('FAIL' in s.name or 'ERROR' in s.name) and s not in _FAIL_STATUSES} }"
 )
@@ -87,24 +93,33 @@ assert _FAIL_STATUSES.issuperset(
 # automatically. tuple (not frozenset) so it is usable directly with
 # str.endswith(); sorted for deterministic ordering.
 
+
 # Guard for the SSOT-derived constants below: if the .ts or .py group
 # is ever removed from _LANGUAGE_EXTENSION_GROUPS, the next(..., None)
 # would silently return None, and "None or f()" would call this. Raise
 # a clear error rather than crashing at module level with StopIteration.
-def _STOP_ITER_FALLBACK(name: str) -> None:
-    raise RuntimeError(
-        f"SSOT invariant broken: no group containing {name} found in "
-        f"_LANGUAGE_EXTENSION_GROUPS"
-    )
+def _stop_iter_fallback(name: str) -> NoReturn:
+    raise RuntimeError(f"SSOT invariant broken: no group containing {name} found in _LANGUAGE_EXTENSION_GROUPS")
 
-_TS_JS_EXTENSIONS: tuple = tuple(sorted(
-    next((g for g in _LANGUAGE_EXTENSION_GROUPS if ".ts" in g), None)
-    or _STOP_ITER_FALLBACK("_TS_JS_EXTENSIONS (.ts)")
-))
-_PY_EXTENSIONS: tuple = tuple(sorted(
-    next((g for g in _LANGUAGE_EXTENSION_GROUPS if ".py" in g), None)
-    or _STOP_ITER_FALLBACK("_PY_EXTENSIONS (.py)")
-))
+
+_TS_JS_EXTENSIONS: tuple = tuple(
+    sorted(
+        next(
+            (g for g in _LANGUAGE_EXTENSION_GROUPS if ".ts" in g),
+            None,
+        )
+        or _stop_iter_fallback("_TS_JS_EXTENSIONS (.ts)")
+    )
+)
+_PY_EXTENSIONS: tuple = tuple(
+    sorted(
+        next(
+            (g for g in _LANGUAGE_EXTENSION_GROUPS if ".py" in g),
+            None,
+        )
+        or _stop_iter_fallback("_PY_EXTENSIONS (.py)")
+    )
+)
 
 # ── Shared repo file walkers ─────────────────────────────────────────────────
 # Consolidated here so symbol_search and call_graph share ONE walk
@@ -139,11 +154,13 @@ def _warn_walk_truncated(root_key: str, cap: int, collected: int) -> None:
         "File walk for %s truncated at cap %d (collected %d); files beyond the "
         "cap are INVISIBLE to find_symbol / find_relevant_files / "
         "analyze_change_impact. Raise the cap if the repo is larger.",
-        root_key, cap, collected,
+        root_key,
+        cap,
+        collected,
     )
 
 
-def _walk_truncated_for(root, cache: dict, max_files: Optional[int] = None) -> bool:
+def _walk_truncated_for(root, cache: dict, max_files: int | None = None) -> bool:
     """True if the walk *this caller* would receive for *root* is incomplete.
 
     Callers (e.g. find_symbol on a miss) consult this to distinguish "symbol
@@ -208,6 +225,7 @@ _TS_WALK_GEN: list[int] = [0]
 # one for a larger cap; see ``_walk_repo_files`` cache-hit logic).
 _PY_WALK_CACHE: dict[str, tuple[float, list, bool]] = {}
 _TS_WALK_CACHE: dict[str, tuple[float, list, bool]] = {}
+
 
 def _walk_repo_files(root, max_files: int, cache: dict, keep, gen_counter: list[int]) -> list:
     """Shared walk engine behind :func:`_walk_py_files` / :func:`_walk_ts_js_files`.
@@ -388,8 +406,8 @@ def make_tool_signature(tool_name: str, tool_args: Any) -> str:
 def _scan_to_line_state(
     lines,
     end_lineno: int,
-    comment_syntax: Optional[CommentSyntax] = None,
-) -> tuple[Optional[str], bool, Optional[str]]:
+    comment_syntax: CommentSyntax | None = None,
+) -> tuple[str | None, bool, str | None]:
     """Scan ``lines[0:end_lineno]`` and return the literal/block-comment state
     ENTERING line ``end_lineno`` — ``(in_str, in_triple, block_close)``.
 
@@ -441,11 +459,11 @@ def _scan_to_line_state(
 
 def _net_bracket_delta(
     text: str,
-    comment_syntax: Optional[CommentSyntax] = None,
+    comment_syntax: CommentSyntax | None = None,
     *,
-    in_str: Optional[str] = None,
+    in_str: str | None = None,
     in_triple: bool = False,
-    block_close: Optional[str] = None,
+    block_close: str | None = None,
 ) -> int:
     """Net bracket delta (``{}``, ``()``, ``[]``) outside string/comment content.
 
@@ -535,7 +553,7 @@ def _net_bracket_delta(
             # literal open, swallowing the code after it. Mirrors the verified
             # escape state machine in :mod:`external_llm.providers`.
             if _in_triple:
-                if not _esc and text[_j:_j + 3] == _in_str * 3:
+                if not _esc and text[_j : _j + 3] == _in_str * 3:
                     _in_str = None
                     _in_triple = False
                     _esc = False
@@ -548,14 +566,14 @@ def _net_bracket_delta(
                 continue
             if _esc:
                 _esc = False
-            elif _ch == '\\':
+            elif _ch == "\\":
                 _esc = True
             _j += 1
             continue
         # Not inside a literal: a quote opens one (incl. triple), else fall
         # through to comment / bracket accounting.
-        if _ch in ('"', "'", '`'):
-            if _j + 2 < _n and text[_j:_j + 3] == _ch * 3:
+        if _ch in ('"', "'", "`"):
+            if _j + 2 < _n and text[_j : _j + 3] == _ch * 3:
                 _in_str = _ch
                 _in_triple = True
                 _esc = False
@@ -571,7 +589,7 @@ def _net_bracket_delta(
         # wins. (Also handles PHP '/* */' alongside its '#' line token.)
         _skipped = False
         for _open, _close in _block_pairs:
-            if text[_j:_j + len(_open)] == _open:
+            if text[_j : _j + len(_open)] == _open:
                 _end = text.find(_close, _j + len(_open))
                 _j = _n if _end < 0 else _end + len(_close)
                 _skipped = True
@@ -581,16 +599,16 @@ def _net_bracket_delta(
         # Line comments — '#' (Python/Ruby/Bash/php), '//' (C-family),
         # '--' (Lua); PHP matches BOTH '#' and '//'.
         for _tok in _line_tokens:
-            if text[_j:_j + len(_tok)] == _tok:
-                _nl = text.find('\n', _j)
+            if text[_j : _j + len(_tok)] == _tok:
+                _nl = text.find("\n", _j)
                 _j = _n if _nl < 0 else _nl
                 _skipped = True
                 break
         if _skipped:
             continue
-        if _ch in '({[':
+        if _ch in "({[":
             _delta += 1
-        elif _ch in ')}]':
+        elif _ch in ")}]":
             _delta -= 1
         _j += 1
     return _delta
@@ -598,11 +616,11 @@ def _net_bracket_delta(
 
 def _scan_line_brackets_delta(
     line: str,
-    in_str: Optional[str],
+    in_str: str | None,
     in_triple: bool,
-    block_close: Optional[str],
-    comment_syntax: Optional[CommentSyntax] = None,
-) -> tuple[int, Optional[str], bool, Optional[str]]:
+    block_close: str | None,
+    comment_syntax: CommentSyntax | None = None,
+) -> tuple[int, str | None, bool, str | None]:
     """Scan ONE line for net bracket delta, carrying string/comment state.
 
     Stateful companion to :func:`_net_bracket_delta` for the multi-line F2
@@ -640,7 +658,7 @@ def _scan_line_brackets_delta(
         _ch = line[_j]
         # 1. Inside a block comment: look ONLY for its close token.
         if block_close is not None:
-            if line[_j:_j + len(block_close)] == block_close:
+            if line[_j : _j + len(block_close)] == block_close:
                 _j += len(block_close)
                 block_close = None
                 continue
@@ -654,7 +672,7 @@ def _scan_line_brackets_delta(
         #    char of the next line), so each line starts unescaped.
         if in_str is not None:
             if in_triple:
-                if not _esc and line[_j:_j + 3] == in_str * 3:
+                if not _esc and line[_j : _j + 3] == in_str * 3:
                     in_str = None
                     in_triple = False
                     _esc = False
@@ -667,13 +685,13 @@ def _scan_line_brackets_delta(
                 continue
             if _esc:
                 _esc = False
-            elif _ch == '\\':
+            elif _ch == "\\":
                 _esc = True
             _j += 1
             continue
         # 3. String/template-literal open.
-        if _ch in ('"', "'", '`'):
-            if _j + 2 < _n and line[_j:_j + 3] == _ch * 3:
+        if _ch in ('"', "'", "`"):
+            if _j + 2 < _n and line[_j : _j + 3] == _ch * 3:
                 in_str = _ch
                 in_triple = True
                 _esc = False
@@ -688,8 +706,8 @@ def _scan_line_brackets_delta(
         #    that shares a prefix with a line token (Lua '--[[' vs '--') wins.
         _skipped = False
         for _open, _close in _block_pairs:
-            if line[_j:_j + len(_open)] == _open:
-                _rest = line[_j + len(_open):]
+            if line[_j : _j + len(_open)] == _open:
+                _rest = line[_j + len(_open) :]
                 _end = _rest.find(_close)
                 if _end >= 0:
                     _j = _j + len(_open) + _end + len(_close)
@@ -702,16 +720,16 @@ def _scan_line_brackets_delta(
             continue
         # 5. Line comment — rest of line ignored.
         for _tok in _line_tokens:
-            if line[_j:_j + len(_tok)] == _tok:
+            if line[_j : _j + len(_tok)] == _tok:
                 _j = _n  # break out of the while loop
                 _skipped = True
                 break
         if _skipped:
             continue
         # 6. Brackets.
-        if _ch in '({[':
+        if _ch in "({[":
             _delta += 1
-        elif _ch in ')}]':
+        elif _ch in ")}]":
             _delta -= 1
         _j += 1
     return _delta, in_str, in_triple, block_close
@@ -722,12 +740,12 @@ def _scan_line_brackets_delta(
 # (input_per_M_usd, output_per_M_usd)
 # Provider-level pricing — fallback when no model-specific match.
 _COST_PER_M: dict[str, tuple[float, float]] = {
-    "google":    (0.10,  0.40),
-    "openai":    (5.00, 15.00),
+    "google": (0.10, 0.40),
+    "openai": (5.00, 15.00),
     "anthropic": (3.00, 15.00),
-    "deepseek":  (0.27,  1.10),
-    "ollama":    (0.00,  0.00),
-    "zai":       (1.40,  4.40),
+    "deepseek": (0.27, 1.10),
+    "ollama": (0.00, 0.00),
+    "zai": (1.40, 4.40),
     # OpenRouter serves many vendors; no single representative price. Default to
     # a low DeepSeek-tier rate since the common OpenRouter workloads (DeepSeek
     # Flash/Pro) are cheap — model-specific entries in _MODEL_COST_PER_M win.
@@ -743,35 +761,35 @@ _COST_PER_M: dict[str, tuple[float, float]] = {
 #   Z.AI:      https://docs.z.ai/guides/overview/pricing
 _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
     # DeepSeek — V4-Pro 75% discount made permanent 2026-05-22
-    "deepseek-v4-flash":    (0.14,  0.28),
-    "deepseek-v4-pro":      (0.435, 0.87),
-    "deepseek-reasoner":    (0.55,  2.19),
-    "deepseek-r1":          (0.55,  2.19),
-    "deepseek-chat":        (0.27,  1.10),
+    "deepseek-v4-flash": (0.14, 0.28),
+    "deepseek-v4-pro": (0.435, 0.87),
+    "deepseek-reasoner": (0.55, 2.19),
+    "deepseek-r1": (0.55, 2.19),
+    "deepseek-chat": (0.27, 1.10),
     # Anthropic
-    "claude-fable-5":       (15.00, 75.00),
-    "claude-mythos-5":      (15.00, 75.00),
-    "claude-4-opus":        (15.00, 75.00),
-    "claude-opus-4-8":      (15.00, 75.00),
-    "claude-opus-4-7":      (15.00, 75.00),
-    "claude-sonnet-5":      (3.00, 15.00),
-    "claude-3-5-sonnet":    (3.00, 15.00),
-    "claude-sonnet-4-6":    (3.00, 15.00),
-    "claude-sonnet-4-5":    (3.00, 15.00),
-    "claude-3-5-haiku":     (0.80,  4.00),
-    "claude-haiku-4-5":     (0.80,  4.00),
-    "claude-3-opus":        (15.00, 75.00),
-    "claude-3-sonnet":      (3.00, 15.00),
-    "claude-3-haiku":       (0.25,  1.25),
+    "claude-fable-5": (15.00, 75.00),
+    "claude-mythos-5": (15.00, 75.00),
+    "claude-4-opus": (15.00, 75.00),
+    "claude-opus-4-8": (15.00, 75.00),
+    "claude-opus-4-7": (15.00, 75.00),
+    "claude-sonnet-5": (3.00, 15.00),
+    "claude-3-5-sonnet": (3.00, 15.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-3-5-haiku": (0.80, 4.00),
+    "claude-haiku-4-5": (0.80, 4.00),
+    "claude-3-opus": (15.00, 75.00),
+    "claude-3-sonnet": (3.00, 15.00),
+    "claude-3-haiku": (0.25, 1.25),
     # OpenAI
-    "gpt-4o-mini":          (0.15,  0.60),
-    "gpt-4o":               (2.50, 10.00),
-    "gpt-4.1":              (2.00,  8.00),
-    "o3-mini":              (1.10,  4.40),
-    "o4-mini":              (1.10,  4.40),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1": (2.00, 8.00),
+    "o3-mini": (1.10, 4.40),
+    "o4-mini": (1.10, 4.40),
     # Google
-    "gemini-2.0-flash":     (0.10,  0.40),
-    "gemini-2.5-pro":       (1.25,  5.00),
+    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-2.5-pro": (1.25, 5.00),
     # OpenRouter / third-party models served via OpenAI-compatible API.
     # OpenRouter slugs use the ``<vendor>/<model>`` form. These are
     # LONGEST-prefix-matched, so a vendor-prefixed slug (e.g.
@@ -779,17 +797,17 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
     # bare ``deepseek-...`` entries above — otherwise the cheaper OpenRouter
     # rate would be shadowed by the native DeepSeek price.
     # Source (verified 2026-06): https://openrouter.ai/models
-    "deepseek/deepseek-v4-flash":  (0.09,  0.18),   # 35% cheaper than native
-    "deepseek/deepseek-v4-pro":    (0.435, 0.87),    # same as native
-    "qwen/qwen3.6":                (0.289, 2.40),
+    "deepseek/deepseek-v4-flash": (0.09, 0.18),  # 35% cheaper than native
+    "deepseek/deepseek-v4-pro": (0.435, 0.87),  # same as native
+    "qwen/qwen3.6": (0.289, 2.40),
     # Z.AI — source: https://docs.z.ai/guides/overview/pricing (verified 2026-06)
-    "glm-5.2":              (1.40,  4.40),
-    "glm-5.1":              (1.40,  4.40),
-    "glm-5-turbo":          (1.20,  4.00),
-    "glm-5":                (1.00,  3.20),
-    "glm-4.7":              (0.60,  2.20),
-    "glm-4.6":              (0.60,  2.20),
-    "glm-4.5":              (0.60,  2.20),
+    "glm-5.2": (1.40, 4.40),
+    "glm-5.1": (1.40, 4.40),
+    "glm-5-turbo": (1.20, 4.00),
+    "glm-5": (1.00, 3.20),
+    "glm-4.7": (0.60, 2.20),
+    "glm-4.6": (0.60, 2.20),
+    "glm-4.5": (0.60, 2.20),
 }
 
 # Fraction of input rate charged for cached tokens (e.g. 0.1 → 10%).
@@ -802,7 +820,7 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
 # provider's rate), per DEEPSEEK_CACHE_READ_MULTIPLIER in their docs.
 _CACHE_DISCOUNT: dict[str, float] = {
     "anthropic": 0.1,
-    "deepseek":  0.26,
+    "deepseek": 0.26,
     "openrouter": 0.1,
 }
 
@@ -817,19 +835,19 @@ _CACHE_DISCOUNT: dict[str, float] = {
 _MODEL_CACHE_RATE: dict[str, float] = {
     # DeepSeek — cache-hit rates per model (source: api-docs.deepseek.com/quick_start/pricing)
     # Stored as $/1M tokens (not a discount fraction) to avoid rounding error.
-    "deepseek-v4-flash":  0.0028,
-    "deepseek-v4-pro":    0.003625,
-    "deepseek-chat":      0.07,
-    "deepseek-reasoner":  0.14,
-    "deepseek-r1":        0.14,
+    "deepseek-v4-flash": 0.0028,
+    "deepseek-v4-pro": 0.003625,
+    "deepseek-chat": 0.07,
+    "deepseek-reasoner": 0.14,
+    "deepseek-r1": 0.14,
     # Z.AI GLM models — source: https://docs.z.ai/guides/overview/pricing
-    "glm-5.2":     0.26,
-    "glm-5.1":     0.26,
+    "glm-5.2": 0.26,
+    "glm-5.1": 0.26,
     "glm-5-turbo": 0.24,
-    "glm-5":       0.20,
-    "glm-4.7":     0.11,
-    "glm-4.6":     0.11,
-    "glm-4.5":     0.11,
+    "glm-5": 0.20,
+    "glm-4.7": 0.11,
+    "glm-4.6": 0.11,
+    "glm-4.5": 0.11,
 }
 
 
@@ -913,9 +931,8 @@ def estimate_cost(provider: str, prompt_tok: int, completion_tok: int, model: st
     in_rate, out_rate = _get_rates(provider, model)
     return (prompt_tok * in_rate + completion_tok * out_rate) / 1_000_000
 
-def _get_cached_input_rate(
-    provider: str, in_rate: float, model: str = "", base_url: str = ""
-) -> Optional[float]:
+
+def _get_cached_input_rate(provider: str, in_rate: float, model: str = "", base_url: str = "") -> float | None:
     """Return the per-M-token rate charged for cached input tokens.
 
     Tries a model-specific cached rate first (prefix-matched against
@@ -991,9 +1008,7 @@ def estimate_cache_adjusted_cost(
     return raw / 1_000_000
 
 
-def total_input_tokens(
-    provider: str, prompt_tok: int, cache_read_tok: int, cache_creation_tok: int = 0
-) -> int:
+def total_input_tokens(provider: str, prompt_tok: int, cache_read_tok: int, cache_creation_tok: int = 0) -> int:
     """Total input context size sent to the model for a single LLM call.
 
     Provider-aware per ``_CACHE_TOKENS_SEPARATE``:
@@ -1037,9 +1052,7 @@ def coerce_token_count(value: Any) -> int:
     return value if isinstance(value, int) else 0
 
 
-def cache_hit_pct(
-    provider: str, prompt_tok: int, cache_read_tok: int, cache_creation_tok: int = 0
-) -> float:
+def cache_hit_pct(provider: str, prompt_tok: int, cache_read_tok: int, cache_creation_tok: int = 0) -> float:
     """Return cache-read tokens as a percentage of total input tokens.
 
     Uses the correct denominator per provider via ``total_input_tokens``:
@@ -1086,12 +1099,15 @@ def cache_cost_summary(
         full_in = prompt_tok
     full_cost = estimate_cost(provider, full_in, completion_tok, model=model)
     actual_cost = estimate_cache_adjusted_cost(
-        provider, prompt_tok, completion_tok,
-        cache_read_tok, cache_creation_tok, model, base_url=base_url,
+        provider,
+        prompt_tok,
+        completion_tok,
+        cache_read_tok,
+        cache_creation_tok,
+        model,
+        base_url=base_url,
     )
-    return full_cost, actual_cost, cache_hit_pct(
-        provider, prompt_tok, cache_read_tok, cache_creation_tok
-    )
+    return full_cost, actual_cost, cache_hit_pct(provider, prompt_tok, cache_read_tok, cache_creation_tok)
 
 
 def extract_files_from_patch(patch_text: str) -> list:
@@ -1107,7 +1123,7 @@ def extract_files_from_patch(patch_text: str) -> list:
             if f and f not in files:
                 files.append(f)
         elif line.startswith("diff --git a/"):
-            _parts = line.split(' b/', 1)
+            _parts = line.split(" b/", 1)
             if len(_parts) >= 2:
                 f = _parts[1].strip()
                 if f and f not in files:
@@ -1120,9 +1136,13 @@ def _discover_repo_files(repo_root: str, max_files: int = 120) -> list:
     result = []
     try:
         for _root, _dirs, _files in os.walk(repo_root):
-            _dirs[:] = sorted(d for d in _dirs
-                              if not d.startswith(".") and d != "__pycache__"
-                              and d not in ("node_modules", "venv", ".venv", "dist", "build", ".git"))
+            _dirs[:] = sorted(
+                d
+                for d in _dirs
+                if not d.startswith(".")
+                and d != "__pycache__"
+                and d not in ("node_modules", "venv", ".venv", "dist", "build", ".git")
+            )
             for _f in sorted(_files):
                 if _f.startswith("."):
                     continue
@@ -1160,10 +1180,7 @@ def load_project_context_md(repo_root: str) -> str:
                 with open(path, "w", encoding="utf-8") as _fw:
                     _fw.write(_content)
             except Exception as e:
-                logger.warning(
-                    "Failed to auto-generate %s: %s (disk full or permission denied)",
-                    path, e
-                )
+                logger.warning("Failed to auto-generate %s: %s (disk full or permission denied)", path, e)
             return _content
         with open(path, encoding="utf-8") as _f:
             content = _f.read().strip()
@@ -1171,16 +1188,17 @@ def load_project_context_md(repo_root: str) -> str:
             return ""
         return (
             "## ═══ PROJECT CONTEXT (.asicode/project.md) ═══\n"
-            "Static architecture reference — use to skip exploratory file reads:\n\n"
-            + content
+            "Static architecture reference — use to skip exploratory file reads:\n\n" + content
         )
     except Exception as e:
         import logging
+
         logging.getLogger(__name__).warning("Could not load project context: %s", e)
         return ""
 
 
 # ── Token estimation (shared by AgentLoop and DesignChatLoop) ──
+
 
 def _cjk_aware_tokens(text: str) -> int:
     """Estimate tokens via ``utf8_bytes // 2`` (conservative upper bound).
@@ -1195,7 +1213,7 @@ def _cjk_aware_tokens(text: str) -> int:
     """
     if not text:
         return 0
-    return len(text.encode('utf-8')) // 2 + 1
+    return len(text.encode("utf-8")) // 2 + 1
 
 
 def estimate_tokens(text: str) -> int:
@@ -1248,12 +1266,12 @@ def _cjk_tokens_from_jsonable(obj: object) -> int:
 def _tok_tool_use(block: dict) -> int:
     """tool_use: ``input`` holds actual tool args (bash, patches, …)."""
     n = 0
-    inp = block.get('input')
+    inp = block.get("input")
     if isinstance(inp, dict):
         n += _cjk_tokens_from_jsonable(inp)
     elif isinstance(inp, str):
         n += _cjk_aware_tokens(inp)
-    tname = block.get('name', '')
+    tname = block.get("name", "")
     if tname:
         n += (len(tname) + 10) // 3 + 1
     return n
@@ -1262,33 +1280,33 @@ def _tok_tool_use(block: dict) -> int:
 def _tok_tool_result(block: dict) -> int:
     """tool_result: ``content`` holds tool output (file reads, bash stdout, …)."""
     n = 0
-    _tr_content = block.get('content')
+    _tr_content = block.get("content")
     if isinstance(_tr_content, str):
         n += _cjk_aware_tokens(_tr_content)
     elif isinstance(_tr_content, list):
         for sub in _tr_content:
             if isinstance(sub, dict):
-                stext = sub.get('text', '')
+                stext = sub.get("text", "")
                 if stext:
                     n += _cjk_aware_tokens(stext)
-                elif sub.get('type') == 'image':
+                elif sub.get("type") == "image":
                     n += _IMAGE_BLOCK_TOKEN_ESTIMATE
     return n
 
 
 def _tok_thinking(block: dict) -> int:
     """thinking (Anthropic/zai-native): reasoning trace sent alongside text."""
-    return _cjk_aware_tokens(block.get('thinking', ''))
+    return _cjk_aware_tokens(block.get("thinking", ""))
 
 
 def _tok_redacted_thinking(block: dict) -> int:
     """redacted_thinking: opaque signature payload, still on the wire."""
-    return _cjk_aware_tokens(block.get('data', ''))
+    return _cjk_aware_tokens(block.get("data", ""))
 
 
 def _tok_function_call(block: dict) -> int:
     """Gemini functionCall part (typed or content-key form)."""
-    fc = block.get('functionCall') or block.get('function_call')
+    fc = block.get("functionCall") or block.get("function_call")
     if isinstance(fc, dict):
         return _cjk_tokens_from_jsonable(fc)
     return 0
@@ -1296,7 +1314,7 @@ def _tok_function_call(block: dict) -> int:
 
 def _tok_function_response(block: dict) -> int:
     """Gemini functionResponse part (typed or content-key form)."""
-    fr = block.get('functionResponse') or block.get('function_response')
+    fr = block.get("functionResponse") or block.get("function_response")
     if isinstance(fr, dict):
         return _cjk_tokens_from_jsonable(fr)
     return 0
@@ -1320,21 +1338,21 @@ def _tok_image(block: dict) -> int:
 # generic text pre-pass in ``_estimate_single_message_tokens`` and intentionally
 # NOT listed here (their payload IS the ``text`` field).
 _WIRE_BLOCK_TOKENIZERS: dict[str, Any] = {
-    'tool_use': _tok_tool_use,
-    'tool_result': _tok_tool_result,
-    'thinking': _tok_thinking,
-    'redacted_thinking': _tok_redacted_thinking,
-    'functionCall': _tok_function_call,
-    'functionResponse': _tok_function_response,
-    'image': _tok_image,
+    "tool_use": _tok_tool_use,
+    "tool_result": _tok_tool_result,
+    "thinking": _tok_thinking,
+    "redacted_thinking": _tok_redacted_thinking,
+    "functionCall": _tok_function_call,
+    "functionResponse": _tok_function_response,
+    "image": _tok_image,
 }
 
 # Gemini native ``parts`` carry the type as a TOP-LEVEL KEY rather than in a
 # ``type`` field, so type dispatch misses them.  These markers re-route such
 # untyped blocks to the matching tokenizer (preserving pre-registry behaviour).
 _WIRE_CONTENT_KEY_MARKERS: dict[str, Any] = {
-    'functionCall': _tok_function_call,
-    'functionResponse': _tok_function_response,
+    "functionCall": _tok_function_call,
+    "functionResponse": _tok_function_response,
 }
 
 # ── Intra-type drift guard ───────────────────────────────────────────────────
@@ -1353,25 +1371,30 @@ _WIRE_CONTENT_KEY_MARKERS: dict[str, Any] = {
 # counted wholesale. Drift then fails toward OVER-counting, matching the policy
 # the rest of this subsystem already follows.
 _WIRE_BLOCK_CONSUMED_KEYS: dict[str, frozenset[str]] = {
-    'tool_use': frozenset({'input', 'name'}),
-    'tool_result': frozenset({'content'}),
-    'thinking': frozenset({'thinking'}),
-    'redacted_thinking': frozenset({'data'}),
-    'functionCall': frozenset({'functionCall', 'function_call'}),
-    'functionResponse': frozenset({'functionResponse', 'function_response'}),
+    "tool_use": frozenset({"input", "name"}),
+    "tool_result": frozenset({"content"}),
+    "thinking": frozenset({"thinking"}),
+    "redacted_thinking": frozenset({"data"}),
+    "functionCall": frozenset({"functionCall", "function_call"}),
+    "functionResponse": frozenset({"functionResponse", "function_response"}),
     # image is a flat provider-cap estimate that deliberately ignores the
     # base64 payload (see _IMAGE_BLOCK_TOKEN_ESTIMATE) — counting `source`
     # wholesale would reintroduce the ~130k-token screenshot it exists to avoid.
-    'image': frozenset({'source', 'data'}),
+    "image": frozenset({"source", "data"}),
 }
 
 # Keys that are pure wire structure. They ride along on every block and carry no
 # payload, so counting them would inflate every correct-shape estimate without
 # protecting against anything. `text` is here because the generic text pre-pass
 # in _estimate_single_message_tokens already counted it for EVERY block type.
-_WIRE_STRUCTURAL_KEYS: frozenset[str] = frozenset({
-    'type', 'index', 'cache_control', 'text',
-})
+_WIRE_STRUCTURAL_KEYS: frozenset[str] = frozenset(
+    {
+        "type",
+        "index",
+        "cache_control",
+        "text",
+    }
+)
 
 # Keys that a tokenizer does not read but that legitimately ride on the block.
 # They are COUNTED (they are on the wire and billed) but never WARNED about:
@@ -1379,14 +1402,14 @@ _WIRE_STRUCTURAL_KEYS: frozenset[str] = frozenset({
 # Warning on them would make the drift counter fire on every single request and
 # turn a signal that exists to catch a real regression into constant noise.
 _WIRE_EXPECTED_EXTRA_KEYS: dict[str, frozenset[str]] = {
-    'tool_use': frozenset({'id'}),
-    'tool_result': frozenset({'tool_use_id', 'is_error'}),
+    "tool_use": frozenset({"id"}),
+    "tool_result": frozenset({"tool_use_id", "is_error"}),
     # Anthropic sends `signature` on every extended-thinking block and this
     # client mirrors it back unchanged, so it is billed on every such turn.
     # Counting it is the leak this guard was written for; it is expected, so it
     # must not also raise a drift warning forever.
-    'thinking': frozenset({'signature'}),
-    'redacted_thinking': frozenset({'signature'}),
+    "thinking": frozenset({"signature"}),
+    "redacted_thinking": frozenset({"signature"}),
 }
 
 
@@ -1403,8 +1426,9 @@ def _count_unconsumed_payload(block: dict, btype: str) -> tuple[int, tuple[str, 
     if consumed is None:
         return 0, ()
     residual = {
-        k: v for k, v in block.items()
-        if k not in consumed and k not in _WIRE_STRUCTURAL_KEYS and v not in (None, '', [], {})
+        k: v
+        for k, v in block.items()
+        if k not in consumed and k not in _WIRE_STRUCTURAL_KEYS and v not in (None, "", [], {})
     }
     if not residual:
         return 0, ()
@@ -1412,10 +1436,11 @@ def _count_unconsumed_payload(block: dict, btype: str) -> tuple[int, tuple[str, 
     drift = tuple(sorted(k for k in residual if k not in expected))
     return _cjk_tokens_from_jsonable(residual), drift
 
+
 # The canonical set of wire block types this subsystem must recognise.  The
 # contract test asserts the registry covers exactly this set.  When a provider
 # adds a new type, add its fixture here AND register a tokenizer.
-CANONICAL_WIRE_BLOCK_TYPES: frozenset[str] = frozenset(_WIRE_BLOCK_TOKENIZERS) | {'text'}
+CANONICAL_WIRE_BLOCK_TYPES: frozenset[str] = frozenset(_WIRE_BLOCK_TOKENIZERS) | {"text"}
 
 # Module-level counters for unknown wire block types (type → occurrences).
 # Replaces the original one-time-per-type set so the stats are observable
@@ -1486,7 +1511,9 @@ def _warn_block_key_drift(btype: str, key: str) -> None:
             "read — counted wholesale (fail-safe). Teach the %s tokenizer to read it, "
             "or add it to _WIRE_EXPECTED_EXTRA_KEYS in "
             "external_llm/agent/_shared_utils.py if it is expected.",
-            btype, key, btype,
+            btype,
+            key,
+            btype,
         )
 
 
@@ -1531,11 +1558,7 @@ def _images_ocr_len(images: object) -> int:
     """
     if not isinstance(images, list):
         return 0
-    return sum(
-        len(img.get("ocr_text") or "")
-        for img in images
-        if isinstance(img, dict)
-    )
+    return sum(len(img.get("ocr_text") or "") for img in images if isinstance(img, dict))
 
 
 def _msg_token_fingerprint(m: object) -> tuple:
@@ -1556,12 +1579,12 @@ def _msg_token_fingerprint(m: object) -> tuple:
     pre-OCR flat estimate stays cached and the message is under-counted, which
     is the context-overflow failure this subsystem exists to prevent.
     """
-    rc = getattr(m, 'raw_content', None)
-    tc = getattr(m, 'tool_calls', None)
-    images = getattr(m, 'images', None)
-    reasoning = getattr(m, 'reasoning_content', None)
+    rc = getattr(m, "raw_content", None)
+    tc = getattr(m, "tool_calls", None)
+    images = getattr(m, "images", None)
+    reasoning = getattr(m, "reasoning_content", None)
     return (
-        len(getattr(m, 'content', '') or ''),
+        len(getattr(m, "content", "") or ""),
         len(rc) if isinstance(rc, (list, str)) else 0,
         len(tc) if isinstance(tc, list) else 0,
         len(images) if isinstance(images, list) else 0,
@@ -1570,7 +1593,7 @@ def _msg_token_fingerprint(m: object) -> tuple:
     )
 
 
-def _msg_field(m: object, field: str, default: Any = '') -> Any:
+def _msg_field(m: object, field: str, default: Any = "") -> Any:
     """Read *field* from an LLMMessage (attribute) or plain dict (key).
 
     Dict messages (Ollama wire format) use ``m[key]`` access; LLMMessage
@@ -1604,9 +1627,9 @@ def _estimate_single_message_tokens(m: object) -> int:
     ``dict`` messages (always recompute — dict has no writable ``__dict__``).
     """
     # Cache check — only for mutable objects with __dict__ (not plain dicts).
-    _can_cache = not isinstance(m, dict) and hasattr(m, '__dict__')
+    _can_cache = not isinstance(m, dict) and hasattr(m, "__dict__")
     if _can_cache:
-        cached = getattr(m, '_msg_token_estimate', None)
+        cached = getattr(m, "_msg_token_estimate", None)
         if cached is not None and getattr(m, "_msg_token_fp", None) == _msg_token_fingerprint(m):
             # Fingerprint guard: recompute if any counted field's length changed
             # since the estimate was cached.  Self-heals in-place mutation that
@@ -1620,8 +1643,8 @@ def _estimate_single_message_tokens(m: object) -> int:
     # authoritative wire form; content is a derived mirror. Counting both would
     # double-count assistant text (anthropic/zai/native assistant messages include
     # the same text in both content and raw_content text blocks).
-    content = _msg_field(m, 'content', '') or ''
-    rc = _msg_field(m, 'raw_content', None)
+    content = _msg_field(m, "content", "") or ""
+    rc = _msg_field(m, "raw_content", None)
     # Type-guard: raw_content is typed Optional[list[dict]]; a non-list truthy
     # value (type violation, stray JSON string) must NOT be treated as
     # "content is covered" — that would under-count the message to ~0 tokens,
@@ -1630,14 +1653,14 @@ def _estimate_single_message_tokens(m: object) -> int:
         mt += _cjk_aware_tokens(content)
     # Reasoning content (DeepSeek reasoner) — separate field sent on wire alongside content.
     # NOT covered by raw_content; this is a parallel attribute that always needs counting.
-    reasoning_attr = _msg_field(m, 'reasoning_content', None)
+    reasoning_attr = _msg_field(m, "reasoning_content", None)
     if reasoning_attr:
         mt += _cjk_aware_tokens(reasoning_attr if isinstance(reasoning_attr, str) else str(reasoning_attr))
     # Tool calls — args are routed through the canonical byte-based estimator so
     # CJK-heavy payloads (Korean edit content, etc.) are not under-counted.  The
     # tool/function *name* is an ASCII identifier; the +10 covers the JSON
     # envelope and //3 is an adequate over-count for pure-ASCII names.
-    tc = _msg_field(m, 'tool_calls', None)
+    tc = _msg_field(m, "tool_calls", None)
     if tc:
         try:
             for t in tc:
@@ -1663,10 +1686,10 @@ def _estimate_single_message_tokens(m: object) -> int:
                 continue
             # Generic text pre-pass: counts plain text blocks and any inline
             # ``text`` field regardless of block type (harmless when absent).
-            text = block.get('text', '')
+            text = block.get("text", "")
             if text:
                 mt += _cjk_aware_tokens(text)
-            btype = block.get('type')
+            btype = block.get("type")
             if btype is not None and not isinstance(btype, str):
                 # Malformed block (client-supplied raw_content can carry a
                 # non-string type).  Normalize to str so dict lookup and the
@@ -1687,21 +1710,19 @@ def _estimate_single_message_tokens(m: object) -> int:
                 # on the block is still on the wire and still billed. Counting
                 # the residual is what keeps intra-type drift from going silent
                 # (see _WIRE_BLOCK_CONSUMED_KEYS).
-                _extra, _drift_keys = _count_unconsumed_payload(block, btype)
+                _extra, _drift_keys = _count_unconsumed_payload(block, btype or "")
                 if _extra:
                     mt += _extra
                     for _k in _drift_keys:
-                        _warn_block_key_drift(btype, _k)
-            elif btype in (None, '', 'text'):
+                        _warn_block_key_drift(btype or "", _k)
+            elif btype in (None, "", "text"):
                 # 'text' blocks and blocks without a type whose payload is covered
                 # by the generic text pre-pass above — these are safe to skip.
                 # BUT: Gemini untyped parts (inlineData, fileData, executableCode,
                 # etc.) that have NO 'text' field and matched no content-key marker
                 # are NOT covered by any pre-pass — they reach here as btype=None
                 # and silently produce 0 tokens. Count them wholesale as fail-safe.
-                if btype is None and not text and not any(
-                    _m in block for _m in _WIRE_CONTENT_KEY_MARKERS
-                ):
+                if btype is None and not text and not any(_m in block for _m in _WIRE_CONTENT_KEY_MARKERS):
                     mt += _count_block_wholesale(block)
                     _warn_unknown_block_type("<untyped-gemini-part>")
             else:
@@ -1716,7 +1737,7 @@ def _estimate_single_message_tokens(m: object) -> int:
     # _images_to_text on first call), use its token-equivalent length
     # as a floor so that text-only model paths never under-count
     # Korean-heavy OCR output (which can be ~2x the flat cap).
-    images = _msg_field(m, 'images', None)
+    images = _msg_field(m, "images", None)
     if images:
         for img in images:
             ocr_len = len(img.get("ocr_text") or "") if isinstance(img, dict) else 0
@@ -1726,8 +1747,8 @@ def _estimate_single_message_tokens(m: object) -> int:
     # objects).  Store a length fingerprint alongside so a later in-place
     # mutation is detected by the cache probe above (self-healing guard).
     if _can_cache:
-        m._msg_token_estimate = mt
-        m._msg_token_fp = _msg_token_fingerprint(m)
+        m._msg_token_estimate = mt  # type: ignore[attr-defined]  # cacheable objects (non-dict, has __dict__) accept dynamic attrs
+        m._msg_token_fp = _msg_token_fingerprint(m)  # type: ignore[attr-defined]  # cacheable objects (non-dict, has __dict__) accept dynamic attrs
     return mt
 
 
@@ -1777,7 +1798,7 @@ def _tool_schema_fingerprint(tool_schemas: list) -> tuple[int, tuple[str, ...]]:
     return len(tool_schemas), tuple(names)
 
 
-def estimate_tokens_from_tool_schemas(tool_schemas: Optional[list]) -> int:
+def estimate_tokens_from_tool_schemas(tool_schemas: list | None) -> int:
     """Estimate tokens consumed by serialised tool/function schemas.
 
     OpenAI-compatible and Ollama chat APIs serialise the ``tools`` array (name,
@@ -1819,9 +1840,9 @@ MIN_USABLE_MESSAGE_BUDGET: int = 2048
 _IMPOSSIBLE_BUDGET_WARNED: set = set()
 
 
-def context_message_cap(ctx_limit: int, safety_margin: int,
-                        tool_schemas: Optional[list] = None,
-                        tool_tokens: Optional[int] = None) -> int:
+def context_message_cap(
+    ctx_limit: int, safety_margin: int, tool_schemas: list | None = None, tool_tokens: int | None = None
+) -> int:
     """Max prompt-token budget for chat messages, reserving room for output.
 
     Subtracts (a) an output reserve so the prompt never fills the whole window —
@@ -1855,7 +1876,10 @@ def context_message_cap(ctx_limit: int, safety_margin: int,
                 "window=%d, output reserve=%d, tool schemas=%d → only %d tokens "
                 "left for messages (below the %d minimum). Reduce the toolset "
                 "or use a larger context window.",
-                ctx_limit, _output_reserve, _tool_tokens, _raw,
+                ctx_limit,
+                _output_reserve,
+                _tool_tokens,
+                _raw,
                 MIN_USABLE_MESSAGE_BUDGET,
             )
     return max(512, _raw)

@@ -15,6 +15,7 @@ silently reshuffle them — so these tests transcribe the PRE-consolidation
 formulas VERBATIM (from commit 0da2c67e) and demand EXACT ``==`` float
 equality, never ``isclose``.
 """
+
 from __future__ import annotations
 
 import ast
@@ -59,10 +60,7 @@ def _old_reference_score(query_tokens, doc_token_counts, doc_len, df, n_docs, av
 
 def _old_insights_idf_map(qset, df, n_docs):
     """insights_manager idf_map comprehension @ 0da2c67e."""
-    return {
-        qt: math.log((n_docs - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5) + 1.0)
-        for qt in qset
-    }
+    return {qt: math.log((n_docs - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5) + 1.0) for qt in qset}
 
 
 def _old_insights_tf_norm(doc_len, avgdl):
@@ -80,10 +78,7 @@ def _old_twin_scores(query_tokens, tokenized_docs):
     _df: dict[str, int] = {}
     for qt in query_tokens:
         _df[qt] = sum(1 for tc in _doc_tc if qt in tc)
-    return [
-        _old_reference_score(query_tokens, _doc_tc[i], _doc_lens[i], _df, _n, _avgdl)
-        for i in range(_n)
-    ]
+    return [_old_reference_score(query_tokens, _doc_tc[i], _doc_lens[i], _df, _n, _avgdl) for i in range(_n)]
 
 
 # ── Randomised bit-identity ──────────────────────────────────────────────────
@@ -139,8 +134,8 @@ def test_fast_path_bit_identical_to_reference():
 
 def test_zero_guards_preserved():
     tc = {"a": 3}
-    assert bm25_score(["a"], tc, 0, {"a": 1}, 5, 4.0) == 0.0   # doc_len == 0
-    assert bm25_score(["a"], tc, 7, {"a": 1}, 5, 0.0) == 0.0   # avgdl == 0
+    assert bm25_score(["a"], tc, 0, {"a": 1}, 5, 4.0) == 0.0  # doc_len == 0
+    assert bm25_score(["a"], tc, 7, {"a": 1}, 5, 0.0) == 0.0  # avgdl == 0
     assert bm25_score_pairs([("a", 1.2)], tc, 0, 0.0) == 0.0
 
 
@@ -149,9 +144,7 @@ def test_duplicate_query_token_contributes_per_occurrence():
     # because the old loop iterated the raw (un-deduped) token list.
     tc = {"a": 2, "b": 1}
     df = {"a": 3, "b": 5}
-    assert bm25_score(["a", "a", "b"], tc, 6, df, 10, 4.0) == _old_reference_score(
-        ["a", "a", "b"], tc, 6, df, 10, 4.0
-    )
+    assert bm25_score(["a", "a", "b"], tc, 6, df, 10, 4.0) == _old_reference_score(["a", "a", "b"], tc, 6, df, 10, 4.0)
     doubled = bm25_score(["a", "a", "b"], tc, 6, df, 10, 4.0)
     single = bm25_score(["a", "b"], tc, 6, df, 10, 4.0)
     assert doubled > single  # the duplicate visibly adds weight

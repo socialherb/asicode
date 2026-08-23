@@ -17,12 +17,12 @@ Scope intentionally limited to `typing` module only:
 Cross-module project imports (from external_llm.agent.foo import Bar) are
 handled by the existing _strip_hallucinated_imports + F821 repair chain.
 """
+
 from __future__ import annotations
 
 import ast
 import logging
 import os
-from typing import Optional
 
 from external_llm.common.atomic_io import atomic_write_text
 from external_llm.languages import LanguageId
@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 # ── F821-protected imports cache ──────────────────────────────────────
 # When F821 auto-repair inserts a typing import (e.g. `from typing import
 _f821_protected: dict[str, set[str]] = {}
-
-
 
 
 def _collect_f821_protected_from_source(source: str) -> set[str]:
@@ -49,21 +47,21 @@ def _collect_f821_protected_from_source(source: str) -> set[str]:
     _protected: set[str] = set()
     for _line in source.splitlines():
         _line_stripped = _line.strip()
-        if not _line_stripped.startswith('from typing import '):
+        if not _line_stripped.startswith("from typing import "):
             continue
         # Check if the line has a f821-protected marker in a comment
-        _comment_start = _line_stripped.find('#')
+        _comment_start = _line_stripped.find("#")
         if _comment_start == -1:
             continue
-        _comment = _line_stripped[_comment_start + 1:].strip()
-        if not (_comment == 'f821-protected' or _comment.startswith('f821-protected:')):
+        _comment = _line_stripped[_comment_start + 1 :].strip()
+        if not (_comment == "f821-protected" or _comment.startswith("f821-protected:")):
             continue
         # Extract names from the import statement (before the comment)
         _import_part = _line_stripped[:_comment_start].strip()
-        if not _import_part.startswith('from typing import '):
+        if not _import_part.startswith("from typing import "):
             continue  # pragma: no cover — L52 already guaranteed this prefix; defensive
-        _rest = _import_part[len('from typing import '):]
-        for _name in _rest.split(','):
+        _rest = _import_part[len("from typing import ") :]
+        for _name in _rest.split(","):
             _name = _name.strip()
             if _name:
                 _protected.add(_name)
@@ -86,7 +84,7 @@ def mark_f821_protected(file_path: str, name: str) -> None:
 
     # ── Persist to file as comment marker (survives process restart) ──
     try:
-        with open(_abs, encoding='utf-8') as _fh:
+        with open(_abs, encoding="utf-8") as _fh:
             _lines = _fh.readlines()
     except OSError:
         logger.debug("f821-protect marker read failed: %s", _abs, exc_info=True)
@@ -94,10 +92,10 @@ def mark_f821_protected(file_path: str, name: str) -> None:
 
     _modified = False
     for _i, _line in enumerate(_lines):
-        if _line.strip().startswith('from typing import ') and name in _line:
-            if '# f821-protected' not in _line:
-                _stripped = _line.rstrip('\n').rstrip()
-                _lines[_i] = _stripped + '  # f821-protected\n'
+        if _line.strip().startswith("from typing import ") and name in _line:
+            if "# f821-protected" not in _line:
+                _stripped = _line.rstrip("\n").rstrip()
+                _lines[_i] = _stripped + "  # f821-protected\n"
                 _modified = True
             break
 
@@ -108,7 +106,8 @@ def mark_f821_protected(file_path: str, name: str) -> None:
             logger.warning(
                 "mark_f821_protected: failed to persist marker to %s: %s "
                 "(in-memory cache updated; marker may not survive restart)",
-                file_path, _exc,
+                file_path,
+                _exc,
             )
 
 
@@ -118,15 +117,43 @@ def mark_f821_protected(file_path: str, name: str) -> None:
 
 _TYPING_SYMBOLS: set[str] = {
     # Generics
-    "Any", "Callable", "ClassVar", "Dict", "Final", "FrozenSet",
-    "Generator", "Generic", "Iterable", "Iterator", "List", "Literal",
-    "Mapping", "MutableMapping", "MutableSequence", "Optional", "Protocol",
-    "Sequence", "Set", "Tuple", "Type", "TypeVar", "Union",
+    "Any",
+    "Callable",
+    "ClassVar",
+    "Dict",
+    "Final",
+    "FrozenSet",
+    "Generator",
+    "Generic",
+    "Iterable",
+    "Iterator",
+    "List",
+    "Literal",
+    "Mapping",
+    "MutableMapping",
+    "MutableSequence",
+    "Optional",
+    "Protocol",
+    "Sequence",
+    "Set",
+    "Tuple",
+    "Type",
+    "TypeVar",
+    "Union",
     # Utilities
-    "Annotated", "TypedDict", "NamedTuple", "cast", "overload",
-    "runtime_checkable", "TYPE_CHECKING", "get_type_hints",
+    "Annotated",
+    "TypedDict",
+    "NamedTuple",
+    "cast",
+    "overload",
+    "runtime_checkable",
+    "TYPE_CHECKING",
+    "get_type_hints",
     # Python 3.10+
-    "ParamSpec", "Concatenate", "TypeAlias", "Never",
+    "ParamSpec",
+    "Concatenate",
+    "TypeAlias",
+    "Never",
 }
 
 
@@ -158,11 +185,7 @@ def collect_typing_usage(source: str) -> set[str]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # Argument annotations
-            all_args = (
-                node.args.args
-                + node.args.posonlyargs
-                + node.args.kwonlyargs
-            )
+            all_args = node.args.args + node.args.posonlyargs + node.args.kwonlyargs
             for arg in all_args:
                 if arg.annotation and isinstance(arg.annotation, ast.Constant):
                     annotation_node_ids.add(id(arg.annotation))
@@ -208,8 +231,8 @@ def collect_typing_usage(source: str) -> set[str]:
                 sv = node.value
                 idx = sv.find(sym)
                 while idx != -1:
-                    before = idx == 0 or not (sv[idx-1].isalnum() or sv[idx-1] == '_')
-                    after = idx + len(sym) >= len(sv) or not (sv[idx+len(sym)].isalnum() or sv[idx+len(sym)] == '_')
+                    before = idx == 0 or not (sv[idx - 1].isalnum() or sv[idx - 1] == "_")
+                    after = idx + len(sym) >= len(sv) or not (sv[idx + len(sym)].isalnum() or sv[idx + len(sym)] == "_")
                     if before and after:
                         used.add(sym)
                         break
@@ -243,10 +266,14 @@ def normalize_typing_imports(file_path: str) -> bool:
         return False
 
     # ── Step 1: Find existing 'from typing import ...' nodes ─────────────
-    typing_nodes: list = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-            and node.module == "typing"
-            and node.names  # not "from typing import *"
-            and not any(a.name == "*" for a in node.names)]
+    typing_nodes: list = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "typing"
+        and node.names  # not "from typing import *"
+        and not any(a.name == "*" for a in node.names)
+    ]
 
     existing_names: set[str] = set()
     for node in typing_nodes:
@@ -289,7 +316,8 @@ def normalize_typing_imports(file_path: str) -> bool:
     logger.info(
         "normalize_typing_imports %s: existing=%s needed=%s",
         file_path,
-        sorted(existing_names), sorted(needed),
+        sorted(existing_names),
+        sorted(needed),
     )
 
     # ── Step 4: Rewrite source ───────────────────────────────────────────
@@ -299,7 +327,7 @@ def normalize_typing_imports(file_path: str) -> bool:
     # A node may span multiple lines for parenthesized imports.
     typing_line_indices: set[int] = set()
     for node in typing_nodes:
-        start = node.lineno - 1          # 0-indexed
+        start = node.lineno - 1  # 0-indexed
         end = getattr(node, "end_lineno", node.lineno) - 1
         for i in range(start, end + 1):
             typing_line_indices.add(i)
@@ -308,16 +336,14 @@ def normalize_typing_imports(file_path: str) -> bool:
     # Preserve ``# f821-protected`` marker when any protected name survives.
     _has_protected = bool(_collect_f821_protected_from_source(source) & needed)
     new_import_line = (
-        "from typing import " + ", ".join(sorted(needed))
-        + ("  # f821-protected" if _has_protected else "") + "\n"
-        if needed else ""
+        "from typing import " + ", ".join(sorted(needed)) + ("  # f821-protected" if _has_protected else "") + "\n"
+        if needed
+        else ""
     )
 
     # Replace: insert new line at first typing import position,
     # then blank out the rest.
-    first_idx: Optional[int] = (
-        min(typing_line_indices) if typing_line_indices else None
-    )
+    first_idx: int | None = min(typing_line_indices) if typing_line_indices else None
 
     new_lines = list(lines)
     replaced = False
@@ -328,7 +354,7 @@ def normalize_typing_imports(file_path: str) -> bool:
                 new_lines[idx] = new_import_line
                 replaced = True
             else:
-                new_lines[idx] = ""   # blank out extra/old lines
+                new_lines[idx] = ""  # blank out extra/old lines
 
     # No existing import but symbols needed → find first non-docstring import
     # line and insert before it.
@@ -344,7 +370,8 @@ def normalize_typing_imports(file_path: str) -> bool:
     except SyntaxError as exc:
         logger.warning(
             "normalize_typing_imports: parse error after rewrite of %s: %s — skipping",
-            file_path, exc,
+            file_path,
+            exc,
         )
         return False
 
@@ -355,7 +382,9 @@ def normalize_typing_imports(file_path: str) -> bool:
         atomic_write_text(file_path, new_source)
         logger.info(
             "normalize_typing_imports: updated %s (%s → %s)",
-            file_path, sorted(existing_names), sorted(needed),
+            file_path,
+            sorted(existing_names),
+            sorted(needed),
         )
     except OSError as exc:
         logger.warning("normalize_typing_imports: write failed for %s: %s", file_path, exc)

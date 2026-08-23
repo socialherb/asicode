@@ -8,6 +8,7 @@ the RAG file cap returns an answer identical to one against a small,
 fully-indexed repo — actively misleading the agent into concluding the target
 does not exist.
 """
+
 from __future__ import annotations
 
 from external_llm.agent.rag_searcher import SearchResult
@@ -25,8 +26,8 @@ def test_empty_results_with_truncated_index_advises_fallback(tool_registry, monk
     # "No relevant files found" alone reads as 'searched, absent'. The hint must
     # nudge toward a full-repo fallback the cap does not bind.
     low = result.content.lower()
-    assert ("grep" in low or "glob" in low), result.content
-    assert ("incomplete" in low or "cap" in low), result.content
+    assert "grep" in low or "glob" in low, result.content
+    assert "incomplete" in low or "cap" in low, result.content
 
 
 def test_empty_results_without_truncation_is_a_clean_negative(tool_registry, monkeypatch):
@@ -56,7 +57,7 @@ def test_nonempty_results_with_truncation_appends_a_note(tool_registry, monkeypa
     assert (result.metadata or {}).get("index_truncated") is True
     assert "src/widget.py" in result.content
     low = result.content.lower()
-    assert ("incomplete" in low or "cap" in low), result.content
+    assert "incomplete" in low or "cap" in low, result.content
 
 
 def test_nonempty_results_without_truncation_has_no_note(tool_registry, monkeypatch):

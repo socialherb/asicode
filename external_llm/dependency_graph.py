@@ -8,12 +8,12 @@ Tracks:
 - Module dependencies
 - Call chains
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from .code_analyzer import CodeAnalysis, CodeAnalyzer
 
@@ -21,6 +21,7 @@ from .code_analyzer import CodeAnalysis, CodeAnalyzer
 @dataclass
 class CallRelation:
     """Represents a function call relationship"""
+
     caller: str  # function/method name
     callee: str  # called function/method
     file_path: str
@@ -111,10 +112,10 @@ class DependencyGraphBuilder:
 
         # Recurse into imported files
         for imported_file in imported_files:
-            if imported_file.exists() and imported_file.suffix == '.py':
+            if imported_file.exists() and imported_file.suffix == ".py":
                 self._build_recursive(imported_file, graph, visited, depth + 1, max_depth)
 
-    def _get_analysis(self, file_path: Path) -> Optional[CodeAnalysis]:
+    def _get_analysis(self, file_path: Path) -> CodeAnalysis | None:
         """Get or cache code analysis.
 
         Returns a SHARED cached object: every caller for a given file_path
@@ -127,7 +128,10 @@ class DependencyGraphBuilder:
         enforced by convention (all current callers iterate only).
         """
         if file_path not in self._analysis_cache:
-            self._analysis_cache[file_path] = self.analyzer.analyze_file(file_path)
+            analysis = self.analyzer.analyze_file(file_path)
+            if analysis is None:
+                return None  # unreadable / unparseable — do not poison the cache
+            self._analysis_cache[file_path] = analysis
         return self._analysis_cache[file_path]
 
     def _track_internal_calls(self, file_path: Path, analysis: CodeAnalysis, graph: DependencyGraph):
@@ -164,12 +168,7 @@ class DependencyGraphBuilder:
             if cls.bases:
                 graph.inheritance[cls.name] = cls.bases
 
-    def _track_imports(
-        self,
-        file_path: Path,
-        analysis: CodeAnalysis,
-        graph: DependencyGraph
-    ) -> list[Path]:
+    def _track_imports(self, file_path: Path, analysis: CodeAnalysis, graph: DependencyGraph) -> list[Path]:
         """Track imports and return imported file paths"""
         file_str = str(file_path.relative_to(self.repo_root))
         imported_files = []
@@ -189,7 +188,7 @@ class DependencyGraphBuilder:
 
         return imported_files
 
-    def _resolve_import(self, current_file: Path, module: str) -> Optional[Path]:
+    def _resolve_import(self, current_file: Path, module: str) -> Path | None:
         """
         Resolve import to actual file path
 
@@ -201,12 +200,12 @@ class DependencyGraphBuilder:
             return None
 
         # Relative import
-        if module.startswith('.'):
+        if module.startswith("."):
             base_dir = current_file.parent
-            parts = module.lstrip('.').split('.')
+            parts = module.lstrip(".").split(".")
 
             # Count leading dots
-            num_dots = len(module) - len(module.lstrip('.'))
+            num_dots = len(module) - len(module.lstrip("."))
             for _ in range(num_dots - 1):
                 base_dir = base_dir.parent
 
@@ -229,19 +228,19 @@ class DependencyGraphBuilder:
 
         # Absolute import (within project)
         else:
-            parts = module.split('.')
+            parts = module.split(".")
 
             # Try from repo root
             for i in range(len(parts), 0, -1):
                 path_parts = parts[:i]
 
                 # Try as file
-                candidate = self.repo_root / '/'.join(path_parts[:-1]) / f"{path_parts[-1]}.py"
+                candidate = self.repo_root / "/".join(path_parts[:-1]) / f"{path_parts[-1]}.py"
                 if candidate.exists():
                     return candidate
 
                 # Try as package
-                candidate = self.repo_root / '/'.join(path_parts) / "__init__.py"
+                candidate = self.repo_root / "/".join(path_parts) / "__init__.py"
                 if candidate.exists():
                     return candidate
 
@@ -277,4 +276,4 @@ class DependencyGraphBuilder:
                 lines.append("Called by:")
                 lines.extend(f"  ├─ {caller}" for caller in callers)
 
-        return '\n'.join(lines) if lines else "No call information available"
+        return "\n".join(lines) if lines else "No call information available"

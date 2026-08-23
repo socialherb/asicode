@@ -9,6 +9,7 @@ Usage:
     python -m external_llm.repl.collaborate.cli mcp list
     python -m external_llm.repl.collaborate.cli mcp start
 """
+
 from __future__ import annotations
 
 import argparse
@@ -36,7 +37,8 @@ Examples:
         """,
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose logging",
     )
@@ -53,18 +55,21 @@ Examples:
         help="Run a collaboration session with Claude Code Agent",
     )
     collab_parser.add_argument(
-        "--task", "-t",
+        "--task",
+        "-t",
         type=str,
         required=True,
         help="Task description for Claude Code Agent",
     )
     collab_parser.add_argument(
-        "--context", "-c",
+        "--context",
+        "-c",
         type=str,
         help="Optional additional context",
     )
     collab_parser.add_argument(
-        "--model", "-m",
+        "--model",
+        "-m",
         type=str,
         help=(
             "Claude Code model to use. Default: claude-sonnet-4-20250514 (bundled CLI default). "
@@ -84,12 +89,14 @@ Examples:
         help="Skip asicode preprocessing digest",
     )
     collab_parser.add_argument(
-        "--file", "-f",
+        "--file",
+        "-f",
         type=str,
         help="Output file for session logs",
     )
     collab_parser.add_argument(
-        "--quiet", "-q",
+        "--quiet",
+        "-q",
         action="store_true",
         help="Suppress streaming display (only show verdict)",
     )
@@ -133,7 +140,8 @@ Examples:
     )
 
     mcp_parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose logging",
     )

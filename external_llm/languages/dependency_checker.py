@@ -28,7 +28,6 @@ import tempfile
 import textwrap
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Optional
 
 from ..common.repo_files import git_list_repo_files
 from .models import LanguageId
@@ -65,9 +64,9 @@ class _Tool:
     #: Human-readable label.
     label: str
     #: ``None`` means "cannot auto-install, instructions only".
-    npm_package: Optional[str] = None
+    npm_package: str | None = None
     #: Fallback pip package (pyright only).
-    pip_package: Optional[str] = None
+    pip_package: str | None = None
     #: Install command shown to the user when auto-install is impossible.
     manual_hint: str = ""
     #: If True, the provider invokes this tool via ``npx <cmd>`` (e.g. tsc,
@@ -254,7 +253,9 @@ def _detect_version(cmd: str) -> str:
         version_cmd = [cmd, "version"] if cmd == "go" else [cmd, "--version"]
         proc = subprocess.run(
             version_cmd,
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             check=False,
         )
         if proc.returncode == 0:
@@ -298,7 +299,9 @@ def _npm_install(package: str) -> bool:
     try:
         proc = subprocess.run(
             ["npm", "install", "-g", package],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
             check=False,
         )
     except FileNotFoundError:
@@ -329,7 +332,9 @@ def _pip_install(package: str) -> bool:
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pip", "install", package],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -351,16 +356,14 @@ def _pip_install(package: str) -> bool:
         # usually not on $PATH, so we deliberately install into the system tree
         # with --break-system-packages (no --user) to keep the script findable.
         if "externally-managed-environment" in combined:
-            print(
-                "    \u21b3 Python externally managed (PEP 668) "
-                "\u2014 retrying with --break-system-packages"
-            )
+            print("    \u21b3 Python externally managed (PEP 668) \u2014 retrying with --break-system-packages")
             try:
                 proc = subprocess.run(
-                    [sys.executable, "-m", "pip", "install",
-                     "--break-system-packages", package],
-                    capture_output=True, text=True, timeout=120,
-                     check=False,
+                    [sys.executable, "-m", "pip", "install", "--break-system-packages", package],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
                 )
             except (OSError, subprocess.SubprocessError) as e2:
                 print(f"    \u2717 retry failed: {e2}")
@@ -417,11 +420,16 @@ def _clone_tools(langs) -> list[_Tool]:
                 continue
             seen.add(tmpl.cmd)
             # dataclass(replace=False) — explicit copy keeps it cheap and clear.
-            fresh.append(_Tool(
-                cmd=tmpl.cmd, label=tmpl.label,
-                npm_package=tmpl.npm_package, pip_package=tmpl.pip_package,
-                manual_hint=tmpl.manual_hint, use_npx=tmpl.use_npx,
-            ))
+            fresh.append(
+                _Tool(
+                    cmd=tmpl.cmd,
+                    label=tmpl.label,
+                    npm_package=tmpl.npm_package,
+                    pip_package=tmpl.pip_package,
+                    manual_hint=tmpl.manual_hint,
+                    use_npx=tmpl.use_npx,
+                )
+            )
     return fresh
 
 
@@ -538,11 +546,11 @@ def _sync_tool_state(tools: list[_Tool], baseline: dict[str, str]) -> None:
     # Preserve dismissals for tools whose language is absent from this repo.
     # The global state spans all repos; only the tools we actually examined
     # this run may be re-derived.
-    decisions.update(
-        {cmd: dec for cmd, dec in baseline.items() if cmd not in examined}
-    )
+    decisions.update({cmd: dec for cmd, dec in baseline.items() if cmd not in examined})
     if decisions != baseline:
         _save_tool_state(decisions)
+
+
 def _check_tools_with_state(
     langs,
     *,
@@ -658,10 +666,17 @@ def check_and_install_all(
     # Build fresh private instances from the shared templates so the
     # module-level _TOOLS never carries stale found/skipped state.
     templates = _TOOLS if include_go else [t for t in _TOOLS if t.cmd != "go"]
-    tools = [_Tool(
-        cmd=t.cmd, label=t.label, npm_package=t.npm_package,
-        pip_package=t.pip_package, manual_hint=t.manual_hint, use_npx=t.use_npx,
-    ) for t in templates]
+    tools = [
+        _Tool(
+            cmd=t.cmd,
+            label=t.label,
+            npm_package=t.npm_package,
+            pip_package=t.pip_package,
+            manual_hint=t.manual_hint,
+            use_npx=t.use_npx,
+        )
+        for t in templates
+    ]
 
     # 1. Scan all tools (npx-aware)
     _check_tools(tools)

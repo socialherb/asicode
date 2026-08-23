@@ -7,6 +7,7 @@ _determine_output_mode heuristics, _output_mode_to_string, and the single-file
 retry loop (diff→full_file fallback, error feedback, same-failure repeat,
 create-fallback / modify-protection).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -381,9 +382,7 @@ def test_single_file_target_from_suggested(tmp_path, monkeypatch):
     llm = _FakeLLM({"success": True, "patch": "P"})
     svc = _make_service(llm)
     _patch_analyzers(monkeypatch, _analysis(suggested_files=["sug.py"]), _structure())
-    result = svc.handle_request(
-        repo_root=str(tmp_path), user_request="r", mode="single", target_file=None
-    )
+    result = svc.handle_request(repo_root=str(tmp_path), user_request="r", mode="single", target_file=None)
     assert result["success"] is True
     assert llm.calls[0]["target_file"] == "sug.py"
 
@@ -408,8 +407,12 @@ def test_single_file_diff_then_full_file_retry_with_feedback(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("old\n", encoding="utf-8")
     result = svc._handle_single_file(
-        tmp_path, "fix it", _analysis(suggested_files=["app.py"]), _structure(),
-        "app.py", 0.0,
+        tmp_path,
+        "fix it",
+        _analysis(suggested_files=["app.py"]),
+        _structure(),
+        "app.py",
+        0.0,
     )
     assert result["success"] is True
     assert result["output_mode_used"] == "full_file"
@@ -427,8 +430,12 @@ def test_single_file_same_failure_repeat_stops_early(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("old\n", encoding="utf-8")
     result = svc._handle_single_file(
-        tmp_path, "fix", _analysis(suggested_files=["app.py"]), _structure(),
-        "app.py", 0.0,
+        tmp_path,
+        "fix",
+        _analysis(suggested_files=["app.py"]),
+        _structure(),
+        "app.py",
+        0.0,
     )
     assert result["success"] is False
     assert result["same_failure_repeat"] is True
@@ -440,8 +447,12 @@ def test_single_file_create_fallback_placeholder(tmp_path):
     llm = _FakeLLM({"success": False, "error": "invalid_diff: nope"})
     svc = _make_service(llm)
     result = svc._handle_single_file(
-        tmp_path, "create a module", _analysis(suggested_files=["new_mod.py"]), _structure(),
-        "new_mod.py", 0.0,
+        tmp_path,
+        "create a module",
+        _analysis(suggested_files=["new_mod.py"]),
+        _structure(),
+        "new_mod.py",
+        0.0,
     )
     assert result["success"] is True
     assert result["fallback_used"] is True
@@ -458,8 +469,12 @@ def test_single_file_modify_failure_no_fallback(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("KEEP\n", encoding="utf-8")
     result = svc._handle_single_file(
-        tmp_path, "fix", _analysis(suggested_files=["app.py"]), _structure(),
-        "app.py", 0.0,
+        tmp_path,
+        "fix",
+        _analysis(suggested_files=["app.py"]),
+        _structure(),
+        "app.py",
+        0.0,
     )
     assert result["success"] is False
     assert result["fallback_used"] is False
@@ -476,8 +491,12 @@ def test_single_file_create_fallback_write_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "write_text", broken_write)
     result = svc._handle_single_file(
-        tmp_path, "create", _analysis(suggested_files=["x.py"]), _structure(),
-        "x.py", 0.0,
+        tmp_path,
+        "create",
+        _analysis(suggested_files=["x.py"]),
+        _structure(),
+        "x.py",
+        0.0,
     )
     assert result["success"] is False
     assert result["fallback_reason"] == "fallback_generation_failed"
@@ -489,8 +508,12 @@ def test_single_file_success_metadata(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("old\n", encoding="utf-8")
     result = svc._handle_single_file(
-        tmp_path, "fix", _analysis(suggested_files=["app.py"]), _structure(),
-        "app.py", 0.0,
+        tmp_path,
+        "fix",
+        _analysis(suggested_files=["app.py"]),
+        _structure(),
+        "app.py",
+        0.0,
     )
     assert result["success"] is True
     assert result["output_mode_used"] == "unified_diff"

@@ -18,6 +18,7 @@ from external_llm.agent.tool_registry import AgentConfig
 # 1. No callback when stream_callback is None
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_no_callback_when_no_stream():
     cfg = AgentConfig(stream_callback=None, consume_content_events=True)
     assert cfg.make_token_callback() is None
@@ -26,6 +27,7 @@ def test_no_callback_when_no_stream():
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. No callback when consume_content_events is False (CLI mode)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_no_callback_when_consume_disabled():
     mock_stream = MagicMock()
@@ -37,6 +39,7 @@ def test_no_callback_when_consume_disabled():
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Callback returned when both conditions met
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_callback_returned_when_gated_on():
     mock_stream = MagicMock()
@@ -50,6 +53,7 @@ def test_callback_returned_when_gated_on():
 # 4. No event emitted for None text (reset sentinel)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_none_text_does_not_emit():
     mock_stream = MagicMock()
     cfg = AgentConfig(stream_callback=mock_stream, consume_content_events=True)
@@ -62,6 +66,7 @@ def test_none_text_does_not_emit():
 # 5. Real text emits correct event shape
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_real_text_emits_content_event():
     mock_stream = MagicMock()
     cfg = AgentConfig(stream_callback=mock_stream, consume_content_events=True)
@@ -73,6 +78,7 @@ def test_real_text_emits_content_event():
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. Multiple tokens accumulate correctly
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_multiple_tokens_emit_sequentially():
     mock_stream = MagicMock()
@@ -91,6 +97,7 @@ def test_multiple_tokens_emit_sequentially():
 # 7. Empty string IS emitted (valid text, not a reset sentinel)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_empty_string_emitted_but_not_none():
     mock_stream = MagicMock()
     cfg = AgentConfig(stream_callback=mock_stream, consume_content_events=True)
@@ -103,11 +110,12 @@ def test_empty_string_emitted_but_not_none():
 # 8. Stream-reset: None text → no event, then real text → event
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_reset_then_emit_pattern():
     mock_stream = MagicMock()
     cfg = AgentConfig(stream_callback=mock_stream, consume_content_events=True)
     cb = cfg.make_token_callback()
-    cb(None)   # reset sentinel — should not emit
+    cb(None)  # reset sentinel — should not emit
     cb("new")  # first real token — should emit
     mock_stream.assert_called_once_with("content", {"text": "new"})
 
@@ -116,6 +124,7 @@ def test_reset_then_emit_pattern():
 # 9. Gate parity: stream_callback=True + consume=False → None
 #    (mirrors CLI: _ProgressPrinter has no "content" handler)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_cli_mode_gate():
     mock_stream = MagicMock()
@@ -129,6 +138,7 @@ def test_cli_mode_gate():
 # ══════════════════════════════════════════════════════════════════════════════
 # 10. Webapp mode: stream_callback=True + consume=True → callback works
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_webapp_mode_gate():
     mock_stream = MagicMock()

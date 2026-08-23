@@ -29,6 +29,7 @@ must then fall back to the full suite. This makes scoped verification
 *safe-by-construction*: it never runs *zero* tests when a run was requested,
 and it never silently skips verification because a name didn't resolve.
 """
+
 from __future__ import annotations
 
 import ast
@@ -37,7 +38,7 @@ import subprocess
 import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from ._shared_utils import _capped_put
 
@@ -75,13 +76,15 @@ def _build_or_get_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[str
     _capped_put(_index_cache, key, (*idx, now), cap=_INDEX_CACHE_CAP)
     return idx
 
-_MAX_CALLGRAPH_DEPTH = 2   # callers + callers-of-callers
-_MAX_TEST_FILES = 60       # cap so a "fix everything" edit doesn't select the whole suite
+
+_MAX_CALLGRAPH_DEPTH = 2  # callers + callers-of-callers
+_MAX_TEST_FILES = 60  # cap so a "fix everything" edit doesn't select the whole suite
 
 
 # ── symbol extraction ────────────────────────────────────────────────────────
 
-def _parse_module(path: Path) -> Optional[ast.Module]:
+
+def _parse_module(path: Path) -> ast.Module | None:
     """Parse *path* as UTF-8 Python source, tolerating unreadable/broken files.
 
     Returns ``None`` when the file cannot be read or parsed so callers can
@@ -105,7 +108,9 @@ def _iter_top_level_nodes(path: Path) -> Iterator[ast.stmt]:
     tree = _parse_module(path)
     if tree is None:
         return
-    yield from ast.iter_child_nodes(tree)
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.stmt):
+            yield node
 
 
 def _collect_top_level(path: Path, visit) -> set[str]:
@@ -159,7 +164,6 @@ def is_test_file(rel_path: str) -> bool:
     return ("/test_" in p or p.startswith("test_") or p.endswith("_test.py")) and p.endswith(".py")
 
 
-
 def git_status_test_files(repo_root: str | Path) -> list[str]:
     """Return repo-relative test files that are new/modified per ``git status``.
 
@@ -186,10 +190,10 @@ def git_status_test_files(repo_root: str | Path) -> list[str]:
     root = Path(repo_root)
     try:
         r = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain", "-z",
-             "--untracked-files=all"],
-            capture_output=True, timeout=5,
-             check=False,
+            ["git", "-C", str(root), "status", "--porcelain", "-z", "--untracked-files=all"],
+            capture_output=True,
+            timeout=5,
+            check=False,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):  # best-effort augmentation only
         return []
@@ -214,6 +218,7 @@ def git_status_test_files(repo_root: str | Path) -> list[str]:
 
 
 # ── import extraction (signal 3) ─────────────────────────────────────────────
+
 
 def _collect_import_names(out: set[str], node: ast.stmt) -> None:
     """Add the module names imported by one top-level *node* to *out*."""
@@ -248,13 +253,11 @@ def _is_first_party_module(mod: str, repo_root: Path) -> bool:
     repo are meaningful for test selection).
     """
     as_path = mod.replace(".", "/")
-    return (
-        (repo_root / f"{as_path}.py").exists()
-        or (repo_root / as_path / "__init__.py").exists()
-    )
+    return (repo_root / f"{as_path}.py").exists() or (repo_root / as_path / "__init__.py").exists()
 
 
 # ── signal 1: naming convention ──────────────────────────────────────────────
+
 
 def _build_test_stem_index(repo_root: Path) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Walk tests/ once and build **two** indexes.
@@ -313,7 +316,8 @@ def _tests_for_module(stem_index: dict[str, list[str]], module_stem: str) -> lis
 
 # ── signal 2: call graph ─────────────────────────────────────────────────────
 
-def _caller_files(call_graph: "CallGraphIndexer", symbol: str, depth: int) -> set[str]:
+
+def _caller_files(call_graph: CallGraphIndexer, symbol: str, depth: int) -> set[str]:
     """Transitive set of files that call ``symbol`` (BFS up the reverse edges)."""
     seen_files: set[str] = set()
     frontier = {symbol}
@@ -343,11 +347,12 @@ def _caller_files(call_graph: "CallGraphIndexer", symbol: str, depth: int) -> se
 
 # ── public API ───────────────────────────────────────────────────────────────
 
+
 def select_affected_tests(
     repo_root: str | Path,
     touched_paths: Iterable[str],
     *,
-    call_graph: Optional["CallGraphIndexer"] = None,
+    call_graph: CallGraphIndexer | None = None,
     max_tests: int = _MAX_TEST_FILES,
 ) -> list[str]:
     """Return scoped pytest ``args`` (file paths) for tests affected by edits.

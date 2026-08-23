@@ -1,4 +1,5 @@
 """HtmlSyntaxProvider unit tests."""
+
 from __future__ import annotations
 
 import pytest
@@ -14,6 +15,7 @@ def provider():
 
 # ── language_id / capabilities ────────────────────────────────────────────────
 
+
 def test_language_id(provider):
     assert provider.language_id() == LanguageId.HTML
 
@@ -23,6 +25,7 @@ def test_capabilities_has_syntax_validator(provider):
 
 
 # ── Valid HTML ────────────────────────────────────────────────────────────────
+
 
 def test_valid_minimal(provider):
     result = provider.validate_syntax("index.html", "<html><body></body></html>")
@@ -62,6 +65,7 @@ def test_valid_all_void_elements(provider):
 
 # ── Invalid HTML: unbalanced tags ──────────────────────────────────────────────
 
+
 def test_unclosed_div(provider):
     result = provider.validate_syntax("bad.html", "<div><p>text</p>")
     assert result.ok is False
@@ -89,6 +93,7 @@ def test_wrong_nesting(provider):
 
 # ── Error location and metadata ────────────────────────────────────────────────
 
+
 def test_error_has_file_path(provider):
     result = provider.validate_syntax("my/page.html", "<div>")
     assert result.ok is False
@@ -110,12 +115,14 @@ def test_language_in_result(provider):
 
 # ── .htm extension ───────────────────────────────────────────────────────────
 
+
 def test_htm_extension_ok(provider):
     result = provider.validate_syntax("old.htm", "<html></html>")
     assert result.ok is True
 
 
 # ── File globs ───────────────────────────────────────────────────────────────
+
 
 def test_file_globs(provider):
     globs = provider.get_file_globs()
@@ -124,6 +131,7 @@ def test_file_globs(provider):
 
 
 # ── Unimplemented methods return safe defaults ─────────────────────────────────
+
 
 def test_get_symbol_patterns_empty(provider):
     assert provider.get_symbol_patterns() == []

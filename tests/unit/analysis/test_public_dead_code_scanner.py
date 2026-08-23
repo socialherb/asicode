@@ -1,4 +1,5 @@
 """Tests for external_llm/analysis/public_dead_code_scanner.py."""
+
 from __future__ import annotations
 
 import tempfile
@@ -139,7 +140,8 @@ def test_public_symbol_detected_with_cross_file_refs():
             return 3
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names={"some_other_func"},
     )
     # public_func_one, public_func_two, _private_func should all be dead.
@@ -162,7 +164,8 @@ def test_public_symbol_not_detected_if_in_cross_file_refs():
             return 2
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names={"used_elsewhere"},
     )
     # used_elsewhere has cross-file references → not dead
@@ -248,7 +251,8 @@ def test_pytest_fixture_not_flagged():
             pass
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names=set(),
     )
     all_names = {m.name for c in candidates for m in c.members}
@@ -277,7 +281,8 @@ def test_bare_fixture_decorator_not_flagged():
             pass
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names=set(),
     )
     all_names = {m.name for c in candidates for m in c.members}
@@ -306,7 +311,8 @@ def test_fixture_with_args_not_flagged():
             pass
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names=set(),
     )
     all_names = {m.name for c in candidates for m in c.members}
@@ -331,7 +337,8 @@ def test_non_fixture_public_symbol_still_detected():
             pass
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names=set(),
     )
     all_names = {m.name for c in candidates for m in c.members}
@@ -405,7 +412,8 @@ def test_all_reexport_skipped():
         __all__ = ["public_api"]
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names=set(),
     )
     # public_api is in __all__ → not dead
@@ -432,7 +440,8 @@ def test_dunder_names_skipped():
             return 3
     """)
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[src],
+        repo_root="",
+        file_paths=[src],
         cross_file_referenced_names=set(),
     )
     names = {m.name for c in candidates for m in c.members}
@@ -505,6 +514,7 @@ def test_non_py_file_skipped():
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as tmp:
         tmp.write("def _dead(): pass\n")
     from external_llm.agent.scanner_registry import get_registry
+
     reg = get_registry()
     result = reg.run("public_dead_code_scanner", file_paths=[tmp.name])
     assert not result.candidates_raw, f"Expected 0 candidates, got {len(result.candidates_raw)}"
@@ -570,6 +580,7 @@ def test_dead_block_candidate_to_dict():
 def test_collect_all_defs():
     """_collect_all_defs finds module-level and class-level functions, classes, assignments."""
     import ast
+
     tree = ast.parse("""\
 def func(): pass
 class Klass: pass
@@ -587,6 +598,7 @@ y: int = 2
 def test_collect_all_defs_class_body():
     """_collect_all_defs skips class-level assignments (API-contract false positives)."""
     import ast
+
     tree = ast.parse("""\
 class MyClass:
     _CONST = 1
@@ -606,6 +618,7 @@ class MyClass:
 def test_collect_name_references():
     """_collect_name_references finds Name nodes in Load context."""
     import ast
+
     tree = ast.parse("""\
 x = os.getcwd()
 y = os.path.join("a", "b")
@@ -627,14 +640,26 @@ def test_is_externally_referenced_cross_file():
     """_is_externally_referenced detects cross-file references."""
     references = {}
     # No same-file refs, but name is in cross_file_referenced_names
-    assert _is_externally_referenced(
-        "helper", 1, 5, references,
-        cross_file_referenced_names={"helper"},
-    ) is True
-    assert _is_externally_referenced(
-        "helper", 1, 5, references,
-        cross_file_referenced_names={"other"},
-    ) is False
+    assert (
+        _is_externally_referenced(
+            "helper",
+            1,
+            5,
+            references,
+            cross_file_referenced_names={"helper"},
+        )
+        is True
+    )
+    assert (
+        _is_externally_referenced(
+            "helper",
+            1,
+            5,
+            references,
+            cross_file_referenced_names={"other"},
+        )
+        is False
+    )
 
 
 # ── Use-position references (for-iterable / assignment RHS / with) ───────
@@ -755,10 +780,7 @@ def test_subscript_assignment_rhs_identifier_not_a_def():
 def _dead_sig(candidates):
     """(file, cluster_start, cluster_end, member names) signature — the cache
     must reproduce the scan output bit-for-bit, not just the count."""
-    return sorted(
-        (c.file, c.cluster_start, c.cluster_end, tuple(m.name for m in c.members))
-        for c in candidates
-    )
+    return sorted((c.file, c.cluster_start, c.cluster_end, tuple(m.name for m in c.members)) for c in candidates)
 
 
 def test_extraction_cache_hot_run_matches_cold(tmp_path):
@@ -771,7 +793,8 @@ def test_extraction_cache_hot_run_matches_cold(tmp_path):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "mod.py").write_text(textwrap.dedent("""\
+    (repo / "mod.py").write_text(
+        textwrap.dedent("""\
         def _dead_one():
             return 1
 
@@ -780,7 +803,8 @@ def test_extraction_cache_hot_run_matches_cold(tmp_path):
 
         def live():
             return 3
-    """))
+    """)
+    )
     cache_path = _dbx_cache_path(str(repo))
     assert not os.path.exists(cache_path)
 

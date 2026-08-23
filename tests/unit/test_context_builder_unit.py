@@ -14,6 +14,7 @@ Covers defects fixed together:
      (agent_context_manager) and the recent-commits log is process-wide
      TTL-cached (P2).
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -21,16 +22,17 @@ import time
 
 import pytest
 
-from common import normalize_rel_path_fast
 from context_collector import collect_related_files_shallow
 from external_llm import context_builder as cb
 from external_llm.context_builder import EnhancedContextBuilder
+from path_security import normalize_rel_path
 
 # ── Defect A: dotfile / dot-directory path normalization ────────────────────
 
+
 def _norm(s: str) -> str:
-    """Mirror of the inline normalization now used in both modules."""
-    return normalize_rel_path_fast(s)
+    """Mirror of the inline normalization now used in both modules (SSOT)."""
+    return normalize_rel_path(s)
 
 
 def test_rel_normalization_preserves_dotfiles():
@@ -40,6 +42,15 @@ def test_rel_normalization_preserves_dotfiles():
     assert _norm("./foo.py") == "foo.py"
     assert _norm("/foo.py") == "foo.py"
     assert _norm("foo.py") == "foo.py"
+
+
+def test_rel_normalization_ssot_contract():
+    # SSOT additionally strips quotes + a/b prefixes and rejects traversal.
+    assert _norm("'m.py'") == "m.py"
+    assert _norm("a/m.py") == "m.py"
+    assert _norm("b/m.py") == "m.py"
+    assert _norm("../evil.py") == ""
+    assert _norm("C:/evil.py") == ""
 
 
 def test_collect_related_finds_dotfile_target(tmp_path):
@@ -82,6 +93,7 @@ def test_find_related_excludes_dotdir_target(tmp_path):
 
 
 # ── Defect B: bounded _structure_hints_cache ────────────────────────────────
+
 
 @pytest.fixture
 def isolated_hints_cache():
@@ -180,6 +192,7 @@ def test_structure_hints_list_dirs_and_files_in_sorted_order(isolated_hints_cach
 
 
 # ── Defect C: git context — status delegates to SSOT, log is TTL-cached ─────
+
 
 @pytest.fixture
 def isolated_git_log_cache():
@@ -335,6 +348,7 @@ def test_super_builder_shares_git_ssot_and_log_cache(isolated_git_log_cache, tmp
 
 # ── P21-3: file-context reads are head-bounded ───────────────────────────────
 
+
 def test_file_context_small_full(tmp_path):
     builder = EnhancedContextBuilder(str(tmp_path))
     (tmp_path / "a.py").write_text("def a():\n    pass\n", encoding="utf-8")
@@ -345,6 +359,7 @@ def test_file_context_small_full(tmp_path):
 
 def test_file_context_huge_head_bounded(tmp_path):
     from external_llm.context_builder import _FILE_CONTEXT_MAX_BYTES
+
     builder = EnhancedContextBuilder(str(tmp_path))
     with open(tmp_path / "big.py", "wb") as f:
         f.write(b"x = 1\n" * 200_000)  # 1.2 MiB — beyond the 1 MiB head
@@ -365,6 +380,7 @@ def test_file_context_utf8_boundary_clean(tmp_path):
 
 def test_related_files_head_bounded(tmp_path, monkeypatch):
     from external_llm.context_builder import _FILE_CONTEXT_MAX_BYTES
+
     builder = EnhancedContextBuilder(str(tmp_path))
     with open(tmp_path / "mymod.py", "wb") as f:
         f.write(b"x = 1\n" * 200_000)
@@ -376,6 +392,7 @@ def test_related_files_head_bounded(tmp_path, monkeypatch):
 
 
 # ── P22-2: related-files fallback containment ────────────────────────────────
+
 
 def test_find_related_files_rejects_escape_path(tmp_path):
     """P22-2: the fallback import-scan must not resolve outside the repo."""

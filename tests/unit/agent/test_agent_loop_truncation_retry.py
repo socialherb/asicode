@@ -11,6 +11,7 @@ These tests pin the consumer contract: "truncated" must drive the exact same
 recovery chain as "length" — budget-doubling retry (up to 3 attempts), then
 clearing partial tool calls while preserving text content.
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -66,10 +67,12 @@ def _call(loop):
 
 def test_truncated_triggers_budget_doubling_retry_then_succeeds():
     """Regression: previously a truncated tool call was silently skipped."""
-    loop = _make_host([
-        _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
-        _resp("end_turn", content="ok"),
-    ])
+    loop = _make_host(
+        [
+            _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
+            _resp("end_turn", content="ok"),
+        ]
+    )
     result = _call(loop)
 
     assert loop.llm_client.chat_with_tools.call_count == 2
@@ -81,11 +84,13 @@ def test_truncated_triggers_budget_doubling_retry_then_succeeds():
 
 def test_truncated_after_three_attempts_clears_tool_calls_preserves_text():
     """Exhausted retries must clear partial tool calls but keep text content."""
-    loop = _make_host([
-        _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
-        _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
-        _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
-    ])
+    loop = _make_host(
+        [
+            _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
+            _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
+            _resp("truncated", tool_calls=[{"id": "t1", "name": "bash", "args": {"command": "rm"}}]),
+        ]
+    )
     with mock.patch("external_llm.agent.agent_loop.get_global_collector") as _gg:
         result = _call(loop)
 
@@ -106,10 +111,12 @@ def test_truncated_after_three_attempts_clears_tool_calls_preserves_text():
 
 def test_length_retry_chain_regression():
     """The original "length" (max_tokens) recovery must be unchanged."""
-    loop = _make_host([
-        _resp("length", tool_calls=[{"id": "t1", "name": "bash", "args": {}}]),
-        _resp("end_turn", content="ok"),
-    ])
+    loop = _make_host(
+        [
+            _resp("length", tool_calls=[{"id": "t1", "name": "bash", "args": {}}]),
+            _resp("end_turn", content="ok"),
+        ]
+    )
     result = _call(loop)
 
     assert loop.llm_client.chat_with_tools.call_count == 2
@@ -119,10 +126,12 @@ def test_length_retry_chain_regression():
 
 def test_truncated_text_only_response_is_retried_too():
     """Even without tool calls, truncated text must retry (not be accepted)."""
-    loop = _make_host([
-        _resp("truncated", content="partial json {"),
-        _resp("end_turn", content='{"ok": true}'),
-    ])
+    loop = _make_host(
+        [
+            _resp("truncated", content="partial json {"),
+            _resp("end_turn", content='{"ok": true}'),
+        ]
+    )
     result = _call(loop)
 
     assert loop.llm_client.chat_with_tools.call_count == 2

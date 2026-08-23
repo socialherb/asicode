@@ -89,9 +89,7 @@ class TestInvalidateCachesOnSuccess:
         assert invalidated == [True]
 
     def test_failure_does_not_invalidate(self, monkeypatch):
-        monkeypatch.setattr(
-            asi.subprocess, "run", lambda cmd, **kw: _FakeCompleted(1, stderr="nope")
-        )
+        monkeypatch.setattr(asi.subprocess, "run", lambda cmd, **kw: _FakeCompleted(1, stderr="nope"))
         _force_non_tty(monkeypatch)
         _silence_print(monkeypatch)
 

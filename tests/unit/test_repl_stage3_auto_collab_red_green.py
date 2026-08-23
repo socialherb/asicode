@@ -12,6 +12,7 @@ flags swap in a fake ``external_llm.repl.collaborate`` module via
 site in repl_impl resolves to it; ``--auto-suggest-text``/``--force-underline``
 arm a real countdown so the auto-submit fires through the live prompt.
 """
+
 from __future__ import annotations
 
 import os
@@ -40,8 +41,8 @@ class _PtyReplBase:
 
     def _spawn(self, repo_root, *extra, env=None, timeout=60.0):
         from tests.unit.pty_driver import SpawnPtySession
-        argv = [sys.executable, self.CHILD, "--mode", "repl", "--repo", repo_root,
-                *extra]
+
+        argv = [sys.executable, self.CHILD, "--mode", "repl", "--repo", repo_root, *extra]
         return SpawnPtySession(argv, cwd=os.getcwd(), env=env, timeout=timeout)
 
     def _send_cmd(self, sess, text):
@@ -126,15 +127,13 @@ class TestCollabPty(_PtyReplBase):
 
     def test_collab_sdk_missing_install_ok(self, tmp_path):
         """SDK missing + y + install ok -> session starts."""
-        sess = self._session(tmp_path, "--collab-sdk", "missing",
-                             "--collab-install", "ok")
+        sess = self._session(tmp_path, "--collab-sdk", "missing", "--collab-install", "ok")
         try:
             self._send_cmd(sess, "/claude verify the build")
             sess.wait_for(b"Install it now?", timeout=10)
             sess.clear()
             sess.send(b"y\n")
-            sess.wait_for(b"installed \xe2\x80\x94 starting collaboration session.",
-                          timeout=10)
+            sess.wait_for(b"installed \xe2\x80\x94 starting collaboration session.", timeout=10)
             sess.wait_for(b"verify the build (claude-sonnet-4-6)", timeout=10)
             sess.wait_for(b"[collab summary]", timeout=10)
             self._send_cmd(sess, "exit")
@@ -144,8 +143,7 @@ class TestCollabPty(_PtyReplBase):
 
     def test_collab_sdk_missing_install_fail(self, tmp_path):
         """SDK missing + y + install failure -> manual-install hint."""
-        sess = self._session(tmp_path, "--collab-sdk", "missing",
-                             "--collab-install", "fail")
+        sess = self._session(tmp_path, "--collab-sdk", "missing", "--collab-install", "fail")
         try:
             self._send_cmd(sess, "/claude verify the build")
             sess.wait_for(b"Install it now?", timeout=10)
@@ -160,8 +158,7 @@ class TestCollabPty(_PtyReplBase):
 
     def test_collab_sdk_missing_install_keyboardinterrupt(self, tmp_path):
         """SDK missing + y + install KeyboardInterrupt -> cancelled."""
-        sess = self._session(tmp_path, "--collab-sdk", "missing",
-                             "--collab-install", "kb")
+        sess = self._session(tmp_path, "--collab-sdk", "missing", "--collab-install", "kb")
         try:
             self._send_cmd(sess, "/claude verify the build")
             sess.wait_for(b"Install it now?", timeout=10)
@@ -276,8 +273,7 @@ class TestAutoContinuePty(_PtyReplBase):
             self._send_cmd(sess, "/auto on")
             sess.wait_for(b"auto-continue ON", timeout=10)
             self._send_cmd(sess, "hello")
-            sess.wait_for(b"auto-continue: turn ended with an error \xe2\x80\x94 stopped",
-                          timeout=10)
+            sess.wait_for(b"auto-continue: turn ended with an error \xe2\x80\x94 stopped", timeout=10)
             self._send_cmd(sess, "exit")
             sess.wait_for(b"session ended.", timeout=30)
         finally:
@@ -358,8 +354,7 @@ class TestAutoContinuePty(_PtyReplBase):
         """
         env = dict(os.environ)
         env["ASICODE_AUTO_CONTINUE_DELAY"] = "2"
-        sess = self._session(tmp_path, "--auto-suggest-text", "verify the change",
-                             "--force-underline", env=env)
+        sess = self._session(tmp_path, "--auto-suggest-text", "verify the change", "--force-underline", env=env)
         try:
             self._send_cmd(sess, "/auto 1")
             sess.wait_for(b"auto-continue ON", timeout=10)

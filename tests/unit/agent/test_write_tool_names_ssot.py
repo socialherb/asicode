@@ -8,13 +8,21 @@ write_tool_used detection, test-impact invalidation) must derive from
 lets edits via it silently bypass up to six correctness mechanisms — this
 test makes that drift fail loudly instead of silently bypassing the gates.
 """
+
 from external_llm.agent.agent_loop_types import WRITE_TOOL_NAMES, TurnContext
 from external_llm.agent.tool_registry import ToolRegistry
 
-_EXPECTED = frozenset({
-    "apply_patch", "write_plan", "edit_ast", "edit_file",
-    "edit_text", "modify_symbol", "anchor_edit",
-})
+_EXPECTED = frozenset(
+    {
+        "apply_patch",
+        "write_plan",
+        "edit_ast",
+        "edit_file",
+        "edit_text",
+        "modify_symbol",
+        "anchor_edit",
+    }
+)
 
 
 def test_write_tool_names_value_is_pinned():

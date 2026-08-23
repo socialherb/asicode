@@ -5,6 +5,7 @@ REPL child driver (``repl_stage2_child.py``) so the child behaves byte-
 identically to what the in-process tests validated. Every fake mirrors the
 established A+B-phase contracts (``test_repl_ab_phase_red_green.py``).
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -50,8 +51,7 @@ class FakeSession:
         self.chat_mode = "code"
 
     def add_turn(self, session_id, role, note, **kw):
-        self.turns.append({"session_id": session_id, "role": role,
-                           "note": note, **kw})
+        self.turns.append({"session_id": session_id, "role": role, "note": note, **kw})
 
     def build_context_messages(self, session, **kw):
         return [{"role": "user", "content": "fake context"}]
@@ -108,8 +108,7 @@ class FakeClient:
 
     def chat(self, messages=None, **kw):
         self.calls.append((messages or [], kw))
-        joined = "\n".join(
-            getattr(m, "content", "") or "" for m in (messages or []))
+        joined = "\n".join(getattr(m, "content", "") or "" for m in (messages or []))
         if "[user request]" in joined:
             return FakeLLMMessage("NONE")
         if "### [pattern]" in joined or "### [design_decision]" in joined:
@@ -125,8 +124,11 @@ class FakeSvc:
         self.provider = provider
         self.model = model
         self.llm_service = SimpleNamespace(
-            provider=provider, model=model, client=FakeClient(),
-            thinking_mode=None, reasoning_effort=None,
+            provider=provider,
+            model=model,
+            client=FakeClient(),
+            thinking_mode=None,
+            reasoning_effort=None,
         )
 
 
@@ -146,24 +148,33 @@ class FakeDesignChatLoop:
                 stream_callback("design_llm_call", None)
         if self.fail_mode == "cancel":
             from external_llm.agent.agent_loop_types import AgentCancelled
+
             raise AgentCancelled("cancelled by orchestrator")
         if self.fail_mode == "error":
             raise RuntimeError("fake task crash")
         from external_llm.agent.design_chat_loop import DesignChatResult
+
         if self.fail_mode == "error_result":
             # An is_error result (NOT a raised exception) — the REPL's
             # "turn ended with an error" auto-continue stop path keys off
             # chat_result.is_error (L5907), which a raise never reaches.
             return DesignChatResult(
-                content="fake error result", tool_calls_made=[],
-                tokens_used=0, prompt_tokens=0, completion_tokens=0,
-                cache_read_tokens=0, cache_creation_tokens=0,
-                last_call_prompt_tokens=0, last_call_completion_tokens=0,
+                content="fake error result",
+                tool_calls_made=[],
+                tokens_used=0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                cache_read_tokens=0,
+                cache_creation_tokens=0,
+                last_call_prompt_tokens=0,
+                last_call_completion_tokens=0,
                 last_call_cache_read_tokens=0,
                 last_call_cache_creation_tokens=0,
                 provider="anthropic",
-                is_error=True, error_type="general",
-                hit_max_iterations=False, total_llm_calls=0,
+                is_error=True,
+                error_type="general",
+                hit_max_iterations=False,
+                total_llm_calls=0,
             )
         return DesignChatResult(
             content="Here is the plan: done.",
@@ -185,8 +196,16 @@ class FakeDesignChatLoop:
 
 
 class FakeOrchAgent:
-    def __init__(self, llm_client=None, registry=None, orch_config=None,
-                 model=None, callback=None, design_stream_callback=None, **kw):
+    def __init__(
+        self,
+        llm_client=None,
+        registry=None,
+        orch_config=None,
+        model=None,
+        callback=None,
+        design_stream_callback=None,
+        **kw,
+    ):
         self.llm_client = llm_client
         self.registry = registry
         self.orch_config = orch_config
@@ -203,8 +222,13 @@ class FakeOrchAgent:
 
 def worker_args(repo_root: str, **over) -> SimpleNamespace:
     base = {
-        "subagent_id": "w1", "repo": repo_root, "provider": "anthropic",
-        "model": "m1", "api_key": None, "verbose": False, "max_turns": 5,
+        "subagent_id": "w1",
+        "repo": repo_root,
+        "provider": "anthropic",
+        "model": "m1",
+        "api_key": None,
+        "verbose": False,
+        "max_turns": 5,
         "orch_pid": 0,
     }
     base.update(over)
@@ -218,6 +242,7 @@ def worker_args(repo_root: str, **over) -> SimpleNamespace:
 # ...`` site in repl_impl resolves to these fakes. ``install_state`` is a
 # mutable holder so the install-then-run flow (y -> pip install -> SDK
 # suddenly "installed") is representable.
+
 
 class FakeCollabInstallState:
     def __init__(self, sdk_installed: bool = True):
@@ -278,8 +303,7 @@ class FakeCollabModule:
     is scriptable.
     """
 
-    def __init__(self, install_state: FakeCollabInstallState,
-                 orch_fail_mode: str = "none", result_error=None):
+    def __init__(self, install_state: FakeCollabInstallState, orch_fail_mode: str = "none", result_error=None):
         self._state = install_state
         self.orch_fail_mode = orch_fail_mode
         self.result_error = result_error
@@ -309,9 +333,7 @@ class FakeCollabModule:
         return SimpleNamespace(**kw)
 
     def make_orchestrator(self, registry, config):
-        orch = FakeCollabOrchestrator(
-            registry, config, fail_mode=self.orch_fail_mode,
-            result_error=self.result_error)
+        orch = FakeCollabOrchestrator(registry, config, fail_mode=self.orch_fail_mode, result_error=self.result_error)
         self.orch_instances.append(orch)
         return orch
 

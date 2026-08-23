@@ -113,8 +113,7 @@ def test_sweep_and_cross_process_flock_coexist(tmp_path: Path) -> None:
     assert file_lock.sweep_stale_lock_files(tmp_path) == 1
 
 
-@pytest.mark.skipif(not (file_lock._HAS_LOCK and file_lock._LOCK_IMPL == "fcntl"),
-                    reason="fcntl backend required")
+@pytest.mark.skipif(not (file_lock._HAS_LOCK and file_lock._LOCK_IMPL == "fcntl"), reason="fcntl backend required")
 def test_held_exclusive_holds_lock_during_body(tmp_path: Path) -> None:
     """P1-1: while ``_held_exclusive`` yields True the lock is ACTUALLY held —
     a second non-blocking exclusive flock on the same file must fail. The old
@@ -135,8 +134,7 @@ def test_held_exclusive_holds_lock_during_body(tmp_path: Path) -> None:
         fcntl.flock(fh3, fcntl.LOCK_UN)
 
 
-@pytest.mark.skipif(not (file_lock._HAS_LOCK and file_lock._LOCK_IMPL == "fcntl"),
-                    reason="fcntl backend required")
+@pytest.mark.skipif(not (file_lock._HAS_LOCK and file_lock._LOCK_IMPL == "fcntl"), reason="fcntl backend required")
 def test_held_exclusive_false_when_contended(tmp_path: Path) -> None:
     """P1-1: a lock held by another open file description yields False."""
     import fcntl

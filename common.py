@@ -3,6 +3,7 @@ Common utility functions for asicode.
 
 Eliminates duplicated utility functions across modules.
 """
+
 from __future__ import annotations
 
 # P9-2: single source of truth for the edit-target size cap (64 MiB). All
@@ -39,15 +40,15 @@ def safe_filename(name: str, max_len: int = 128) -> str:
     # Replace invalid characters with underscore
     result = name.translate(str.maketrans(dict.fromkeys('\\/:*?"<>|', "_")))
     # Compress consecutive underscores
-    while '__' in result:
-        result = result.replace('__', '_')
+    while "__" in result:
+        result = result.replace("__", "_")
     # Strip leading/trailing spaces and dots
-    result = result.strip(' .')
+    result = result.strip(" .")
     # Truncate to max_len
     if len(result) > max_len:
-        result = result[:max_len].rstrip('_. ')
+        result = result[:max_len].rstrip("_. ")
     # Return 'unnamed' if empty
-    return result if result else 'unnamed'
+    return result if result else "unnamed"
 
 
 def norm_ws(s: str) -> str:
@@ -65,29 +66,4 @@ def chunk_list(items: list, chunk_size: int) -> list[list]:
     """Split a list into chunks of the given size."""
     if items is None:
         return []
-    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-
-
-def normalize_rel_path_fast(rel_path: str) -> str:
-    """Quick normalization of repo-relative path.
-
-    - Strips surrounding whitespace
-    - Replaces backslashes with forward slashes
-    - Removes repeated leading ``./`` (loop, not lstrip — avoids eating ``.gitignore``)
-    - Removes leading ``/``
-    - Returns empty string for empty/None input
-
-    This is the canonical single-source helper for path normalization.
-    All previous callers that used the defective inline chain
-    ``.strip().removeprefix("/").removeprefix("./")`` have been migrated to call
-    this function (or ``path_security.normalize_rel_path``, which additionally
-    strips quotes, removes ``a/``/``b/`` prefixes, and rejects traversal).
-    No defective chain remains in the repo as of 2026-07.
-    """
-    p = (rel_path or "").strip()
-    p = p.replace("\\", "/")
-    # Use loop instead of lstrip to avoid character-set stripping
-    # (lstrip("./") would turn .gitignore into gitignore)
-    while p.startswith("./"):
-        p = p[2:]
-    return p.lstrip("/")
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]

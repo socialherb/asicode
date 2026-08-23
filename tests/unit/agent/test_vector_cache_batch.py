@@ -4,6 +4,7 @@ Mocks the embedding model so these run without sentence-transformers (only
 numpy + FAISS required). Locks the contract that batching is equivalent to
 per-file add_document, dedups by doc_id, and handles empty/mixed input.
 """
+
 import shutil
 import tempfile
 
@@ -13,6 +14,7 @@ try:
     import numpy as np
 
     from external_llm.agent.vector_cache import HAS_FAISS, HAS_NUMPY, VectorCacheManager
+
     _OK = HAS_NUMPY and HAS_FAISS
 except ImportError:
     _OK = False

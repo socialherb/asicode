@@ -1,6 +1,7 @@
 """Tests for the machine-readable JSON output paths: --json (final blob) and
 --json-stream (NDJSON), plus the clarification-questions field (B4) shared by
 both. These pin the payload shape that Tenet-style automation depends on."""
+
 from __future__ import annotations
 
 import json
@@ -26,9 +27,11 @@ def test_result_output_dict_includes_questions_on_clarification():
     r = _result(
         status="clarification_needed",
         final_message="Which file?",
-        metadata={"required_clarifications": [
-            {"field": "target_files", "reason": "not specified", "suggestion": "src/app.py"},
-        ]},
+        metadata={
+            "required_clarifications": [
+                {"field": "target_files", "reason": "not specified", "suggestion": "src/app.py"},
+            ]
+        },
     )
     d = asi._result_output_dict(r, 1.5)
     assert d["status"] == "clarification_needed"
@@ -85,6 +88,7 @@ def test_json_stream_result_line_has_full_payload(capsys):
 
 # ── patched_files extraction (in-process string form vs IPC dict form) ──────
 
+
 def test_extract_patched_file_dict_form():
     """IPC worker patches are {'file': ...} dicts — extract the path."""
     assert asi._extract_patched_file({"file": "src/app.py"}) == "src/app.py"
@@ -138,12 +142,16 @@ def test_result_output_dict_patched_files_normalizes_mixed_forms():
     )
     d = asi._result_output_dict(r, 0.5)
     assert d["patched_files"] == [
-        "from_worker.py", "from_inprocess.py", "from_engine.py", "from_modify_symbol.py",
+        "from_worker.py",
+        "from_inprocess.py",
+        "from_engine.py",
+        "from_modify_symbol.py",
     ]
     assert d["patches"] == 5  # count reflects raw entries, list reflects parsed files
 
 
 # ── turns field: metadata.turns_used fallback ───────────────────────────────
+
 
 def test_result_output_dict_turns_uses_list_when_populated():
     """When result.turns is populated, its length is authoritative."""
@@ -221,6 +229,7 @@ def test_orchestrator_result_to_agent_like_aggregates_int_turns():
 
 # ── error output stable schema (questions present on every status) ──────────
 
+
 def test_json_error_output_has_questions_field(capsys):
     """Every status — including errors — must carry a questions list (stable schema)."""
     asi._json_error_output("error", "boom", duration_ms=10)
@@ -233,6 +242,7 @@ def test_json_error_output_has_questions_field(capsys):
 
 
 # ── --json single-blob stdout cleanliness ───────────────────────────────────
+
 
 def test_run_once_json_blob_keeps_stdout_to_single_json_line(tmp_path, monkeypatch, capsys):
     """--json (single blob) must not pollute stdout with human progress output.
@@ -270,10 +280,16 @@ def test_run_once_json_blob_keeps_stdout_to_single_json_line(tmp_path, monkeypat
     monkeypatch.setattr(repl_impl, "_run_with_cancel", _fake_run_with_cancel)
 
     args = SimpleNamespace(
-        repo=str(tmp_path), verbose=False,
-        json_stream=False, json=True,
-        provider="", model="", api_key=None, max_turns=3,
-        thinking_mode=None, reasoning_effort=None,
+        repo=str(tmp_path),
+        verbose=False,
+        json_stream=False,
+        json=True,
+        provider="",
+        model="",
+        api_key=None,
+        max_turns=3,
+        thinking_mode=None,
+        reasoning_effort=None,
     )
     rc = asi.run_once(args, "do something")
     out = capsys.readouterr().out
@@ -319,6 +335,7 @@ def test_orchestrator_result_to_agent_like_flattens_subtasks():
     """F5: OrchestratorResult is flattened to the AgentResult-like shape the JSON
     output expects — sub-task patches and turn counts roll up to the top level."""
     from types import SimpleNamespace
+
     _orch = SimpleNamespace(
         status="success",
         summary="did the thing",
@@ -341,9 +358,12 @@ def test_orchestrator_result_to_agent_like_flattens_subtasks():
 def test_orchestrator_result_to_agent_like_error_carries_summary():
     """A non-success status carries the summary as the error reason."""
     from types import SimpleNamespace
+
     _orch = SimpleNamespace(
-        status="error", summary="all sub-agents failed",
-        subtask_results=[], metadata={},
+        status="error",
+        summary="all sub-agents failed",
+        subtask_results=[],
+        metadata={},
     )
     d = asi._orchestrator_result_to_agent_like(_orch)
     assert d.status == "error"
@@ -355,6 +375,7 @@ def test_orchestrator_result_to_agent_like_error_carries_summary():
 def test_orchestrate_flag_is_recognized():
     """F5: --orchestrate parses into args.orchestrate (the run_once gate)."""
     import argparse
+
     # Reproduce the relevant slice of the real parser to avoid importing the
     # whole module's main() side effects.
     p = argparse.ArgumentParser()

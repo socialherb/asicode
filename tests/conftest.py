@@ -1,6 +1,7 @@
 """
 Pytest fixtures for asicode agent tests.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -46,6 +47,7 @@ def restore_sys_modules():
     removed, originals are put back.
     """
     import sys as _sys
+
     snapshot = dict(_sys.modules)
     try:
         yield
@@ -100,9 +102,7 @@ def _isolate_context_override_cache(tmp_path_factory):
 
     import external_llm.agent.context_budget as cb
 
-    target = str(
-        tmp_path_factory.mktemp("ctx_override_cache") / "context_override_cache.json"
-    )
+    target = str(tmp_path_factory.mktemp("ctx_override_cache") / "context_override_cache.json")
     os.environ["ASICODE_CONTEXT_OVERRIDE_CACHE"] = target
     cb._OVERRIDE_CACHE_FILE = target
 
@@ -134,12 +134,11 @@ def _isolate_strategy_state(tmp_path_factory):
     """
     import os
 
-    target = str(
-        tmp_path_factory.mktemp("strategy_state") / "strategy_state.json"
-    )
+    target = str(tmp_path_factory.mktemp("strategy_state") / "strategy_state.json")
     os.environ["ASICODE_STRATEGY_STATE"] = target
     try:
         import external_llm.editor.learning.strategy_state as ss
+
         ss._STRATEGY_STATE_PATH = target
     except Exception:  # pragma: no cover - import shape only
         pass
@@ -219,24 +218,21 @@ def temp_repo_root() -> Generator[str, None, None]:
         # identity is written straight into .git/config (git init always
         # creates that file) instead of two `git config` subprocesses.
         import subprocess
+
         subprocess.run(["git", "init", "-q"], cwd=tmpdir, capture_output=True, check=False)
         with (Path(tmpdir) / ".git" / "config").open("a") as cfg:
-            cfg.write(
-                "[user]\n"
-                "\temail = test@example.com\n"
-                "\tname = Test User\n"
-            )
+            cfg.write("[user]\n\temail = test@example.com\n\tname = Test User\n")
 
         # Create a sample Python file for testing
         sample_file = Path(tmpdir) / "sample.py"
         # NOTE: Avoid leading newline so patch hunks starting at line 1 match reliably.
         sample_file.write_text(
-            'def hello() -> str:\n'
+            "def hello() -> str:\n"
             '    return "world"\n'
-            '\n'
-            'class Calculator:\n'
-            '    def add(self, a: int, b: int) -> int:\n'
-            '        return a + b\n'
+            "\n"
+            "class Calculator:\n"
+            "    def add(self, a: int, b: int) -> int:\n"
+            "        return a + b\n"
         )
 
         # Commit the file
@@ -264,6 +260,7 @@ def agent_config() -> AgentConfig:
     from external_llm.agent.enums import Complexity, Scope
     from external_llm.agent.task_router import Lane, RouteDecision, TaskKind
     from external_llm.agent.tool_registry import AgentConfig
+
     config = AgentConfig(
         max_turns=5,
         run_tests=False,
@@ -316,15 +313,15 @@ def mock_llm_client() -> Mock:
 def tool_registry(temp_repo_root: str, agent_config: AgentConfig) -> ToolRegistry:
     """Return a ToolRegistry instance for testing."""
     from external_llm.agent.tool_registry import ToolRegistry
+
     return ToolRegistry(temp_repo_root, agent_config)
 
 
 @pytest.fixture
-def agent_loop(
-    mock_llm_client: Mock, tool_registry: ToolRegistry, agent_config: AgentConfig
-) -> AgentLoop:
+def agent_loop(mock_llm_client: Mock, tool_registry: ToolRegistry, agent_config: AgentConfig) -> AgentLoop:
     """Return an AgentLoop instance with mocked LLM client."""
     from external_llm.agent.agent_loop import AgentLoop
+
     return AgentLoop(
         llm_client=mock_llm_client,
         registry=tool_registry,
@@ -372,6 +369,7 @@ def invalid_patch() -> str:
 def file_lock_manager() -> FileLockManager:
     """FileLockManager instance for multi-agent tests."""
     from external_llm.agent.orchestrator import FileLockManager
+
     return FileLockManager()
 
 
@@ -386,12 +384,12 @@ def sample_plan_dict() -> dict[str, Any]:
                 "path": "sample.py",
                 "blocks": [
                     {
-                        "before": '    def add(self, a: int, b: int) -> int:\n        return a + b',
-                        "after": '    def add(self, a: int, b: int) -> int:\n        return a + b\n\n    def subtract(self, a: int, b: int) -> int:\n        return a - b'
+                        "before": "    def add(self, a: int, b: int) -> int:\n        return a + b",
+                        "after": "    def add(self, a: int, b: int) -> int:\n        return a + b\n\n    def subtract(self, a: int, b: int) -> int:\n        return a - b",
                     }
-                ]
+                ],
             }
-        ]
+        ],
     }
 
 
@@ -406,12 +404,12 @@ def sample_simple_edit_plan_dict() -> dict[str, Any]:
                 "path": "sample.py",
                 "blocks": [
                     {
-                        "before": '    def add(self, a: int, b: int) -> int:\n        return a + b',
-                        "after": '    def add(self, a: int, b: int) -> int:\n        return a + b  # Fixed indentation'
+                        "before": "    def add(self, a: int, b: int) -> int:\n        return a + b",
+                        "after": "    def add(self, a: int, b: int) -> int:\n        return a + b  # Fixed indentation",
                     }
-                ]
+                ],
             }
-        ]
+        ],
     }
 
 
@@ -421,12 +419,8 @@ def sample_create_file_plan_dict() -> dict[str, Any]:
     return {
         "version": "ASICODE_PLAN_V1",
         "operations": [
-            {
-                "type": "create_file",
-                "path": "new_file.py",
-                "content": 'def new_function():\n    return "new"'
-            }
-        ]
+            {"type": "create_file", "path": "new_file.py", "content": 'def new_function():\n    return "new"'}
+        ],
     }
 
 
@@ -441,16 +435,11 @@ def sample_multi_file_plan_dict() -> dict[str, Any]:
                 "path": "sample.py",
                 "blocks": [
                     {
-                        "before": '    def add(self, a: int, b: int) -> int:\n        return a + b',
-                        "after": '    def add(self, a: int, b: int) -> int:\n        return a + b  # multi'
+                        "before": "    def add(self, a: int, b: int) -> int:\n        return a + b",
+                        "after": "    def add(self, a: int, b: int) -> int:\n        return a + b  # multi",
                     }
-                ]
+                ],
             },
-            {
-                "type": "create_file",
-                "path": "utils.py",
-                "content": 'def helper():\n    return "help"'
-            }
-        ]
+            {"type": "create_file", "path": "utils.py", "content": 'def helper():\n    return "help"'},
+        ],
     }
-

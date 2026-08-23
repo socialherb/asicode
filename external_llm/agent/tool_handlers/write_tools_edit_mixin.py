@@ -5,6 +5,7 @@ the syntax/rollback gate helpers. Split out of ``WriteToolsMixin`` in
 ``write_tools.py``; recombined there via ``class WriteToolsMixin(...,
 WriteToolsEditMixin, ...)``.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -13,7 +14,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from ...common.atomic_io import atomic_write_bytes, atomic_write_text
 from ...common.text_reading import read_text_with_encoding_fallback
@@ -38,8 +39,24 @@ logger = logging.getLogger(__name__)
 class WriteToolsEditMixin:
     """Edit-family write handlers: edit_text, edit_file, modify_symbol."""
 
+    # Host contracts (P29 pattern): ToolRegistry / WriteToolsPatchMixin own
+    # these at runtime via MRO combination; annotations only — never assign.
+    repo_root: str
+    _effective_repo_root: Any
+    defer_semantic_check: Any
+    _make_result: Any
+    _secure_path: Any
+    _should_soft_fail_verify: Any
+    _refuse_foreign_leased: Any
+    _acquire_edit_leases: Any
+    _append_applied_patch: Any
+    _text_edited_files: set[str]
+
     def _resolve_edit_anchor(
-        self, modified: str, anchor: str, line: Optional[int] = None,
+        self,
+        modified: str,
+        anchor: str,
+        line: int | None = None,
     ) -> tuple[int, str, float]:
         """Find anchor in modified text with exact-match fallback strategies.
 
@@ -71,7 +88,9 @@ class WriteToolsEditMixin:
                 _best = min(_positions, key=lambda q: abs(q - _target_byte))
                 logger.info(
                     "edit_file: anchor not unique (%d matches) — line hint %d → byte %d",
-                    _count, line, _best,
+                    _count,
+                    line,
+                    _best,
                 )
                 return _best, anchor, 0.0
             raise ValueError(
@@ -81,18 +100,19 @@ class WriteToolsEditMixin:
 
         # 2. Line hint → use actual content at that line
         if line is not None and 1 <= line <= len(_lines):
-            _line_content = _lines[line - 1].rstrip('\n\r')
+            _line_content = _lines[line - 1].rstrip("\n\r")
             if _line_content:
                 # Compute exact byte offset from line number (handles duplicates correctly)
                 _byte_pos = sum(len(_lines[i]) for i in range(line - 1))
-                if modified[_byte_pos:_byte_pos+len(_line_content)] == _line_content:
+                if modified[_byte_pos : _byte_pos + len(_line_content)] == _line_content:
                     logger.info(
-                        "edit_file: line hint %d → exact byte offset", line,
+                        "edit_file: line hint %d → exact byte offset",
+                        line,
                     )
                     return _byte_pos, _line_content, 0.0
 
         # 3. First anchor line → strip-match in search window
-        _first_line = anchor.split('\n', maxsplit=1)[0].strip()
+        _first_line = anchor.split("\n", maxsplit=1)[0].strip()
         if _first_line:
             _search_start = 0
             _search_end = len(_lines)
@@ -104,10 +124,9 @@ class WriteToolsEditMixin:
             # exact-match path. Silently taking the first of several stripped
             # matches is exactly the wrong-location failure mode the exact
             # path fails loud on — the fallback must not reintroduce it.
-            if '\n' not in anchor:
+            if "\n" not in anchor:
                 _strip_matches = [
-                    _smi for _smi in range(_search_start, _search_end)
-                    if _lines[_smi].strip() == _first_line
+                    _smi for _smi in range(_search_start, _search_end) if _lines[_smi].strip() == _first_line
                 ]
                 if not _strip_matches:
                     pass  # fall through to the error path below
@@ -118,7 +137,9 @@ class WriteToolsEditMixin:
                         _li = min(_strip_matches, key=lambda q: abs(q - (line - 1)))
                         logger.info(
                             "edit_file: %d stripped matches — line hint %d → line %d",
-                            len(_strip_matches), line, _li + 1,
+                            len(_strip_matches),
+                            line,
+                            _li + 1,
                         )
                     else:
                         raise ValueError(
@@ -126,23 +147,23 @@ class WriteToolsEditMixin:
                             f"indentation ({_first_line[:60]!r}). Include 2-3 surrounding "
                             "lines to make it unique, or pass a 'line' hint."
                         )
-                    _raw = _lines[_li].rstrip('\n\r')
+                    _raw = _lines[_li].rstrip("\n\r")
                     _li_byte_pos = sum(len(_lines[i]) for i in range(_li))
                     logger.info("edit_file: first-line match → line %d", _li + 1)
                     return _li_byte_pos, _raw, 0.0
 
             for _li in range(_search_start, _search_end):
                 if _lines[_li].strip() == _first_line:
-                    _raw = _lines[_li].rstrip('\n\r')
+                    _raw = _lines[_li].rstrip("\n\r")
                     pos = modified.find(_raw)
                     # _raw IS a line of ``modified`` (the strip match succeeded on
                     # the same line), so find() always succeeds.
                     if pos == -1:  # pragma: no cover
                         continue
                     # Multi-line anchor: reconstruct from actual file content
-                    _anchor_line_count = anchor.count('\n') + 1
+                    _anchor_line_count = anchor.count("\n") + 1
                     if _anchor_line_count > 1 and _li + _anchor_line_count <= len(_lines):
-                        _actual = "".join(_lines[_li:_li + _anchor_line_count]).rstrip('\n\r')
+                        _actual = "".join(_lines[_li : _li + _anchor_line_count]).rstrip("\n\r")
                         if modified.count(_actual) == 1:
                             _actual_pos = modified.find(_actual)
                             if _actual_pos != -1:
@@ -156,7 +177,7 @@ class WriteToolsEditMixin:
                         # otherwise a common prefix could match the wrong location.
                         if _anchor_line_count > 2:
                             for _try_lines in range(_anchor_line_count - 1, 1, -1):
-                                _partial = "".join(_lines[_li:_li + _try_lines]).rstrip('\n\r')
+                                _partial = "".join(_lines[_li : _li + _try_lines]).rstrip("\n\r")
                                 # A duplicated full block implies duplicated
                                 # prefixes (same text), so this is unreachable.
                                 if _partial and modified.count(_partial) == 1:  # pragma: no cover
@@ -164,7 +185,9 @@ class WriteToolsEditMixin:
                                     if _actual_pos != -1:
                                         logger.info(
                                             "edit_file: first-line match → progressive %d/%d lines at line %d",
-                                            _try_lines, _anchor_line_count, _li + 1,
+                                            _try_lines,
+                                            _anchor_line_count,
+                                            _li + 1,
                                         )
                                         return _actual_pos, _partial, 0.0
                         # Multi-line reconstruction failed (duplicate/out-of-bounds/progressive)
@@ -185,14 +208,17 @@ class WriteToolsEditMixin:
         _suggestions = ""
         if _first_line:
             _close = difflib.get_close_matches(
-                _first_line, [ln.strip() for ln in modified.splitlines()], n=3, cutoff=0.4,
+                _first_line,
+                [ln.strip() for ln in modified.splitlines()],
+                n=3,
+                cutoff=0.4,
             )
             if _close:
                 _suggestions = f". Did you mean: {_close}"
 
         raise ValueError(f"anchor text not found: {anchor[:80]!r}{_suggestions}")
 
-    def _tool_edit_file(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_edit_file(self, args: dict[str, Any]) -> ToolResult:
         """Edit a single file using anchor-based text operations.
 
         No diff/patch syntax needed.  Supports:
@@ -204,6 +230,7 @@ class WriteToolsEditMixin:
         whole call is rolled back and an error is returned.
         """
         import time as _time
+
         start_time = _time.monotonic()
         args = self._recover_args_from_raw(args, ("path",))
         file_path = (args.get("path") or "").strip()
@@ -225,7 +252,9 @@ class WriteToolsEditMixin:
                 execution_time=0,
             )
         if not ops:
-            return self._make_result(ok=False, error=f"operations list cannot be empty for {file_path}", execution_time=0)
+            return self._make_result(
+                ok=False, error=f"operations list cannot be empty for {file_path}", execution_time=0
+            )
 
         # Repo-boundary check — see _tool_edit_text. Placed at the resolution
         # point rather than next to the arg read, so it covers the path whichever
@@ -238,7 +267,8 @@ class WriteToolsEditMixin:
         _secured = self._secure_path(file_path, confine=True)
         if _secured is None:
             return self._make_result(
-                ok=False, error=f"Path blocked (outside repo): {file_path}",
+                ok=False,
+                error=f"Path blocked (outside repo): {file_path}",
                 execution_time=0,
             )
 
@@ -256,12 +286,10 @@ class WriteToolsEditMixin:
         try:
             original = _norm.read_text(encoding="utf-8")
         except Exception as e:
-            return self._make_result(
-                ok=False, error=f"Failed to read {file_path}: {e}", execution_time=0
-            )
+            return self._make_result(ok=False, error=f"Failed to read {file_path}: {e}", execution_time=0)
 
         # Detect file line ending style so insert operations preserve it
-        _file_newline = '\r\n' if '\r\n' in original else '\n'
+        _file_newline = "\r\n" if "\r\n" in original else "\n"
         modified = original
         _op_type_counts: dict[str, int] = {}
         _edit_warnings: list[str] = []
@@ -270,13 +298,13 @@ class WriteToolsEditMixin:
             anchor = op.get("anchor", "")
             content = op.get("content", "")
             if not anchor:
-                return self._make_result(
-                    ok=False, error=f"Operation {i}: 'anchor' is required"
-                )
+                return self._make_result(ok=False, error=f"Operation {i}: 'anchor' is required")
 
             try:
                 _pos, _actual_anchor, _fuzzy_ratio = self._resolve_edit_anchor(
-                    modified, anchor, op.get("line"),
+                    modified,
+                    anchor,
+                    op.get("line"),
                 )
             except ValueError as e:
                 return self._make_result(
@@ -290,8 +318,6 @@ class WriteToolsEditMixin:
                 _warn = f"op {i}: anchor fuzzy-matched at ratio={_fuzzy_ratio:.2f} (anchor={anchor[:60]!r}, matched={_actual_anchor[:60]!r})"
                 logger.warning("edit_file %s", _warn)
                 _edit_warnings.append(_warn)
-
-
 
             if op_type == "replace":
                 _op_type_counts["replace"] = _op_type_counts.get("replace", 0) + 1
@@ -309,11 +335,11 @@ class WriteToolsEditMixin:
                     )
                     logger.warning("edit_file %s", _warn_content_anchor_ratio)
                     _edit_warnings.append(_warn_content_anchor_ratio)
-                modified = modified[:_pos] + content + modified[_pos + len(_actual_anchor):]
+                modified = modified[:_pos] + content + modified[_pos + len(_actual_anchor) :]
 
             elif op_type == "insert_after":
                 _op_type_counts["insert_after"] = _op_type_counts.get("insert_after", 0) + 1
-                _eol = modified.find('\n', _pos + len(_actual_anchor))
+                _eol = modified.find("\n", _pos + len(_actual_anchor))
 
                 # ── Block-end auto-correction (mirrors anchor_edit) ────────
                 # If the anchor line is a block header (def/class/if/... in
@@ -325,24 +351,24 @@ class WriteToolsEditMixin:
                 # sibling. Installing a grammar enables this for that language
                 # with no code change.
                 if _eol != -1:
-                    _ef_anchor_lineno = modified[:_pos].count('\n')
+                    _ef_anchor_lineno = modified[:_pos].count("\n")
                     _ef_lines = modified.splitlines(True)
                     _ef_block_end = _find_block_end_line(
                         modified,
                         LanguageId.from_path(str(_norm)).value,
-                        _ef_anchor_lineno, _ef_lines,
+                        _ef_anchor_lineno,
+                        _ef_lines,
                     )
                     if _ef_block_end is not None and _ef_block_end > _ef_anchor_lineno:
-                        _ef_new_eol = (
-                            sum(len(_l) for _l in _ef_lines[:_ef_block_end + 1]) - 1
-                        )
-                        if 0 <= _ef_new_eol < len(modified) and modified[_ef_new_eol] == '\n':
+                        _ef_new_eol = sum(len(_l) for _l in _ef_lines[: _ef_block_end + 1]) - 1
+                        if 0 <= _ef_new_eol < len(modified) and modified[_ef_new_eol] == "\n":
                             _eol = _ef_new_eol
                             logger.info(
                                 "edit_file op %d (insert_after): anchor L%d is a "
                                 "%d-line block header — inserting after block end "
                                 "L%d instead of into the body",
-                                i, _ef_anchor_lineno + 1,
+                                i,
+                                _ef_anchor_lineno + 1,
                                 _ef_block_end - _ef_anchor_lineno + 1,
                                 _ef_block_end + 1,
                             )
@@ -357,28 +383,26 @@ class WriteToolsEditMixin:
                 # Second clause covers the EOF case (no trailing newline) — exact
                 # match only, since a permissive startswith would false-positive on
                 # any prefix (e.g. content="x = 1" vs after_text="x = 123\n...").
-                _after_text = modified[_eol+1:]
-                _normalized_content = content.rstrip('\r\n') + _file_newline
-                _already_present = (
-                    _after_text.startswith(_normalized_content)
-                    or _after_text == content.rstrip('\r\n')
-                )
+                _after_text = modified[_eol + 1 :]
+                _normalized_content = content.rstrip("\r\n") + _file_newline
+                _already_present = _after_text.startswith(_normalized_content) or _after_text == content.rstrip("\r\n")
                 if _already_present:
                     logger.info(
-                        "edit_file op %d (insert_after): content already present after anchor — skipping (idempotent)", i,
+                        "edit_file op %d (insert_after): content already present after anchor — skipping (idempotent)",
+                        i,
                     )
                 else:
-                    modified = modified[:_eol+1] + _normalized_content + modified[_eol+1:]
+                    modified = modified[: _eol + 1] + _normalized_content + modified[_eol + 1 :]
 
             elif op_type == "insert_before":
                 _op_type_counts["insert_before"] = _op_type_counts.get("insert_before", 0) + 1
                 # Idempotency check: skip if content (normalized) already exists before anchor.
                 # Checks the text immediately preceding _pos (after the last newline before anchor).
                 _before_text = modified[:_pos]
-                _candidate_end = _before_text.rfind('\n', 0, _pos)
-                _candidate = _before_text[:_pos] if _candidate_end == -1 else _before_text[_candidate_end + 1:_pos]
-                _candidate_norm = _candidate.rstrip('\r\n')
-                _content_norm = content.rstrip('\r\n')
+                _candidate_end = _before_text.rfind("\n", 0, _pos)
+                _candidate = _before_text[:_pos] if _candidate_end == -1 else _before_text[_candidate_end + 1 : _pos]
+                _candidate_norm = _candidate.rstrip("\r\n")
+                _content_norm = content.rstrip("\r\n")
                 _already_present = _candidate_norm == _content_norm
                 # Also check multi-line: content might span multiple lines before anchor
                 if not _already_present:
@@ -386,10 +410,11 @@ class WriteToolsEditMixin:
                     _already_present = _before_text.endswith(_content_with_newline)
                 if _already_present:
                     logger.info(
-                        "edit_file op %d (insert_before): content already present before anchor -- skipping (idempotent)", i,
+                        "edit_file op %d (insert_before): content already present before anchor -- skipping (idempotent)",
+                        i,
                     )
                 else:
-                    modified = modified[:_pos] + content.rstrip('\r\n') + _file_newline + modified[_pos:]
+                    modified = modified[:_pos] + content.rstrip("\r\n") + _file_newline + modified[_pos:]
 
             else:
                 return self._make_result(
@@ -400,9 +425,7 @@ class WriteToolsEditMixin:
         try:
             atomic_write_text(str(_norm), modified)
         except Exception as e:
-            return self._make_result(
-                ok=False, error=f"Failed to write {file_path}: {e}"
-            )
+            return self._make_result(ok=False, error=f"Failed to write {file_path}: {e}")
 
         _orig_lines = original.splitlines()
         _mod_lines = modified.splitlines()
@@ -410,11 +433,11 @@ class WriteToolsEditMixin:
         # Compute separate add/remove counts via a simple line-diff
         _added_lines = _removed_lines = 0
         for line in difflib.unified_diff(_orig_lines, _mod_lines, n=0):
-            if line.startswith(('+++', '---')):
+            if line.startswith(("+++", "---")):
                 continue
-            if line.startswith('+'):
+            if line.startswith("+"):
                 _added_lines += 1
-            elif line.startswith('-'):
+            elif line.startswith("-"):
                 _removed_lines += 1
         # Build op-type breakdown for the summary
         _op_type_breakdown = " + ".join(
@@ -454,17 +477,14 @@ class WriteToolsEditMixin:
                 return self._make_result(
                     ok=False,
                     error=(
-                        f"Syntax error after editing {file_path}. Rolled back to original.\n"
-                        f"Errors: {_error_details}\n"
+                        f"Syntax error after editing {file_path}. Rolled back to original.\nErrors: {_error_details}\n"
                     ),
                     metadata=_meta,
                     execution_time=_exec,
                 )
         _exec = _time.monotonic() - start_time
         # Track applied patch so agent_loop can detect successful writes
-        self._append_applied_patch(
-            f"edit_file:{file_path}:{_op_type_breakdown}:{_added_lines:+}/{-_removed_lines:-}"
-        )
+        self._append_applied_patch(f"edit_file:{file_path}:{_op_type_breakdown}:{_added_lines:+}/{-_removed_lines:-}")
         # F1: stake our lease (edit_file does not call _record_text_edit, so
         # the acquire lives here explicitly).
         self._acquire_edit_leases([file_path])
@@ -475,9 +495,7 @@ class WriteToolsEditMixin:
             execution_time=_exec,
         )
 
-    def _current_file_head_snippet(
-        self, content: str, max_lines: int = 25, max_chars: int = 2000
-    ) -> str:
+    def _current_file_head_snippet(self, content: str, max_lines: int = 25, max_chars: int = 2000) -> str:
         """Head of the CURRENT file content, read_file-gutter style.
 
         Attached to search_string_mismatch errors when near-match hinting
@@ -499,17 +517,12 @@ class WriteToolsEditMixin:
             shown.append(_line)
         if not shown:
             return ""
-        _tail = (
-            "" if len(lines) <= len(shown)
-            else f"\n... ({len(lines) - len(shown)} more lines)"
-        )
+        _tail = "" if len(lines) <= len(shown) else f"\n... ({len(lines) - len(shown)} more lines)"
         return (
             "--- current file content (re-read from disk; the file may have "
-            f"changed since you last read it - first {len(shown)} lines) ---\n"
-            + "\n".join(shown)
-            + _tail
-            + "\n---\n"
+            f"changed since you last read it - first {len(shown)} lines) ---\n" + "\n".join(shown) + _tail + "\n---\n"
         )
+
     def _patch_failure_snippet(self, patch_text: str, path_hint) -> str:
         """Current-file head for a failed apply_patch (stale-target diagnosis).
 
@@ -543,6 +556,7 @@ class WriteToolsEditMixin:
         if _content is None:  # pragma: no cover
             return ""
         return self._current_file_head_snippet(_content)
+
     @staticmethod
     def _raw_repr(text: str, max_lines: int = 3) -> str:
         """Show raw character representation of a text snippet.
@@ -560,9 +574,7 @@ class WriteToolsEditMixin:
             raw = raw[1:-1]
         return f"Raw old_string (repr): {raw}\n"
 
-    def _near_match_hint(
-        self, content: str, old_string: str, max_window_lines: int = 200
-    ) -> str:
+    def _near_match_hint(self, content: str, old_string: str, max_window_lines: int = 200) -> str:
         """Best-effort 'did you mean' hint for a failed exact-match edit.
 
         When old_string does not match verbatim (the dominant cause being
@@ -579,6 +591,7 @@ class WriteToolsEditMixin:
         """
         try:
             import difflib
+
             file_lines = content.splitlines()
             old_lines = old_string.splitlines()
             if not file_lines or not old_lines:
@@ -613,7 +626,7 @@ class WriteToolsEditMixin:
                 _sm.set_seq2(old_blob)
                 for ci in cand_idxs:
                     for start in range(max(0, ci - window + 1), ci + 1):
-                        region = file_lines[start:start + window]
+                        region = file_lines[start : start + window]
                         # start <= ci < len(file_lines) and window >= 1, so the
                         # slice is never empty.
                         if not region:  # pragma: no cover
@@ -626,21 +639,23 @@ class WriteToolsEditMixin:
                 # Window scan skipped or inconclusive — anchor on the single
                 # best candidate line so the model at least gets a location.
                 best_start = cand_idxs[0]
-                best_ratio = difflib.SequenceMatcher(
-                    None, old_first, stripped[best_start], autojunk=False
-                ).ratio()
+                best_ratio = difflib.SequenceMatcher(None, old_first, stripped[best_start], autojunk=False).ratio()
 
             ctx_start = max(0, best_start - 2)
             ctx_end = min(len(file_lines), best_start + window + 2)
             numbered = "\n".join(
-                f"{ctx_start + j + 1:5d}| {file_lines[ctx_start + j]}"
-                for j in range(ctx_end - ctx_start)
+                f"{ctx_start + j + 1:5d}| {file_lines[ctx_start + j]}" for j in range(ctx_end - ctx_start)
             )
-            region = file_lines[best_start:best_start + window]
-            diff = "\n".join(difflib.unified_diff(
-                old_lines, region,
-                fromfile="your old_string", tofile="actual file", lineterm="",
-            ))
+            region = file_lines[best_start : best_start + window]
+            diff = "\n".join(
+                difflib.unified_diff(
+                    old_lines,
+                    region,
+                    fromfile="your old_string",
+                    tofile="actual file",
+                    lineterm="",
+                )
+            )
             # Cap diff size so a wildly-wrong old_string can't bloat the result.
             if len(diff) > 2000:
                 diff = diff[:2000] + "\n… (diff truncated)"
@@ -674,13 +689,13 @@ class WriteToolsEditMixin:
                     if ol == rl:
                         continue
                     if ol.strip() == rl.strip():
+
                         def _vis(s):
-                            lead = s[:len(s) - len(s.lstrip())]
+                            lead = s[: len(s) - len(s.lstrip())]
                             return lead.replace(" ", "·").replace("\t", "⇥") + s.lstrip()
+
                         ws_note = (
-                            "\nWhitespace differs (· = space, ⇥ = tab):\n"
-                            f"  yours: {_vis(ol)!r}\n"
-                            f"  file : {_vis(rl)!r}"
+                            f"\nWhitespace differs (· = space, ⇥ = tab):\n  yours: {_vis(ol)!r}\n  file : {_vis(rl)!r}"
                         )
                         break
                     if _decor_norm(ol) == _decor_norm(rl):
@@ -715,6 +730,7 @@ class WriteToolsEditMixin:
         caller appends the result and degrades to the original message.
         """
         import difflib
+
         try:
             _missing = (file_path or "").strip()
             if not _missing:
@@ -771,9 +787,7 @@ class WriteToolsEditMixin:
         except (OSError, ValueError, TypeError):  # repo walk / path ops
             return ""
 
-    def _ast_fail_hint(
-        self, source: str, ops: list[dict[str, Any]], symbol: str
-    ) -> str:
+    def _ast_fail_hint(self, source: str, ops: list[dict[str, Any]], symbol: str) -> str:
         """'Did you mean' hint for a failed edit_ast call.
 
         edit_ast fails in two distinct ways the model can't self-diagnose
@@ -791,6 +805,7 @@ class WriteToolsEditMixin:
         try:
             import ast as _ast
             import difflib
+
             parts: list[str] = []
 
             # 1. Symbol resolution suggestions.
@@ -825,7 +840,11 @@ class WriteToolsEditMixin:
                             self.generic_visit(node)
                             self.stack.pop()
 
-                        visit_AsyncFunctionDef = visit_FunctionDef
+                        def visit_AsyncFunctionDef(self, node):
+                            self._record(node.name)
+                            self.stack.append(node.name)
+                            self.generic_visit(node)
+                            self.stack.pop()
 
                     _V().visit(tree)
                     bare = sym.split(".")[-1]
@@ -833,16 +852,11 @@ class WriteToolsEditMixin:
                         pool = sorted(qualified | defined)
                         close = difflib.get_close_matches(bare, pool, n=5, cutoff=0.4)
                         if close:
-                            parts.append(
-                                f"symbol {sym!r} not found in this file. "
-                                f"Did you mean: {close}?"
-                            )
+                            parts.append(f"symbol {sym!r} not found in this file. Did you mean: {close}?")
                         else:
                             _avail = sorted(defined)[:20]
                             if _avail:
-                                parts.append(
-                                    f"symbol {sym!r} not found. Defined here: {_avail}"
-                                )
+                                parts.append(f"symbol {sym!r} not found. Defined here: {_avail}")
 
             # 2. Text-search op suggestions — only when the searched text is
             #    genuinely absent verbatim (a reliable proxy for "this op is
@@ -866,9 +880,7 @@ class WriteToolsEditMixin:
         except (KeyError, TypeError, ValueError, IndexError):
             return ""
 
-    def _resolve_with_fallback(
-        self, content: str, old_string: str
-    ) -> "tuple[str, int, Optional[list], Optional[list]]":
+    def _resolve_with_fallback(self, content: str, old_string: str) -> tuple[str, int, list | None, list | None]:
         """Resolve old_string via exact → whitespace-tolerant → unicode-tolerant matching.
 
         Returns (resolved_old_string, count, fallback_matches, orig_split).
@@ -888,22 +900,27 @@ class WriteToolsEditMixin:
         _norm_old_lines = [_item_.rstrip() for _item_ in old_string.splitlines()]
 
         # ── Unicode decoration map ──
-        _UNI_DECORATIVE = str.maketrans({
-            '─': '-', '━': '-',  # box-drawing horizontal
-            '—': '-', '\u2013': '-',  # em-dash, en-dash
-            '│': '|', '┃': '|',  # box-drawing vertical
-            '┌': '|', '┐': '|',  # box-drawing corners
-            '└': '|', '┘': '|',  # box-drawing corners
-        })
+        _uni_decorative = str.maketrans(
+            {
+                "─": "-",
+                "━": "-",  # box-drawing horizontal
+                "—": "-",
+                "\u2013": "-",  # em-dash, en-dash
+                "│": "|",
+                "┃": "|",  # box-drawing vertical
+                "┌": "|",
+                "┐": "|",  # box-drawing corners
+                "└": "|",
+                "┘": "|",  # box-drawing corners
+            }
+        )
 
         # ── Whitespace-tolerant fallback ──────────────────────────────
         if _norm_old_lines:
             _ws_matches: list[tuple[int, str]] = []
-            for _s_idx in range(
-                len(_norm_content_lines) - len(_norm_old_lines) + 1
-            ):
-                if _norm_content_lines[_s_idx:_s_idx + len(_norm_old_lines)] == _norm_old_lines:
-                    _recon = "".join(_orig_split[_s_idx:_s_idx + len(_norm_old_lines)])
+            for _s_idx in range(len(_norm_content_lines) - len(_norm_old_lines) + 1):
+                if _norm_content_lines[_s_idx : _s_idx + len(_norm_old_lines)] == _norm_old_lines:
+                    _recon = "".join(_orig_split[_s_idx : _s_idx + len(_norm_old_lines)])
                     # Honor caller's trailing-newline intent
                     if not old_string.endswith(("\n", "\r")):
                         _recon = _recon.rstrip("\r\n")
@@ -922,11 +939,9 @@ class WriteToolsEditMixin:
         _indent_norm_content = [_item_.strip() for _item_ in _orig_split]
         _indent_norm_old = [_item_.strip() for _item_ in old_string.splitlines()]
         _indent_matches: list[tuple[int, str]] = []
-        for _s_idx in range(
-            len(_indent_norm_content) - len(_indent_norm_old) + 1
-        ):
-            if _indent_norm_content[_s_idx:_s_idx + len(_indent_norm_old)] == _indent_norm_old:
-                _recon = "".join(_orig_split[_s_idx:_s_idx + len(_indent_norm_old)])
+        for _s_idx in range(len(_indent_norm_content) - len(_indent_norm_old) + 1):
+            if _indent_norm_content[_s_idx : _s_idx + len(_indent_norm_old)] == _indent_norm_old:
+                _recon = "".join(_orig_split[_s_idx : _s_idx + len(_indent_norm_old)])
                 if not old_string.endswith(("\n", "\r")):
                     _recon = _recon.rstrip("\r\n")
                 _indent_matches.append((_s_idx, _recon))
@@ -937,18 +952,18 @@ class WriteToolsEditMixin:
 
         # ── Unicode-tolerant fallback ─────────────────────────────────
         import unicodedata
+
         def _unorm(s):
             s = unicodedata.normalize("NFC", s)
-            return s.translate(_UNI_DECORATIVE)
+            return s.translate(_uni_decorative)
+
         _uni_norm_lines = [_unorm(_item_.rstrip()) for _item_ in _orig_split]
         _uni_old_lines = [_unorm(_item_.rstrip()) for _item_ in old_string.splitlines()]
         if _uni_old_lines:
             _uni_matches: list[tuple[int, str]] = []
-            for _s_idx in range(
-                len(_uni_norm_lines) - len(_uni_old_lines) + 1
-            ):
-                if _uni_norm_lines[_s_idx:_s_idx + len(_uni_old_lines)] == _uni_old_lines:
-                    _recon = "".join(_orig_split[_s_idx:_s_idx + len(_uni_old_lines)])
+            for _s_idx in range(len(_uni_norm_lines) - len(_uni_old_lines) + 1):
+                if _uni_norm_lines[_s_idx : _s_idx + len(_uni_old_lines)] == _uni_old_lines:
+                    _recon = "".join(_orig_split[_s_idx : _s_idx + len(_uni_old_lines)])
                     if not old_string.endswith(("\n", "\r")):
                         _recon = _recon.rstrip("\r\n")
                     _uni_matches.append((_s_idx, _recon))
@@ -1011,10 +1026,7 @@ class WriteToolsEditMixin:
                 regions.append((_start, _end))
             if not regions:
                 return True, []  # couldn't find a change but content differs — be safe
-            in_region = any(
-                max(1, s - context) <= lineno_1based <= e + context
-                for (s, e) in regions
-            )
+            in_region = any(max(1, s - context) <= lineno_1based <= e + context for (s, e) in regions)
         except Exception:
             return True, []  # safe default: assume in-region so gate still refuses
         else:
@@ -1139,10 +1151,7 @@ class WriteToolsEditMixin:
         the caller then omits the hint and falls back to indentation/cascade.
         """
         m_lower = (msg or "").lower()
-        if (
-            "expected 'except' or 'finally'" in m_lower
-            or "has no 'except' or 'finally'" in m_lower
-        ):
+        if "expected 'except' or 'finally'" in m_lower or "has no 'except' or 'finally'" in m_lower:
             return (
                 "Structural imbalance: new_string opens a `try:` block but is "
                 "missing its matching `except`/`finally` clause — a truncated "
@@ -1157,14 +1166,10 @@ class WriteToolsEditMixin:
             )
         if "'[' was never closed" in m_lower:
             return (
-                "Structural imbalance: an opening `[` is never closed — "
-                "new_string likely dropped the closing bracket."
+                "Structural imbalance: an opening `[` is never closed — new_string likely dropped the closing bracket."
             )
         if "'{' was never closed" in m_lower:
-            return (
-                "Structural imbalance: an opening `{` is never closed — "
-                "new_string likely dropped the closing brace."
-            )
+            return "Structural imbalance: an opening `{` is never closed — new_string likely dropped the closing brace."
         if "unexpected eof while parsing" in m_lower:
             return (
                 "Structural imbalance: the source ends while a bracket or block "
@@ -1199,6 +1204,8 @@ class WriteToolsEditMixin:
             }
 
         _resolved, total_count, fallback_matches, _orig_split = self._resolve_with_fallback(content, old_string)
+        if _orig_split is None:
+            _orig_split = []
 
         in_scope_matches = []
         if fallback_matches is not None:
@@ -1208,7 +1215,7 @@ class WriteToolsEditMixin:
             _offset_by_line = [0]
             for _l in _orig_split:
                 _offset_by_line.append(_offset_by_line[-1] + len(_l))
-            for (_m_idx, _m_recon) in fallback_matches:
+            for _m_idx, _m_recon in fallback_matches:
                 _start_line = _m_idx + 1
                 _n = len(_m_recon.splitlines()) or 1
                 if scope_start <= _start_line <= scope_end:
@@ -1234,20 +1241,41 @@ class WriteToolsEditMixin:
                 _raw = self._raw_repr(old_string)
                 return {
                     "ok": False,
-                    "error": (f"old_string not found in {file_path}\n{_raw}{_hint}\nTo fix this, re-read the file and include 2-3 lines of surrounding context as old_string."),
-                    "metadata": {"matched": False, "near_match": bool(_hint), "failure_class": "search_string_mismatch"},
+                    "error": (
+                        f"old_string not found in {file_path}\n{_raw}{_hint}\nTo fix this, re-read the file and include 2-3 lines of surrounding context as old_string."
+                    ),
+                    "metadata": {
+                        "matched": False,
+                        "near_match": bool(_hint),
+                        "failure_class": "search_string_mismatch",
+                    },
                 }
             return {
                 "ok": False,
-                "error": (f"old_string not found WITHIN scope L{scope_start}-{scope_end} in {file_path}, but {total_count} occurrence(s) exist OUTSIDE the scope. Adjust scope_start_line/scope_end_line to cover the intended occurrence."),
-                "metadata": {"matched": False, "in_scope_count": 0, "out_of_scope_count": total_count, "scope": list(scope), "failure_class": "search_string_mismatch"},
+                "error": (
+                    f"old_string not found WITHIN scope L{scope_start}-{scope_end} in {file_path}, but {total_count} occurrence(s) exist OUTSIDE the scope. Adjust scope_start_line/scope_end_line to cover the intended occurrence."
+                ),
+                "metadata": {
+                    "matched": False,
+                    "in_scope_count": 0,
+                    "out_of_scope_count": total_count,
+                    "scope": list(scope),
+                    "failure_class": "search_string_mismatch",
+                },
             }
 
         if in_scope_count > 1:
             return {
                 "ok": False,
-                "error": (f"Found {in_scope_count} occurrences of old_string WITHIN scope L{scope_start}-{scope_end} in {file_path}. Narrow the scope or make old_string more unique (include 2-3 lines of context)."),
-                "metadata": {"matched": False, "in_scope_count": in_scope_count, "scope": list(scope), "failure_class": "search_string_mismatch"},
+                "error": (
+                    f"Found {in_scope_count} occurrences of old_string WITHIN scope L{scope_start}-{scope_end} in {file_path}. Narrow the scope or make old_string more unique (include 2-3 lines of context)."
+                ),
+                "metadata": {
+                    "matched": False,
+                    "in_scope_count": in_scope_count,
+                    "scope": list(scope),
+                    "failure_class": "search_string_mismatch",
+                },
             }
 
         _ms, _me, _char_pos, _recon = in_scope_matches[0]
@@ -1256,7 +1284,7 @@ class WriteToolsEditMixin:
         # (same as replace_all); for the exact path _recon == old_string so
         # _reindent_to_match is a no-op.
         _reindented_new = _reindent_to_match(new_string, _recon, file_unit=_detect_file_unit(content))
-        new_content = content[:_char_pos] + _reindented_new + content[_char_pos + len(_recon):]
+        new_content = content[:_char_pos] + _reindented_new + content[_char_pos + len(_recon) :]
         return {
             "ok": True,
             "new_content": new_content,
@@ -1266,7 +1294,6 @@ class WriteToolsEditMixin:
             "match_indent": _leading_indent_width(_recon),
             "reindent_applied": (_reindented_new != new_string),
         }
-
 
     def _apply_one_edit_text(
         self,
@@ -1295,17 +1322,14 @@ class WriteToolsEditMixin:
         replaced even when an earlier identical block exists out-of-scope.
         Mutually exclusive with ``replace_all`` (validated by the caller).
         """
-        _MAX_REPLACE_ALL_MATCHES = 20
+        _max_replace_all_matches = 20
 
         # ── Scoped replacement: restrict matching to a line range ──
         # Early-return branch: when scope is set we delegate to a dedicated
         # helper. The scope=None path below is COMPLETELY UNTOUCHED, so no
         # existing caller can regress.
         if scope is not None:
-            return self._apply_scoped_replacement(
-                content, file_path, old_string, new_string, scope
-            )
-
+            return self._apply_scoped_replacement(content, file_path, old_string, new_string, scope)
 
         # No minimum-length gate: uniqueness is measured by occurrence count
         # below (count==0 → not found; count>1 → not unique; count==1 → safe).
@@ -1320,10 +1344,7 @@ class WriteToolsEditMixin:
         if not old_string.strip():
             return {
                 "ok": False,
-                "error": (
-                    "old_string is empty or whitespace only; cannot perform a "
-                    "meaningful replacement."
-                ),
+                "error": ("old_string is empty or whitespace only; cannot perform a meaningful replacement."),
                 "metadata": {},
             }
 
@@ -1331,12 +1352,17 @@ class WriteToolsEditMixin:
         _orig_old_string = old_string
         _orig_new_string = new_string
         old_string, count, fallback_matches, _orig_split = self._resolve_with_fallback(content, old_string)
+        # Contract: fallback_matches non-None implies _orig_split non-None; exact
+        # match path returns None but no fallback code touches it there. Bind to
+        # [] (not None) so all later fallback branches see a list.
+        if _orig_split is None:
+            _orig_split = []
 
         # ── Re-indent new_string when fallback resolved with diff indent ──
         _reindent_applied = False
         if count > 0 and old_string != _orig_old_string:
             new_string = _reindent_to_match(new_string, old_string, file_unit=_detect_file_unit(content))
-            _reindent_applied = (new_string != _orig_new_string)
+            _reindent_applied = new_string != _orig_new_string
 
         _high_count_warning = ""
         if not replace_all:
@@ -1359,7 +1385,11 @@ class WriteToolsEditMixin:
                         "surrounding context as old_string (not just the line you "
                         "want to change)."
                     ),
-                    "metadata": {"matched": False, "near_match": bool(_hint), "failure_class": "search_string_mismatch"},
+                    "metadata": {
+                        "matched": False,
+                        "near_match": bool(_hint),
+                        "failure_class": "search_string_mismatch",
+                    },
                 }
             if count > 1:
                 # Build disambiguation context for each occurrence
@@ -1370,9 +1400,7 @@ class WriteToolsEditMixin:
                         _start_line = max(0, _m_idx - 2)
                         _end_line = min(len(_orig_split), _m_idx + _n_lines + 2)
                         _snippet = "".join(_orig_split[_start_line:_end_line]).rstrip()
-                        _contexts.append(
-                            f"  [match {_mi + 1}] around line {_m_idx + 1}:\n{_snippet}"
-                        )
+                        _contexts.append(f"  [match {_mi + 1}] around line {_m_idx + 1}:\n{_snippet}")
                 else:
                     lines = content.splitlines(keepends=True)
                     _contexts = []
@@ -1409,26 +1437,27 @@ class WriteToolsEditMixin:
                 _m_idx, _m_recon = fallback_matches[0]
                 _first_pos = _offset_by_line[_m_idx]
                 _reindented_new = _reindent_to_match(new_string, _m_recon, file_unit=_detect_file_unit(content))
-                new_content = content[:_first_pos] + _reindented_new + content[_first_pos + len(_m_recon):]
+                new_content = content[:_first_pos] + _reindented_new + content[_first_pos + len(_m_recon) :]
                 _match_line = _m_idx + 1
                 _match_indent = _leading_indent_width(_m_recon)
             else:
                 new_content = content.replace(old_string, new_string, 1)
-                #── Capture edit location for Enot/inside metadata ──
+                # ── Capture edit location for Enot/inside metadata ──
                 _first_pos = content.find(old_string)
                 _match_line = content[:_first_pos].count("\n") + 1 if _first_pos >= 0 else 0
                 _match_indent = _leading_indent_width(old_string)
             _occurrences_replaced = 1
         else:
-            if count > _MAX_REPLACE_ALL_MATCHES:
+            if count > _max_replace_all_matches:
                 _high_count_warning = (
                     f" ⚠️ old_string matched {count} times "
-                    f"(max recommended: {_MAX_REPLACE_ALL_MATCHES}). "
+                    f"(max recommended: {_max_replace_all_matches}). "
                     f"Use a more specific old_string if this was unintentional."
                 )
                 logger.warning(
                     "%s [REPLACE_ALL_HIGH_COUNT] in %s",
-                    _high_count_warning, file_path,
+                    _high_count_warning,
+                    file_path,
                 )
             if count == 0:
                 _hint = self._near_match_hint(content, old_string)
@@ -1441,7 +1470,11 @@ class WriteToolsEditMixin:
                         "surrounding context as old_string (not just the line you "
                         "want to change)."
                     ),
-                    "metadata": {"matched": False, "near_match": bool(_hint), "failure_class": "search_string_mismatch"},
+                    "metadata": {
+                        "matched": False,
+                        "near_match": bool(_hint),
+                        "failure_class": "search_string_mismatch",
+                    },
                 }
             # ── replace_all: when the fallback matched (count == 1 OR > 1),
             #    old_string may not actually exist in the file verbatim — for
@@ -1460,7 +1493,7 @@ class WriteToolsEditMixin:
                     _pos = _offset_by_line[_m_idx]
                     # Reindent new_string to match this particular match's indent
                     _reindented_new = _reindent_to_match(new_string, _m_recon, file_unit=_detect_file_unit(content))
-                    _repl = _repl[:_pos] + _reindented_new + _repl[_pos + len(_m_recon):]
+                    _repl = _repl[:_pos] + _reindented_new + _repl[_pos + len(_m_recon) :]
                 new_content = _repl
                 # First match location for metadata
                 _match_line = (fallback_matches[0][0] + 1) if fallback_matches else 0
@@ -1482,9 +1515,7 @@ class WriteToolsEditMixin:
             "reindent_applied": _reindent_applied,
         }
 
-    def _tool_edit_text(
-        self, args: dict[str, Any], *, _reread_retry: bool = False
-    ) -> "ToolResult":
+    def _tool_edit_text(self, args: dict[str, Any], *, _reread_retry: bool = False) -> ToolResult:
         """Edit a file by replacing exact strings — mirrors Claude Code's Edit tool.
 
         ``_reread_retry`` is an internal recursion guard (private): when a
@@ -1523,6 +1554,7 @@ class WriteToolsEditMixin:
            tool call instead of N round-trips.
         """
         import time as _time
+
         start_time = _time.monotonic()
         # --- Fix ①: Recover args from truncated streaming JSON ---
         args = self._recover_args_from_raw(args, ("file_path", "old_string", "new_string", "edits"))
@@ -1546,7 +1578,8 @@ class WriteToolsEditMixin:
         _secured = self._secure_path(file_path, confine=True)
         if _secured is None:
             return self._make_result(
-                ok=False, error=f"Path blocked (outside repo): {file_path}",
+                ok=False,
+                error=f"Path blocked (outside repo): {file_path}",
                 execution_time=0,
             )
 
@@ -1588,24 +1621,16 @@ class WriteToolsEditMixin:
             _has_start = _ssl is not None
             _has_end = _sel is not None
             if _has_start != _has_end:
-                return None, (
-                    "scope_start_line and scope_end_line must be provided "
-                    "together (got only one of them)."
-                )
+                return None, ("scope_start_line and scope_end_line must be provided together (got only one of them).")
             if not _has_start:
                 return None, None
             try:
                 _s = int(_ssl)
                 _e = int(_sel)
             except (TypeError, ValueError):
-                return None, (
-                    f"scope_start_line/scope_end_line must be integers "
-                    f"(got start={_ssl!r}, end={_sel!r})."
-                )
+                return None, (f"scope_start_line/scope_end_line must be integers (got start={_ssl!r}, end={_sel!r}).")
             if _s > _e:
-                return None, (
-                    f"scope_start_line ({_s}) must be <= scope_end_line ({_e})."
-                )
+                return None, (f"scope_start_line ({_s}) must be <= scope_end_line ({_e}).")
             if _s < 1:
                 return None, "scope_start_line must be >= 1."
             if allow_replace_all_field and d.get("replace_all"):
@@ -1618,6 +1643,7 @@ class WriteToolsEditMixin:
 
         if is_batch:
             edits = []
+            assert isinstance(raw_edits, list)  # is_batch guarantees this
             for i, e in enumerate(raw_edits):
                 if not isinstance(e, dict):
                     return self._make_result(
@@ -1646,12 +1672,14 @@ class WriteToolsEditMixin:
                         error=f"edits[{i}]: {_e_scope_err}",
                         execution_time=0,
                     )
-                edits.append({
-                    "old_string": _old,
-                    "new_string": _new,
-                    "replace_all": bool(e.get("replace_all", False)),
-                    "scope": _e_scope,
-                })
+                edits.append(
+                    {
+                        "old_string": _old,
+                        "new_string": _new,
+                        "replace_all": bool(e.get("replace_all", False)),
+                        "scope": _e_scope,
+                    }
+                )
         else:
             old_string = args.get("old_string") or ""
             new_string = args.get("new_string") or ""
@@ -1661,7 +1689,9 @@ class WriteToolsEditMixin:
             _single_scope, _single_scope_err = _parse_scope(args)
             if _single_scope_err is not None:
                 return self._make_result(ok=False, error=_single_scope_err, execution_time=0)
-            edits = [{"old_string": old_string, "new_string": new_string, "replace_all": replace_all, "scope": _single_scope}]
+            edits = [
+                {"old_string": old_string, "new_string": new_string, "replace_all": replace_all, "scope": _single_scope}
+            ]
 
         # Resolved path from the confine check above (symlink-preserving, bias-
         # corrected) — same as create_file. Never re-derive from repo_root: an
@@ -1670,7 +1700,9 @@ class WriteToolsEditMixin:
         _norm = _secured
 
         if not _norm.exists():
-            return self._make_result(ok=False, error=f"File not found: {_norm}{self._suggest_missing_paths(file_path)}", execution_time=0)
+            return self._make_result(
+                ok=False, error=f"File not found: {_norm}{self._suggest_missing_paths(file_path)}", execution_time=0
+            )
 
         # Strict UTF-8 first, then latin-1. latin-1 decodes ANY byte sequence
         # losslessly (1:1 byte↔char), so untouched regions round-trip exactly
@@ -1695,7 +1727,7 @@ class WriteToolsEditMixin:
         _cur_content = content
         _total_occurrences = 0
         _high_count_warnings = []
-        #Capture edit-site location from the FIRST edit (for single-mode Enot/inside
+        # Capture edit-site location from the FIRST edit (for single-mode Enot/inside
         # metadata: matched_line / matched_indent / reindent_applied). In batch
         # mode only the first edit's location is surfaced — batch callers get
         # per-edit detail via the diff, not metadata.
@@ -1704,7 +1736,11 @@ class WriteToolsEditMixin:
         _first_reindent_applied = False
         for i, e in enumerate(edits):
             _res = self._apply_one_edit_text(
-                _cur_content, file_path, e["old_string"], e["new_string"], e["replace_all"],
+                _cur_content,
+                file_path,
+                e["old_string"],
+                e["new_string"],
+                e["replace_all"],
                 scope=e.get("scope"),
             )
             if not _res["ok"]:
@@ -1721,11 +1757,7 @@ class WriteToolsEditMixin:
                 #     deterministic and pointless, so fall through to the
                 #     normal error path below.
                 _fc = _res.get("metadata", {}).get("failure_class")
-                if (
-                    not _reread_retry
-                    and _fc == "search_string_mismatch"
-                    and _norm.exists()
-                ):
+                if not _reread_retry and _fc == "search_string_mismatch" and _norm.exists():
                     _fresh_content = None
                     for _enc2 in ("utf-8", "latin-1"):
                         with contextlib.suppress(UnicodeDecodeError, UnicodeError):
@@ -1733,9 +1765,7 @@ class WriteToolsEditMixin:
                             break
                     if _fresh_content is not None and _fresh_content != content:
                         _retry_args = dict(args)
-                        _retry_result = self._tool_edit_text(
-                            _retry_args, _reread_retry=True
-                        )
+                        _retry_result = self._tool_edit_text(_retry_args, _reread_retry=True)
                         _retry_meta = dict(_retry_result.metadata or {})
                         _retry_meta["reread_retried"] = True
                         if _retry_result.ok:
@@ -1812,13 +1842,8 @@ class WriteToolsEditMixin:
                     # guessing whether it broke its own block or a cascade from
                     # elsewhere surfaced lines away.
                     _err_line = _se.lineno or 0
-                    _in_edited, _regions = self._edited_line_regions(
-                        content, new_content, _err_line
-                    )
-                    _region_str = (
-                        ", ".join(f"L{s}-{e}" for (s, e) in _regions[:6])
-                        or "unknown"
-                    )
+                    _in_edited, _regions = self._edited_line_regions(content, new_content, _err_line)
+                    _region_str = ", ".join(f"L{s}-{e}" for (s, e) in _regions[:6]) or "unknown"
                     if _in_edited:
                         _diagnosis = (
                             "The error line is INSIDE the block you just edited "
@@ -1851,9 +1876,7 @@ class WriteToolsEditMixin:
                     # Generic messages ("unexpected indent") never state the
                     # column count, so the LLM retries guessing. Compute the
                     # actual expected width from neighbouring lines.
-                    _indent_hint = self._indentation_hint(
-                        new_content, _err_line, _se.msg or ""
-                    )
+                    _indent_hint = self._indentation_hint(new_content, _err_line, _se.msg or "")
                     if _indent_hint:
                         _diagnosis += " " + _indent_hint
                     return self._make_result(
@@ -1861,8 +1884,7 @@ class WriteToolsEditMixin:
                         error=(
                             f"edit_text refused (file NOT modified): the replacement would "
                             f"introduce a Python syntax error in {file_path}: "
-                            f"{_se.msg} at line {_se.lineno}.\n"
-                            + _diagnosis
+                            f"{_se.msg} at line {_se.lineno}.\n" + _diagnosis
                         ),
                         metadata={
                             "syntax_error": str(_se),
@@ -1894,48 +1916,34 @@ class WriteToolsEditMixin:
         if _et_lang is not LanguageId.PYTHON and _et_lang is not LanguageId.UNKNOWN:
             try:
                 from ...languages import LanguageRegistry
+
                 _et_provider = LanguageRegistry.instance().get(file_path)
             except Exception:
                 _et_provider = None
-            if (
-                _et_provider is not None
-                and _et_provider.capabilities().has_syntax_validator
-            ):
+            if _et_provider is not None and _et_provider.capabilities().has_syntax_validator:
                 try:
-                    _et_orig_ok = _et_provider.validate_syntax(
-                        file_path, content
-                    ).ok
+                    _et_orig_ok = _et_provider.validate_syntax(file_path, content).ok
                 except Exception:
                     _et_orig_ok = True  # validator crash → don't block the edit
                 if _et_orig_ok:
                     try:
-                        _et_new_val = _et_provider.validate_syntax(
-                            file_path, new_content
-                        )
+                        _et_new_val = _et_provider.validate_syntax(file_path, new_content)
                     except Exception:
                         _et_new_val = None
                     if _et_new_val is not None and not _et_new_val.ok:
                         _et_errs = _et_new_val.errors or []
                         if _et_errs:
                             _e0 = _et_errs[0]
-                            _et_detail = (
-                                f"{_e0.file}:{_e0.line}:{_e0.col}: {_e0.message}"
-                            )
+                            _et_detail = f"{_e0.file}:{_e0.line}:{_e0.col}: {_e0.message}"
                             for _e in _et_errs[1:3]:
-                                _et_detail += (
-                                    f"; L{_e.line}:{_e.col} {_e.message}"
-                                )
+                                _et_detail += f"; L{_e.line}:{_e.col} {_e.message}"
                             if len(_et_errs) > 3:
-                                _et_detail += (
-                                    f" (+{len(_et_errs) - 3} more syntax errors)"
-                                )
+                                _et_detail += f" (+{len(_et_errs) - 3} more syntax errors)"
                         else:
                             _et_detail = f"syntax error in {file_path}"
                         # Mirror dispatch soft-fail: keep cross-file-resolvable
                         # errors; refuse only genuine syntax errors.
-                        if not self._should_soft_fail_verify(
-                            _et_detail, {file_path: content}
-                        ):
+                        if not self._should_soft_fail_verify(_et_detail, {file_path: content}):
                             return self._make_result(
                                 ok=False,
                                 error=(
@@ -1991,10 +1999,7 @@ class WriteToolsEditMixin:
             )
         else:
             # Preserve the exact single-edit success wording.
-            _count_detail = (
-                f"{_total_occurrences} occurrence"
-                f"{'s' if _total_occurrences > 1 else ''}"
-            )
+            _count_detail = f"{_total_occurrences} occurrence{'s' if _total_occurrences > 1 else ''}"
             _content_msg = (
                 f"Edited {file_path} (replaced {_count_detail}, "
                 f"{_added:+d} chars{_enc_detail}){_high_warn} [{_exec:.1f}s]"
@@ -2008,7 +2013,7 @@ class WriteToolsEditMixin:
         _meta: dict[str, Any] = {}
         if _high_count_warnings:
             _meta["high_count_warnings"] = _high_count_warnings
-        #── Enot/inside: surface the edit site's actual indentation ──
+        # ── Enot/inside: surface the edit site's actual indentation ──
         # In single mode, matched_line/matched_indent let the LLM verify it hit
         # the intended location at the intended depth — paired with read_file's
         # │N│ gutter, this closes the indent-guessing loop. reindent_applied
@@ -2031,7 +2036,7 @@ class WriteToolsEditMixin:
             execution_time=_exec,
         )
 
-    def _tool_create_file(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_create_file(self, args: dict[str, Any]) -> ToolResult:
         """Create or overwrite a file with the given content.
 
         Creates parent directories automatically. Fails if the file already
@@ -2063,6 +2068,7 @@ class WriteToolsEditMixin:
           or empty file.
         """
         import time as _time
+
         start_time = _time.monotonic()
         args = self._recover_args_from_raw(args, ("path",))
         file_path = (args.get("path") or args.get("file_path") or "").strip()
@@ -2084,7 +2090,9 @@ class WriteToolsEditMixin:
         _secured = self._secure_path(file_path, confine=True)
         if _secured is None:
             return self._make_result(
-                ok=False, error=f"Path blocked (outside repo): {file_path}", execution_time=0,
+                ok=False,
+                error=f"Path blocked (outside repo): {file_path}",
+                execution_time=0,
             )
         _norm = _secured
 
@@ -2152,11 +2160,14 @@ class WriteToolsEditMixin:
                 # indistinguishable from a gate that ran and passed.
                 logger.debug(
                     "create_file: Python syntax gate skipped for %s (%s: %s)",
-                    file_path, type(_ce).__name__, _ce,
+                    file_path,
+                    type(_ce).__name__,
+                    _ce,
                 )
         elif _lang is not LanguageId.UNKNOWN:
             try:
                 from ...languages import LanguageRegistry
+
                 _provider = LanguageRegistry.instance().get(file_path)
             except Exception:
                 _provider = None
@@ -2199,7 +2210,9 @@ class WriteToolsEditMixin:
             atomic_write_text(str(_norm), content)
         except Exception as e:
             return self._make_result(
-                ok=False, error=f"Failed to create {file_path}: {e}", execution_time=0,
+                ok=False,
+                error=f"Failed to create {file_path}: {e}",
+                execution_time=0,
             )
 
         _exec = _time.monotonic() - start_time
@@ -2227,6 +2240,7 @@ class WriteToolsEditMixin:
         the array via bracket matching instead of full JSON parsing.
         """
         import json as _json
+
         _m = re.search(r'"operations"\s*:\s*(\[)', raw)
         if not _m:
             return []
@@ -2234,9 +2248,9 @@ class WriteToolsEditMixin:
         _depth = 0
         _end = -1
         for _i, _c in enumerate(raw[_start:], start=_start):
-            if _c == '[':
+            if _c == "[":
                 _depth += 1
-            elif _c == ']':
+            elif _c == "]":
                 _depth -= 1
                 if _depth == 0:
                     _end = _i + 1
@@ -2267,7 +2281,7 @@ class WriteToolsEditMixin:
         return _recover_args_from_raw(args, required_keys)
 
     @staticmethod
-    def _try_repair_truncated_json(raw: str) -> Optional[dict[str, Any]]:
+    def _try_repair_truncated_json(raw: str) -> dict[str, Any] | None:
         """Repair and parse a truncated JSON object string.
 
         Delegates to :func:`external_llm.agent.write_targets.try_repair_truncated_json`
@@ -2331,10 +2345,7 @@ class WriteToolsEditMixin:
             out = {
                 "ok": result.ok,
                 "language": result.language.value if result.language else None,
-                "errors": [
-                    {"line": e.line, "col": e.col, "message": e.message}
-                    for e in (result.errors or [])
-                ],
+                "errors": [{"line": e.line, "col": e.col, "message": e.message} for e in (result.errors or [])],
             }
             # Only run semantic check on syntactically-valid files to avoid
             # cascading-error noise from the backing tool.
@@ -2362,15 +2373,13 @@ class WriteToolsEditMixin:
                             # timed out, no project config). Reporting an empty
                             # diagnostics list here would read as "checked,
                             # clean" — see ToolRegistry.SemanticOutcome.
-                            out["semantic_check_skipped"] = (
-                                getattr(sem, "skip_reason", "")
-                                or "the checker did not run"
-                            )
+                            out["semantic_check_skipped"] = getattr(sem, "skip_reason", "") or "the checker did not run"
                         else:
                             out["semantic_diagnostics"] = [
                                 {
                                     "file_path": abs_path,
-                                    "line": e.line, "col": e.col,
+                                    "line": e.line,
+                                    "col": e.col,
                                     "message": e.message,
                                     "severity": getattr(e, "severity", "error"),
                                     "code": getattr(e, "code", ""),
@@ -2379,15 +2388,12 @@ class WriteToolsEditMixin:
                             ]
                     except Exception as sem_exc:
                         logger.debug("Semantic check failed for %s: %s", abs_path, sem_exc)
-                        out["semantic_check_skipped"] = (
-                            "the semantic checker raised before reporting"
-                        )
+                        out["semantic_check_skipped"] = "the semantic checker raised before reporting"
         except Exception as exc:
             logger.debug("Post-apply syntax check failed: %s", exc)
             return {"ok": True, "skipped": True, "reason": "exception"}
         else:
             return out
-
 
     def _norm_repo_rel(self, p: str) -> str:
         """Normalize a path (absolute or relative) to repo-root-relative form."""
@@ -2395,7 +2401,7 @@ class WriteToolsEditMixin:
             return ""
         rr = str(getattr(self, "_effective_repo_root", None) or getattr(self, "repo_root", ""))
         if rr and p.startswith(rr):
-            p = p[len(rr):]
+            p = p[len(rr) :]
         return p.lstrip("/")
 
     def _record_text_edit(self, file_path: str) -> None:
@@ -2420,7 +2426,8 @@ class WriteToolsEditMixin:
                 "<module>::WriteToolsEditMixin::_record_text_edit:1 edit-lease acquire suppressed",
                 exc_info=True,
             )
-    def _tool_modify_symbol(self, args: dict[str, Any]) -> "ToolResult":
+
+    def _tool_modify_symbol(self, args: dict[str, Any]) -> ToolResult:
         """Modify a symbol in a file deterministically — no LLM call.
 
         Fallback chain: AST precise (Python) → surgical edit (any language) → text replacement.
@@ -2446,7 +2453,9 @@ class WriteToolsEditMixin:
             return self._make_result(ok=False, content="", error=f"Path traversal blocked: {file_path}")
         abs_path = str(sec)
         if not os.path.isfile(abs_path):
-                return self._make_result(ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}")
+            return self._make_result(
+                ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}"
+            )
 
         # F1 cross-process edit-lease guard.
         _lease_refused = self._refuse_foreign_leased([abs_path])
@@ -2459,14 +2468,15 @@ class WriteToolsEditMixin:
         # so a preview REQUIRES a snapshot to restore from. Refuse the dry run
         # if the snapshot cannot be taken — otherwise the "preview" would
         # silently mutate the file.
-        original_source: Optional[str] = None
+        original_source: str | None = None
         if dry_run:
             try:
-                with open(abs_path, encoding='utf-8') as f:
+                with open(abs_path, encoding="utf-8") as f:
                     original_source = f.read()
             except Exception as e:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=f"[DRY RUN] cannot snapshot {rel_path} for preview: {e}",
                 )
 
@@ -2479,34 +2489,31 @@ class WriteToolsEditMixin:
                     atomic_write_text(abs_path, original_source)
                 except Exception as e:
                     return self._make_result(
-                        ok=False, content="",
+                        ok=False,
+                        content="",
                         error=(
                             f"[DRY RUN] modify succeeded but restoring {rel_path} failed: {e} "
                             f"— the file HAS BEEN MODIFIED on disk"
                         ),
-                        metadata={"file_path": rel_path, "symbol": symbol, "dry_run": True,
-                                  "restore_failed": True},
+                        metadata={"file_path": rel_path, "symbol": symbol, "dry_run": True, "restore_failed": True},
                     )
             if success:
                 return self._make_result(
                     ok=True,
-                    content=(
-                        f"[DRY RUN] modify_symbol preview for {rel_path}@{symbol}\n"
-                        f"Diff:\n{diff_or_error}"
-                    ),
+                    content=(f"[DRY RUN] modify_symbol preview for {rel_path}@{symbol}\nDiff:\n{diff_or_error}"),
                     metadata={
                         "file_path": rel_path,
                         "symbol": symbol,
                         "dry_run": True,
                         "diff_preview": diff_or_error[:25000] if diff_or_error else "",
-                    }
+                    },
                 )
             preview = f"[DRY RUN] Preview for {rel_path}@{symbol} (apply skipped: {diff_or_error})\n"
             preview += f"New code:\n{code}"
             return self._make_result(
                 ok=True,
                 content=preview,
-                metadata={"file_path": rel_path, "symbol": symbol, "dry_run": True, "preview_only": True}
+                metadata={"file_path": rel_path, "symbol": symbol, "dry_run": True, "preview_only": True},
             )
 
         if success:
@@ -2518,7 +2525,7 @@ class WriteToolsEditMixin:
                 "diff_preview": diff_or_error[:25000] if diff_or_error else "",
                 "changed": True,
             }
-            #── Enot/inside: surface the replaced symbol's definition indent ──
+            # ── Enot/inside: surface the replaced symbol's definition indent ──
             # new_content is the post-edit file in memory (3rd tuple element of
             # _do_modify). Locate the symbol's def/decorator start line and
             # report its leading-whitespace column count, mirroring read_file's
@@ -2528,6 +2535,7 @@ class WriteToolsEditMixin:
             if new_content:
                 with contextlib.suppress(IndexError, TypeError, ValueError):  # best-effort metadata enrichment
                     from external_llm.agent.symbol_modify_tool import _find_symbol_line_range as _find_range
+
                     _rng = _find_range(new_content, symbol, rel_path)
                     if _rng is not None:
                         _nc_lines = new_content.splitlines()
@@ -2542,13 +2550,9 @@ class WriteToolsEditMixin:
                 _meta["syntax_check"] = _syn
             return self._make_result(
                 ok=True,
-                content=(
-                    f"Modified symbol '{symbol}' in {rel_path}\n"
-                    f"Diff:\n{diff_or_error}"
-                ),
+                content=(f"Modified symbol '{symbol}' in {rel_path}\nDiff:\n{diff_or_error}"),
                 metadata=_meta,
             )
         return self._make_result(
-            ok=False, content="",
-            error=f"modify_symbol failed for {rel_path}@{symbol}: {diff_or_error}"
+            ok=False, content="", error=f"modify_symbol failed for {rel_path}@{symbol}: {diff_or_error}"
         )

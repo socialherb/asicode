@@ -16,6 +16,7 @@ Covers every uncovered surface of typescript_provider.py:
   class methods (incl. no-brace class and control-keyword filter),
   symbol body range, symbol-in-file
 """
+
 from __future__ import annotations
 
 import builtins
@@ -45,6 +46,7 @@ TS_1259 = "app.ts(1,8): error TS1259: Can only be default-imported using esModul
 
 # ── is_genuine_syntax_error ────────────────────────────────────────────────
 
+
 class TestIsGenuineSyntaxError:
     @pytest.mark.parametrize("code", ["", "abc", "E1005", "TS", "TS12a", "TS999", "TS2000", "TS7006"])
     def test_not_genuine(self, code):
@@ -61,6 +63,7 @@ class TestIsGenuineSyntaxError:
 
 # ── capabilities caching ───────────────────────────────────────────────────
 
+
 class TestCapabilitiesCache:
     def test_capabilities_cached_per_instance(self):
         p = TypeScriptSyntaxProvider()
@@ -72,6 +75,7 @@ class TestCapabilitiesCache:
 
 
 # ── validate_syntax: tsc path ──────────────────────────────────────────────
+
 
 class TestValidateSyntaxTsc:
     def test_tempfile_failure_returns_ok(self):
@@ -124,6 +128,7 @@ class TestValidateSyntaxTsc:
 
 
 # ── validate_semantics_batch / _batch_by_root / _run_tsc_semantic ──────────
+
 
 class TestSemanticsBatch:
     def test_missing_files_skipped(self, tmp_path):
@@ -218,14 +223,16 @@ class TestSemanticsBatch:
         #       other.ts error → dropped (not in batch)
         #       TS1005 (1xxx) → dropped by band filter
         #       TScode (non-numeric) → dropped
-        out_lines = "\n".join([
-            "a.ts(2,5): error TS2304: Cannot find name 'foo'.",
-            "b.ts(2,5): error TS2304: Cannot find name 'bar'.",
-            "other.ts(1,1): error TS2304: Cannot find name 'nope'.",
-            "a.ts(1,1): error TS1005: ';' expected.",
-            "a.ts(1,1): error TScode: weird.",
-            "",
-        ])
+        out_lines = "\n".join(
+            [
+                "a.ts(2,5): error TS2304: Cannot find name 'foo'.",
+                "b.ts(2,5): error TS2304: Cannot find name 'bar'.",
+                "other.ts(1,1): error TS2304: Cannot find name 'nope'.",
+                "a.ts(1,1): error TS1005: ';' expected.",
+                "a.ts(1,1): error TScode: weird.",
+                "",
+            ]
+        )
         with patch(
             "external_llm.languages.typescript_provider.subprocess.run",
             return_value=_fake_proc(1, stdout=out_lines),
@@ -244,10 +251,13 @@ class TestSemanticsBatch:
         f = tmp_path / "app.js"
         f.write_text("const x = 1;")
         p = TypeScriptSyntaxProvider()
-        with patch(
-            "external_llm.languages.typescript_provider.subprocess.run",
-            return_value=_fake_proc(0),
-        ) as run, patch("json.dump") as dump_mock:
+        with (
+            patch(
+                "external_llm.languages.typescript_provider.subprocess.run",
+                return_value=_fake_proc(0),
+            ) as run,
+            patch("json.dump") as dump_mock,
+        ):
             out = p._batch_by_root(
                 [str(f)],
                 language=LanguageId.JAVASCRIPT,
@@ -264,6 +274,7 @@ class TestSemanticsBatch:
 
 
 # ── symbol patterns / lint / test directory / test command ─────────────────
+
 
 class TestSymbolPatternsKinds:
     def test_kind_any_has_all(self):
@@ -303,33 +314,23 @@ class TestGetTestDirectory:
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) == "__tests__"
 
     def test_jest_config_roots_falls_back_to_first(self, tmp_path):
-        (tmp_path / "jest.config.js").write_text(
-            "module.exports = { roots: ['<rootDir>/src'] };"
-        )
+        (tmp_path / "jest.config.js").write_text("module.exports = { roots: ['<rootDir>/src'] };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) == "src"
 
     def test_jest_config_inline_dir(self, tmp_path):
-        (tmp_path / "jest.config.js").write_text(
-            "module.exports = { tests: '__tests__' };"
-        )
+        (tmp_path / "jest.config.js").write_text("module.exports = { tests: '__tests__' };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) == "__tests__"
 
     def test_vitest_config_dir(self, tmp_path):
-        (tmp_path / "vitest.config.ts").write_text(
-            "export default { test: { dir: 'tests' } };"
-        )
+        (tmp_path / "vitest.config.ts").write_text("export default { test: { dir: 'tests' } };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) == "tests"
 
     def test_package_json_inline_jest_roots(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"jest": {"roots": ["<rootDir>/test"]}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"jest": {"roots": ["<rootDir>/test"]}}))
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) == "test"
 
     def test_package_json_test_script_roots(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"scripts": {"test": "jest --roots tests"}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "jest --roots tests"}}))
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) == "tests"
 
     def test_convention_dirs(self, tmp_path):
@@ -366,26 +367,33 @@ class TestGetTestDirectory:
 class TestGetTestCommand:
     def test_no_package_json_defaults_jest(self, tmp_path):
         assert TypeScriptSyntaxProvider().get_test_command(str(tmp_path)) == [
-            "npx", "jest", "--passWithNoTests",
+            "npx",
+            "jest",
+            "--passWithNoTests",
         ]
 
     def test_vitest_dependency_detected(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"devDependencies": {"vitest": "^1.0.0"}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"devDependencies": {"vitest": "^1.0.0"}}))
         assert TypeScriptSyntaxProvider().get_test_command(str(tmp_path)) == [
-            "npx", "vitest", "--passWithNoTests",
+            "npx",
+            "vitest",
+            "--passWithNoTests",
         ]
 
     def test_test_args_appended(self, tmp_path):
         assert TypeScriptSyntaxProvider().get_test_command(str(tmp_path), ["x.test.ts"]) == [
-            "npx", "jest", "--passWithNoTests", "x.test.ts",
+            "npx",
+            "jest",
+            "--passWithNoTests",
+            "x.test.ts",
         ]
 
     def test_unparseable_package_json_defaults_jest(self, tmp_path):
         (tmp_path / "package.json").write_text("{ nope")
         assert TypeScriptSyntaxProvider().get_test_command(str(tmp_path)) == [
-            "npx", "jest", "--passWithNoTests",
+            "npx",
+            "jest",
+            "--passWithNoTests",
         ]
 
 
@@ -443,7 +451,8 @@ class TestRegexFallbacks:
     def test_control_keywords_filtered_from_methods(self):
         p = TypeScriptSyntaxProvider()
         methods = p._find_class_methods_regex(
-            "class C {\n  if (x) { return; }\n  real() {}\n}", "C",
+            "class C {\n  if (x) { return; }\n  real() {}\n}",
+            "C",
         )
         assert [m[0] for m in methods] == ["real"]
 
@@ -461,61 +470,49 @@ class TestRegexFallbacks:
 
 # ── remaining branch coverage: test-directory / test-command edge paths ─────
 
+
 class TestGetTestDirectoryEdges:
     def test_testmatch_only_falls_through(self, tmp_path):
-        (tmp_path / "jest.config.js").write_text(
-            "module.exports = { testMatch: ['<rootDir>/__tests__/**/*.ts'] };"
-        )
+        (tmp_path / "jest.config.js").write_text("module.exports = { testMatch: ['<rootDir>/__tests__/**/*.ts'] };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
     def test_first_root_empty_strip_skips_return(self, tmp_path):
-        (tmp_path / "jest.config.js").write_text(
-            "module.exports = { roots: ['<rootDir>'] };"
-        )
+        (tmp_path / "jest.config.js").write_text("module.exports = { roots: ['<rootDir>'] };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
     def test_empty_roots_skips_dir(self, tmp_path):
-        (tmp_path / "jest.config.js").write_text(
-            "module.exports = { roots: [] };"
-        )
+        (tmp_path / "jest.config.js").write_text("module.exports = { roots: [] };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
     def test_vitest_dir_without_test_word_falls_through(self, tmp_path):
-        (tmp_path / "vitest.config.ts").write_text(
-            "export default { test: { dir: 'src' } };"
-        )
+        (tmp_path / "vitest.config.ts").write_text("export default { test: { dir: 'src' } };")
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
     def test_package_json_jest_roots_without_test_word(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"jest": {"roots": ["<rootDir>/spec"]}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"jest": {"roots": ["<rootDir>/spec"]}}))
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
     def test_test_script_without_hint(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"scripts": {"test": "jest"}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "jest"}}))
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
     def test_test_script_hint_without_test_word(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"scripts": {"test": "mocha spec/"}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "mocha spec/"}}))
         assert TypeScriptSyntaxProvider().get_test_directory(str(tmp_path)) is None
 
 
 class TestGetTestCommandEdges:
     def test_package_json_without_vitest_defaults_jest(self, tmp_path):
-        (tmp_path / "package.json").write_text(
-            json.dumps({"dependencies": {"jest": "^29.0.0"}})
-        )
+        (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"jest": "^29.0.0"}}))
         assert TypeScriptSyntaxProvider().get_test_command(str(tmp_path)) == [
-            "npx", "jest", "--passWithNoTests",
+            "npx",
+            "jest",
+            "--passWithNoTests",
         ]
 
 
 # ── multi-line type alias: end_line > start_line (no floor applied) ─────────
+
 
 class TestRegexFallbackEdges:
     @pytest.fixture(autouse=True)
@@ -535,9 +532,11 @@ class TestRegexFallbackEdges:
 
 # ── tree-sitter primary path (result non-empty → return directly) ───────────
 
+
 class TestTreeSitterPrimaryPath:
     def _ts_or_skip(self):
         import external_llm.languages.tree_sitter_utils as tsu
+
         if not tsu.is_available():
             pytest.skip("tree-sitter core not installed")
 

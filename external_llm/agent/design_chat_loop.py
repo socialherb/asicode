@@ -6,6 +6,7 @@ Handles a single design chat turn:
 
 Includes write-capable tools and bash with danger gates.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -19,7 +20,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import TimeoutError as _FutureTimeoutError
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent._response_utils import _TRUNCATION_REASONS, extract_llm_reasoning, replace_tool_calls
 from external_llm.client import (
@@ -100,8 +101,8 @@ _PROCESS_TEMPERATURE = round(random.uniform(0.0, 0.3), 2)
 # shorter timeout so alternating attempts can't stack N x the (long) primary
 # timeout into a multi-minute hang; the retry fires almost immediately because
 # switching facades — not waiting — is the mitigation.
-_ZAI_FAILOVER_TIMEOUT = 60      # seconds; cap for the flipped sibling client
-_ZAI_FAILOVER_RETRY_DELAY = 1   # seconds; near-zero backoff after an endpoint flip
+_ZAI_FAILOVER_TIMEOUT = 60  # seconds; cap for the flipped sibling client
+_ZAI_FAILOVER_RETRY_DELAY = 1  # seconds; near-zero backoff after an endpoint flip
 
 # Plan completion gate: when the model ends a turn while its update_plan
 # checklist still has open items, it is nudged ONCE to resume or to mark
@@ -117,10 +118,7 @@ _PLAN_GATE_MAX_NUDGES = 1
 # this message so the REPL / webapp / subagent summary / session history never
 # receive a blank turn. is_error stays False — budget exhaustion with partial
 # progress is not a failure.
-_EMPTY_RESPONSE_FALLBACK = (
-    "⚠️ The model returned an empty response — nothing to show for this turn. "
-    "Please try again."
-)
+_EMPTY_RESPONSE_FALLBACK = "⚠️ The model returned an empty response — nothing to show for this turn. Please try again."
 
 # ── Shared fallback utilities (module-level for reuse by routes/design_chat.py) ──
 
@@ -139,17 +137,19 @@ def _strip_tool_messages(msgs: list[LLMMessage]) -> list[LLMMessage]:
         if m.role == "assistant" and getattr(m, "tool_calls", None):
             # Convert to plain assistant message with tool call summary
             tool_names = []
-            for tc in m.tool_calls:
+            for tc in m.tool_calls or []:
                 fn = tc.get("function", {})
                 tool_names.append(fn.get("name", "?"))
             summary = m.content or ""
             if tool_names:
                 summary += f"\n[Code analysis performed: {', '.join(tool_names)}]"
-            plain.append(LLMMessage(
-                role="assistant",
-                content=summary.strip(),
-                reasoning_content=getattr(m, "reasoning_content", None),
-            ))
+            plain.append(
+                LLMMessage(
+                    role="assistant",
+                    content=summary.strip(),
+                    reasoning_content=getattr(m, "reasoning_content", None),
+                )
+            )
         else:
             plain.append(m)
     return plain
@@ -159,7 +159,7 @@ def _apply_context_hard_cap(
     messages: list[LLMMessage],
     model: str,
     tool_schemas: Any = None,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
 ) -> list[LLMMessage]:
     """
     Context hard cap guard: raise a clear error when the window is structurally
@@ -190,7 +190,6 @@ def _apply_context_hard_cap(
             f"toolset or raise the model's context window (e.g. num_ctx)."
         )
     return messages
-
 
 
 def _cancel_aware_callback(stream_callback, cancel_event):
@@ -230,7 +229,7 @@ def _extract_provider_message(raw: str) -> str:
     return ""
 
 
-def _upstream_gateway_name(provider_msg: str) -> Optional[str]:
+def _upstream_gateway_name(provider_msg: str) -> str | None:
     """Detect a gateway *upstream* failure and return the gateway's name.
 
     Aggregating gateways (e.g. opencode/zen "Console Go") that proxy to a
@@ -248,7 +247,7 @@ def _upstream_gateway_name(provider_msg: str) -> Optional[str]:
     start = provider_msg.find("(")
     end = provider_msg.find(")", start + 1)
     if start >= 0 and end > start:
-        return provider_msg[start + 1:end].strip()
+        return provider_msg[start + 1 : end].strip()
     return ""
 
 
@@ -300,8 +299,8 @@ def _fallback_plain_chat(
     messages: list[LLMMessage],
     llm_client: Any,
     model: str,
-    max_tokens: Optional[int] = None,
-    token_callback: Optional[Callable] = None,
+    max_tokens: int | None = None,
+    token_callback: Callable | None = None,
 ) -> dict[str, Any]:
     """
     Fallback plain chat without tool calling.
@@ -317,7 +316,8 @@ def _fallback_plain_chat(
     try:
         _fb_t0 = time.monotonic()
         response = llm_client.chat(
-            messages=plain_msgs, model=model,
+            messages=plain_msgs,
+            model=model,
             temperature=_PROCESS_TEMPERATURE,
             max_tokens=max_tokens,
             token_callback=token_callback,
@@ -336,7 +336,8 @@ def _fallback_plain_chat(
             "error": False,
             "tokens_used": coerce_token_count(response.tokens_used),
             "prompt_tokens": coerce_token_count(
-                getattr(response, "prompt_tokens", 0) or getattr(response, "tokens_used", 0)),
+                getattr(response, "prompt_tokens", 0) or getattr(response, "tokens_used", 0)
+            ),
             "completion_tokens": coerce_token_count(getattr(response, "completion_tokens", 0)),
             "cache_read_tokens": coerce_token_count(getattr(response, "cache_read_input_tokens", 0)),
             "cache_creation_tokens": coerce_token_count(getattr(response, "cache_creation_input_tokens", 0)),
@@ -353,6 +354,7 @@ def _fallback_plain_chat(
         # (Insight A38: defense-depth parity — match _respond_impl's
         # `except LLMClientError` handler, not a stale 2-name tuple.)
         from external_llm.client import LLMClientError
+
         if isinstance(e, LLMClientError):
             raise
         return {
@@ -369,18 +371,20 @@ def _fallback_plain_chat(
 
 
 # Tool names to keep in /general (chat) mode — excludes all code-related tools
-_GENERAL_MODE_TOOLS: frozenset = frozenset({
-    "save_insight",
-    "delete_insight",
-    "edit_insight",
-    "search_web",
-    "browser_action",
-    "ask_user",
-    "web_fetch",
-    "search_design_history",
-    "bash",
-    "read_image",
-})
+_GENERAL_MODE_TOOLS: frozenset = frozenset(
+    {
+        "save_insight",
+        "delete_insight",
+        "edit_insight",
+        "search_web",
+        "browser_action",
+        "ask_user",
+        "web_fetch",
+        "search_design_history",
+        "bash",
+        "read_image",
+    }
+)
 
 
 def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
@@ -442,7 +446,7 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
             logger.debug("tool-call JSON unparseable even after bracket repair")
             return None
 
-    def _normalize(data: dict) -> Optional[dict[str, Any]]:
+    def _normalize(data: dict) -> dict[str, Any] | None:
         if not isinstance(data, dict):
             return None
         idx = len(tool_calls)
@@ -506,15 +510,15 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
     # OUTSIDE (even index) / INSIDE (odd index) segments — only odd-indexed
     # segments are actual fenced code blocks. Restricting the scan to them avoids
     # misexecuting a JSON-shaped example written in free text (e.g. a text-mode
- # model that writes 'example: {"name": "edit_text", ...}' outside any fence would
+    # model that writes 'example: {"name": "edit_text", ...}' outside any fence would
     # otherwise be parsed and run as a real call here). Free-text JSON is still
     # recovered by the stage-3 fallback below, but ONLY when no fenced call was
     # found — so a real fenced call takes precedence over a free-text lookalike.
-    for _seg_i, block in enumerate(content.split('```')):
+    for _seg_i, block in enumerate(content.split("```")):
         if _seg_i % 2 == 0:
             continue  # outside a fence — leave to the stage-3 free-text fallback
         block = block.strip()
-        idx = block.find('{')
+        idx = block.find("{")
         if idx >= 0:
             parsed = _try_json(block[idx:].strip())
             if parsed is not None:
@@ -563,7 +567,6 @@ def _parse_text_tool_calls(content: str) -> list[dict[str, Any]]:
     return tool_calls
 
 
-
 # _PLANNER_SWITCH_SIGNAL — removed (planner lane deactivated)
 # _PLANNER_SWITCH_SIGNAL = "__PLANNER_SWITCH__"
 
@@ -585,8 +588,10 @@ def _save_insight_to_file(repo_root: str, insight: str, category: str) -> str:
         # Create file with header if new
         if not os.path.exists(insights_path):
             with open(insights_path, "w", encoding="utf-8") as f:
-                f.write("# Design Chat Insights\n\n"
-                        "Discoveries and insights saved by the design chat LLM across sessions.\n\n")
+                f.write(
+                    "# Design Chat Insights\n\n"
+                    "Discoveries and insights saved by the design chat LLM across sessions.\n\n"
+                )
 
         with open(insights_path, "a", encoding="utf-8") as f:
             f.write(f"### [{category}] {timestamp}\n{insight}\n\n")
@@ -596,8 +601,9 @@ def _save_insight_to_file(repo_root: str, insight: str, category: str) -> str:
 
 
 def _find_entry_by_match(
-    entries: list, match_str: str,
-) -> tuple[Optional[int], Optional[str]]:
+    entries: list,
+    match_str: str,
+) -> tuple[int | None, str | None]:
     """Find an insight entry whose ``header_line`` contains ``match_str``.
 
     Returns ``(index, header_line)`` of the single match, or
@@ -615,18 +621,12 @@ def _find_entry_by_match(
         if match_str in entry.header_line:
             matches.append((i, entry))
     if len(matches) == 0:
-        return None, (
-            f"No insight found matching \"{match_str}\". "
-            f"Check the design-chat context for available entries."
-        )
+        return None, (f'No insight found matching "{match_str}". Check the design-chat context for available entries.')
     if len(matches) > 1:
         return None, (
-            f"Multiple insights match \"{match_str}\". "
+            f'Multiple insights match "{match_str}". '
             f"Be more specific — available matches: "
-            + "; ".join(
-                f"[{entry.category or 'uncategorized'}] {entry.body.strip()[:60]}"
-                for _, entry in matches
-            )
+            + "; ".join(f"[{entry.category or 'uncategorized'}] {entry.body.strip()[:60]}" for _, entry in matches)
             + "."
         )
     return matches[0][0], None
@@ -651,6 +651,7 @@ def _delete_insight(repo_root: str, entry_match: str) -> str:
         idx, err = _find_entry_by_match(entries, entry_match)
         if err:
             return f"Error: {err}"
+        assert idx is not None, "match without error must have an index"  # _find_entry_by_match contract
 
         removed_header = entries[idx].header_line
         new_entries = drop_entry(entries, idx + 1)  # drop_entry uses 1-based index
@@ -662,8 +663,10 @@ def _delete_insight(repo_root: str, entry_match: str) -> str:
 
 
 def _edit_insight(
-    repo_root: str, entry_match: str,
-    new_insight: str, new_category: Optional[str] = None,
+    repo_root: str,
+    entry_match: str,
+    new_insight: str,
+    new_category: str | None = None,
 ) -> str:
     """Edit (replace body of) an insight entry. Returns a status message.
 
@@ -683,6 +686,7 @@ def _edit_insight(
         idx, err = _find_entry_by_match(entries, entry_match)
         if err:
             return f"Error: {err}"
+        assert idx is not None, "match without error must have an index"  # _find_entry_by_match contract
 
         entry = entries[idx]
         old_header = entry.header_line
@@ -749,7 +753,11 @@ def load_design_insights(repo_root: str, max_chars: int = 50000) -> str:
     if not content:
         return ""
     if len(content) > max_chars:
-        logger.debug("[TRUNCATION_VIOLATION] design_insights=%d chars exceeds %d, but passing full content", len(content), max_chars)
+        logger.debug(
+            "[TRUNCATION_VIOLATION] design_insights=%d chars exceeds %d, but passing full content",
+            len(content),
+            max_chars,
+        )
 
     # Layer 2: always-on archive header index (bounded — ~tens of bytes/line).
     # Only changes when the archive file changes (demotion/restore/drop), so
@@ -796,9 +804,11 @@ def load_promoted_insights(repo_root: str, task_query: str) -> str:
     except (OSError, ValueError, KeyError, TypeError):  # insights file/shape failures
         return ""  # non-critical — never block injection
 
+
 @dataclass
 class DesignChatResult:
     """Result of a design chat turn."""
+
     content: str = ""
     reasoning_content: str = ""
     tool_calls_made: list[dict[str, Any]] = field(default_factory=list)
@@ -834,6 +844,7 @@ class DesignChatResult:
     # reuses freed object addresses and collapses distinct turns onto one key.
     recall_session_key: str = ""
 
+
 class _SessionSearcher:
     """
     Lightweight BM25 searcher for design session turns / decisions / summary.
@@ -849,7 +860,7 @@ class _SessionSearcher:
         # Each result: {id, text, score}
     """
 
-    def __init__(self, session_prefix: str = "", vector_cache: Optional[Any] = None) -> None:
+    def __init__(self, session_prefix: str = "", vector_cache: Any | None = None) -> None:
         self._session_prefix = session_prefix
         self._doc_ids: list[Any] = []
         self._doc_token_counts: list[dict[str, int]] = []
@@ -889,8 +900,8 @@ class _SessionSearcher:
     def index_docs(
         self,
         docs: list[tuple[Any, str]],
-        pre_tokenized: Optional[list[tuple[Any, dict, int, str]]] = None,
-        archive_sig: Optional[tuple] = None,
+        pre_tokenized: list[tuple[Any, dict, int, str]] | None = None,
+        archive_sig: tuple | None = None,
     ) -> None:
         """Index a list of (id, text) documents for BM25 retrieval.
 
@@ -1018,13 +1029,8 @@ class _SessionSearcher:
                 # VectorCacheManager lock in add_document/search); only the
                 # FAISS call is held, so the subsequent key_to_idx/ranking is
                 # unlocked.
-                vec_results = self._vector_cache.search(
-                    query, top_k=min(max(top_k * 2, 10), self._n_docs)
-                )
-                key_to_idx = {
-                    f"{self._session_prefix}{self._doc_ids[i]}": i
-                    for i in range(self._n_docs)
-                }
+                vec_results = self._vector_cache.search(query, top_k=min(max(top_k * 2, 10), self._n_docs))
+                key_to_idx = {f"{self._session_prefix}{self._doc_ids[i]}": i for i in range(self._n_docs)}
                 rank = 0
                 for vr in vec_results:
                     idx = key_to_idx.get(vr.get("file_path"))
@@ -1047,27 +1053,26 @@ class _SessionSearcher:
         if not vector_rank:
             ranked_idxs = [doc_idx for _, doc_idx in bm25_scored]
         else:
-            RRF_K = 60.0
+            _rrf_k = 60.0
             rrf_scored: list[tuple[float, int]] = []
             for idx, bm25_score in bm25_rank.items():
-                rrf = 1.0 / (RRF_K + bm25_score)
+                rrf = 1.0 / (_rrf_k + bm25_score)
                 if idx in vector_rank:
-                    rrf += 1.0 / (RRF_K + vector_rank[idx])
+                    rrf += 1.0 / (_rrf_k + vector_rank[idx])
                 rrf_scored.append((rrf, idx))
             rrf_scored.sort(key=lambda x: -x[0])
             ranked_idxs = [idx for _, idx in rrf_scored]
 
         # Build results. The displayed "score" stays the interpretable BM25
         # value (0.0 for vector-only hits); RRF drives ordering only.
-        return [{
+        return [
+            {
                 "id": self._doc_ids[doc_idx],
                 "text": self._doc_texts[doc_idx],
                 "score": round(bm25_score_of.get(doc_idx, 0.0), 4),
-            } for doc_idx in ranked_idxs[:top_k]]
-
-
-
-
+            }
+            for doc_idx in ranked_idxs[:top_k]
+        ]
 
 
 # ── Archive BM25 cache ──────────────────────────────────────────────────────
@@ -1085,7 +1090,7 @@ class _SessionSearcher:
 # session is cached.  The cap bounds the worst case; tune
 # ``_ARCHIVED_BM25_CACHE_MAX`` (default 2: the current + most-recent other
 # session) if memory matters more than cross-session search latency.
-_ARCHIVED_BM25_CACHE: "OrderedDict[tuple, list[tuple[Any, dict, int, str]]]" = OrderedDict()
+_ARCHIVED_BM25_CACHE: OrderedDict[tuple, list[tuple[Any, dict, int, str]]] = OrderedDict()
 _ARCHIVED_BM25_CACHE_LOCK = threading.Lock()
 """Serialises all access to ``_ARCHIVED_BM25_CACHE`` (read + write).
 
@@ -1128,7 +1133,7 @@ def _parse_cache_max(raw: str | None = None) -> int | float:
 
 _ARCHIVED_BM25_CACHE_MAX = _parse_cache_max()
 
-_VECTOR_CACHE_INDEXED_ARCHIVES: "OrderedDict[tuple, None]" = OrderedDict()
+_VECTOR_CACHE_INDEXED_ARCHIVES: OrderedDict[tuple, None] = OrderedDict()
 """Archive signatures whose documents have already been indexed into the vector cache.
 
 The BM25 cache avoids re-tokenising the archive, but ``index_docs`` was still calling
@@ -1160,7 +1165,7 @@ short sessions.
 """
 
 
-_SHARED_SESSION_VCM: Optional[Any] = None
+_SHARED_SESSION_VCM: Any | None = None
 """Process-wide memoised ``VectorCacheManager`` for ``.asicode/session_vector_cache``.
 
 Previously each ``search_design_history()`` call constructed a fresh
@@ -1184,7 +1189,7 @@ _SHARED_SESSION_VCM_LOCK = threading.Lock()
 """Guards creation of ``_SHARED_SESSION_VCM`` (double-checked init)."""
 
 
-def _get_session_vcm() -> Optional[Any]:
+def _get_session_vcm() -> Any | None:
     """Return the process-wide shared session vector cache (created once).
 
     Returns ``None`` when the vector stack is unavailable
@@ -1226,7 +1231,9 @@ def _archive_sig(session_mgr: Any, sid: str):
 
 
 def _archived_bm25_entries(
-    session_mgr: Any, sid: str, archived_turns: list,
+    session_mgr: Any,
+    sid: str,
+    archived_turns: list,
 ) -> tuple[list[tuple[Any, dict, int, str]], tuple | None, bool]:
     """Return pre-tokenised BM25 entries for a session's archived turns (cached).
 
@@ -1315,15 +1322,15 @@ class DesignChatLoop:
     def respond(
         self,
         messages: list[LLMMessage],
-        stream_callback: Optional[Callable] = None,
-        reasoning_callback: Optional[Callable] = None,
-        max_tool_iterations: Optional[int] = None,
-        token_callback: Optional[Callable] = None,
-        session_id: Optional[str] = None,
+        stream_callback: Callable | None = None,
+        reasoning_callback: Callable | None = None,
+        max_tool_iterations: int | None = None,
+        token_callback: Callable | None = None,
+        session_id: str | None = None,
         session_mgr=None,  # DesignSessionManager — enables search_design_history tool
         mode: str = "code",  # chat mode: "code" or "general"
-        thinking_mode: Optional[bool] = None,  # override thinking/reasoning
-        reasoning_effort: Optional[str] = None,  # thinking depth ("high" | "max")
+        thinking_mode: bool | None = None,  # override thinking/reasoning
+        reasoning_effort: str | None = None,  # thinking depth ("high" | "max")
     ) -> DesignChatResult:
         """Process a single design chat turn with tool use."""
         result = DesignChatResult()
@@ -1331,6 +1338,7 @@ class DesignChatLoop:
         # [RECALL] dedup re-arms on the next turn (id()-based keys reused freed
         # addresses — see failure_pattern_store.new_session_key).
         from .failure_pattern_store import new_session_key
+
         result.recall_session_key = new_session_key()
         msgs = list(messages)
         self.session_id = session_id or ""
@@ -1343,11 +1351,21 @@ class DesignChatLoop:
         if _ce is not None:
             self.llm_client.cancel_event = _ce
         try:
-            _r = self._respond_impl(msgs, stream_callback, reasoning_callback, max_tool_iterations, token_callback, result, mode=mode, thinking_mode=thinking_mode, reasoning_effort=reasoning_effort)
+            _r = self._respond_impl(
+                msgs,
+                stream_callback,
+                reasoning_callback,
+                max_tool_iterations,
+                token_callback,
+                result,
+                mode=mode,
+                thinking_mode=thinking_mode,
+                reasoning_effort=reasoning_effort,
+            )
         except AgentCancelled as _ac:
             # User pressed ESC — let the caller pause/cancel, not an error.
             # Attach the partial result so the caller can persist what the agent
- # was doing (keeps a referent for a following "let's do that" confirmation).
+            # was doing (keeps a referent for a following "let's do that" confirmation).
             _ac.partial_result = result
             raise
         except LLMCancelled as _lc:
@@ -1414,7 +1432,8 @@ class DesignChatLoop:
             logger.warning(
                 "Design chat: empty response escaped the tool loop "
                 "(hit_max_iterations=%s, tools_made=%d) — injected fallback message",
-                _r.hit_max_iterations, len(_r.tool_calls_made),
+                _r.hit_max_iterations,
+                len(_r.tool_calls_made),
             )
         return _r
 
@@ -1463,7 +1482,10 @@ class DesignChatLoop:
                 # The final give-up surfaces as a raised exception either way.
                 logger.info(
                     "Design chat transient LLM error (%s), outer retry %d/%d in %ds",
-                    type(e).__name__, _attempt + 1, retries, delay,
+                    type(e).__name__,
+                    _attempt + 1,
+                    retries,
+                    delay,
                 )
                 self._retry_wait(delay)
             except LLMConnectionError as e:
@@ -1478,14 +1500,13 @@ class DesignChatLoop:
                 # is the stronger mitigation — hence the near-zero delay after
                 # a flip; non-z.ai (or a custom base_url) uses backoff.
                 _flipped = self._flip_zai_endpoint()
-                delay = (
-                    _ZAI_FAILOVER_RETRY_DELAY
-                    if _flipped
-                    else min(2 ** (_attempt + 2), 30)
-                )
+                delay = _ZAI_FAILOVER_RETRY_DELAY if _flipped else min(2 ** (_attempt + 2), 30)
                 logger.info(
                     "Design chat connection error (%s), outer retry %d/%d in %ds%s",
-                    type(e).__name__, _attempt + 1, retries, delay,
+                    type(e).__name__,
+                    _attempt + 1,
+                    retries,
+                    delay,
                     " — flipped z.ai endpoint" if _flipped else "",
                 )
                 self._retry_wait(delay)
@@ -1506,16 +1527,23 @@ class DesignChatLoop:
                     raise
                 _auth_flipped = True
                 logger.info(
-                    "Design chat auth error (%s) on zai — flipped endpoint, "
-                    "retry %d/%d (no backoff)", type(e).__name__, _attempt + 1, retries,
+                    "Design chat auth error (%s) on zai — flipped endpoint, retry %d/%d (no backoff)",
+                    type(e).__name__,
+                    _attempt + 1,
+                    retries,
                 )
             except LLMAPIError as e:
                 # Context-length 400 → record overflow override + in-turn retry
                 if _is_context_length_error(e):
-                    _record_context_overflow(self.model, estimated_prompt_tokens=_estimated_prompt_tokens, base_url=getattr(self.llm_client, "base_url", None))
+                    _record_context_overflow(
+                        self.model,
+                        estimated_prompt_tokens=_estimated_prompt_tokens,
+                        base_url=getattr(self.llm_client, "base_url", None),
+                    )
                     logger.warning(
                         "Context-length 400 for %s — recorded overflow override (est=%s)",
-                        self.model, _estimated_prompt_tokens,
+                        self.model,
+                        _estimated_prompt_tokens,
                     )
                     # In-turn recovery: re-trim messages and retry once in this loop,
                     # continuing rather than raising so the retry loop handles it.
@@ -1571,7 +1599,12 @@ class DesignChatLoop:
             return False
         from external_llm.anthropic_client import ZAIAnthropicClient
         from external_llm.openai_client import ZAIClient
+
         api_key = getattr(cur, "api_key", None)
+        # Clients construct with a str api_key; the flip only proceeds for known
+        # client types so the value must be a real key here. The assert also
+        # narrows `Any | None` for pyright.
+        assert api_key is not None, "z.ai client must carry an api_key"
         if isinstance(cur, ZAIAnthropicClient):
             new_client: Any = ZAIClient(api_key, None, _ZAI_FAILOVER_TIMEOUT)
         elif isinstance(cur, ZAIClient):
@@ -1586,30 +1619,33 @@ class DesignChatLoop:
             new_client.cancel_event = _ce
         logger.info(
             "z.ai endpoint flipped to %s (timeout=%ss) for connection-error retry",
-            type(new_client).__name__, _ZAI_FAILOVER_TIMEOUT,
+            type(new_client).__name__,
+            _ZAI_FAILOVER_TIMEOUT,
         )
         return True
 
     def _respond_impl(
         self,
         msgs: list[LLMMessage],
-        stream_callback: Optional[Callable],
-        reasoning_callback: Optional[Callable],
-        max_tool_iterations: Optional[int],
-        token_callback: Optional[Callable],
+        stream_callback: Callable | None,
+        reasoning_callback: Callable | None,
+        max_tool_iterations: int | None,
+        token_callback: Callable | None,
         result: DesignChatResult,
         mode: str = "code",
-        thinking_mode: Optional[bool] = None,
-        reasoning_effort: Optional[str] = None,
+        thinking_mode: bool | None = None,
+        reasoning_effort: str | None = None,
     ) -> DesignChatResult:
-        _max_iterations = max_tool_iterations if max_tool_iterations and max_tool_iterations > 0 else _cfg.counts.DESIGN_CHAT_MAX_TOOL_ITERATIONS
+        _max_iterations = (
+            max_tool_iterations
+            if max_tool_iterations and max_tool_iterations > 0
+            else _cfg.counts.DESIGN_CHAT_MAX_TOOL_ITERATIONS
+        )
 
         # design_chat=True: the insight tools and search_design_history are
         # dispatched by THIS loop (by name, below), not by ToolRegistry, so this
         # is the only surface allowed to advertise them.
-        all_schemas = self.registry.get_tool_schemas(
-            lang_filter=self.registry.repo_language, design_chat=True
-        )
+        all_schemas = self.registry.get_tool_schemas(lang_filter=self.registry.repo_language, design_chat=True)
         if mode == "general":
             # /general mode: keep only non-code tools (web search, ask user, etc.)
             tool_schemas = [s for s in all_schemas if s["name"] in _GENERAL_MODE_TOOLS]
@@ -1629,6 +1665,9 @@ class DesignChatLoop:
         # happens through the final message (persistence contract, rule 8).
         self.registry.session_plan = None
         for iteration in range(_max_iterations):
+            # Pre-bind per-iteration timer so the exception path (which reads
+            # _call_start to record the failed call) never hits an unbound local.
+            _call_start = time.monotonic()
             # ── Cancel check (ESC) — stop cleanly between iterations ──
             # The tool dispatch guard (ToolRegistry.dispatch) short-circuits an
             # in-flight tool; this catches the cancel on the next loop turn so we
@@ -1638,17 +1677,24 @@ class DesignChatLoop:
                 raise AgentCancelled("cancelled by user during design chat")
             # ── Tool-result eviction (occupancy-gated gentle context bound; only
             # fires as the prompt nears the model's cap — see _evict_for_loop) ──
-            msgs = _evict_for_loop(msgs, model=self.model or "", tool_schemas=tool_schemas, base_url=getattr(self.llm_client, "base_url", None))
+            msgs = _evict_for_loop(
+                msgs,
+                model=self.model or "",
+                tool_schemas=tool_schemas,
+                base_url=getattr(self.llm_client, "base_url", None),
+            )
             # ── Context hard cap guard (prevents HTTP 400 on oversized context) ──
             # Reserve output room AND account for tool-schema tokens — otherwise a
             # full prompt fills small windows (Ollama 8192) leaving 0 to generate.
-            msgs = _apply_context_hard_cap(msgs, self.model, tool_schemas=tool_schemas, base_url=getattr(self.llm_client, "base_url", None))
+            msgs = _apply_context_hard_cap(
+                msgs, self.model, tool_schemas=tool_schemas, base_url=getattr(self.llm_client, "base_url", None)
+            )
             # ── Work-plan state ──
             # The work plan is surfaced to the model via the update_plan tool
             # result itself (agent_tools._tool_update_plan returns render_plan),
             # so the model always sees the current checklist inline after each
             # status change. Per-iteration re-injection was removed — it
- # redundantly pressured the model into "continuing now..." narrative
+            # redundantly pressured the model into "continuing now..." narrative
             # preambles on every cycle. The completion gate (below) still catches
             # turns that end with open items.
             _llm_msgs = msgs
@@ -1682,9 +1728,11 @@ class DesignChatLoop:
                     response: ToolCallResponse = self._call_llm_with_retry(
                         lambda _lt=_ladder_tokens: self.llm_client.chat_with_tools(
                             messages=_llm_msgs,  # noqa: B023 — _llm_msgs deliberately late-bound (comment above)
-                            tools=tool_schemas, model=self.model,
+                            tools=tool_schemas,
+                            model=self.model,
                             cache_breakpoint_offset=0,
-                            temperature=_PROCESS_TEMPERATURE, max_tokens=_lt,
+                            temperature=_PROCESS_TEMPERATURE,
+                            max_tokens=_lt,
                             reasoning_callback=reasoning_callback,
                             token_callback=token_callback,
                             **({"thinking_mode": thinking_mode} if thinking_mode is not None else {}),
@@ -1697,9 +1745,10 @@ class DesignChatLoop:
                         _attempt += 1
                         _ladder_tokens = _base_tokens * (1 << _attempt)
                         logger.warning(
-                            "[DESIGN_CHAT_LLM_RETRY] finish_reason=%s (max_tokens=%d), "
-                            "retrying (%d/3)",
-                            _finish_reason, _ladder_tokens, _attempt + 1,
+                            "[DESIGN_CHAT_LLM_RETRY] finish_reason=%s (max_tokens=%d), retrying (%d/3)",
+                            _finish_reason,
+                            _ladder_tokens,
+                            _attempt + 1,
                         )
                         continue
                     break
@@ -1718,7 +1767,8 @@ class DesignChatLoop:
                         response = replace_tool_calls(response, [])
                         logger.warning(
                             "Design chat: finish_reason=%s — cleared %d partial tool call(s)",
-                            _finish_reason, _truncated_calls,
+                            _finish_reason,
+                            _truncated_calls,
                         )
                     # Turn-level outcome channel (record_agent_result): the ONLY
                     # place a truncation storm surfaces — the LLM call itself
@@ -1727,7 +1777,9 @@ class DesignChatLoop:
                     get_global_collector().record_agent_result(truncated=True)
                 logger.debug(
                     "Design chat LLM call: iter=%d elapsed=%.1fs tokens=%d tools=%d",
-                    iteration, _call_elapsed, response.tokens_used or 0,
+                    iteration,
+                    _call_elapsed,
+                    response.tokens_used or 0,
                     len(response.tool_calls or []) if response.tool_calls else 0,
                 )
                 # Record LLM call to global collector for dashboard visibility.
@@ -1748,6 +1800,7 @@ class DesignChatLoop:
                 )
             except Exception as e:
                 from external_llm.client import LLMClientError
+
                 # Record the failed main LLM call (this exception path means
                 # _call_llm_with_retry failed after all retries). The fallback
                 # below will be recorded as a separate successful LLM call.
@@ -1775,12 +1828,14 @@ class DesignChatLoop:
                 # naming the offending tool-schema field), which is the single
                 # most useful signal for diagnosing why native tools were dropped.
                 logger.warning(
-                    "Design chat tool call failed (%s) — falling back to tool-less "
-                    "plain chat (NO TOOLS this turn): %s",
-                    type(e).__name__, e,
+                    "Design chat tool call failed (%s) — falling back to tool-less plain chat (NO TOOLS this turn): %s",
+                    type(e).__name__,
+                    e,
                 )
                 result.total_llm_calls += 1
-                _fb = _fallback_plain_chat(msgs, self.llm_client, self.model, max_tokens=_max_tokens, token_callback=token_callback)
+                _fb = _fallback_plain_chat(
+                    msgs, self.llm_client, self.model, max_tokens=_max_tokens, token_callback=token_callback
+                )
                 result.content = _fb["content"]
                 result.reasoning_content = _fb.get("reasoning", "") or ""
                 # Mirror the reasoning fallback of the other exit paths (normal
@@ -1855,6 +1910,7 @@ class DesignChatLoop:
                 _text_parsed = _parse_text_tool_calls(response.content)
                 if _text_parsed:
                     from external_llm.client import ToolCallRequest
+
                     _effective_tool_calls = [
                         ToolCallRequest(
                             call_id=tc["id"],
@@ -1886,14 +1942,16 @@ class DesignChatLoop:
                 if not result.content.strip() and not _empty_retried:
                     _empty_retried = True
                     logger.info("Design chat: empty response on iter %d, retrying once", iteration)
-                    msgs.append(LLMMessage(
-                        role="user",
-                        content=(
-                            "[SYSTEM] You produced an empty response. "
-                            "Please either use the appropriate tool to fulfill the user's request "
-                            "or provide a meaningful text response."
-                        ),
-                    ))
+                    msgs.append(
+                        LLMMessage(
+                            role="user",
+                            content=(
+                                "[SYSTEM] You produced an empty response. "
+                                "Please either use the appropriate tool to fulfill the user's request "
+                                "or provide a meaningful text response."
+                            ),
+                        )
+                    )
                     continue
 
                 # ── Plan completion gate ──
@@ -1909,36 +1967,41 @@ class DesignChatLoop:
                         _plan_nudges += 1
                         logger.info(
                             "Design chat plan gate: %d open item(s), nudge %d/%d",
-                            len(_open), _plan_nudges, _PLAN_GATE_MAX_NUDGES,
+                            len(_open),
+                            _plan_nudges,
+                            _PLAN_GATE_MAX_NUDGES,
                         )
                         if stream_callback:
                             try:
-                                stream_callback("design_plan_gate", {
-                                    "open_items": [it["title"] for it in _open],
-                                    "nudge": _plan_nudges,
-                                    "max_nudges": _PLAN_GATE_MAX_NUDGES,
-                                })
+                                stream_callback(
+                                    "design_plan_gate",
+                                    {
+                                        "open_items": [it["title"] for it in _open],
+                                        "nudge": _plan_nudges,
+                                        "max_nudges": _PLAN_GATE_MAX_NUDGES,
+                                    },
+                                )
                             except Exception:
                                 logger.debug("design_plan_gate callback raised", exc_info=True)
                         msgs.append(LLMMessage(role="assistant", content=result.content))
-                        msgs.append(LLMMessage(
-                            role="user",
-                            content=(
-                                "[SYSTEM] Your work plan still has unresolved items:\n"
-                                f"{_titles}\n"
-                                "Do NOT narrate intent (no '이어서 진행하겠습니다' or similar filler) — "
-                                "act directly: either (a) call the next tool immediately to make progress on "
-                                "an open item, or (b) mark each unactionable item skipped/blocked with a reason "
-                                "via update_plan, then give your final answer explaining what was not done and why. "
-                                "Do not end with items silently unresolved."
-                            ),
-                        ))
+                        msgs.append(
+                            LLMMessage(
+                                role="user",
+                                content=(
+                                    "[SYSTEM] Your work plan still has unresolved items:\n"
+                                    f"{_titles}\n"
+                                    "Do NOT narrate intent (no '이어서 진행하겠습니다' or similar filler) — "
+                                    "act directly: either (a) call the next tool immediately to make progress on "
+                                    "an open item, or (b) mark each unactionable item skipped/blocked with a reason "
+                                    "via update_plan, then give your final answer explaining what was not done and why. "
+                                    "Do not end with items silently unresolved."
+                                ),
+                            )
+                        )
                         continue
                     # Nudges exhausted — accept the exit, but surface the
                     # unfinished items so the user always sees honest state.
-                    result.content += (
-                        "\n\n---\n⚠️ Unresolved plan items (auto-noted by the system):\n" + _titles
-                    )
+                    result.content += "\n\n---\n⚠️ Unresolved plan items (auto-noted by the system):\n" + _titles
                 return result
 
             # Not final — tool calls follow. If tokens were streamed, signal frontend to reset.
@@ -1951,10 +2014,13 @@ class DesignChatLoop:
             # Emit text content alongside tool calls for CLI display
             if stream_callback and response.content and response.content.strip():
                 try:
-                    stream_callback("design_thinking", {
-                        "content": response.content.strip()[:6000],
-                        "elapsed": _call_elapsed,
-                    })
+                    stream_callback(
+                        "design_thinking",
+                        {
+                            "content": response.content.strip()[:6000],
+                            "elapsed": _call_elapsed,
+                        },
+                    )
                 except Exception:
                     logger.debug("design_thinking callback raised", exc_info=True)
 
@@ -1983,16 +2049,18 @@ class DesignChatLoop:
             # top-level "content" list, so this stays None for them — no impact
             # on non-Anthropic providers.
             _raw = response.raw_response or {}
-            _assistant_raw_blocks = (
-                _raw.get("content") if isinstance(_raw.get("content"), list) else None
-            )
+            _assistant_raw_blocks = _raw.get("content") if isinstance(_raw.get("content"), list) else None
 
             # Build assistant message
             assistant_msg = LLMMessage(
-                role="assistant", content=response.content or "",
+                role="assistant",
+                content=response.content or "",
                 tool_calls=[
-                    {"id": tc.call_id, "type": "function",
-                     "function": {"name": tc.name, "arguments": json.dumps(tc.args, ensure_ascii=False)}}
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": json.dumps(tc.args, ensure_ascii=False)},
+                    }
                     for tc in _effective_tool_calls
                 ],
                 reasoning_content=reasoning_for_msg or None,
@@ -2014,20 +2082,23 @@ class DesignChatLoop:
             # (cache {hit_pct}% → ${actual}) above.
             if stream_callback:
                 try:
-                    stream_callback("design_llm_call", {
-                        "prompt_tokens": result.last_call_prompt_tokens,
-                        "completion_tokens": result.last_call_completion_tokens,
-                        "cache_read_tokens": result.last_call_cache_read_tokens,
-                        "cache_creation_tokens": result.last_call_cache_creation_tokens,
-                        "cache_hit_ratio": _cache_hit_ratio(
-                            cache_read_tokens=result.last_call_cache_read_tokens,
-                            cache_creation_tokens=result.last_call_cache_creation_tokens,
-                            prompt_tokens=result.last_call_prompt_tokens,
-                            provider=getattr(response, "provider", "") or "",
-                        ),
-                        "provider": getattr(response, "provider", "") or "",
-                        "tool_call_count": len(_effective_tool_calls),
-                    })
+                    stream_callback(
+                        "design_llm_call",
+                        {
+                            "prompt_tokens": result.last_call_prompt_tokens,
+                            "completion_tokens": result.last_call_completion_tokens,
+                            "cache_read_tokens": result.last_call_cache_read_tokens,
+                            "cache_creation_tokens": result.last_call_cache_creation_tokens,
+                            "cache_hit_ratio": _cache_hit_ratio(
+                                cache_read_tokens=result.last_call_cache_read_tokens,
+                                cache_creation_tokens=result.last_call_cache_creation_tokens,
+                                prompt_tokens=result.last_call_prompt_tokens,
+                                provider=getattr(response, "provider", "") or "",
+                            ),
+                            "provider": getattr(response, "provider", "") or "",
+                            "tool_call_count": len(_effective_tool_calls),
+                        },
+                    )
                 except Exception:
                     logger.debug("design_llm_call event failed", exc_info=True)
 
@@ -2054,13 +2125,18 @@ class DesignChatLoop:
                         if _ce is not None and _ce.is_set():
                             raise AgentCancelled("cancelled by user before serial tool")
                         tool_result = self._process_tool_call_with_learning(
-                            tc, stream_callback, result,
+                            tc,
+                            stream_callback,
+                            result,
                         )
                     else:
                         from ._thread_pool import CANCEL_POLL_INTERVAL, shared_pool
+
                         _future = shared_pool.submit(
-                            self._process_tool_call_with_learning, tc,
-                            _cancel_aware_callback(stream_callback, _ce), result,
+                            self._process_tool_call_with_learning,
+                            tc,
+                            _cancel_aware_callback(stream_callback, _ce),
+                            result,
                         )
                         while True:
                             try:
@@ -2083,11 +2159,17 @@ class DesignChatLoop:
                     tool_result = f"Error: tool execution failed: {_err}"
                     with self._result_lock:
                         result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
-                        result.tool_results.append({"tool": tc.name, "args": tc.args, "content": tool_result, "ok": False})
-                msgs.append(LLMMessage(
-                    role="tool", content=tool_result,
-                    tool_call_id=tc.call_id, name=tc.name,
-                ))
+                        result.tool_results.append(
+                            {"tool": tc.name, "args": tc.args, "content": tool_result, "ok": False}
+                        )
+                msgs.append(
+                    LLMMessage(
+                        role="tool",
+                        content=tool_result,
+                        tool_call_id=tc.call_id,
+                        name=tc.name,
+                    )
+                )
             else:
                 # Multiple tool calls — execute in parallel.
                 #
@@ -2153,24 +2235,33 @@ class DesignChatLoop:
                     if is_mutating:
                         with _write_lock:
                             tool_result = self._process_tool_call_with_learning(
-                                tc, _safe_cb, result,
+                                tc,
+                                _safe_cb,
+                                result,
                             )
                     else:
                         tool_result = self._process_tool_call_with_learning(
-                            tc, _safe_cb, result,
+                            tc,
+                            _safe_cb,
+                            result,
                         )
                     return (tc, tool_result)
 
                 from ._thread_pool import shared_pool
+
                 # Partition into read phase (parallel) and write phase (serialized),
                 # preserving original indices so tool messages map back to call_ids
                 # in the order the LLM emitted them.
-                _read_calls = [(i, tc) for i, tc in enumerate(_effective_tool_calls)
-                               if not _is_mutating(tc)
-                               and not self.registry._tool_call_is_serial(tc.name, tc.args)]
-                _write_calls = [(i, tc) for i, tc in enumerate(_effective_tool_calls)
-                                if _is_mutating(tc)
-                                and not self.registry._tool_call_is_serial(tc.name, tc.args)]
+                _read_calls = [
+                    (i, tc)
+                    for i, tc in enumerate(_effective_tool_calls)
+                    if not _is_mutating(tc) and not self.registry._tool_call_is_serial(tc.name, tc.args)
+                ]
+                _write_calls = [
+                    (i, tc)
+                    for i, tc in enumerate(_effective_tool_calls)
+                    if _is_mutating(tc) and not self.registry._tool_call_is_serial(tc.name, tc.args)
+                ]
                 # Serial tools (ask_user; job only for action == "kill" — see
                 # ToolRegistry._tool_call_is_serial) run strictly one-at-a-time, NOT
                 # via shared_pool (which would parallelize >1 of them). ask_user
@@ -2179,29 +2270,27 @@ class DesignChatLoop:
                 # stall the batch on the slowest — human — response). A serial call
                 # takes priority over both other phases even when it's also
                 # "mutating" (e.g. job kill), so it isn't double-placed.
-                _serial_calls = [(i, tc) for i, tc in enumerate(_effective_tool_calls)
-                                 if self.registry._tool_call_is_serial(tc.name, tc.args)]
+                _serial_calls = [
+                    (i, tc)
+                    for i, tc in enumerate(_effective_tool_calls)
+                    if self.registry._tool_call_is_serial(tc.name, tc.args)
+                ]
                 # Structural invariant: every call lands in EXACTLY one phase. The
                 # three filters above are independent, so a tool mistakenly placed
                 # in two phases (e.g. a SERIAL tool also classed mutating) would
                 # execute twice and silently overwrite _results[idx]. Enforce a
                 # disjoint cover explicitly so that latent invariant can't regress.
-                _all_idx = ([i for i, _ in _read_calls]
-                            + [i for i, _ in _write_calls]
-                            + [i for i, _ in _serial_calls])
+                _all_idx = [i for i, _ in _read_calls] + [i for i, _ in _write_calls] + [i for i, _ in _serial_calls]
                 if sorted(_all_idx) != list(range(len(_effective_tool_calls))):
                     raise AssertionError("tool phase partition is not a disjoint cover")
 
-                _results: list[Optional[str]] = [None] * len(_effective_tool_calls)
+                _results: list[str | None] = [None] * len(_effective_tool_calls)
                 _tc_by_index = dict(enumerate(_effective_tool_calls))
 
                 def _collect_phase(phase_calls, _tc_by_index=_tc_by_index, _results=_results):
                     if not phase_calls:
                         return
-                    futures = [
-                        (shared_pool.submit(_safe_process, tc), idx)
-                        for idx, tc in phase_calls
-                    ]
+                    futures = [(shared_pool.submit(_safe_process, tc), idx) for idx, tc in phase_calls]
                     # Cancel-aware collection: poll instead of blocking on a bare
                     # future.result() so ESC (cancel_event) is honored while a long
                     # tool is still running — a blocking wait would otherwise freeze
@@ -2209,6 +2298,7 @@ class DesignChatLoop:
                     # minutes). Threads cannot be killed: the in-flight tool keeps
                     # running in the pool and its result is simply discarded.
                     from ._thread_pool import CANCEL_POLL_INTERVAL
+
                     _ce = getattr(self.registry.config, "cancel_event", None)
                     for future, idx in futures:
                         tc = _tc_by_index[idx]
@@ -2235,7 +2325,9 @@ class DesignChatLoop:
                             tool_result = f"Error: tool execution failed: {_ferr}"
                             with self._result_lock:
                                 result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
-                                result.tool_results.append({"tool": tc.name, "args": tc.args, "content": tool_result, "ok": False})
+                                result.tool_results.append(
+                                    {"tool": tc.name, "args": tc.args, "content": tool_result, "ok": False}
+                                )
                         _results[idx] = tool_result
 
                 # Phase 1: reads run first (fills cache without interference).
@@ -2259,7 +2351,9 @@ class DesignChatLoop:
                         tool_result = f"Error: tool execution failed: {_ferr}"
                         with self._result_lock:
                             result.tool_calls_made.append({"tool": tc.name, "args": tc.args, "result_length": 0})
-                            result.tool_results.append({"tool": tc.name, "args": tc.args, "content": tool_result, "ok": False})
+                            result.tool_results.append(
+                                {"tool": tc.name, "args": tc.args, "content": tool_result, "ok": False}
+                            )
                     _results[idx] = tool_result
 
                 # Append tool messages in original call order for correct tool_call_id mapping.
@@ -2269,28 +2363,38 @@ class DesignChatLoop:
                     if tool_result is None:
                         # Defensive: should be unreachable (every index covered above).
                         tool_result = "Error: tool produced no result"
-                    msgs.append(LLMMessage(
-                        role="tool", content=tool_result,
-                        tool_call_id=tc.call_id, name=tc.name,
-                    ))
+                    msgs.append(
+                        LLMMessage(
+                            role="tool",
+                            content=tool_result,
+                            tool_call_id=tc.call_id,
+                            name=tc.name,
+                        )
+                    )
 
         # ── Safety limit reached — request final response ───────────────
         result.hit_max_iterations = True
         logger.info("Design chat: tool iteration safety limit reached, requesting final response")
-        msgs.append(LLMMessage(
-            role="user",
-            content=self._build_final_instruction(),
-        ))
+        msgs.append(
+            LLMMessage(
+                role="user",
+                content=self._build_final_instruction(),
+            )
+        )
 
         _final_t0 = time.monotonic()
         _final_recorded = False
         try:
             plain_msgs = _strip_tool_messages(msgs)
-            plain_msgs = _apply_context_hard_cap(plain_msgs, self.model, base_url=getattr(self.llm_client, "base_url", None))
+            plain_msgs = _apply_context_hard_cap(
+                plain_msgs, self.model, base_url=getattr(self.llm_client, "base_url", None)
+            )
             result.total_llm_calls += 1
             final_response = self.llm_client.chat(
-                messages=plain_msgs, model=self.model,
-                temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
+                messages=plain_msgs,
+                model=self.model,
+                temperature=_PROCESS_TEMPERATURE,
+                max_tokens=_max_tokens,
                 token_callback=token_callback,
             )
             _final_content = final_response.content or ""
@@ -2320,10 +2424,11 @@ class DesignChatLoop:
             # Some tool-strong models (Gemma 4 via Ollama) may return empty
             # content + tool_calls even when the schema has no tools.
             _retry_superseded = False  # set True if a retry response supersedes final_response
+            # Pre-bind the retry timer so the exception path (which reads
+            # _retry_t0 to record the failed retry call) never hits an unbound local.
+            _retry_t0 = time.monotonic()
             if not _final_content.strip():
-                logger.warning(
-                    "Design chat: final response empty, retrying with stronger instruction"
-                )
+                logger.warning("Design chat: final response empty, retrying with stronger instruction")
                 _retry_msgs = list(plain_msgs)
                 # Replace the last user message with a more forceful version
                 _retry_msgs[-1] = LLMMessage(
@@ -2339,8 +2444,10 @@ class DesignChatLoop:
                     _retry_t0 = time.monotonic()
                     result.total_llm_calls += 1
                     retry_response = self.llm_client.chat(
-                        messages=_retry_msgs, model=self.model,
-                        temperature=_PROCESS_TEMPERATURE, max_tokens=_max_tokens,
+                        messages=_retry_msgs,
+                        model=self.model,
+                        temperature=_PROCESS_TEMPERATURE,
+                        max_tokens=_max_tokens,
                         token_callback=token_callback,
                     )
                     _retry_content = retry_response.content or ""
@@ -2364,24 +2471,30 @@ class DesignChatLoop:
                     result.prompt_tokens += coerce_token_count(_dc_rpt)
                     result.completion_tokens += coerce_token_count(getattr(retry_response, "completion_tokens", None))
                     result.cache_read_tokens += coerce_token_count(
-                        getattr(retry_response, "cache_read_input_tokens", None))
+                        getattr(retry_response, "cache_read_input_tokens", None)
+                    )
                     result.cache_creation_tokens += coerce_token_count(
-                        getattr(retry_response, "cache_creation_input_tokens", None))
+                        getattr(retry_response, "cache_creation_input_tokens", None)
+                    )
                     # A successful retry supersedes the final_response — its token
                     # split becomes the authoritative "last call" reading.
                     result.last_call_prompt_tokens = coerce_token_count(getattr(retry_response, "prompt_tokens", None))
                     result.last_call_completion_tokens = coerce_token_count(
-                        getattr(retry_response, "completion_tokens", None))
+                        getattr(retry_response, "completion_tokens", None)
+                    )
                     result.last_call_cache_read_tokens = coerce_token_count(
-                        getattr(retry_response, "cache_read_input_tokens", None))
+                        getattr(retry_response, "cache_read_input_tokens", None)
+                    )
                     result.last_call_cache_creation_tokens = coerce_token_count(
-                        getattr(retry_response, "cache_creation_input_tokens", None))
+                        getattr(retry_response, "cache_creation_input_tokens", None)
+                    )
                     _retry_superseded = True
                     # Record the retry-response LLM call to global collector
                     # (parallel with the final_response last_call_* recording).
                     get_global_collector().record_llm_call(
                         provider=self.llm_client.get_provider_name(),
-                        prompt_tokens=getattr(retry_response, "prompt_tokens", None) or (retry_response.tokens_used or 0),
+                        prompt_tokens=getattr(retry_response, "prompt_tokens", None)
+                        or (retry_response.tokens_used or 0),
                         completion_tokens=getattr(retry_response, "completion_tokens", None) or 0,
                         execution_time_ms=round((time.monotonic() - _retry_t0) * 1000),
                         failed=False,
@@ -2401,6 +2514,7 @@ class DesignChatLoop:
                     # Propagate service-side LLM errors and user cancellation —
                     # never catch-and-swallow them (parallel with the tool-loop error-propagation guard).
                     from external_llm.client import LLMClientError
+
                     if isinstance(retry_e, (LLMClientError, AgentCancelled)):
                         raise
                     logger.warning("Design chat: retry also failed: %s", retry_e)
@@ -2414,7 +2528,8 @@ class DesignChatLoop:
             result.completion_tokens += coerce_token_count(getattr(final_response, "completion_tokens", None))
             result.cache_read_tokens += coerce_token_count(getattr(final_response, "cache_read_input_tokens", None))
             result.cache_creation_tokens += coerce_token_count(
-                getattr(final_response, "cache_creation_input_tokens", None))
+                getattr(final_response, "cache_creation_input_tokens", None)
+            )
             # Only record final_response's split as "last call" if it was not
             # already superseded by a successful retry above. The retry supersedes
             # final_response because the LLM's final answer was actually drawn
@@ -2422,11 +2537,14 @@ class DesignChatLoop:
             if not _retry_superseded:
                 result.last_call_prompt_tokens = coerce_token_count(getattr(final_response, "prompt_tokens", None))
                 result.last_call_completion_tokens = coerce_token_count(
-                    getattr(final_response, "completion_tokens", None))
+                    getattr(final_response, "completion_tokens", None)
+                )
                 result.last_call_cache_read_tokens = coerce_token_count(
-                    getattr(final_response, "cache_read_input_tokens", None))
+                    getattr(final_response, "cache_read_input_tokens", None)
+                )
                 result.last_call_cache_creation_tokens = coerce_token_count(
-                    getattr(final_response, "cache_creation_input_tokens", None))
+                    getattr(final_response, "cache_creation_input_tokens", None)
+                )
             if not result.provider:
                 result.provider = getattr(final_response, "provider", "") or ""
         except Exception as e:
@@ -2446,6 +2564,7 @@ class DesignChatLoop:
             # Propagate service-side LLM errors and user cancellation —
             # never catch-and-swallow them (parallel with the tool-loop error-propagation guard).
             from external_llm.client import LLMClientError
+
             if isinstance(e, (LLMClientError, AgentCancelled)):
                 raise
             # hit_max_iterations is already True (set just before the try), but a
@@ -2458,7 +2577,6 @@ class DesignChatLoop:
 
         return result
 
-
     @staticmethod
     def _build_final_instruction() -> str:
         """Build the max-iterations exhaustion instruction."""
@@ -2470,9 +2588,11 @@ class DesignChatLoop:
         )
 
     def _search_design_history(
-        self, query: str, max_results: int = 10,
-        target_session_id: Optional[str] = None,
-        search_field: Optional[str] = None,
+        self,
+        query: str,
+        max_results: int = 10,
+        target_session_id: str | None = None,
+        search_field: str | None = None,
     ) -> str:
         """Search design chat conversation history, optionally across sessions.
 
@@ -2490,9 +2610,16 @@ class DesignChatLoop:
 
         # ── P0: Session listing ──────────────────────────────────────────────
         _list_indicators = {
-            "list sessions", "session list", "list session",
-            "세션 목록", "세션 리스트", "세션 리스팅", "모든 세션",
-            "show sessions", "sessions list", "list all sessions",
+            "list sessions",
+            "session list",
+            "list session",
+            "세션 목록",
+            "세션 리스트",
+            "세션 리스팅",
+            "모든 세션",
+            "show sessions",
+            "sessions list",
+            "list all sessions",
         }
         _q_norm = query.lower().strip()
         if _q_norm in _list_indicators or _q_norm.startswith("list session"):
@@ -2510,9 +2637,7 @@ class DesignChatLoop:
                 updated_str = datetime.datetime.fromtimestamp(updated).strftime("%Y-%m-%d %H:%M") if updated else "?"
                 summary_mark = " 📋" if has_summary else ""
                 lines.append(
-                    f"  session={sid}{summary_mark}\n"
-                    f"    created={created_str}, updated={updated_str}, "
-                    f"turns={turns}"
+                    f"  session={sid}{summary_mark}\n    created={created_str}, updated={updated_str}, turns={turns}"
                 )
             lines.append("")
             lines.append(
@@ -2536,9 +2661,10 @@ class DesignChatLoop:
         def _load_archived(sid: str) -> list:
             # Old compressed turns live in <sid>.archive.jsonl — include them so
             # history search still covers the full conversation.
-            if hasattr(self._session_mgr, "load_archived_turns"):
+            _mgr = self._session_mgr
+            if _mgr is not None and hasattr(_mgr, "load_archived_turns"):
                 try:
-                    return self._session_mgr.load_archived_turns(sid)
+                    return _mgr.load_archived_turns(sid)
                 except (OSError, ValueError, KeyError, TypeError):  # archive read/shape
                     return []
             return []
@@ -2559,9 +2685,7 @@ class DesignChatLoop:
             if not self.session_id:
                 return "No active session to search."
             session = self._session_mgr.get_or_create(self.session_id)
-            _local_cut = max(
-                0, session.compressed_up_to - getattr(session, "archived_count", 0)
-            )
+            _local_cut = max(0, session.compressed_up_to - getattr(session, "archived_count", 0))
             _archived = _load_archived(self.session_id) if _need_archive else []
             _active = session.turns[:_local_cut] if _local_cut > 0 else []
             label = "current session"
@@ -2581,7 +2705,7 @@ class DesignChatLoop:
         # key_to_idx map restricts vector results to its own indexed docs, so
         # field isolation is preserved. Lazily created: never loaded if no
         # searcher is actually built (e.g. an early-return path).
-        _shared_vcm: Optional[Any] = None
+        _shared_vcm: Any | None = None
         _shared_vcm_loaded = False
 
         def _get_shared_vcm(n_docs: int = 0) -> Any:
@@ -2627,19 +2751,14 @@ class DesignChatLoop:
             if not docs:
                 return f"No matches found for '{query}' in {_field} of {label}."
 
-            searcher = _SessionSearcher(
-                session_prefix=_session_key, vector_cache=_get_shared_vcm(len(docs))
-            )
+            searcher = _SessionSearcher(session_prefix=_session_key, vector_cache=_get_shared_vcm(len(docs)))
             searcher.index_docs(docs)
             results = searcher.search(query, top_k=max_results)
 
             if not results:
                 return f"No matches found for '{query}' in {_field} of {label}."
 
-            lines = [
-                f"Found {len(results)} match(es) in {_field} of {label}"
-                f" (showing top {len(results)}):\n"
-            ]
+            lines = [f"Found {len(results)} match(es) in {_field} of {label} (showing top {len(results)}):\n"]
             for r in results:
                 item_type = r["id"]
                 item_text = r["text"][:500].replace("\n", " ")
@@ -2651,15 +2770,13 @@ class DesignChatLoop:
             return "\n".join(lines)
 
         # ── Per-turn + field search (content / all) ──────────────────────────
-        searcher = _SessionSearcher(
-            session_prefix=_session_key, vector_cache=_get_shared_vcm(len(_turns))
-        )
+        searcher = _SessionSearcher(session_prefix=_session_key, vector_cache=_get_shared_vcm(len(_turns)))
         # Cached archived-turn BM25 vectors (skips ~3.9s re-tokenisation on
         # repeat searches of a long archive).  The small active prefix is
         # always tokenised fresh — it grows as the conversation progresses, and
         # df/avgdl are recomputed over the combined set so scores stay correct.
-        _archived_tok, _archive_sig_val, _archive_from_cache = (
-            _archived_bm25_entries(self._session_mgr, _search_sid, _archived)
+        _archived_tok, _archive_sig_val, _archive_from_cache = _archived_bm25_entries(
+            self._session_mgr, _search_sid, _archived
         )
         _base = len(_archived)
         _active_docs: list[tuple[int, str]] = []
@@ -2668,7 +2785,8 @@ class DesignChatLoop:
             if content:
                 _active_docs.append((_base + j, content))
         searcher.index_docs(
-            _active_docs, pre_tokenized=_archived_tok,
+            _active_docs,
+            pre_tokenized=_archived_tok,
             archive_sig=_archive_sig_val,
         )
         results = searcher.search(query, top_k=max_results)
@@ -2680,8 +2798,7 @@ class DesignChatLoop:
         if results:
             scored_turns = [(r["id"], r["score"]) for r in results]
             all_lines.append(
-                f"Found {len(scored_turns)} turn(s) matching '{query}' in {label}"
-                f" (showing top {max_results}):\n"
+                f"Found {len(scored_turns)} turn(s) matching '{query}' in {label} (showing top {max_results}):\n"
             )
             for turn_idx, score in scored_turns:
                 start = max(0, turn_idx - 1)
@@ -2720,9 +2837,7 @@ class DesignChatLoop:
             # Summary
             _summary = session.compressed_summary
             if _summary:
-                s_searcher = _SessionSearcher(
-                    session_prefix=_session_key, vector_cache=_get_shared_vcm(1)
-                )
+                s_searcher = _SessionSearcher(session_prefix=_session_key, vector_cache=_get_shared_vcm(1))
                 s_searcher.index_docs([("Summary", _summary)])
                 s_results = s_searcher.search(query, top_k=min(3, max_results))
                 if s_results:
@@ -2745,7 +2860,7 @@ class DesignChatLoop:
     def _process_tool_call_with_learning(
         self,
         tc: Any,
-        stream_callback: Optional[Callable],
+        stream_callback: Callable | None,
         result: DesignChatResult,
     ) -> str:
         """Wrapper around _process_tool_call that records tool usage for adaptive learning."""
@@ -2759,9 +2874,7 @@ class DesignChatLoop:
                 logger.debug("record_tool_usage failed", exc_info=True)
         return tool_result
 
-    def _apply_no_effective_progress_gate(
-        self, tool_name: str, ok: bool, pre_snapshots: dict, metadata: Any
-    ) -> bool:
+    def _apply_no_effective_progress_gate(self, tool_name: str, ok: bool, pre_snapshots: dict, metadata: Any) -> bool:
         """NO_EFFECTIVE_PROGRESS hard gate (apply_patch only).
 
         A patch that applied "successfully" but left every touched file
@@ -2797,7 +2910,7 @@ class DesignChatLoop:
     def _process_tool_call(
         self,
         tc: Any,
-        stream_callback: Optional[Callable],
+        stream_callback: Callable | None,
         result: DesignChatResult,
     ) -> str:
         """Process a single tool call with budget and routing checks.
@@ -2821,11 +2934,15 @@ class DesignChatLoop:
             # can briefly block under heavy I/O.
             if stream_callback:
                 try:
-                    stream_callback("design_tool_call", {
-                        "call_id": tc.call_id,
-                        "tool": "save_insight", "args": tc.args,
-                        "status": "running",
-                    })
+                    stream_callback(
+                        "design_tool_call",
+                        {
+                            "call_id": tc.call_id,
+                            "tool": "save_insight",
+                            "args": tc.args,
+                            "status": "running",
+                        },
+                    )
                 except Exception:
                     logger.debug("save_insight running event failed", exc_info=True)
             try:
@@ -2839,12 +2956,16 @@ class DesignChatLoop:
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": _saved, "ok": True})
                 if stream_callback:
                     try:
-                        stream_callback("design_tool_call", {
-                            "call_id": tc.call_id,
-                            "tool": "save_insight", "args": tc.args,
-                            "status": "complete",
-                            "preview": f"💡 Insight saved: {_insight[:80]}...",
-                        })
+                        stream_callback(
+                            "design_tool_call",
+                            {
+                                "call_id": tc.call_id,
+                                "tool": "save_insight",
+                                "args": tc.args,
+                                "status": "complete",
+                                "preview": f"💡 Insight saved: {_insight[:80]}...",
+                            },
+                        )
                     except Exception:
                         logger.debug("save_insight complete event failed", exc_info=True)
             except Exception as e:
@@ -2866,11 +2987,15 @@ class DesignChatLoop:
                 return "Error: 'entry_match' is required."
             if stream_callback:
                 try:
-                    stream_callback("design_tool_call", {
-                        "call_id": tc.call_id,
-                        "tool": "delete_insight", "args": tc.args,
-                        "status": "running",
-                    })
+                    stream_callback(
+                        "design_tool_call",
+                        {
+                            "call_id": tc.call_id,
+                            "tool": "delete_insight",
+                            "args": tc.args,
+                            "status": "running",
+                        },
+                    )
                 except Exception:
                     logger.debug("delete_insight running event failed", exc_info=True)
             try:
@@ -2884,12 +3009,16 @@ class DesignChatLoop:
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": _result, "ok": _is_ok})
                 if stream_callback:
                     try:
-                        stream_callback("design_tool_call", {
-                            "call_id": tc.call_id,
-                            "tool": "delete_insight", "args": tc.args,
-                            "status": "complete" if _is_ok else "error",
-                            "preview": _result[:120],
-                        })
+                        stream_callback(
+                            "design_tool_call",
+                            {
+                                "call_id": tc.call_id,
+                                "tool": "delete_insight",
+                                "args": tc.args,
+                                "status": "complete" if _is_ok else "error",
+                                "preview": _result[:120],
+                            },
+                        )
                     except Exception:
                         logger.debug("delete_insight complete event failed", exc_info=True)
             except Exception as e:
@@ -2918,11 +3047,15 @@ class DesignChatLoop:
             _new_category = (tc.args.get("new_category") or "").strip() or None
             if stream_callback:
                 try:
-                    stream_callback("design_tool_call", {
-                        "call_id": tc.call_id,
-                        "tool": "edit_insight", "args": tc.args,
-                        "status": "running",
-                    })
+                    stream_callback(
+                        "design_tool_call",
+                        {
+                            "call_id": tc.call_id,
+                            "tool": "edit_insight",
+                            "args": tc.args,
+                            "status": "running",
+                        },
+                    )
                 except Exception:
                     logger.debug("edit_insight running event failed", exc_info=True)
             try:
@@ -2938,12 +3071,16 @@ class DesignChatLoop:
                     result.tool_results.append({"tool": tc.name, "args": tc.args, "content": _result, "ok": _is_ok})
                 if stream_callback:
                     try:
-                        stream_callback("design_tool_call", {
-                            "call_id": tc.call_id,
-                            "tool": "edit_insight", "args": tc.args,
-                            "status": "complete" if _is_ok else "error",
-                            "preview": _result[:120],
-                        })
+                        stream_callback(
+                            "design_tool_call",
+                            {
+                                "call_id": tc.call_id,
+                                "tool": "edit_insight",
+                                "args": tc.args,
+                                "status": "complete" if _is_ok else "error",
+                                "preview": _result[:120],
+                            },
+                        )
                     except Exception:
                         logger.debug("edit_insight complete event failed", exc_info=True)
             except Exception as e:
@@ -2968,11 +3105,15 @@ class DesignChatLoop:
             # which can take >1s). Mirrors the generic-tool path's running-event emission.
             if stream_callback:
                 try:
-                    stream_callback("design_tool_call", {
-                        "call_id": tc.call_id,
-                        "tool": "search_design_history", "args": tc.args,
-                        "status": "running",
-                    })
+                    stream_callback(
+                        "design_tool_call",
+                        {
+                            "call_id": tc.call_id,
+                            "tool": "search_design_history",
+                            "args": tc.args,
+                            "status": "running",
+                        },
+                    )
                 except Exception:
                     logger.debug("search_design_history running event failed", exc_info=True)
             # Coerce max_results defensively: a text-mode model may emit a
@@ -2987,18 +3128,25 @@ class DesignChatLoop:
                 _target_session_id = tc.args.get("target_session_id") or None
                 _search_field = tc.args.get("search_field") or None
                 _result = self._search_design_history(
-                    _query, _max_results,
+                    _query,
+                    _max_results,
                     target_session_id=_target_session_id,
                     search_field=_search_field,
                 )
                 if stream_callback:
                     try:
-                        stream_callback("design_tool_call", {
-                            "call_id": tc.call_id,
-                            "tool": "search_design_history", "args": tc.args,
-                            "status": "complete",
-                            "preview": _result.split("\n")[0] if _result and not _result.startswith("No") and not _result.startswith("Error") else _result[:120],
-                        })
+                        stream_callback(
+                            "design_tool_call",
+                            {
+                                "call_id": tc.call_id,
+                                "tool": "search_design_history",
+                                "args": tc.args,
+                                "status": "complete",
+                                "preview": _result.split("\n")[0]
+                                if _result and not _result.startswith("No") and not _result.startswith("Error")
+                                else _result[:120],
+                            },
+                        )
                     except Exception:
                         logger.debug("search_design_history complete event failed", exc_info=True)
                 with self._result_lock:
@@ -3009,12 +3157,16 @@ class DesignChatLoop:
                 _err_msg = f"Error searching design history: {e}"
                 if stream_callback:
                     try:
-                        stream_callback("design_tool_call", {
-                            "call_id": tc.call_id,
-                            "tool": "search_design_history", "args": tc.args,
-                            "status": "error",
-                            "preview": _err_msg,
-                        })
+                        stream_callback(
+                            "design_tool_call",
+                            {
+                                "call_id": tc.call_id,
+                                "tool": "search_design_history",
+                                "args": tc.args,
+                                "status": "error",
+                                "preview": _err_msg,
+                            },
+                        )
                     except Exception:
                         logger.debug("search_design_history error event failed", exc_info=True)
                 with self._result_lock:
@@ -3026,13 +3178,19 @@ class DesignChatLoop:
 
         # ── Execute tool ──
         _tool_start = time.monotonic()
+        # Pre-bind so the stream_callback block below (which assigns it inside
+        # a try) never leaves _display_args unbound for the completion event.
+        _display_args: dict = {}
         if stream_callback:
             try:
                 _display_args = self.registry.normalize_args_for_display(tc.args)
             except (AttributeError, TypeError):
                 _display_args = tc.args
             try:
-                stream_callback("design_tool_call", {"call_id": tc.call_id, "tool": tc.name, "args": _display_args, "status": "running"})
+                stream_callback(
+                    "design_tool_call",
+                    {"call_id": tc.call_id, "tool": tc.name, "args": _display_args, "status": "running"},
+                )
             except Exception:
                 logger.debug("design_tool_call running event failed", exc_info=True)
 
@@ -3079,18 +3237,26 @@ class DesignChatLoop:
                     record_write_tool_failure,
                     record_write_tool_failure_from_tr,
                 )
+
                 _repo_root = getattr(self.registry, "repo_root", None)
                 if tr is not None:
                     record_write_tool_failure_from_tr(
-                        tool=tc.name, tr=tr, args=tc.args,
-                        model=self.model, repo_root=_repo_root,
+                        tool=tc.name,
+                        tr=tr,
+                        args=tc.args,
+                        model=self.model,
+                        repo_root=_repo_root,
                         session_key=_session_key,
                     )
                 else:
                     record_write_tool_failure(
-                        tool=tc.name, ok=False,
-                        error=tool_result, metadata=None,
-                        args=tc.args, model=self.model, repo_root=_repo_root,
+                        tool=tc.name,
+                        ok=False,
+                        error=tool_result,
+                        metadata=None,
+                        args=tc.args,
+                        model=self.model,
+                        repo_root=_repo_root,
                         session_key=_session_key,
                     )
             except Exception:
@@ -3102,6 +3268,7 @@ class DesignChatLoop:
         # so the two never tangle.
         try:
             from .failure_pattern_store import record_recall_outcome
+
             record_recall_outcome(ok=ok, session_key=_session_key)
         except Exception:
             logger.debug("recall_outcome settle error", exc_info=True)
@@ -3119,8 +3286,11 @@ class DesignChatLoop:
         if not ok:
             try:
                 from .failure_pattern_store import recall_on_failure
+
                 _recall_hint = recall_on_failure(
-                    tc.name, tc.args, tr,
+                    tc.name,
+                    tc.args,
+                    tr,
                     getattr(self.registry, "repo_root", None),
                     exc=_dispatch_exc,
                     # Per-turn key (new_session_key() stamped on the result at
@@ -3137,6 +3307,9 @@ class DesignChatLoop:
         # (registry already rolled back / soft-failed syntax breakage; this adds
         # the orthogonal "did the intended change actually land, and where" signal.)
         if ok and _pre_snapshots:
+            # ok=True implies dispatch() returned a ToolResult (except path sets
+            # ok=False and tr=None), so tr is live here — assert for pyright.
+            assert tr is not None, "ok=True requires a dispatch result"
             try:
                 _change_summary = self.registry._safety_manager.summarize_change(_pre_snapshots)
             except Exception:
@@ -3151,9 +3324,7 @@ class DesignChatLoop:
             # here we additionally downgrade `ok` so progress/retry heuristics
             # and the stream status treat it as a failure. anchor_edit's
             # already_equal no-op is a deliberate success and is NOT touched.
-            ok = self._apply_no_effective_progress_gate(
-                tc.name, ok, _pre_snapshots, tr.metadata
-            )
+            ok = self._apply_no_effective_progress_gate(tc.name, ok, _pre_snapshots, tr.metadata)
 
             # Phase 0 — surface verify_warning (soft-fail from registry's repair cascade)
             try:
@@ -3170,9 +3341,7 @@ class DesignChatLoop:
                     if _sem:
                         tool_result = f"{tool_result}\n\n{_sem}"
                 except Exception:
-                    logger.debug(
-                        "semantic_lint error", exc_info=True
-                    )
+                    logger.debug("semantic_lint error", exc_info=True)
 
             # Phase 2 — auto-repair notification (inform LLM + CLI that semantic fixes were applied)
             try:
@@ -3196,11 +3365,14 @@ class DesignChatLoop:
             # most informative part of the preview. Re-attach it when the
             # front-truncation above cut it off.
             if "[POST-EDIT DIFF]" in tool_result and "[POST-EDIT DIFF]" not in preview:
-                preview += "\n" + tool_result[tool_result.rindex("[POST-EDIT DIFF]"):][:400]
+                preview += "\n" + tool_result[tool_result.rindex("[POST-EDIT DIFF]") :][:400]
             extra: dict = {"args": _display_args}
             if tc.name == "update_plan" and ok:
                 # Attach structured plan + previous status map to the event — allows
                 # CLI to render checklist/changelog UI without parsing text previews.
+                # ok=True implies dispatch() returned a ToolResult (except path
+                # sets ok=False and tr=None).
+                assert tr is not None, "ok=True requires a dispatch result"
                 try:
                     _md = tr.metadata or {}
                     if _md.get("plan"):
@@ -3209,11 +3381,16 @@ class DesignChatLoop:
                 except (AttributeError, TypeError):
                     logger.debug("plan metadata read failed")
             try:
-                stream_callback("design_tool_call", {
-                    "call_id": tc.call_id,
-                    "tool": tc.name, "status": "complete" if ok else "error",
-                    "preview": preview, **extra,
-                })
+                stream_callback(
+                    "design_tool_call",
+                    {
+                        "call_id": tc.call_id,
+                        "tool": tc.name,
+                        "status": "complete" if ok else "error",
+                        "preview": preview,
+                        **extra,
+                    },
+                )
             except Exception:
                 logger.debug("design_tool_call complete event failed", exc_info=True)
 
@@ -3222,9 +3399,9 @@ class DesignChatLoop:
             result.tool_results.append({"tool": tc.name, "args": tc.args, "content": tool_result, "ok": ok})
         logger.debug(
             "Design chat tool executed: tool=%s elapsed=%.1fs result_len=%d ok=%s",
-            tc.name, time.monotonic() - _tool_start, len(tool_result), ok,
+            tc.name,
+            time.monotonic() - _tool_start,
+            len(tool_result),
+            ok,
         )
         return tool_result
-
-
-

@@ -1,13 +1,13 @@
 """
 Tests for common.py — shared utility functions.
 """
+
 from __future__ import annotations
 
 from common import (
     chunk_list,
     ensure_trailing_newline,
     norm_ws,
-    normalize_rel_path_fast,
     safe_filename,
     unique_keep_order,
 )
@@ -45,7 +45,7 @@ class TestSafeFilename:
         assert safe_filename("hello.txt") == "hello.txt"
 
     def test_replaces_invalid_chars(self):
-        assert safe_filename("a/b:c*d?e\"f<g>h|i") == "a_b_c_d_e_f_g_h_i"
+        assert safe_filename('a/b:c*d?e"f<g>h|i') == "a_b_c_d_e_f_g_h_i"
 
     def test_compresses_underscores(self):
         assert safe_filename("a___b__c") == "a_b_c"
@@ -135,25 +135,3 @@ class TestChunkList:
 
     def test_chunk_size_larger_than_list(self):
         assert chunk_list([1, 2], 10) == [[1, 2]]
-
-
-class TestNormalizeRelPathFast:
-    """Tests for normalize_rel_path_fast."""
-
-    def test_strip_dot_slash(self):
-        assert normalize_rel_path_fast("./foo/bar.py") == "foo/bar.py"
-
-    def test_strip_whitespace(self):
-        assert normalize_rel_path_fast("  foo/bar  ") == "foo/bar"
-
-    def test_multiple_dot_slash(self):
-        assert normalize_rel_path_fast("././foo.py") == "foo.py"
-
-    def test_no_change(self):
-        assert normalize_rel_path_fast("foo/bar.py") == "foo/bar.py"
-
-    def test_empty_string(self):
-        assert normalize_rel_path_fast("") == ""
-
-    def test_none_input(self):
-        assert normalize_rel_path_fast(None) == ""

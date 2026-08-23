@@ -20,6 +20,7 @@ nodes. Whichever grammar a machine happens to resolve, the other one is still
 covered here. If only one is installed, the other parametrisation skips — so
 this file never gates on an undeclared dependency.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -143,12 +144,13 @@ def test_public_dead_code_scanner_respects_all(forced_python_grammar, tmp_path):
 
     src = tmp_path / "m.py"
     src.write_text(
-        "def public_api():\n    return 1\n\n\ndef _internal():\n    return 2\n\n"
-        '__all__ = ["public_api"]\n',
+        'def public_api():\n    return 1\n\n\ndef _internal():\n    return 2\n\n__all__ = ["public_api"]\n',
         encoding="utf-8",
     )
     candidates = scan_public_dead_blocks(
-        repo_root="", file_paths=[str(src)], cross_file_referenced_names=set(),
+        repo_root="",
+        file_paths=[str(src)],
+        cross_file_referenced_names=set(),
     )
     flagged = {m.name for c in candidates for m in c.members}
     assert "public_api" not in flagged, f"{forced_python_grammar}: __all__ ignored"
@@ -157,7 +159,9 @@ def test_public_dead_code_scanner_respects_all(forced_python_grammar, tmp_path):
 def test_module_level_assignment_is_a_symbol(forced_python_grammar):
     """The shared _SYMBOL_QUERIES python pattern must capture module-level names."""
     captures = tsu.query_captures(
-        "X = 1\ndef f(): pass\n", "python", tsu._SYMBOL_QUERIES["python"],
+        "X = 1\ndef f(): pass\n",
+        "python",
+        tsu._SYMBOL_QUERIES["python"],
     )
     names = {c.text for c in captures if c.capture_name == "name"}
     assert {"X", "f"}.issubset(names), f"{forced_python_grammar}: got {sorted(names)}"

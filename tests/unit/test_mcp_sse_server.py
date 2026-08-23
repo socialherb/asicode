@@ -7,6 +7,7 @@ Hermetic: the server binds to 127.0.0.1 with an ephemeral port (port=0) and
 all client traffic uses loopback http.client / raw sockets.  No network
 access and no claude-agent-sdk required.
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,6 @@ import socket
 import threading
 import time
 from http.client import HTTPConnection
-from typing import Optional
 
 import pytest
 
@@ -61,18 +61,16 @@ class _SseReader:
         event, data = "message", ""
         for line in raw.split(b"\n"):
             if line.startswith(b"event:"):
-                event = line[len(b"event:"):].strip().decode("utf-8")
+                event = line[len(b"event:") :].strip().decode("utf-8")
             elif line.startswith(b"data:"):
-                data = line[len(b"data:"):].strip().decode("utf-8")
+                data = line[len(b"data:") :].strip().decode("utf-8")
         return event, data
 
 
 def _open_sse(host: str, port: int) -> tuple[socket.socket, bytes]:
     """GET /sse over a raw socket; returns (sock, leftover after headers)."""
     sock = socket.create_connection((host, port), timeout=10)
-    sock.sendall(
-        b"GET /sse HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n"
-    )
+    sock.sendall(b"GET /sse HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n")
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
@@ -88,8 +86,8 @@ def _post(
     host: str,
     port: int,
     path: str,
-    payload: Optional[object] = None,
-    raw: Optional[bytes] = None,
+    payload: object | None = None,
+    raw: bytes | None = None,
 ) -> tuple[int, bytes]:
     conn = HTTPConnection(host, port, timeout=5)
     body = raw if raw is not None else json.dumps(payload).encode("utf-8")
@@ -134,7 +132,9 @@ def test_sse_initialize_and_list_tools_roundtrip(sse_server):
     endpoint, reader = _open_endpoint(host, port)
 
     status, _ = _post(
-        host, port, endpoint,
+        host,
+        port,
+        endpoint,
         {"jsonrpc": "2.0", "id": 1, "method": "mcp.initialize", "params": {}},
     )
     assert status == 202
@@ -145,7 +145,9 @@ def test_sse_initialize_and_list_tools_roundtrip(sse_server):
     assert result["server_name"] == "asicode"  # legacy flat keys preserved
 
     _post(
-        host, port, endpoint,
+        host,
+        port,
+        endpoint,
         {"jsonrpc": "2.0", "id": 2, "method": "mcp.list_tools", "params": {}},
     )
     _, raw = reader.read_event()
@@ -166,9 +168,13 @@ def test_sse_call_tool_read_file(tmp_path):
     try:
         endpoint, reader = _open_endpoint(server.host, server.port)
         _post(
-            server.host, server.port, endpoint,
+            server.host,
+            server.port,
+            endpoint,
             {
-                "jsonrpc": "2.0", "id": 3, "method": "mcp.call_tool",
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "mcp.call_tool",
                 "params": {"name": "read_file", "arguments": {"path": "hello.txt"}},
             },
         )
@@ -186,9 +192,13 @@ def test_sse_call_tool_read_file(tmp_path):
 def test_sse_call_tool_unknown_tool_is_error(sse_server):
     endpoint, reader = _open_endpoint(sse_server.host, sse_server.port)
     _post(
-        sse_server.host, sse_server.port, endpoint,
+        sse_server.host,
+        sse_server.port,
+        endpoint,
         {
-            "jsonrpc": "2.0", "id": 4, "method": "mcp.call_tool",
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "mcp.call_tool",
             "params": {"name": "no_such_tool", "arguments": {}},
         },
     )
@@ -202,14 +212,18 @@ def test_sse_notification_gets_no_message_event(sse_server):
     """Notifications (no id) are acked with 202 but never produce a stream event."""
     endpoint, reader = _open_endpoint(sse_server.host, sse_server.port)
     status, _ = _post(
-        sse_server.host, sse_server.port, endpoint,
+        sse_server.host,
+        sse_server.port,
+        endpoint,
         {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
     )
     assert status == 202
     # A request with an id sent afterwards must be the FIRST message event —
     # proving the notification produced none (FIFO queue order).
     _post(
-        sse_server.host, sse_server.port, endpoint,
+        sse_server.host,
+        sse_server.port,
+        endpoint,
         {"jsonrpc": "2.0", "id": 9, "method": "mcp.ping", "params": {}},
     )
     _, raw = reader.read_event()
@@ -228,7 +242,9 @@ def test_sse_parse_error_gets_jsonrpc_error_event(sse_server):
 
 def test_sse_post_unknown_session_404(sse_server):
     status, body = _post(
-        sse_server.host, sse_server.port, "/message?session_id=deadbeef",
+        sse_server.host,
+        sse_server.port,
+        "/message?session_id=deadbeef",
         {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
     )
     assert status == 404
@@ -368,14 +384,20 @@ def test_run_http_server_injects_handler_and_prints_endpoint(capsys):
             captured["shutdown"] = True
 
     mcp_server_mod._run_http_server(
-        _make_registry(), "127.0.0.1", 9999,
-        server_factory=FakeServer, endpoint="/mcp", label="Streamable-HTTP",
+        _make_registry(),
+        "127.0.0.1",
+        9999,
+        server_factory=FakeServer,
+        endpoint="/mcp",
+        label="Streamable-HTTP",
     )
     err = capsys.readouterr().err
     assert "Streamable-HTTP mode" in err
     assert "http://127.0.0.1:9999/mcp" in err
     assert captured["handle"] is mcp_server_mod._handle_jsonrpc
     assert captured["shutdown"] is True
+
+
 def test_sse_post_session_queue_full_returns_503(sse_server, monkeypatch):
     """A session whose SSE backlog is full (reader not consuming) must answer
     503 instead of growing an unbounded queue (memory-DoS guard)."""
@@ -388,7 +410,9 @@ def test_sse_post_session_queue_full_returns_503(sse_server, monkeypatch):
     messages.put("event-2")  # backlog full — no reader drains it
 
     status, body = _post(
-        sse_server.host, sse_server.port, f"/message?session_id={session_id}",
+        sse_server.host,
+        sse_server.port,
+        f"/message?session_id={session_id}",
         {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
     )
     assert status == 503
@@ -414,7 +438,9 @@ def test_sse_delete_full_session_drops_without_blocking(sse_server, monkeypatch)
 
     assert sse_server._get_session(session_id) is None
     status, _ = _post(
-        sse_server.host, sse_server.port, f"/message?session_id={session_id}",
+        sse_server.host,
+        sse_server.port,
+        f"/message?session_id={session_id}",
         {"jsonrpc": "2.0", "id": 2, "method": "mcp.ping"},
     )
     assert status == 404
@@ -444,10 +470,9 @@ def test_sse_post_during_teardown_answers_409_not_silent_202():
         def post_slow():
             conn = HTTPConnection(host, port, timeout=10)
             conn.request(
-                "POST", endpoint,
-                body=json.dumps(
-                    {"jsonrpc": "2.0", "id": 77, "method": "mcp.ping", "params": {}}
-                ).encode(),
+                "POST",
+                endpoint,
+                body=json.dumps({"jsonrpc": "2.0", "id": 77, "method": "mcp.ping", "params": {}}).encode(),
                 headers={"Content-Type": "application/json"},
             )
             resp = conn.getresponse()
@@ -499,7 +524,9 @@ def test_sse_post_after_delete_404(sse_server):
     conn.close()
 
     status, body = _post(
-        sse_server.host, sse_server.port, endpoint,
+        sse_server.host,
+        sse_server.port,
+        endpoint,
         {"jsonrpc": "2.0", "id": 5, "method": "mcp.ping"},
     )
     assert status == 404
@@ -553,7 +580,9 @@ def test_sse_active_session_survives_sweep():
         for _ in range(4):
             time.sleep(0.1)
             status, _ = _post(
-                server.host, server.port, endpoint,
+                server.host,
+                server.port,
+                endpoint,
                 {"jsonrpc": "2.0", "method": "mcp.ping", "params": {}},
             )
             assert status == 202
@@ -590,7 +619,9 @@ def test_shutdown_drops_all_sessions():
 def test_sse_post_wrong_path_404(sse_server):
     """POST to a non-/message path answers 404 (L151-152)."""
     status, data = _post(
-        sse_server.host, sse_server.port, "/wrong",
+        sse_server.host,
+        sse_server.port,
+        "/wrong",
         {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
     )
     assert status == 404
@@ -605,7 +636,9 @@ def test_sse_post_invalid_content_length_400(sse_server):
     try:
         conn = HTTPConnection(sse_server.host, sse_server.port, timeout=5)
         conn.request(
-            "POST", endpoint, body=b"{}",
+            "POST",
+            endpoint,
+            body=b"{}",
             headers={"Content-Type": "application/json", "Content-Length": "abc"},
         )
         resp = conn.getresponse()
@@ -643,6 +676,111 @@ def test_sse_post_body_too_large_413(sse_server):
         sock.close()
 
 
+def test_sse_error_response_closes_connection(sse_server):
+    """An error response must close the connection (no keep-alive reuse).
+
+    Regression: error paths answered 413/404/400 but left the connection in
+    HTTP/1.1 keep-alive state, so the server looped back into
+    ``rfile.readline`` on a socket the client had closed — a
+    ``ConnectionResetError`` that socketserver printed as a traceback
+    (log spam for a routine disconnect).
+    """
+    from external_llm.editor.agent.mcp._session_queue import _MAX_MESSAGE_BODY_BYTES
+
+    # Open a session so we have a real endpoint to POST against.
+    sock, rest = _open_sse(sse_server.host, sse_server.port)
+    reader = _SseReader(sock, rest)
+    _, endpoint = reader.read_event()
+
+    # Send only the headers with an oversized Content-Length; the server must
+    # answer 413 AND close the connection (no keep-alive reuse).
+    conn = socket.create_connection((sse_server.host, sse_server.port), timeout=5)
+    conn.sendall(
+        f"POST {endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Type: "
+        f"application/json\r\nContent-Length: {_MAX_MESSAGE_BODY_BYTES + 1}\r\n\r\n".encode()
+    )
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    header_block, _, body = buf.partition(b"\r\n\r\n")
+    assert b" 413 " in header_block.split(b"\r\n")[0], header_block
+    # ``Connection: close`` — the server must not wait for another request
+    # on this connection.  Without this, the next readline would block on a
+    # socket the client has closed (keep-alive reuse after an error).
+    assert b"close" in header_block.lower(), header_block
+    # The server closes the connection: read the declared body length, then a
+    # subsequent read must return EOF immediately (not hang on a keep-alive
+    # read of a connection the client closed, not fail on a reset).
+    content_length = int(
+        next(
+            line.split(b": ", 1)[1]
+            for line in header_block.split(b"\r\n")
+            if line.lower().startswith(b"content-length:")
+        )
+    )
+    conn.settimeout(5)
+    while len(body) < content_length:
+        chunk = conn.recv(4096)
+        assert chunk, "connection closed before the 413 body completed"
+        body += chunk
+    rest = conn.recv(4096)
+    assert rest == b"", f"expected EOF after 413, got {rest!r}"
+    conn.close()
+    sock.close()
+
+
+def test_sse_disconnect_between_requests_is_quiet(sse_server, capsys):
+    """RST between requests must not crash the handler or log a traceback.
+
+    ``QuietHttpHandler`` swallows ``ConnectionResetError`` out of the
+    keep-alive readline — socketserver would otherwise print a traceback for
+    the routine act of a client vanishing between requests.  The server must
+    stay fully usable afterwards, and stderr must stay clean.
+    """
+    import struct
+
+    # Raw-socket keep-alive connection: complete one request (404), then RST
+    # the same socket.  The server's worker thread sits in its next
+    # rfile.readline() (keep-alive loop); without the QuietHttpHandler guard
+    # that readline raises ConnectionResetError which socketserver prints as
+    # a traceback.
+    sock = socket.create_connection((sse_server.host, sse_server.port), timeout=5)
+    sock.sendall(b"GET /wrong HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    assert b" 404 " in buf.split(b"\r\n")[0], buf
+    # RST the connection (linger-0 close) so the server's next readline —
+    # which it is about to attempt on the keep-alive loop — fails hard.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
+
+    # Give the server thread time to hit the dead socket.  It must swallow
+    # the reset quietly: the worker thread survives AND no traceback reaches
+    # stderr (socketserver's default behaviour would print one).
+    time.sleep(0.5)
+
+    # The server must still answer new requests (worker thread survived).
+    status, body = _post(
+        sse_server.host,
+        sse_server.port,
+        "/message?session_id=nope",
+        {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
+    )
+    assert status == 404
+    assert b"Unknown session_id" in body
+
+    # And no traceback was printed by the server's worker thread.
+    err = capsys.readouterr().err
+    assert "Traceback" not in err, err
+
+
 def test_sse_delete_wrong_path_404(sse_server):
     """DELETE to a non-/message path answers 404 (L207-208)."""
     conn = HTTPConnection(sse_server.host, sse_server.port, timeout=5)
@@ -668,9 +806,9 @@ def test_sse_stream_client_disconnect_logged(sse_server, caplog):
     sock.close()
     with caplog.at_level(logging.DEBUG, logger="external_llm.editor.agent.mcp.sse_server"):
         _post(
-            sse_server.host, sse_server.port, endpoint,
+            sse_server.host,
+            sse_server.port,
+            endpoint,
             {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
         )
-        assert _wait_until(
-            lambda: any("client disconnected" in r.message for r in caplog.records)
-        )
+        assert _wait_until(lambda: any("client disconnected" in r.message for r in caplog.records))

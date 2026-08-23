@@ -25,6 +25,7 @@ status line — otherwise they drift apart if either is edited in isolation.
 These are source-contract tests (text parse) — they verify the wiring without
 importing asi (which has heavy import-time side effects).
 """
+
 import re
 
 import pytest
@@ -48,7 +49,9 @@ def _get_print_dep_status_source() -> str:
             start = i
             break
     if start is None:
-        pytest.fail("_print_dep_status not found in asi.py — update this test or restore the symbol; silent skip would mask the regression")
+        pytest.fail(
+            "_print_dep_status not found in asi.py — update this test or restore the symbol; silent skip would mask the regression"
+        )
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]

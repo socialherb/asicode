@@ -7,6 +7,7 @@ Verifies all argument layouts the gate handles:
 * ``write_plan`` with ``"plan"`` as ``dict``, JSON ``str``, or bare ``list``.
 * Fallback to top-level ``"ops"`` / ``"operations"``.
 """
+
 from __future__ import annotations
 
 import json
@@ -36,17 +37,13 @@ def test_apply_patch_empty_args():
 
 def test_apply_patch_patch_text_with_test_file():
     """apply_patch with no ``path`` but patch touching a test file → True."""
-    patch = (
-        "--- a/tests/test_foo.py\n+++ b/tests/test_foo.py\n@@ -1 +1 @@\n-old\n+new\n"
-    )
+    patch = "--- a/tests/test_foo.py\n+++ b/tests/test_foo.py\n@@ -1 +1 @@\n-old\n+new\n"
     assert _write_touched_test_file("apply_patch", {"patch": patch}) is True
 
 
 def test_apply_patch_patch_text_with_source_only():
     """apply_patch with ``patch`` touching only source files → False."""
-    patch = (
-        "--- a/src/bar.py\n+++ b/src/bar.py\n@@ -1 +1 @@\n-old\n+new\n"
-    )
+    patch = "--- a/src/bar.py\n+++ b/src/bar.py\n@@ -1 +1 @@\n-old\n+new\n"
     assert _write_touched_test_file("apply_patch", {"patch": patch}) is False
 
 

@@ -25,9 +25,10 @@ module dict (``globals()[name] = attr``), so subsequent accesses bypass
 ``__getattr__`` entirely — and a ``patch`` restore leaves the real class in
 place.
 """
+
 from __future__ import annotations
 
-__all__ = ["ExternalLLMService"]
+__all__ = ["ExternalLLMService"]  # type: ignore[reportUnsupportedDunderAll]  # PEP 562 lazy re-export via __getattr__
 
 # Map each lazily-exported public name to the submodule that defines it.
 # Relative module paths are resolved against this package via importlib.

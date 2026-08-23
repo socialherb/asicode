@@ -10,6 +10,7 @@ via target_path.write_text() AND the result was reported as success=True
 The fix: (1) single-file fallback only runs when the file does not exist,
 (2) _create_default_file_patch() itself refuses to touch an existing file.
 """
+
 from __future__ import annotations
 
 import os
@@ -80,12 +81,15 @@ def test_create_default_file_patch_refuses_existing_target(tmp_path: Path):
     target.write_text(ORIGINAL, encoding="utf-8")
 
     svc = _make_service()
-    patch = svc._create_default_file_patch(tmp_path, FileOperation(
-        file_path="existing.py",
-        operation="create",
-        description="d",
-        instructions="i",
-    ))
+    patch = svc._create_default_file_patch(
+        tmp_path,
+        FileOperation(
+            file_path="existing.py",
+            operation="create",
+            description="d",
+            instructions="i",
+        ),
+    )
 
     assert patch == ""
     assert target.read_text(encoding="utf-8") == ORIGINAL

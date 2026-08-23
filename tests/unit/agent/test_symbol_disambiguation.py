@@ -79,8 +79,8 @@ class TestRankSymbolResults:
     def test_combined_scoring(self):
         """Multiple tiers should stack."""
         results = [
-            self._make_def("src/models.py", kind="class"),      # dir+2, kind+1 = 3
-            self._make_def("lib/models.py", kind="function"),    # kind+1 = 1
+            self._make_def("src/models.py", kind="class"),  # dir+2, kind+1 = 3
+            self._make_def("lib/models.py", kind="function"),  # kind+1 = 1
             self._make_def("tests/models.py", kind="function"),  # test-2, kind+1 = -1
         ]
         prefer = ["src/core.py"]
@@ -94,7 +94,7 @@ class TestRankSymbolResults:
     def test_exact_file_beats_proximity(self):
         """Exact file match (+4) should beat directory proximity (+2)."""
         results = [
-            self._make_def("src/other.py"),   # dir proximity +2
+            self._make_def("src/other.py"),  # dir proximity +2
             self._make_def("lib/target.py"),  # exact match +4
         ]
         prefer = ["lib/target.py", "src/core.py"]
@@ -133,9 +133,13 @@ class TestRepositoryGraphGetSymbol:
 
         def _sym(name, qualname, file_path, start_line=1):
             return SymbolNode(
-                name=name, qualname=qualname, module=file_path.replace("/", "."),
-                kind="class", file_path=file_path,
-                start_line=start_line, end_line=start_line + 10,
+                name=name,
+                qualname=qualname,
+                module=file_path.replace("/", "."),
+                kind="class",
+                file_path=file_path,
+                start_line=start_line,
+                end_line=start_line + 10,
             )
 
         graph.symbols["auth/models.py:User"] = _sym("User", "User", "auth/models.py", 10)
@@ -196,9 +200,13 @@ class TestRepositoryGraphGetSymbol:
 
         graph = self._make_graph()
         sym = SymbolNode(
-            name="validate", qualname="User.validate",
-            module="auth.models", kind="method", file_path="auth/models.py",
-            start_line=15, end_line=25,
+            name="validate",
+            qualname="User.validate",
+            module="auth.models",
+            kind="method",
+            file_path="auth/models.py",
+            start_line=15,
+            end_line=25,
         )
         graph.symbols["auth/models.py:User.validate"] = sym
 

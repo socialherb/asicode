@@ -360,12 +360,6 @@ select = [
 # Rules excluded globally (enable gradually after baseline cleanup):
 ignore = [
     "E501",         # line-too-long: 16,665 violations — enable after bulk cleanup
-    "N802",         # invalid-function-name: 101 violations (test helpers, legacy)
-    "N806",         # non-lowercase-variable-in-function: 449 violations
-    "N999",         # invalid-module-name: 46 violations (from __init__ re-exports)
-    "UP037",        # quoted-annotation: 902 violations — enable after staged migration
-    "UP045",        # non-pep604-annotation-optional: 2,845 violations — staged migration
-    "ASYNC100",     # async-function-with-no-await: too noisy for mixed sync/async
 ]
 
 [tool.ruff.format]

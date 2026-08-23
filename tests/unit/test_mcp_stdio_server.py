@@ -12,6 +12,7 @@ R11-3 concurrency contract:
 - tool concurrency is bounded by _MAX_CONCURRENT_TOOL_CALLS;
 - stdin EOF drains in-flight tool calls for a bounded time.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,7 +20,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 
@@ -32,9 +33,9 @@ class _LineFeed:
     """Feeds JSON-RPC lines to the server; close() ends iteration (EOF)."""
 
     def __init__(self) -> None:
-        self._lines: queue.Queue[Optional[str]] = queue.Queue()
+        self._lines: queue.Queue[str | None] = queue.Queue()
 
-    def __iter__(self) -> "_LineFeed":
+    def __iter__(self) -> _LineFeed:
         return self
 
     def __next__(self) -> str:
@@ -83,7 +84,7 @@ class _FakeRegistry:
 
     repo_language = "python"
 
-    def __init__(self, result: Optional[_Result] = None) -> None:
+    def __init__(self, result: _Result | None = None) -> None:
         self.result = result or _Result(ok=True, content="tool-result")
         self.release = threading.Event()
         self.started = threading.Event()
@@ -97,7 +98,7 @@ class _FakeRegistry:
         self.release.wait(timeout=10)
         return self.result
 
-    def get_tool_schemas(self, lang_filter: Optional[str] = None) -> list:
+    def get_tool_schemas(self, lang_filter: str | None = None) -> list:
         return []
 
 
@@ -112,12 +113,10 @@ class _StdioServer:
         # The in-process SDK MCP server build is not the transport under test
         # and requires claude-agent-sdk — stub it out.
         monkeypatch.setattr(mcp_server_mod, "build_asr_mcp_server", lambda *a, **k: None)
-        self.thread = threading.Thread(
-            target=mcp_server_mod._run_stdio_server, args=(registry,), daemon=True
-        )
+        self.thread = threading.Thread(target=mcp_server_mod._run_stdio_server, args=(registry,), daemon=True)
         self.thread.start()
 
-    def request(self, method: str, rid: Optional[int] = None, params: Optional[dict] = None) -> None:
+    def request(self, method: str, rid: int | None = None, params: dict | None = None) -> None:
         payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if rid is not None:
             payload["id"] = rid
@@ -132,12 +131,14 @@ class _StdioServer:
 
 
 def _call_tool(rid: int, name: str = "bash") -> str:
-    return json.dumps({
-        "jsonrpc": "2.0",
-        "id": rid,
-        "method": "mcp.call_tool",
-        "params": {"name": name, "arguments": {"cmd": "echo hi"}},
-    })
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "method": "mcp.call_tool",
+            "params": {"name": name, "arguments": {"cmd": "echo hi"}},
+        }
+    )
 
 
 # -- tests ------------------------------------------------------------------
@@ -310,7 +311,8 @@ def test_run_mcp_server_boot_freshness_self_check_logs(monkeypatch, caplog):
     """
     monkeypatch.setattr(mcp_server_mod, "_run_stdio_server", lambda registry: None)
     with caplog.at_level(
-        logging.INFO, logger="external_llm.editor.agent.mcp.server",
+        logging.INFO,
+        logger="external_llm.editor.agent.mcp.server",
     ):
         mcp_server_mod.run_mcp_server(_FakeRegistry(), mode="stdio")
     assert "freshness self-check" in caplog.text
@@ -390,9 +392,7 @@ def test_tool_response_write_oserror_logged(monkeypatch):
     monkeypatch.setattr("sys.stdout", _BoomStdout())
     monkeypatch.setattr(mcp_server_mod, "build_asr_mcp_server", lambda *a, **k: None)
     registry = _FakeRegistry()
-    thread = threading.Thread(
-        target=mcp_server_mod._run_stdio_server, args=(registry,), daemon=True
-    )
+    thread = threading.Thread(target=mcp_server_mod._run_stdio_server, args=(registry,), daemon=True)
     thread.start()
     feed.feed(_call_tool(1))
     assert registry.started.wait(timeout=2)
@@ -410,9 +410,7 @@ def test_inline_write_oserror_breaks_loop(monkeypatch):
     monkeypatch.setattr("sys.stdin", feed)
     monkeypatch.setattr("sys.stdout", _BoomStdout())
     monkeypatch.setattr(mcp_server_mod, "build_asr_mcp_server", lambda *a, **k: None)
-    thread = threading.Thread(
-        target=mcp_server_mod._run_stdio_server, args=(_FakeRegistry(),), daemon=True
-    )
+    thread = threading.Thread(target=mcp_server_mod._run_stdio_server, args=(_FakeRegistry(),), daemon=True)
     thread.start()
     feed.feed(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"}))
     thread.join(timeout=5)
@@ -448,18 +446,14 @@ def test_eof_drain_timeout_warns_and_exits(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="external_llm.editor.agent.mcp.server"):
         server.thread.join(timeout=5)
     assert not server.thread.is_alive()
-    assert any(
-        "in-flight tool call(s) still running" in r.message for r in caplog.records
-    )
+    assert any("in-flight tool call(s) still running" in r.message for r in caplog.records)
 
 
 def test_run_mcp_server_sse_and_http_modes_dispatch(monkeypatch):
     """run_mcp_server routes sse/http modes to their launchers (L105/L107)."""
     calls: list[str] = []
     monkeypatch.setattr(mcp_server_mod, "_run_sse_server", lambda *a, **k: calls.append("sse"))
-    monkeypatch.setattr(
-        mcp_server_mod, "_run_streamable_server", lambda *a, **k: calls.append("http")
-    )
+    monkeypatch.setattr(mcp_server_mod, "_run_streamable_server", lambda *a, **k: calls.append("http"))
     mcp_server_mod.run_mcp_server(_FakeRegistry(), mode="sse")
     mcp_server_mod.run_mcp_server(_FakeRegistry(), mode="http")
     assert calls == ["sse", "http"]
@@ -475,9 +469,7 @@ def test_boot_freshness_self_check_stale_warns(monkeypatch, caplog):
         def source_versions(self):
             return {}
 
-    monkeypatch.setattr(
-        "external_llm.agent.scanner_registry.get_registry", lambda: _StaleRegistry()
-    )
+    monkeypatch.setattr("external_llm.agent.scanner_registry.get_registry", lambda: _StaleRegistry())
     with caplog.at_level(logging.WARNING, logger="external_llm.editor.agent.mcp.server"):
         mcp_server_mod._log_scanner_freshness_at_startup()
     assert "stale source" in caplog.text

@@ -19,6 +19,7 @@ coverage was indirect (76%):
 These are GREEN-lock tests: every assertion encodes the documented contract, so
 a failure is a real regression, not a spec guess.
 """
+
 from __future__ import annotations
 
 import gc
@@ -114,9 +115,7 @@ class TestCompressFailureNoticeInteractive:
         assert "restore credits" in msg
 
     def test_rate_interactive_wording(self):
-        msg = cm._compress_failure_notice(
-            "s", "m", LLMRateLimitError("429"), use_latch=False, context="interactive"
-        )
+        msg = cm._compress_failure_notice("s", "m", LLMRateLimitError("429"), use_latch=False, context="interactive")
         assert "rate-limited" in msg
         assert "wait a moment" in msg
 
@@ -129,10 +128,7 @@ class TestCompressFailureNoticeInteractive:
         assert second is not None  # not latched
 
     def test_background_generic_error_stays_silent(self):
-        assert (
-            cm._compress_failure_notice("s", "m", RuntimeError("boom"), use_latch=True)
-            is None
-        )
+        assert cm._compress_failure_notice("s", "m", RuntimeError("boom"), use_latch=True) is None
 
 
 # ── SlidingWindowContext.prepare_before_call ───────────────────────────────
@@ -172,8 +168,7 @@ class TestSlidingWindowPrepare:
 
     def test_orphan_standard_tool_result_dropped_from_kept(self):
         # Trim boundary lands on a role="tool" message with no preceding assistant.
-        msgs = [_sys(), _user("u1"), _asst("a1"), _tool("bash", "t1"),
-                _tool("bash", "t2"), _asst("a2"), _user("u2")]
+        msgs = [_sys(), _user("u1"), _asst("a1"), _tool("bash", "t1"), _tool("bash", "t2"), _asst("a2"), _user("u2")]
         out = _trim(msgs, window=5)
         # t2 was trimmed out of `kept` and folded into the summary.
         assert _roles(out) == ["system", "user", "assistant", "user"]
@@ -181,13 +176,16 @@ class TestSlidingWindowPrepare:
         assert "bash: t1" in summary and "bash: t2" in summary
 
     def test_anthropic_mixed_result_keeps_text_blocks(self):
-        tr = LLMMessage(role="user", content="plain", raw_content=[
-            {"type": "tool_result", "tool_use_id": "c1", "content": "out"},
-            {"type": "text", "text": "strategy warning"},
-        ])
+        tr = LLMMessage(
+            role="user",
+            content="plain",
+            raw_content=[
+                {"type": "tool_result", "tool_use_id": "c1", "content": "out"},
+                {"type": "text", "text": "strategy warning"},
+            ],
+        )
         # 6 non-system messages, window=5 → trim boundary lands on `tr` (kept[0]).
-        msgs = [_sys(), _user("u1"), _asst("a1"), _tool("bash", "t1"),
-                tr, _asst("a2"), _user("u2")]
+        msgs = [_sys(), _user("u1"), _asst("a1"), _tool("bash", "t1"), tr, _asst("a2"), _user("u2")]
         out = _trim(msgs, window=5)
         # The mixed message survives with only the text block.
         kept_user = [m for m in out if getattr(m, "role", "") == "user" and m.content == "plain"]
@@ -196,13 +194,16 @@ class TestSlidingWindowPrepare:
         assert _roles(out) == ["system", "user", "user", "assistant", "user"]
 
     def test_anthropic_pure_tool_result_dropped_whole(self):
-        tr = LLMMessage(role="user", content="", raw_content=[
-            {"type": "tool_result", "tool_use_id": "c1", "content": "out"},
-        ])
+        tr = LLMMessage(
+            role="user",
+            content="",
+            raw_content=[
+                {"type": "tool_result", "tool_use_id": "c1", "content": "out"},
+            ],
+        )
         # 6 non-system messages, window=5 → the pure tool_result lands in kept[0]
         # and is dropped whole by the orphan loop.
-        msgs = [_sys(), _user("u1"), _asst("a1"), _tool("bash", "t1"),
-                tr, _asst("a2"), _user("u2")]
+        msgs = [_sys(), _user("u1"), _asst("a1"), _tool("bash", "t1"), tr, _asst("a2"), _user("u2")]
         out = _trim(msgs, window=5)
         assert _roles(out) == ["system", "user", "assistant", "user"]
         assert "out" in out[1].content  # folded into summary
@@ -301,26 +302,42 @@ class TestCompressedMessageCategorisation:
 
     def test_anthropic_tool_result_non_json_content(self):
         a_tc = _asst("", raw_content=[{"type": "tool_use", "id": "c1", "name": "bash"}])
-        tr = LLMMessage(role="user", content="", raw_content=[
-            {"type": "tool_result", "tool_use_id": "c1", "content": {"nested": True}},
-        ])
+        tr = LLMMessage(
+            role="user",
+            content="",
+            raw_content=[
+                {"type": "tool_result", "tool_use_id": "c1", "content": {"nested": True}},
+            ],
+        )
         body = _category_body(_compress([a_tc, tr]))
         assert "Failed tool calls" in body
         assert "bash: {'nested': True}" in body  # str() of non-str content, ok defaults False
 
     def test_anthropic_tool_result_is_error_forces_failure(self):
-        tr = LLMMessage(role="user", content="", raw_content=[
-            {"type": "tool_result", "tool_use_id": "c1",
-             "content": '{"ok": true, "content": "looks fine"}', "is_error": True},
-        ])
+        tr = LLMMessage(
+            role="user",
+            content="",
+            raw_content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "c1",
+                    "content": '{"ok": true, "content": "looks fine"}',
+                    "is_error": True,
+                },
+            ],
+        )
         body = _category_body(_compress([tr]))
         assert "Failed tool calls" in body
         assert "looks fine" in body
 
     def test_anthropic_tool_result_empty_snippet_placeholder(self):
-        tr = LLMMessage(role="user", content="", raw_content=[
-            {"type": "tool_result", "tool_use_id": "c1", "content": ""},
-        ])
+        tr = LLMMessage(
+            role="user",
+            content="",
+            raw_content=[
+                {"type": "tool_result", "tool_use_id": "c1", "content": ""},
+            ],
+        )
         body = _category_body(_compress([tr]))
         assert "[empty result]" in body
 
@@ -406,10 +423,7 @@ class TestSessionBasics:
 
 
 def _turns(n):
-    return [
-        {"role": "user" if i % 2 == 0 else "assistant", "content": f"c{i}"}
-        for i in range(n)
-    ]
+    return [{"role": "user" if i % 2 == 0 else "assistant", "content": f"c{i}"} for i in range(n)]
 
 
 class TestNeedsCompression:
@@ -649,8 +663,7 @@ class TestCompactNow:
         ctx = SessionCompressionContext("/tmp/nonexistent-repo")
         s = _make_session(_turns(6))
         persisted = []
-        assert ctx.compact_now(s, "helper", _FakeClient(), recent_keep=0,
-                               persist=lambda: persisted.append(1)) is True
+        assert ctx.compact_now(s, "helper", _FakeClient(), recent_keep=0, persist=lambda: persisted.append(1)) is True
         assert s.compressed_up_to == 6
         assert persisted == [1]
 
@@ -704,8 +717,7 @@ class TestBuildContextMessages:
     def test_insights_failure_is_silent(self, tmp_path, monkeypatch):
         import external_llm.agent.design_chat_loop as dcl
 
-        monkeypatch.setattr(dcl, "load_design_insights",
-                            lambda repo: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr(dcl, "load_design_insights", lambda repo: (_ for _ in ()).throw(RuntimeError("boom")))
         ctx = SessionCompressionContext(str(tmp_path))
         msgs = _build(ctx, _make_session(_turns(2)), mode="code")
         assert all("DESIGN INSIGHTS" not in c for c in _contents(msgs))
@@ -728,8 +740,7 @@ class TestBuildContextMessages:
         ctx = SessionCompressionContext("/tmp/nonexistent-repo")
         turns = [
             {"role": "user", "content": "old user", "preserve": True},
-            {"role": "assistant", "content": "old asst", "preserve": True,
-             "digest": "DIG: read foo.py"},
+            {"role": "assistant", "content": "old asst", "preserve": True, "digest": "DIG: read foo.py"},
             {"role": "user", "content": "new"},
         ]
         s = _make_session(turns, compressed_up_to=2, summary="SUM")
@@ -759,8 +770,7 @@ class TestBuildContextMessages:
         ]
         msgs = _build(ctx, _make_session(turns), owner="me")
         contents = _contents(msgs)
-        assert any("[IN-PROGRESS IN ANOTHER TERMINAL]" in c and "parallel request" in c
-                   for c in contents)
+        assert any("[IN-PROGRESS IN ANOTHER TERMINAL]" in c and "parallel request" in c for c in contents)
         assert any(c == "(turn 2) mine" for c in contents)
 
     def test_in_progress_same_owner_renders_normally(self):
@@ -780,16 +790,14 @@ class TestBuildContextMessages:
         msgs = _build(ctx, _make_session(turns), current_model="gpt-c")
         contents = _contents(msgs)
         assert any("[Model switched: gpt-a → gpt-b]" in c for c in contents)
-        assert any("You are now continuing this conversation" in c and "gpt-b" in c
-                   for c in contents)
+        assert any("You are now continuing this conversation" in c and "gpt-b" in c for c in contents)
 
     def test_verbatim_assistant_digest_appended(self):
         ctx = SessionCompressionContext("/tmp/nonexistent-repo")
         turns = [{"role": "assistant", "content": "answer", "digest": "DIG: patched x.py"}]
         msgs = _build(ctx, _make_session(turns))
         contents = _contents(msgs)
-        assert any(c.startswith("answer") and "[WORK STATE" in c and "DIG: patched x.py" in c
-                   for c in contents)
+        assert any(c.startswith("answer") and "[WORK STATE" in c and "DIG: patched x.py" in c for c in contents)
 
     def test_non_conversation_role_not_labelled(self):
         ctx = SessionCompressionContext("/tmp/nonexistent-repo")
@@ -808,8 +816,7 @@ class TestBuildContextMessages:
     def test_promoted_insights_failure_silent(self, tmp_path, monkeypatch, caplog):
         import external_llm.agent.design_chat_loop as dcl
 
-        monkeypatch.setattr(dcl, "load_promoted_insights",
-                            lambda repo, q: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr(dcl, "load_promoted_insights", lambda repo, q: (_ for _ in ()).throw(RuntimeError("boom")))
         ctx = SessionCompressionContext(str(tmp_path))
         with caplog.at_level("DEBUG"):
             msgs = _build(ctx, _make_session(_turns(2)), mode="code")

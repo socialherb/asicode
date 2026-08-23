@@ -3,6 +3,7 @@ Patch Synthesizer
 
 Converts all output modes to Unified Diff
 """
+
 from __future__ import annotations
 
 import difflib
@@ -54,7 +55,7 @@ class PatchSynthesizer:
             raise ValueError("cannot_synthesize: mode is None (needs_disambiguation)")
 
         if parse_result.mode == OutputMode.UNIFIED_DIFF:
-            #already diff form
+            # already diff form
             return str(parse_result.diff or "")
 
         if parse_result.mode == OutputMode.ASICODE_BLOCK:
@@ -67,27 +68,26 @@ class PatchSynthesizer:
             return self._from_full_file(parse_result, target_file)
 
         raise ValueError(f"Unknown mode: {parse_result.mode}")
-    def _read_target_text(self, target_file: str, *, missing_ok: bool) -> str:
-            """Read the target file for synthesis — size-gated and lossy-safe.
 
-            P23-1: all three synthesis paths previously read the file unbounded
-            (memory/CPU blowup when the LLM rewrites a huge file) and with
-            errors="ignore" (invalid UTF-8 bytes silently deleted, so the diff
-            was computed against corrupted old_content). Byte size is a
-            conservative proxy for chars, matching patch_engine's stat gate;
-            oversized targets raise so callers fall back to their existing
-            repair/retry contracts.
-            """
-            file_path = self.repo_root / target_file
-            if not file_path.exists():
-                if missing_ok:
-                    return ""
-                raise ValueError("target_file_missing_for_targeted_block")
-            if file_path.stat().st_size > _MAX_SYNTHESIZE_FILE_CHARS:
-                raise ValueError(
-                    f"file_too_large: {target_file} exceeds {_MAX_SYNTHESIZE_FILE_CHARS} bytes"
-                )
-            return file_path.read_text(encoding="utf-8", errors="replace")
+    def _read_target_text(self, target_file: str, *, missing_ok: bool) -> str:
+        """Read the target file for synthesis — size-gated and lossy-safe.
+
+        P23-1: all three synthesis paths previously read the file unbounded
+        (memory/CPU blowup when the LLM rewrites a huge file) and with
+        errors="ignore" (invalid UTF-8 bytes silently deleted, so the diff
+        was computed against corrupted old_content). Byte size is a
+        conservative proxy for chars, matching patch_engine's stat gate;
+        oversized targets raise so callers fall back to their existing
+        repair/retry contracts.
+        """
+        file_path = self.repo_root / target_file
+        if not file_path.exists():
+            if missing_ok:
+                return ""
+            raise ValueError("target_file_missing_for_targeted_block")
+        if file_path.stat().st_size > _MAX_SYNTHESIZE_FILE_CHARS:
+            raise ValueError(f"file_too_large: {target_file} exceeds {_MAX_SYNTHESIZE_FILE_CHARS} bytes")
+        return file_path.read_text(encoding="utf-8", errors="replace")
 
     def _from_asicode_block(self, result: ParseResult, target_file: str) -> str:
         """Convert ASICODE_BLOCK to unified diff"""
@@ -95,8 +95,8 @@ class PatchSynthesizer:
         old_content = self._read_target_text(target_file, missing_ok=True)
         new_content = old_content
 
-        #each block apply
-        for block in (result.blocks or []):
+        # each block apply
+        for block in result.blocks or []:
             before = block["before"]
             after = block["after"]
 
@@ -113,13 +113,9 @@ class PatchSynthesizer:
                 _n_bl = len(_before_norm_lines)
                 _matched = False
                 for _i in range(len(_content_lines) - _n_bl + 1):
-                    _window = _content_lines[_i:_i + _n_bl]
+                    _window = _content_lines[_i : _i + _n_bl]
                     if [ln.rstrip() for ln in _window] == _before_norm_lines:
-                        new_content = "\n".join(
-                            _content_lines[:_i]
-                            + after.split("\n")
-                            + _content_lines[_i + _n_bl:]
-                        )
+                        new_content = "\n".join(_content_lines[:_i] + after.split("\n") + _content_lines[_i + _n_bl :])
                         _matched = True
                         break
 
@@ -133,20 +129,14 @@ class PatchSynthesizer:
                         (len(line) - len(line.lstrip()) for line in _before_lines if line.strip()),
                         default=0,
                     )
-                    _before_canon = [
-                        (line[_before_min:] if line.strip() else line)
-                        for line in _before_lines
-                    ]
+                    _before_canon = [(line[_before_min:] if line.strip() else line) for line in _before_lines]
                     for _i in range(len(_content_lines) - len(_before_lines) + 1):
-                        _window = _content_lines[_i:_i + len(_before_lines)]
+                        _window = _content_lines[_i : _i + len(_before_lines)]
                         _win_min = min(
                             (len(line) - len(line.lstrip()) for line in _window if line.strip()),
                             default=0,
                         )
-                        _window_canon = [
-                            (line[_win_min:] if line.strip() else line)
-                            for line in _window
-                        ]
+                        _window_canon = [(line[_win_min:] if line.strip() else line) for line in _window]
                         if _window_canon == _before_canon:
                             # Shift 'after' uniformly to the matched window's base indent
                             _shift = _win_min - _before_min
@@ -160,13 +150,9 @@ class PatchSynthesizer:
                                         _after_lines.append((" " * _shift) + _l)
                                     else:
                                         _cut = -_shift
-                                        _after_lines.append(
-                                            _l[_cut:] if len(_l) >= _cut else _l.lstrip()
-                                        )
+                                        _after_lines.append(_l[_cut:] if len(_l) >= _cut else _l.lstrip())
                             new_content = "\n".join(
-                                _content_lines[:_i]
-                                + _after_lines
-                                + _content_lines[_i + len(_before_lines):]
+                                _content_lines[:_i] + _after_lines + _content_lines[_i + len(_before_lines) :]
                             )
                             _matched = True
                             break
@@ -175,20 +161,18 @@ class PatchSynthesizer:
                     logger.warning("BEFORE block not found in file")
 
         # Generate diff
-        return self._generate_diff(
-            old_content,
-            new_content,
-            target_file
-        )
+        return self._generate_diff(old_content, new_content, target_file)
 
     def _from_targeted_block(self, result: ParseResult, target_file: str) -> str:
         """Convert TARGETED_BLOCK to unified diff"""
 
         old_content = self._read_target_text(target_file, missing_ok=False)
-        old_lines = old_content.split('\n')
+        old_lines = old_content.split("\n")
 
         # Find insertion position
         insert_point = result.insert_point
+        if insert_point is None:
+            raise ValueError("Insert point is required for TARGETED_BLOCK mode")
         insert_index = -1
 
         if insert_point.startswith("line "):
@@ -206,19 +190,13 @@ class PatchSynthesizer:
             raise ValueError(f"Insert point not found: {insert_point}")
 
         # Insert code
-        new_lines = (
-            old_lines[:insert_index] +
-            result.code.split('\n') +
-            old_lines[insert_index:]
-        )
+        if result.code is None:
+            raise ValueError("Code is required for TARGETED_BLOCK mode")
+        new_lines = old_lines[:insert_index] + result.code.split("\n") + old_lines[insert_index:]
 
-        new_content = '\n'.join(new_lines)
+        new_content = "\n".join(new_lines)
 
-        return self._generate_diff(
-            old_content,
-            new_content,
-            target_file
-        )
+        return self._generate_diff(old_content, new_content, target_file)
 
     def _from_full_file(self, result: ParseResult, target_file: str) -> str:
         """Convert FULL_FILE to unified diff"""
@@ -226,12 +204,10 @@ class PatchSynthesizer:
         old_content = self._read_target_text(target_file, missing_ok=True)
 
         new_content = result.content
+        if new_content is None:
+            raise ValueError("Content is required for FULL_FILE mode")
 
-        return self._generate_diff(
-            old_content,
-            new_content,
-            target_file
-        )
+        return self._generate_diff(old_content, new_content, target_file)
 
     def _generate_diff(
         self,
@@ -241,18 +217,18 @@ class PatchSynthesizer:
     ) -> str:
         """Generate unified diff"""
 
-        old_lines = old_content.split('\n')
-        new_lines = new_content.split('\n')
+        old_lines = old_content.split("\n")
+        new_lines = new_content.split("\n")
 
         diff = difflib.unified_diff(
             old_lines,
             new_lines,
             fromfile=f"a/{file_path}",
             tofile=f"b/{file_path}",
-            lineterm='',
+            lineterm="",
         )
 
-        diff_text = '\n'.join(diff)
+        diff_text = "\n".join(diff)
 
         # Empty check
         if not diff_text or diff_text.strip() == "":
@@ -264,7 +240,7 @@ class PatchSynthesizer:
         if not diff_text.startswith("diff --git "):
             diff_text = header + "\n" + diff_text
 
-        #trailing newline ensure
+        # trailing newline ensure
         if not diff_text.endswith("\n"):
             diff_text += "\n"
 

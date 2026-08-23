@@ -3,11 +3,12 @@
 Maps raw error messages (from compile/javac/kotlinc/go) to FailureType enums
 so the repair planner can dispatch to the right strategy.
 """
+
 from __future__ import annotations
 
 import re
 from contextlib import suppress
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 from external_llm.editor._editor_core.vm.classification import Classification, EvidenceSource, FailureType, FixHint
 from external_llm.editor._editor_core.vm.models import VerifyError
@@ -34,8 +35,8 @@ class BaseFailureClassifier:
     def classify_typed(
         self,
         errors: list[VerifyError],
-        code: Optional[str] = None,
-        language: Optional[str] = None,
+        code: str | None = None,
+        language: str | None = None,
     ) -> Classification:
         """Typed classification returning Classification with evidence source.
 
@@ -52,6 +53,7 @@ class BaseFailureClassifier:
             with suppress(RecursionError, TypeError, ValueError, IndexError):
                 # tree-sitter unavailable or failed — fall back to Layer B/C
                 from external_llm.languages.tree_sitter_utils import find_error_nodes
+
                 error_nodes = find_error_nodes(code, language)
                 if error_nodes:
                     # Found syntax errors — classify as SYNTAX_ERROR
@@ -90,8 +92,11 @@ class BaseFailureClassifier:
         return FailureType.UNKNOWN
 
     def _classify_single_typed(
-        self, error: VerifyError, error_index: int = 0,
-        code: Optional[str] = None, language: Optional[str] = None,
+        self,
+        error: VerifyError,
+        error_index: int = 0,
+        code: str | None = None,
+        language: str | None = None,
     ) -> Classification:
         """Classify a single error with evidence source tracking.
 
@@ -135,8 +140,11 @@ class BaseFailureClassifier:
         return Classification(type=FailureType.UNKNOWN, source=EvidenceSource.NONE, error_index=error_index)
 
     def _extract_symbol_structured(
-        self, error: VerifyError, code: Optional[str], language: Optional[str],
-    ) -> Optional[str]:
+        self,
+        error: VerifyError,
+        code: str | None,
+        language: str | None,
+    ) -> str | None:
         """Extract symbol using position-based tree-sitter lookup (Phase 3).
 
         Falls back to regex-based extract_symbol() if tree-sitter unavailable
@@ -146,6 +154,7 @@ class BaseFailureClassifier:
         if code and language and error.line and error.column:
             with suppress(RecursionError, TypeError, ValueError, IndexError):
                 from external_llm.languages.tree_sitter_utils import extract_symbol_at_position
+
                 symbol = extract_symbol_at_position(code, language, error.line, error.column)
                 if symbol:
                     return symbol
@@ -153,7 +162,7 @@ class BaseFailureClassifier:
         # Fallback to regex-based extraction
         return self.extract_symbol(error)
 
-    def extract_symbol(self, error: VerifyError) -> Optional[str]:
+    def extract_symbol(self, error: VerifyError) -> str | None:
         """First capture-group match across ``self.extract_patterns`` (in order)."""
         for pattern, group in self.extract_patterns:
             m = pattern.search(error.message)
@@ -168,10 +177,10 @@ class BaseFailureClassifier:
 _PY_ERROR_CODE_MAP = {
     # compile() / ast.parse error codes
     "E0602": FailureType.MISSING_VARIABLE,  # undefined variable
-    "E9999": FailureType.SYNTAX_ERROR,       # SyntaxError
+    "E9999": FailureType.SYNTAX_ERROR,  # SyntaxError
     # flake8 codes
-    "F821": FailureType.MISSING_VARIABLE,    # undefined name
-    "F811": FailureType.DUPLICATE_IDENTIFIER, # redefined function
+    "F821": FailureType.MISSING_VARIABLE,  # undefined name
+    "F811": FailureType.DUPLICATE_IDENTIFIER,  # redefined function
     # pyright rule codes (from --outputjson)
     "reportUndefinedVariable": FailureType.MISSING_VARIABLE,
     "reportMissingImports": FailureType.MISSING_IMPORT,
@@ -263,9 +272,7 @@ _JAVA_REGEX_PATTERNS = [
 ]
 
 _JAVA_EXTRACT_SYMBOL = re.compile(r"symbol:\s+(variable|method|class)\s+(\w+)", re.MULTILINE)
-_JAVA_EXTRACT_SYMBOL_FALLBACK = re.compile(
-    r"cannot find symbol[\s\S]*?symbol:[\s\S]*?(\w+)\s*$", re.MULTILINE
-)
+_JAVA_EXTRACT_SYMBOL_FALLBACK = re.compile(r"cannot find symbol[\s\S]*?symbol:[\s\S]*?(\w+)\s*$", re.MULTILINE)
 
 
 class JavaFailureClassifier(BaseFailureClassifier):
@@ -360,9 +367,10 @@ class GoFailureClassifier(BaseFailureClassifier):
 
 # ── Factory ───────────────────────────────────────────────────────────
 
+
 def create_failure_classifier(language: str) -> BaseFailureClassifier:
     """Factory: create the appropriate classifier for *language*."""
-    _CLASSIFIERS = {
+    _classifiers = {
         "python": PythonFailureClassifier,
         "java": JavaFailureClassifier,
         "kotlin": KotlinFailureClassifier,
@@ -370,7 +378,7 @@ def create_failure_classifier(language: str) -> BaseFailureClassifier:
         "typescript": None,
         "javascript": None,
     }
-    cls = _CLASSIFIERS.get(language)
+    cls = _classifiers.get(language)
     if cls is None:
         raise ValueError(f"No failure classifier for language: {language}")
     return cls()

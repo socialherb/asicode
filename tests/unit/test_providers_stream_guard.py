@@ -10,6 +10,7 @@ escape as a raw ``TypeError``) and (b) any non-requests failure inside
 loop now runs through ``guard_sse_iteration``, which converts everything
 except typed LLM errors and requests exceptions into ``LLMAPIError``.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -66,13 +67,9 @@ class _FakeSession:
 def test_gemini_malformed_event_is_typed_error_not_crash():
     # RED: pre-guard this raised raw TypeError out of the loop.
     client = GoogleClient(api_key="test-key")
-    client._session = _FakeSession(
-        _FakeStreamResponse([b'data: {"candidates": 42}\n'])
-    )
+    client._session = _FakeSession(_FakeStreamResponse([b'data: {"candidates": 42}\n']))
     with pytest.raises(LLMAPIError, match="SSE stream iteration failed"):
-        client.chat_with_tools(
-            [], [], model="gemini-2.5-flash", token_callback=lambda _c: None
-        )
+        client.chat_with_tools([], [], model="gemini-2.5-flash", token_callback=lambda _c: None)
 
 
 def test_deepseek_stream_plain_iteration_failure_is_typed():
@@ -94,12 +91,7 @@ def test_gemini_malformed_event_reports_diagnostic(caplog):
     # The converted error must carry a traceback at ERROR level so the
     # failure stays diagnosable even though the turn survives.
     client = GoogleClient(api_key="test-key")
-    client._session = _FakeSession(
-        _FakeStreamResponse([b'data: {"candidates": 42}\n'])
-    )
+    client._session = _FakeSession(_FakeStreamResponse([b'data: {"candidates": 42}\n']))
     with pytest.raises(LLMAPIError):
-        client.chat_with_tools(
-            [], [], model="gemini-2.5-flash", token_callback=lambda _c: None
-        )
-    assert any("SSE stream iteration failed" in r.getMessage()
-               for r in caplog.records)
+        client.chat_with_tools([], [], model="gemini-2.5-flash", token_callback=lambda _c: None)
+    assert any("SSE stream iteration failed" in r.getMessage() for r in caplog.records)

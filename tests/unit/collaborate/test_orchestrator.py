@@ -4,6 +4,7 @@ Tests for CollaborationOrchestrator.
 These tests verify the orchestrator's configuration and digest generation
 without requiring a live Claude Code Agent connection.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -21,6 +22,7 @@ class TestOrchestratorConfig:
     def test_default_config(self):
         config = CollaborationOrchestratorConfig()
         from config import CLAUDE_SDK_MAX_TURNS
+
         assert config.max_turns_per_iteration == CLAUDE_SDK_MAX_TURNS
         assert config.model == "sonnet"
         assert config.permission_mode == "bypassPermissions"
@@ -109,8 +111,7 @@ class TestOrchestratorDigest:
 
         assert seen_threads, "dispatch was never invoked"
         assert any(t != main_thread for t in seen_threads), (
-            "digest dispatch ran in the event-loop thread — "
-            "event loop is NOT offloaded to a worker"
+            "digest dispatch ran in the event-loop thread — event loop is NOT offloaded to a worker"
         )
 
     def test_build_prompt_no_digest(self):
@@ -132,6 +133,7 @@ class TestOrchestratorDigest:
         from external_llm.repl.collaborate.asi_mcp_adapter import (
             get_restricted_options,
         )
+
         options = get_restricted_options(mcp_server_config={"type": "sdk"})
         sp = options.system_prompt
         assert isinstance(sp, dict)
@@ -144,6 +146,7 @@ class TestOrchestratorDigest:
         from external_llm.repl.collaborate.asi_mcp_adapter import (
             get_excluded_tools,
         )
+
         excluded = get_excluded_tools(allow_write=False)
         # bash is in _ANALYSIS_SAFE_TOOLS, so allowed in analysis mode too
         assert "bash" not in excluded
@@ -174,6 +177,7 @@ class TestSessionHandoff:
 
     def _fake_session(self, **kw):
         from types import SimpleNamespace
+
         defaults = {
             "compressed_summary": "",
             "compressed_up_to": 0,
@@ -185,11 +189,13 @@ class TestSessionHandoff:
 
     def test_empty_session(self):
         from external_llm.repl.collaborate import build_session_handoff
+
         assert build_session_handoff(None) == ""
         assert build_session_handoff(self._fake_session()) == ""
 
     def test_summary_and_recent_turns(self):
         from external_llm.repl.collaborate import build_session_handoff
+
         session = self._fake_session(
             compressed_summary="past conversation: discussed the UI structure",
             compressed_up_to=2,
@@ -212,10 +218,11 @@ class TestSessionHandoff:
     def test_recent_turn_not_truncated(self):
         """The most recent turn (analysis conclusion/finding) is not truncated by per_turn_chars."""
         from external_llm.repl.collaborate import build_session_handoff
+
         conclusion = "here is the conclusion " + "Z" * 2000
         session = self._fake_session(
             turns=[
-                {"role": "user", "content": "B" * 2000},   # previous turn → truncated
+                {"role": "user", "content": "B" * 2000},  # previous turn → truncated
                 {"role": "assistant", "content": conclusion},  # recent turn → preserved intact
             ],
         )
@@ -227,6 +234,7 @@ class TestSessionHandoff:
 
     def test_max_chars_cap_preserves_recent_tail(self):
         from external_llm.repl.collaborate import build_session_handoff
+
         # The (old) summary should be trimmed from the front, and the end of the recent turn (the finding) must survive.
         session = self._fake_session(
             compressed_summary="S" * 1500,
@@ -242,6 +250,7 @@ class TestSessionHandoff:
         """Regression: [:1500] kept the HEAD (oldest), discarding recent content.
         Now [-1500:] keeps the TAIL — consistent with budget-aware truncation."""
         from external_llm.repl.collaborate import build_session_handoff
+
         # Build summary > 1500 chars: old prefix + recent marker at the end
         old_prefix = "OLD_" * 500  # 2000 chars of old content
         recent_marker = "RECENT_CONCLUSION"
@@ -261,10 +270,16 @@ class TestVerdictForSession:
     def test_format_includes_provenance_label(self):
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="the UI lives in ui/", details="detailed content",
-            confidence=0.97, suggestions=["check the router"],
-        ))
+
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="the UI lives in ui/",
+                details="detailed content",
+                confidence=0.97,
+                suggestions=["check the router"],
+            )
+        )
         out = format_verdict_for_session(result, "where is the UI located?")
         assert "[Claude Code external analysis" in out  # source provenance label
         assert "status: completed" in out
@@ -278,10 +293,15 @@ class TestVerdictForSession:
         # cut off due to length." The body is now carried in full.
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
+
         big = "D" * 10000
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details=big,
-        ))
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details=big,
+            )
+        )
         out = format_verdict_for_session(result, "task")
         assert big in out  # entire body preserved — no truncation
 
@@ -289,10 +309,16 @@ class TestVerdictForSession:
         # Regression guard: the old suggestions[:5] dropped everything from the 6th onward, losing "Imp N".
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
+
         sugg = [f"Imp {i}" for i in range(1, 9)]
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details="d", suggestions=sugg,
-        ))
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details="d",
+                suggestions=sugg,
+            )
+        )
         out = format_verdict_for_session(result, "task")
         for s in sugg:
             assert f"- {s}" in out  # every suggestion preserved
@@ -303,10 +329,16 @@ class TestVerdictForSession:
         # stored but never surfaced (dead contract).
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
+
         plan = {"steps": [{"action": "read_file", "path": "ui/"}], "goal": "locate UI"}
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details="d", plan=plan,
-        ))
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details="d",
+                plan=plan,
+            )
+        )
         out = format_verdict_for_session(result, "task")
         assert "plan:" in out
         assert '"goal": "locate UI"' in out
@@ -315,10 +347,15 @@ class TestVerdictForSession:
     def test_metadata_included_when_present(self):
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details="d",
-            metadata={"tokens": 1234, "tool_calls": 7},
-        ))
+
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details="d",
+                metadata={"tokens": 1234, "tool_calls": 7},
+            )
+        )
         out = format_verdict_for_session(result, "task")
         assert "metadata:" in out
         assert '"tokens": 1234' in out
@@ -327,9 +364,14 @@ class TestVerdictForSession:
         # Absent plan/metadata must not produce empty stub lines in the injection text.
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details="d",
-        ))
+
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details="d",
+            )
+        )
         out = format_verdict_for_session(result, "task")
         assert "plan:" not in out
         assert "metadata:" not in out
@@ -338,11 +380,16 @@ class TestVerdictForSession:
         # Untrusted model output can carry non-JSON types — must not crash injection.
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details="d",
-            plan={"when": object()},
-            metadata={"blob": object()},
-        ))
+
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details="d",
+                plan={"when": object()},
+                metadata={"blob": object()},
+            )
+        )
         out = format_verdict_for_session(result, "task")  # no exception
         assert "plan:" in out
         assert "metadata:" in out
@@ -351,11 +398,16 @@ class TestVerdictForSession:
         # Same leak-guard as details: SDK/verdict XML tags must not reach the design LLM.
         from external_llm.repl.collaborate import CollaborationVerdict, format_verdict_for_session
         from external_llm.repl.collaborate.claude_session import SessionResult
-        result = SessionResult(verdict=CollaborationVerdict(
-            status="success", summary="s", details="d",
-            plan={"steps": ["run <status>check</status> now"]},
-            metadata={"note": "<plan>leak</plan>"},
-        ))
+
+        result = SessionResult(
+            verdict=CollaborationVerdict(
+                status="success",
+                summary="s",
+                details="d",
+                plan={"steps": ["run <status>check</status> now"]},
+                metadata={"note": "<plan>leak</plan>"},
+            )
+        )
         out = format_verdict_for_session(result, "task")
         assert "<status>" not in out
         assert "<plan>" not in out
@@ -379,6 +431,7 @@ class TestOrchestratorNonSdkBranches:
         class FakeSession:
             def __init__(self):
                 self.queries = []
+
             async def query(self, prompt):
                 self.queries.append(prompt)
                 return SessionResult(
@@ -406,7 +459,8 @@ class TestOrchestratorNonSdkBranches:
         class FakeSession:
             async def query(self, prompt):
                 return SessionResult(
-                    verdict=CollaborationVerdict(), error="agent gave up",
+                    verdict=CollaborationVerdict(),
+                    error="agent gave up",
                 )
 
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
@@ -441,8 +495,10 @@ class TestOrchestratorNonSdkBranches:
         # Git/scan collectors only run when enabled — their failure paths are
         # individually guarded like the base collectors.
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
+
         def boom(name, args):
             raise RuntimeError("tool unavailable")
+
         registry.dispatch = boom
         config = CollaborationOrchestratorConfig(
             include_git_history=True,
@@ -457,6 +513,7 @@ class TestOrchestratorNonSdkBranches:
         class FakeSession:
             def __init__(self):
                 self.interrupted = False
+
             async def interrupt(self):
                 self.interrupted = True
 
@@ -476,6 +533,7 @@ class TestOrchestratorNonSdkBranches:
         # allow_write_tools=True with the default bypassPermissions mode must
         # warn that destructive tools will run without user approval.
         import logging
+
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
         config = CollaborationOrchestratorConfig(allow_write_tools=True)
         with caplog.at_level(
@@ -489,17 +547,22 @@ class TestOrchestratorNonSdkBranches:
         # Each collector is individually guarded — a failing tool must not
         # kill the whole digest.
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
+
         def boom(name, args):
             raise RuntimeError("tool unavailable")
+
         registry.dispatch = boom
         orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())
         assert orch._generate_digest_sync("find bugs") == ""
 
     def test_generate_digest_optional_collectors(self):
         from types import SimpleNamespace
+
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
+
         def fake_dispatch(name, args):
             return SimpleNamespace(ok=True, content="collector-content")
+
         registry.dispatch = fake_dispatch
         config = CollaborationOrchestratorConfig(
             include_git_history=True,
@@ -520,6 +583,7 @@ class TestSessionHandoffTrimEdge:
         from types import SimpleNamespace
 
         from external_llm.repl.collaborate import build_session_handoff
+
         session = SimpleNamespace(
             compressed_summary="S" * 100,
             compressed_up_to=0,
@@ -544,6 +608,7 @@ class TestOrchestratorSdkGate:
 
     def test_ensure_session_raises_with_install_hint(self, monkeypatch):
         import sys
+
         monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
         orch = CollaborationOrchestrator(registry, CollaborationOrchestratorConfig())

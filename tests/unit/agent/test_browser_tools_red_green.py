@@ -10,6 +10,7 @@ Covers the remaining edge branches:
   - _render_and_eval: invalid wait_until, selector wait, close failure, wedge
   - click / type / screenshot / evaluate handlers (previously untested)
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -45,33 +46,43 @@ class _RecPage:
         self.wait_sel = None
         self.closed = False
 
-    def inner_text(self, selector): return self._body
+    def inner_text(self, selector):
+        return self._body
 
-    def title(self): return self._title
+    def title(self):
+        return self._title
 
     @property
-    def url(self): return self._url
+    def url(self):
+        return self._url
 
     def goto(self, url, timeout=None, wait_until=None):
         self.goto_calls.append((url, timeout, wait_until))
 
-    def click(self, selector, timeout=None): self.clicked = (selector, timeout)
+    def click(self, selector, timeout=None):
+        self.clicked = (selector, timeout)
 
-    def wait_for_load_state(self, state): self.wait_load_state_called = True
+    def wait_for_load_state(self, state):
+        self.wait_load_state_called = True
 
-    def fill(self, selector, text, timeout=None): self.filled = (selector, text, timeout)
+    def fill(self, selector, text, timeout=None):
+        self.filled = (selector, text, timeout)
 
-    def screenshot(self, path=None, full_page=None): self.shot_path = path
+    def screenshot(self, path=None, full_page=None):
+        self.shot_path = path
 
     def evaluate(self, js):
         self.evals.append(js)
         return 42
 
-    def wait_for_selector(self, selector, timeout=None): self.wait_sel = (selector, timeout)
+    def wait_for_selector(self, selector, timeout=None):
+        self.wait_sel = (selector, timeout)
 
-    def close(self): self.closed = True
+    def close(self):
+        self.closed = True
 
-    def is_closed(self): return False
+    def is_closed(self):
+        return False
 
 
 @pytest.fixture
@@ -86,6 +97,7 @@ def pw_ready(monkeypatch):
 
 
 # ── module guards ─────────────────────────────────────────────────────────
+
 
 def test_playwright_browser_installed_false_without_package(monkeypatch):
     monkeypatch.setattr(browser_tools, "HAS_PLAYWRIGHT", False)
@@ -125,15 +137,14 @@ def test_ensure_playwright_imported_import_error(monkeypatch):
 
 def test_shutdown_browser_executor_at_exit(monkeypatch):
     calls = []
-    fake = types.SimpleNamespace(
-        shutdown=lambda wait, cancel_futures: calls.append((wait, cancel_futures))
-    )
+    fake = types.SimpleNamespace(shutdown=lambda wait, cancel_futures: calls.append((wait, cancel_futures)))
     monkeypatch.setattr(browser_tools, "_BROWSER_EXECUTOR", fake)
     browser_tools._shutdown_browser_executor_at_exit()
     assert calls == [(False, True)]
 
 
 # ── dispatch edges ─────────────────────────────────────────────────────────
+
 
 def test_tool_browser_action_empty_action_error(pw_ready):
     host = _Host()
@@ -190,6 +201,7 @@ def test_tool_browser_action_generic_exception_mapping(pw_ready, monkeypatch):
 
 
 # ── install / reload branches ──────────────────────────────────────────────
+
 
 def test_ensure_playwright_installed_reloads_after_install(monkeypatch):
     host = _Host()
@@ -271,6 +283,7 @@ def test_reload_playwright_module_import_error(monkeypatch):
 
 # ── lifecycle failure branches ─────────────────────────────────────────────
 
+
 def test_get_browser_driver_stop_failure_logged(monkeypatch):
     monkeypatch.setattr(BrowserActionToolsMixin, "_browser", None)
     monkeypatch.setattr(BrowserActionToolsMixin, "_playwright", None)
@@ -331,6 +344,7 @@ def test_close_shared_browser_teardown_failures_logged(monkeypatch):
 
 # ── _render_and_eval edges ─────────────────────────────────────────────────
 
+
 def test_render_and_eval_invalid_wait_until_and_selector(pw_ready, monkeypatch):
     page = _RecPage()
     browser = types.SimpleNamespace(new_page=lambda user_agent=None: page)
@@ -384,6 +398,7 @@ def test_render_and_eval_hard_timeout_wedge(pw_ready, monkeypatch):
 
 
 # ── action handlers: click / type / screenshot / evaluate ──────────────────
+
 
 def _bind_page(monkeypatch, page):
     monkeypatch.setattr(BrowserActionToolsMixin, "_get_page", lambda self: page)

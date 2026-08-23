@@ -4,6 +4,7 @@ TypeScript / TSX syntax provider.
 Uses ``tsc --noEmit`` for validation and regex-based symbol detection.
 Gracefully degrades when ``tsc`` is not installed.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -36,6 +37,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+
 def _make_capabilities() -> LanguageCapabilities:
     from .tree_sitter_utils import is_available
 
@@ -51,25 +53,26 @@ def _make_capabilities() -> LanguageCapabilities:
         supports_insert_after_symbol=True,
     )
 
+
 # tsc error line: file.ts(10,5): error TS1005: ';' expected.
-_TSC_ERROR_RE = re.compile(
-    r"^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.+)$"
-)
+_TSC_ERROR_RE = re.compile(r"^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.+)$")
 
 # tsc diagnostic codes that live in the 1xxx (syntax) band but are actually
 # module/interop CONFIG diagnostics — they fire on valid source whenever tsc
 # runs without the project's compiler options (e.g. esModuleInterop). They must
 # NOT be treated as genuine syntax errors by a config-blind check.
-_TSC_CONFIG_DEPENDENT_1XXX = frozenset({
-    "TS1192",  # module has no default export
-    "TS1208",  # cannot be compiled under --isolatedModules (global script)
-    "TS1259",  # can only be default-imported using esModuleInterop
-    "TS1286",  # esModuleInterop required for '* as' default
-    "TS1287",  # esModuleInterop / module setting
-    "TS1288",  # esModuleInterop / module setting
-    "TS1371",  # import never used as a value (verbatimModuleSyntax)
-    "TS1479",  # CommonJS import needs esModuleInterop / dynamic import
-})
+_TSC_CONFIG_DEPENDENT_1XXX = frozenset(
+    {
+        "TS1192",  # module has no default export
+        "TS1208",  # cannot be compiled under --isolatedModules (global script)
+        "TS1259",  # can only be default-imported using esModuleInterop
+        "TS1286",  # esModuleInterop required for '* as' default
+        "TS1287",  # esModuleInterop / module setting
+        "TS1288",  # esModuleInterop / module setting
+        "TS1371",  # import never used as a value (verbatimModuleSyntax)
+        "TS1479",  # CommonJS import needs esModuleInterop / dynamic import
+    }
+)
 
 
 def is_genuine_syntax_error(code: str) -> bool:
@@ -117,9 +120,9 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         if not _tmp_path:
             return SyntaxValidationResult(ok=True, language=LanguageId.TYPESCRIPT)
         _cmd = _replace_last_cmd_path(
-            ["npx", "tsc", "--noEmit", "--allowJs", "--pretty", "false",
-             "--skipLibCheck", file_path],
-            file_path, _tmp_path,
+            ["npx", "tsc", "--noEmit", "--allowJs", "--pretty", "false", "--skipLibCheck", file_path],
+            file_path,
+            _tmp_path,
         )
         try:
             try:
@@ -128,7 +131,9 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 # (e.g. TS1208 on a no-export script) that are not syntax errors.
                 proc = subprocess.run(
                     _cmd,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                     cwd=os.path.dirname(_tmp_path) or ".",
                     check=False,
                 )
@@ -159,14 +164,16 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 _code = m.group(4)  # e.g. "TS1005"
                 if not is_genuine_syntax_error(_code):
                     continue
-                errors.append(SyntaxError_(
-                    # Report the real source path, not the internal temp file
-                    # that tsc actually compiled (a long ../../var/folders/... path).
-                    file=file_path,
-                    line=int(m.group(2)),
-                    col=int(m.group(3)),
-                    message=f"{_code}: {m.group(5)}",
-                ))
+                errors.append(
+                    SyntaxError_(
+                        # Report the real source path, not the internal temp file
+                        # that tsc actually compiled (a long ../../var/folders/... path).
+                        file=file_path,
+                        line=int(m.group(2)),
+                        col=int(m.group(3)),
+                        message=f"{_code}: {m.group(5)}",
+                    )
+                )
             if not errors:
                 # No genuine syntax errors. tsc may have exited non-zero on
                 # type/semantic/environmental diagnostics, which we intentionally
@@ -211,7 +218,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         return self.validate_semantics_batch([file_path])[file_path]
 
     def validate_semantics_batch(
-        self, file_paths: list[str],
+        self,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """Semantic-check *file_paths* with one tsc run per project root.
 
@@ -247,6 +255,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         needs it because a JS project may carry either ``jsconfig.json`` or
         ``tsconfig.json``, and the two cannot share one temp config.
         """
+
         # A fresh result per file, never one shared instance: the dataclass is
         # mutable and carries a list, so sharing would let one consumer's
         # append surface on every other skipped file.
@@ -264,19 +273,20 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             if cfg is None or not os.path.isfile(os.path.join(root, cfg)):
                 # No config → tsc would emit config/environment noise. Skip.
                 out[p] = _skip(
-                    f"no {' or '.join(config_markers)} above this file, "
-                    "so tsc has no project to check it against",
+                    f"no {' or '.join(config_markers)} above this file, so tsc has no project to check it against",
                 )
                 continue
             groups.setdefault((root, cfg), []).append(p)
         for (root, cfg), paths in groups.items():
-            out.update(self._run_tsc_semantic(
-                paths,
-                language=language,
-                project_root=root,
-                config_filename=cfg,
-                allow_js=allow_js,
-            ))
+            out.update(
+                self._run_tsc_semantic(
+                    paths,
+                    language=language,
+                    project_root=root,
+                    config_filename=cfg,
+                    allow_js=allow_js,
+                )
+            )
         return out
 
     def _run_tsc_semantic(
@@ -303,11 +313,9 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             allow_js: whether to force ``allowJs``/``checkJs`` for JS files
                 whose config may not enable them.
         """
+
         def _skip(reason: str) -> dict[str, SyntaxValidationResult]:
-            return {
-                p: SyntaxValidationResult.unchecked(language, reason)
-                for p in file_paths
-            }
+            return {p: SyntaxValidationResult.unchecked(language, reason) for p in file_paths}
 
         # Pin the check to exactly the target files via a temp tsconfig that
         # extends the real one. Relative paths are required by tsc `include`.
@@ -321,6 +329,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             f".tsconfig.semcheck.{os.getpid()}.{uuid.uuid4().hex}.json",
         )
         import json as _json
+
         temp_body: dict = {
             # MUST be "./name", not a bare "name": tsc resolves a bare extends
             # as a *node module* specifier, so the real config is never loaded
@@ -344,14 +353,21 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             return _skip("the temporary tsconfig could not be written")
 
         cmd = [
-            "npx", "tsc", "--noEmit", "--pretty", "false",
-            "--skipLibCheck", "--project", tmp_config,
+            "npx",
+            "tsc",
+            "--noEmit",
+            "--pretty",
+            "false",
+            "--skipLibCheck",
+            "--project",
+            tmp_config,
         ]
         try:
             try:
                 proc = subprocess.run(
                     cmd,
-                    capture_output=True, text=True,
+                    capture_output=True,
+                    text=True,
                     # Scaled by batch size; startup dominates, so the base
                     # budget still covers the common small batch.
                     timeout=30 + 5 * len(file_paths),
@@ -372,10 +388,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 # tsc exited clean — a real verdict, not a skip. Sharing the
                 # skip constructor here would report a genuinely checked file as
                 # unchecked, the same conflation in the other direction.
-                return {
-                    p: SyntaxValidationResult(ok=True, language=language)
-                    for p in file_paths
-                }
+                return {p: SyntaxValidationResult(ok=True, language=language) for p in file_paths}
 
             # Parse: file.ts(10,5): error TS2304: Cannot find name 'foo'.
             by_norm = {os.path.normpath(os.path.abspath(p)): p for p in file_paths}
@@ -400,10 +413,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 # "checked, clean". Resolve against the tool's cwd, as
                 # go_provider already does. normpath collapses the "./" prefix
                 # tsc sometimes emits.
-                owner = (
-                    by_norm.get(resolve_tool_path(project_root, _file))
-                    if _file else None
-                )
+                owner = by_norm.get(resolve_tool_path(project_root, _file)) if _file else None
                 if owner is None:
                     continue
                 # Only semantic (2xxx) band: syntax (1xxx) is handled by
@@ -414,13 +424,16 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 num = int(_code[2:])
                 if not (2000 <= num <= 2999):
                     continue
-                collected[owner].append(SyntaxError_(
-                    file=owner,
-                    line=int(_line), col=int(_col),
-                    message=f"{_code}: {_msg}",
-                    severity="error",
-                    code=_code,
-                ))
+                collected[owner].append(
+                    SyntaxError_(
+                        file=owner,
+                        line=int(_line),
+                        col=int(_col),
+                        message=f"{_code}: {_msg}",
+                        severity="error",
+                        code=_code,
+                    )
+                )
                 failed.add(owner)
             return {
                 p: SyntaxValidationResult(
@@ -439,34 +452,44 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     def get_symbol_patterns(self, kind: str = "any") -> list[SymbolPattern]:
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"(?:export\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*[\(<]",
-                description="TS/JS function declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"(?:export\s+)?(?:const|let)\s+{name}\s*=\s*(?:async\s*)?\(",
-                description="TS/JS arrow / function expression",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"(?:export\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*[\(<]",
+                    description="TS/JS function declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"(?:export\s+)?(?:const|let)\s+{name}\s*=\s*(?:async\s*)?\(",
+                    description="TS/JS arrow / function expression",
+                )
+            )
         if kind in ("class", "any"):
-            patterns.append(SymbolPattern(
-                kind="class",
-                regex=r"(?:export\s+)?(?:abstract\s+)?class\s+{name}\s*(?:extends|implements|<|\{)",
-                description="TS/JS class declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="class",
+                    regex=r"(?:export\s+)?(?:abstract\s+)?class\s+{name}\s*(?:extends|implements|<|\{)",
+                    description="TS/JS class declaration",
+                )
+            )
         if kind in ("interface", "any"):
-            patterns.append(SymbolPattern(
-                kind="interface",
-                regex=r"(?:export\s+)?interface\s+{name}\s*(?:extends|<|\{)",
-                description="TS interface",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="interface",
+                    regex=r"(?:export\s+)?interface\s+{name}\s*(?:extends|<|\{)",
+                    description="TS interface",
+                )
+            )
         if kind in ("type", "any"):
-            patterns.append(SymbolPattern(
-                kind="type",
-                regex=r"(?:export\s+)?type\s+{name}\s*(?:=|<)",
-                description="TS type alias",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="type",
+                    regex=r"(?:export\s+)?type\s+{name}\s*(?:=|<)",
+                    description="TS type alias",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -524,9 +547,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
                 items = _roots_m.group(1)
                 dirs = _re.findall(r"[\"']([^\"']+)[\"']", items)
                 # Replace <rootDir> with actual path relative to repo
-                result["roots"] = [
-                    d.replace("<rootDir>", ".") for d in dirs
-                ]
+                result["roots"] = [d.replace("<rootDir>", ".") for d in dirs]
             if _dirs_m:
                 result["dir"] = _dirs_m.group(1).replace("<rootDir>", ".")
             if _suites_m:
@@ -591,14 +612,15 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
 
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: list[str] | None = None
-    ) -> list[str] | None:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         """Auto-detect test runner from package.json (jest/vitest)."""
         pkg_path = os.path.join(repo_root, "package.json")
         runner = "jest"  # default
         if os.path.isfile(pkg_path):
-            with contextlib.suppress(OSError, ValueError), open(pkg_path, encoding="utf-8") as f:  # missing/unparseable package.json
+            with (
+                contextlib.suppress(OSError, ValueError),
+                open(pkg_path, encoding="utf-8") as f,
+            ):  # missing/unparseable package.json
                 pkg = json.load(f)
                 deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
                 if "vitest" in deps:
@@ -607,9 +629,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
 
     # ── Symbol finder (regex + brace counting) ────────────────────────────
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> tuple[int, int] | None:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         """Find *symbol_name* using tree-sitter (precise) or regex + brace counting (fallback)."""
         from .tree_sitter_utils import find_symbol_range, is_available
 
@@ -637,7 +657,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     # ── Regex fallback for structural queries ─────────────────────────────
 
     def _find_top_level_definitions_regex(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level TS/JS definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
@@ -646,24 +667,25 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         # function* Name( (the * is optional — a generator declaration was
         # previously invisible to the fallback).
         for m in re.finditer(
-            r'^(?:export\s+)?(?:async\s+)?function\s*\*?\s+(\w+)\s*\(',
-            content, re.MULTILINE,
+            r"^(?:export\s+)?(?:async\s+)?function\s*\*?\s+(\w+)\s*\(",
+            content,
+            re.MULTILINE,
         ):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         # Classes
-        for m in re.finditer(r'^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)', content, re.MULTILINE):
+        for m in re.finditer(r"^(?:export\s+)?(?:abstract\s+)?class\s+(\w+)", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "class", start_line, end_line))
         # Interfaces
-        for m in re.finditer(r'^(?:export\s+)?interface\s+(\w+)', content, re.MULTILINE):
+        for m in re.finditer(r"^(?:export\s+)?interface\s+(\w+)", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "interface", start_line, end_line))
         # Type aliases
-        for m in re.finditer(r'^(?:export\s+)?type\s+(\w+)\s*=', content, re.MULTILINE):
+        for m in re.finditer(r"^(?:export\s+)?type\s+(\w+)\s*=", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             # Type aliases end at semicolon or newline, not brace. Use the
             # 1-based line_at_offset for the end too — the previous code
@@ -688,14 +710,16 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         return find_brace_block_end_offset(content, offset)
 
     def _find_class_methods_regex(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         """Regex fallback: find methods inside a TS/JS class body."""
         results: list[tuple[str, int, int]] = []
         nl = build_line_index(content)
         esc = re.escape(class_name)
         # Find class definition
-        pat = r'(?:export\s+)?(?:abstract\s+)?class\s+' + esc + r'\s*(?:extends|implements|<|\{|[^{]+?\{)'
+        pat = r"(?:export\s+)?(?:abstract\s+)?class\s+" + esc + r"\s*(?:extends|implements|<|\{|[^{]+?\{)"
         for cm in re.finditer(pat, content):
             class_body_start = content.find("{", cm.start())
             if class_body_start == -1:
@@ -704,8 +728,8 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             class_body = content[class_body_start:class_end]
             # Match methods: method_name(  or async method_name(  or get/set
             for mm in re.finditer(
-                r'(?:(?:public|private|protected|static|async|get|set)\s+)*'
-                r'(?:(\w+)\s*\(|get\s+(\w+)\s*\(|set\s+(\w+)\s*\()',
+                r"(?:(?:public|private|protected|static|async|get|set)\s+)*"
+                r"(?:(\w+)\s*\(|get\s+(\w+)\s*\(|set\s+(\w+)\s*\()",
                 class_body,
             ):
                 _name = mm.group(1) or mm.group(2) or mm.group(3)
@@ -720,27 +744,35 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         from .tree_sitter_utils import find_all_symbols, is_available
+
         result = find_all_symbols(content, "typescript") if is_available() else None
         if result:
             return result
         return self._find_top_level_definitions_regex(content)
 
     def find_class_methods(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         from .tree_sitter_utils import extract_class_methods, is_available
+
         result = extract_class_methods(content, class_name, "typescript") if is_available() else None
         if result:
             return result
         return self._find_class_methods_regex(content, class_name)
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
+        self,
+        content: str,
+        symbol_name: str,
     ) -> tuple[int, int] | None:
         from .tree_sitter_utils import extract_symbol_body, is_available
+
         result = extract_symbol_body(content, symbol_name, "typescript") if is_available() else None
         if result:
             return result

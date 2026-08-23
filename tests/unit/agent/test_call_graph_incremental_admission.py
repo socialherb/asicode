@@ -8,6 +8,7 @@ was ast.parsed as Python (P1 — json is often valid Python syntax, so bogus
 symbols could be injected), and a touched lib.min.js was tree-sitter-indexed
 when the opt-in flag was on (F1) — files a fresh build() never visits.
 """
+
 import textwrap
 
 from external_llm.agent.call_graph import CallGraphIndexer
@@ -32,11 +33,14 @@ def _build_repo(tmp_path, files):
 
 class TestIncrementalLanguageGate:
     def test_non_python_files_are_not_parsed_on_invalidate(self, tmp_path, monkeypatch):
-        _build_repo(tmp_path, {
-            "mod.py": "def real():\n    pass\n",
-            "notes.md": MD_WITH_PYTHON,
-            "data.json": JSON_VALID_PY,
-        })
+        _build_repo(
+            tmp_path,
+            {
+                "mod.py": "def real():\n    pass\n",
+                "notes.md": MD_WITH_PYTHON,
+                "data.json": JSON_VALID_PY,
+            },
+        )
         idx = CallGraphIndexer(str(tmp_path))
         idx.build()
         # record which files the incremental path hands to the Python parser
@@ -52,30 +56,34 @@ class TestIncrementalLanguageGate:
         assert "real" in idx._nodes
 
     def test_build_and_incremental_index_the_same_file_set(self, tmp_path, monkeypatch):
-        _build_repo(tmp_path, {
-            "mod.py": "def real():\n    pass\n",
-            "notes.md": MD_WITH_PYTHON,
-            "data.json": JSON_VALID_PY,
-            "src/app.js": "export function app() {}\n",
-            "src/lib.min.js": MIN_JS,
-        })
+        _build_repo(
+            tmp_path,
+            {
+                "mod.py": "def real():\n    pass\n",
+                "notes.md": MD_WITH_PYTHON,
+                "data.json": JSON_VALID_PY,
+                "src/app.js": "export function app() {}\n",
+                "src/lib.min.js": MIN_JS,
+            },
+        )
         monkeypatch.setattr("config.MULTILANG_CALLGRAPH", True)
         idx = CallGraphIndexer(str(tmp_path))
         idx.build()
         build_files = set(idx._file_nodes)
         assert {"mod.py", "src/app.js"} <= build_files  # non-vacuous
-        idx.invalidate_files(
-            ["mod.py", "notes.md", "data.json", "src/app.js", "src/lib.min.js"]
-        )
+        idx.invalidate_files(["mod.py", "notes.md", "data.json", "src/app.js", "src/lib.min.js"])
         assert set(idx._file_nodes) == build_files
 
 
 class TestIncrementalSuffixGate:
     def test_min_js_not_indexed_on_invalidate(self, tmp_path, monkeypatch):
-        _build_repo(tmp_path, {
-            "src/app.js": "export function app() {}\n",
-            "src/lib.min.js": MIN_JS,
-        })
+        _build_repo(
+            tmp_path,
+            {
+                "src/app.js": "export function app() {}\n",
+                "src/lib.min.js": MIN_JS,
+            },
+        )
         monkeypatch.setattr("config.MULTILANG_CALLGRAPH", True)
         idx = CallGraphIndexer(str(tmp_path))
         idx.build()

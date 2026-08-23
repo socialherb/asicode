@@ -34,6 +34,7 @@ Usage:
     python3 scripts/export_public.py <target-dir> --list   # dry-run listing
     python3 scripts/export_public.py --list                # dry-run listing (no target)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -132,13 +133,15 @@ def tracked_files() -> list[str]:
     # file list here would silently ship the wrong tree.
     try:
         out = subprocess.run(
-            ["git", "ls-files", "-z"], cwd=REPO, capture_output=True,
-            check=True, timeout=120,
+            ["git", "ls-files", "-z"],
+            cwd=REPO,
+            capture_output=True,
+            check=True,
+            timeout=120,
         ).stdout
     except subprocess.TimeoutExpired as exc:
         raise SystemExit(
-            f"git ls-files timed out after {exc.timeout}s in {REPO} — "
-            "refusing to export from an unknown file list"
+            f"git ls-files timed out after {exc.timeout}s in {REPO} — refusing to export from an unknown file list"
         ) from exc
     return [p.decode("utf-8") for p in out.split(b"\0") if p]
 
@@ -369,6 +372,8 @@ def _generate_structural_baseline(target: Path, excluded_paths: list[str]) -> bo
     spec = importlib.util.spec_from_file_location(
         "check_structural_scanners", Path(__file__).resolve().parent / "check_structural_scanners.py"
     )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load check_structural_scanners.py sibling gate script")
     gate = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gate)
     allowed = set(gate.BASELINE_ALLOWED_SCANNERS)
@@ -460,12 +465,10 @@ def _generate_structural_baseline(target: Path, excluded_paths: list[str]) -> bo
         "# Format: <scanner>::<file>::<symbol>",
     ]
     lines += sorted(f"{s}::{rel}::{n}" for s, rel, n in entries)
-    (target / "scripts" / "structural_scanner_baseline.txt").write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
+    (target / "scripts" / "structural_scanner_baseline.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    per_scanner = (
+        ", ".join(f"{s}x{sum(1 for e in entries if e[0] == s)}" for s in sorted({e[0] for e in entries})) or "none"
     )
-    per_scanner = ", ".join(
-        f"{s}x{sum(1 for e in entries if e[0] == s)}" for s in sorted({e[0] for e in entries})
-    ) or "none"
     print(
         f"structural baseline: {len(entries)} verified export-artifact entries ({per_scanner}) "
         "-> scripts/structural_scanner_baseline.txt",
@@ -513,8 +516,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="export_public.py",
         description=(
-            "Materialize the public (CLI-only) snapshot of this repo "
-            "(exclusion rules: see the module docstring)."
+            "Materialize the public (CLI-only) snapshot of this repo (exclusion rules: see the module docstring)."
         ),
         epilog="The target must not exist, or must be an empty directory.",
     )
@@ -555,6 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         for rel in shipped:
             print(rel)
     else:
+        assert target is not None, "build target required when not a dry run"
         if target.exists() and any(target.iterdir()):
             print(f"error: target {target} exists and is not empty", file=sys.stderr)
             return 1

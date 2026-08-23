@@ -1,6 +1,7 @@
 """
 Anthropic (Claude) client for asicode Test
 """
+
 from __future__ import annotations
 
 import json
@@ -8,7 +9,7 @@ import logging
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -35,7 +36,8 @@ from .client import (
 
 logger = logging.getLogger(__name__)
 
-def _parse_glm_error_code(response: requests.Response) -> Optional[int]:
+
+def _parse_glm_error_code(response: requests.Response) -> int | None:
     """Extract GLM-specific error code (1302, 1305, 1210) from response body.
 
     Both the Anthropic and OpenAI endpoints at z.ai return errors in a JSON
@@ -76,10 +78,7 @@ def _is_always_thinking_glm(model: str) -> bool:
     via ``thinking.type = "disabled"``, the model always returns thinking content.
     """
     _m = (model or "").strip().lower()
-    return any(
-        _m.startswith(p)
-        for p in ("glm-5.2", "glm-5.1", "glm-5", "glm-5-", "glm-5_turbo")
-    )
+    return any(_m.startswith(p) for p in ("glm-5.2", "glm-5.1", "glm-5", "glm-5-", "glm-5_turbo"))
 
 
 def _inject_glm_thinking_kwargs(kwargs: dict, thinking_mode, effort_override, always_think: bool) -> None:
@@ -130,7 +129,8 @@ def _is_always_thinking_anthropic(model: str) -> bool:
 # retry-on-truncation logic (budget doubling + partial tool-call clearing in
 # agent_loop). Mirrors _normalize_gemini_finish_reason in providers.py.
 
-def _normalize_anthropic_stop_reason(raw: Optional[str]) -> Optional[str]:
+
+def _normalize_anthropic_stop_reason(raw: str | None) -> str | None:
     """Map Anthropic stop_reason to the OpenAI-style finish_reason convention.
 
     All consumers check for ``"length"`` to detect truncation; ``"max_tokens"``
@@ -164,14 +164,18 @@ def _detect_stream_text_truncation(provider_label: str, text_content: str) -> bo
         logger.warning(
             "%s stream content appears truncated: %d unclosed braces in %d chars "
             "(stop_reason='end_turn' is misleading)",
-            provider_label, _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+            provider_label,
+            _dc["open_curly"] - _dc["close_curly"],
+            len(_trimmed),
         )
         return True
     if _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
         logger.warning(
             "%s stream content appears truncated: %d unclosed brackets in %d chars "
             "(stop_reason='end_turn' is misleading)",
-            provider_label, _dc["open_square"] - _dc["close_square"], len(_trimmed),
+            provider_label,
+            _dc["open_square"] - _dc["close_square"],
+            len(_trimmed),
         )
         return True
     return False
@@ -246,7 +250,7 @@ class AnthropicClient(LLMClient):
             # -> Chunk 2: Available Tools section (semi-stable)
             # -> Chunk 3: everything after (session state, intent, ...)
             chunk1 = system_text[:tools_idx].rstrip()
-            rest = system_text[tools_idx + len(tools_marker):]
+            rest = system_text[tools_idx + len(tools_marker) :]
             next_hdr_idx = rest.find(section_marker)
             if next_hdr_idx != -1:
                 chunk2_end = tools_idx + len(tools_marker) + next_hdr_idx
@@ -347,9 +351,7 @@ class AnthropicClient(LLMClient):
         if isinstance(content, str):
             if not content:
                 return  # empty content block is invalid — nothing to cache
-            target["content"] = [
-                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-            ]
+            target["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
         elif isinstance(content, list) and content:
             # Copy the last block (and rebuild the list) so the caller's original
             # message/content objects are never mutated.
@@ -357,7 +359,7 @@ class AnthropicClient(LLMClient):
             blk["cache_control"] = {"type": "ephemeral"}
             target["content"] = [*content[:-1], blk]
 
-    def _raise_for_429(self, response: requests.Response, error_code: Optional[int]) -> None:
+    def _raise_for_429(self, response: requests.Response, error_code: int | None) -> None:
         """Classify an HTTP 429 and raise the correct error.
 
         zai/GLM report an EXHAUSTED ACCOUNT BALANCE as HTTP 429 with code 1113
@@ -373,12 +375,9 @@ class AnthropicClient(LLMClient):
         """
         suffix = f" code={error_code}" if error_code else ""
         if is_balance_quota_signal(error_code, response.text):
-            logger.error(
-                "%s account balance/quota exhausted (429)%s", self._provider_label, suffix
-            )
+            logger.error("%s account balance/quota exhausted (429)%s", self._provider_label, suffix)
             raise LLMQuotaExceededError(
-                f"{self._provider_label} account balance/quota exhausted (429): "
-                "recharge credits or switch providers."
+                f"{self._provider_label} account balance/quota exhausted (429): recharge credits or switch providers."
             )
         logger.error("%s rate limit exceeded (429)%s", self._provider_label, suffix)
         raise LLMRateLimitError(
@@ -386,13 +385,14 @@ class AnthropicClient(LLMClient):
             retry_after=parse_retry_after(response.headers),
             error_code=error_code,
         )
+
     def chat(
         self,
         messages: list[LLMMessage],
         model: str = "",
-        temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        temperature: float | None = 0.0,
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         """
         Send message request to Anthropic
@@ -408,11 +408,7 @@ class AnthropicClient(LLMClient):
         base_url = self.base_url or self.DEFAULT_BASE_URL
         url = f"{base_url.rstrip('/')}/messages"
 
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": self.API_VERSION,
-            "Content-Type": "application/json"
-        }
+        headers = {"x-api-key": self.api_key, "anthropic-version": self.API_VERSION, "Content-Type": "application/json"}
 
         # Anthropic requires system message separate
         system_content = None
@@ -478,12 +474,7 @@ class AnthropicClient(LLMClient):
         t0 = time.monotonic()
 
         try:
-            response = self._session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=self.timeout
-            )
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -491,8 +482,7 @@ class AnthropicClient(LLMClient):
             if response.status_code == 401:
                 logger.error("%s authentication failed (401)", self._provider_label)
                 raise LLMAuthenticationError(
-                    f"Invalid {self._provider_label} API key. "
-                    "Please check your ANTHROPIC_API_KEY environment variable."
+                    f"Invalid {self._provider_label} API key. Please check your ANTHROPIC_API_KEY environment variable."
                 )
 
             if response.status_code == 429:
@@ -501,8 +491,7 @@ class AnthropicClient(LLMClient):
             if response.status_code >= 500 and response.status_code != 501:
                 error_body = response.text[:500]
                 logger.error(
-                    "%s API error %d in %.0fms: %s", self._provider_label,
-                    response.status_code, elapsed_ms, error_body
+                    "%s API error %d in %.0fms: %s", self._provider_label, response.status_code, elapsed_ms, error_body
                 )
                 raise LLMServerUnavailableError(
                     f"{self._provider_label} API returned HTTP {response.status_code}: {error_body}"
@@ -511,12 +500,9 @@ class AnthropicClient(LLMClient):
             if response.status_code != 200:
                 error_body = response.text[:500]
                 logger.error(
-                    "%s API error %d in %.0fms: %s", self._provider_label,
-                    response.status_code, elapsed_ms, error_body
+                    "%s API error %d in %.0fms: %s", self._provider_label, response.status_code, elapsed_ms, error_body
                 )
-                raise LLMAPIError(
-                    f"{self._provider_label} API returned HTTP {response.status_code}: {error_body}"
-                )
+                raise LLMAPIError(f"{self._provider_label} API returned HTTP {response.status_code}: {error_body}")
 
             data = response.json()
 
@@ -524,12 +510,7 @@ class AnthropicClient(LLMClient):
             content_blocks = data.get("content", [])
             if not content_blocks:
                 logger.warning("%s response has no content blocks", self._provider_label)
-                return LLMResponse(
-                    content="",
-                    model=model,
-                    provider=self.get_provider_name(),
-                    raw_response=data
-                )
+                return LLMResponse(content="", model=model, provider=self.get_provider_name(), raw_response=data)
 
             # Combine all text blocks
             content = ""
@@ -551,8 +532,14 @@ class AnthropicClient(LLMClient):
             tokens_used = input_tokens + output_tokens
 
             logger.info(
-                "%s %s: %.0fms, tok=%d (in=%d, out=%d), finish_reason=%s", self._provider_label,
-                model, elapsed_ms, tokens_used, input_tokens, output_tokens, finish_reason
+                "%s %s: %.0fms, tok=%d (in=%d, out=%d), finish_reason=%s",
+                self._provider_label,
+                model,
+                elapsed_ms,
+                tokens_used,
+                input_tokens,
+                output_tokens,
+                finish_reason,
             )
 
             return LLMResponse(
@@ -561,32 +548,23 @@ class AnthropicClient(LLMClient):
                 provider=self.get_provider_name(),
                 tokens_used=tokens_used,
                 finish_reason=finish_reason,
-                raw_response=data
+                raw_response=data,
             )
 
         except requests.ConnectionError as e:
             logger.exception("Cannot connect to Anthropic API: %s", e)
-            raise LLMConnectionError(
-                "Cannot connect to Anthropic API. "
-                "Please check your internet connection."
-            ) from e
+            raise LLMConnectionError("Cannot connect to Anthropic API. Please check your internet connection.") from e
 
         except requests.Timeout as e:
             logger.exception("%s request timed out after %ds", self._provider_label, self.timeout)
-            raise LLMConnectionError(
-                f"{self._provider_label} request timed out after {self.timeout}s"
-            ) from e
+            raise LLMConnectionError(f"{self._provider_label} request timed out after {self.timeout}s") from e
 
         except requests.RequestException as e:
             logger.exception("%s request failed: %s", self._provider_label, e)
             raise LLMAPIError(f"{self._provider_label} request failed: {e}") from e
 
     def chat_with_tools(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]],
-        model: str = "",
-        **kwargs
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
     ) -> ToolCallResponse:
         """
         Send message request to Anthropic with tool use support.
@@ -622,10 +600,12 @@ class AnthropicClient(LLMClient):
             elif _role == "tool":
                 # Single tool result: wrap in tool_result content block
                 tool_use_id = _msg_field(msg, _dict, "tool_call_id") or ""
-                api_messages.append({
-                    "role": "user",
-                    "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": _content}],
-                })
+                api_messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": _content}],
+                    }
+                )
             elif _role == "assistant" and (tc_list := _msg_field(msg, _dict, "tool_calls")):
                 # Prefer provider-native content blocks when available — these
                 # include the `thinking` block (with signature) that Anthropic
@@ -649,12 +629,14 @@ class AnthropicClient(LLMClient):
                         _input = json.loads(fn.get("arguments", "{}"))
                     except (json.JSONDecodeError, TypeError):
                         _input = {}
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc_id,
-                        "name": fn.get("name", ""),
-                        "input": _input,
-                    })
+                    content_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc_id,
+                            "name": fn.get("name", ""),
+                            "input": _input,
+                        }
+                    )
                 api_messages.append({"role": "assistant", "content": content_blocks})
             else:
                 raw_content = _msg_field(msg, _dict, "raw_content")
@@ -666,14 +648,16 @@ class AnthropicClient(LLMClient):
                     # Multimodal: image blocks + text
                     content_blocks: list[dict[str, Any]] = []
                     for img in images:
-                        content_blocks.append({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": img["media_type"],
-                                "data": img["data"],
-                            },
-                        })
+                        content_blocks.append(
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": img["media_type"],
+                                    "data": img["data"],
+                                },
+                            }
+                        )
                     content_blocks.append({"type": "text", "text": _content})
                     api_messages.append({"role": _role, "content": content_blocks})
                 else:
@@ -733,7 +717,11 @@ class AnthropicClient(LLMClient):
         # Use streaming when token_callback is provided
         if token_callback is not None:
             return self._chat_with_tools_streaming(
-                url, headers, payload, model, token_callback,
+                url,
+                headers,
+                payload,
+                model,
+                token_callback,
             )
 
         t0 = time.monotonic()
@@ -748,8 +736,7 @@ class AnthropicClient(LLMClient):
             if response.status_code >= 500 and response.status_code != 501:
                 error_body = response.text[:500]
                 raise LLMServerUnavailableError(
-                    f"{self._provider_label} API returned HTTP {response.status_code}: "
-                    f"{error_body}"
+                    f"{self._provider_label} API returned HTTP {response.status_code}: {error_body}"
                 )
             if response.status_code != 200:
                 error_body = response.text[:500]
@@ -773,18 +760,25 @@ class AnthropicClient(LLMClient):
                 if block.get("type") == "text":
                     text_content += block.get("text", "")
                 elif block.get("type") == "tool_use":
-                    tool_calls.append(ToolCallRequest(
-                        call_id=block.get("id", ""),
-                        name=block.get("name", ""),
-                        args=block.get("input", {}),
-                    ))
+                    tool_calls.append(
+                        ToolCallRequest(
+                            call_id=block.get("id", ""),
+                            name=block.get("name", ""),
+                            args=block.get("input", {}),
+                        )
+                    )
 
             is_final = stop_reason == "end_turn" or not tool_calls
             logger.info(
                 # tok=%s (not %d): tokens_used is intentionally None when the
                 # response carries no usage block — %d would TypeError.
-                "%s %s (tools): %.0fms, tok=%s, stop=%s (%d)", self._provider_label,
-                model, elapsed_ms, tokens_used, stop_reason, len(tool_calls),
+                "%s %s (tools): %.0fms, tok=%s, stop=%s (%d)",
+                self._provider_label,
+                model,
+                elapsed_ms,
+                tokens_used,
+                stop_reason,
+                len(tool_calls),
             )
             return ToolCallResponse(
                 content=text_content,
@@ -830,8 +824,11 @@ class AnthropicClient(LLMClient):
         t0 = time.monotonic()
         try:
             response = self._session.post(
-                url, headers=headers, json=stream_payload,
-                timeout=self.timeout, stream=True,
+                url,
+                headers=headers,
+                json=stream_payload,
+                timeout=self.timeout,
+                stream=True,
             )
         except requests.ConnectionError as e:
             raise LLMConnectionError("Cannot connect to Anthropic API.") from e
@@ -849,8 +846,7 @@ class AnthropicClient(LLMClient):
             if response.status_code >= 500 and response.status_code != 501:
                 error_body = response.text[:500]
                 raise LLMServerUnavailableError(
-                    f"{self._provider_label} API returned HTTP {response.status_code}: "
-                    f"{error_body}"
+                    f"{self._provider_label} API returned HTTP {response.status_code}: {error_body}"
                 )
             if response.status_code != 200:
                 error_body = response.text[:500]
@@ -863,13 +859,12 @@ class AnthropicClient(LLMClient):
             cache_read_input_tokens = None
             cache_creation_input_tokens = None
 
-            _current_block_type: Optional[str] = None
+            _current_block_type: str | None = None
             _is_streaming_text = False
             _thinking_blocks: list[dict[str, Any]] = []
-            _current_thinking: Optional[dict[str, Any]] = None
+            _current_thinking: dict[str, Any] | None = None
 
             for ev in guard_sse_iteration(iter_sse_data_events(response)):
-
                 ev_type = ev.get("type", "")
 
                 if ev_type == "content_block_start":
@@ -901,11 +896,13 @@ class AnthropicClient(LLMClient):
 
                 elif ev_type == "content_block_stop":
                     if _current_thinking is not None:
-                        _thinking_blocks.append({
-                            "type": "thinking",
-                            "thinking": _current_thinking.get("thinking", ""),
-                            "signature": _current_thinking.get("signature", ""),
-                        })
+                        _thinking_blocks.append(
+                            {
+                                "type": "thinking",
+                                "thinking": _current_thinking.get("thinking", ""),
+                                "signature": _current_thinking.get("signature", ""),
+                            }
+                        )
                         _current_thinking = None
                     _is_streaming_text = False
 
@@ -965,8 +962,14 @@ class AnthropicClient(LLMClient):
         tokens_used = _pt + _ct
 
         logger.info(
-            "%s %s (stream): %.0fms, tok=%d (in=%d, out=%d), finish_reason=%s", self._provider_label,
-            model, elapsed_ms, tokens_used, _pt, _ct, stop_reason
+            "%s %s (stream): %.0fms, tok=%d (in=%d, out=%d), finish_reason=%s",
+            self._provider_label,
+            model,
+            elapsed_ms,
+            tokens_used,
+            _pt,
+            _ct,
+            stop_reason,
         )
 
         # Reconstruct raw_response so multi-turn echo preserves thinking blocks.
@@ -984,7 +987,11 @@ class AnthropicClient(LLMClient):
                 "input_tokens": _pt,
                 "output_tokens": _ct,
                 **({"cache_read_input_tokens": cache_read_input_tokens} if cache_read_input_tokens is not None else {}),
-                **({"cache_creation_input_tokens": cache_creation_input_tokens} if cache_creation_input_tokens is not None else {}),
+                **(
+                    {"cache_creation_input_tokens": cache_creation_input_tokens}
+                    if cache_creation_input_tokens is not None
+                    else {}
+                ),
             },
         }
 
@@ -1025,8 +1032,11 @@ class AnthropicClient(LLMClient):
         t0 = time.monotonic()
         try:
             response = self._session.post(
-                url, headers=headers, json=stream_payload,
-                timeout=self.timeout, stream=True,
+                url,
+                headers=headers,
+                json=stream_payload,
+                timeout=self.timeout,
+                stream=True,
             )
         except requests.ConnectionError as e:
             raise LLMConnectionError("Cannot connect to Anthropic API.") from e
@@ -1043,8 +1053,7 @@ class AnthropicClient(LLMClient):
             if response.status_code >= 500 and response.status_code != 501:
                 error_body = response.text[:500]
                 raise LLMServerUnavailableError(
-                    f"{self._provider_label} API returned HTTP {response.status_code}: "
-                    f"{error_body}"
+                    f"{self._provider_label} API returned HTTP {response.status_code}: {error_body}"
                 )
             if response.status_code != 200:
                 error_body = response.text[:500]
@@ -1060,17 +1069,16 @@ class AnthropicClient(LLMClient):
             cache_creation_input_tokens = None
 
             # State for current content block
-            _current_block_type: Optional[str] = None  # "text", "tool_use", or "thinking"
-            _current_tool: Optional[dict[str, Any]] = None  # id/name/input_json accumulator
+            _current_block_type: str | None = None  # "text", "tool_use", or "thinking"
+            _current_tool: dict[str, Any] | None = None  # id/name/input_json accumulator
             _is_streaming_text = False  # True when we're in a text block with token_callback active
             _truncated_tool_json = False  # True when a tool_use input_json delta was dropped mid-JSON
 
             # thinking block accumulator (for reconstructing raw_response with extended thinking)
             _thinking_blocks: list[dict[str, Any]] = []
-            _current_thinking: Optional[dict[str, Any]] = None  # {thinking: str, signature: str}
+            _current_thinking: dict[str, Any] | None = None  # {thinking: str, signature: str}
 
             for ev in guard_sse_iteration(iter_sse_data_events(response)):
-
                 ev_type = ev.get("type", "")
 
                 if ev_type == "content_block_start":
@@ -1126,19 +1134,23 @@ class AnthropicClient(LLMClient):
                                     "%s tool call '%s' arguments appear truncated: "
                                     "%d unclosed braces in %d chars — dropping so "
                                     "the caller retries",
-                                    self._provider_label, _current_tool["name"],
-                                    _dc["open_curly"] - _dc["close_curly"], len(_raw_json),
+                                    self._provider_label,
+                                    _current_tool["name"],
+                                    _dc["open_curly"] - _dc["close_curly"],
+                                    len(_raw_json),
                                 )
                                 _truncated_tool_json = True
                                 args = None
                             else:
                                 args = {}  # legacy: balanced but unparseable → empty args
                         if args is not None:
-                            tool_calls.append(ToolCallRequest(
-                                call_id=_current_tool["id"],
-                                name=_current_tool["name"],
-                                args=args,
-                            ))
+                            tool_calls.append(
+                                ToolCallRequest(
+                                    call_id=_current_tool["id"],
+                                    name=_current_tool["name"],
+                                    args=args,
+                                )
+                            )
                     elif _current_block_type == "thinking" and _current_thinking:
                         _thinking_blocks.append(dict(_current_thinking))
                     _current_block_type = None
@@ -1147,9 +1159,9 @@ class AnthropicClient(LLMClient):
                     _is_streaming_text = False
 
                 elif ev_type == "message_delta":
-                    stop_reason = _normalize_anthropic_stop_reason(
-                        (ev.get("delta") or {}).get("stop_reason")
-                    ) or stop_reason
+                    stop_reason = (
+                        _normalize_anthropic_stop_reason((ev.get("delta") or {}).get("stop_reason")) or stop_reason
+                    )
                     usage = ev.get("usage") or {}
                     if usage.get("output_tokens"):
                         completion_tokens = usage["output_tokens"]
@@ -1197,14 +1209,23 @@ class AnthropicClient(LLMClient):
 
         # Reconstruct raw_response content array so extended-thinking blocks
         # are preserved for echo in subsequent multi-turn calls.
-        _raw_content: list[dict[str, Any]] = [{"type": "thinking", "thinking": tb["thinking"], "signature": tb["signature"]} for tb in _thinking_blocks]
+        _raw_content: list[dict[str, Any]] = [
+            {"type": "thinking", "thinking": tb["thinking"], "signature": tb["signature"]} for tb in _thinking_blocks
+        ]
         if text_content:
             _raw_content.append({"type": "text", "text": text_content})
-        _raw_content.extend({"type": "tool_use", "id": tc.call_id, "name": tc.name, "input": tc.args} for tc in tool_calls)
+        _raw_content.extend(
+            {"type": "tool_use", "id": tc.call_id, "name": tc.name, "input": tc.args} for tc in tool_calls
+        )
 
         logger.info(
-            "%s %s (tools): %.0fms, tok=%s, stop=%s (%d)", self._provider_label,
-            model, elapsed_ms, tokens_used, stop_reason, len(tool_calls),
+            "%s %s (tools): %.0fms, tok=%s, stop=%s (%d)",
+            self._provider_label,
+            model,
+            elapsed_ms,
+            tokens_used,
+            stop_reason,
+            len(tool_calls),
         )
         return ToolCallResponse(
             content=text_content,
@@ -1240,6 +1261,7 @@ class ZAIAnthropicClient(AnthropicClient):
     Thinking/reasoning mode:
     GLM-5.2+ thinks by default. To disable: pass thinking_mode=False.
     """
+
     DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic/v1"
     DEFAULT_MODEL = "glm-5.3"
     _provider_label = "Z.AI"
@@ -1251,9 +1273,9 @@ class ZAIAnthropicClient(AnthropicClient):
         self,
         messages: list[LLMMessage],
         model: str = "",
-        temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        temperature: float | None = 0.0,
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         # Pop z.ai-specific params before passing to parent
         thinking_mode = kwargs.pop("thinking_mode", None)
@@ -1279,7 +1301,8 @@ class ZAIAnthropicClient(AnthropicClient):
                     cache_pct = (cached_tokens / prompt_tokens * 100) if prompt_tokens else 0
                     logger.info(
                         "Z.AI cache: %s cached tokens (%.0f%% of prompt -- Coding Plan: no discount)",
-                        cached_tokens, cache_pct,
+                        cached_tokens,
+                        cache_pct,
                     )
 
         return resp
@@ -1289,9 +1312,9 @@ class ZAIAnthropicClient(AnthropicClient):
         messages: list[LLMMessage],
         tools: list[dict[str, Any]],
         model: str = "",
-        max_tokens: Optional[int] = None,
-        token_callback: Optional[Callable] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        token_callback: Callable | None = None,
+        **kwargs,
     ) -> ToolCallResponse:
         # Pop z.ai-specific params before passing to parent
         thinking_mode = kwargs.pop("thinking_mode", None)
@@ -1315,9 +1338,7 @@ class ZAIAnthropicClient(AnthropicClient):
             kwargs["temperature"] = round(kwargs["temperature"], 2)
 
         resp = super().chat_with_tools(
-            messages, tools, model=model,
-            max_tokens=max_tokens, token_callback=token_callback,
-            **kwargs
+            messages, tools, model=model, max_tokens=max_tokens, token_callback=token_callback, **kwargs
         )
 
         # Z.AI context cache diagnostics
@@ -1330,7 +1351,8 @@ class ZAIAnthropicClient(AnthropicClient):
                     cache_pct = (cached_tokens / prompt_tokens * 100) if prompt_tokens else 0
                     logger.info(
                         "Z.AI cache: %s cached tokens (%.0f%% of prompt -- Coding Plan: no discount)",
-                        cached_tokens, cache_pct,
+                        cached_tokens,
+                        cache_pct,
                     )
 
         return resp

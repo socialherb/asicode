@@ -12,6 +12,7 @@ oracle for the patch engine — its blind spots propagate into patch strategy
 selection.  The whole 348-line file ships without unit tests; this file
 opens that coverage gap.
 """
+
 from __future__ import annotations
 
 import textwrap
@@ -121,11 +122,7 @@ class TestParseDefinitions:
         assert defs[0].kind == "function"
 
     def test_top_level_class_with_methods(self):
-        src = (
-            "class C:\n"
-            "    def m1(self): pass\n"
-            "    async def m2(self): pass\n"
-        )
+        src = "class C:\n    def m1(self): pass\n    async def m2(self): pass\n"
         defs = parse_definitions(src)
         names = {d.name for d in defs}
         assert names == {"C", "m1", "m2"}
@@ -141,12 +138,7 @@ class TestParseDefinitions:
         assert defs[0].kind == "async_function"
 
     def test_decorator_stack_uses_first_decorator_lineno(self):
-        src = (
-            "@dec1\n"
-            "@dec2\n"
-            "def f():\n"
-            "    pass\n"
-        )
+        src = "@dec1\n@dec2\ndef f():\n    pass\n"
         defs = parse_definitions(src)
         assert len(defs) == 1
         # start_line is the FIRST decorator (line 1), not the def line
@@ -174,8 +166,7 @@ class TestParseDefinitions:
         defs = parse_definitions(src)
         names = {d.name for d in defs}
         assert "stub_helper" in names, (
-            f"TYPE_CHECKING-wrapped def invisible — same wrapper-miss "
-            f"as placement Set 1. names={names}"
+            f"TYPE_CHECKING-wrapped def invisible — same wrapper-miss as placement Set 1. names={names}"
         )
 
     def test_function_inside_try_except(self):
@@ -192,9 +183,7 @@ class TestParseDefinitions:
         """).lstrip()
         defs = parse_definitions(src)
         names = [d.name for d in defs]
-        assert names.count("fast_impl") >= 1, (
-            f"try/except def invisible. defs={names}"
-        )
+        assert names.count("fast_impl") >= 1, f"try/except def invisible. defs={names}"
 
     def test_class_inside_if_version_check(self):
         """``if sys.version_info >= (3, 11): class C(...): else: class C(...)``
@@ -210,9 +199,7 @@ class TestParseDefinitions:
         """).lstrip()
         defs = parse_definitions(src)
         names = [d.name for d in defs]
-        assert "FastPath" in names, (
-            f"version-gated class invisible. defs={names}"
-        )
+        assert "FastPath" in names, f"version-gated class invisible. defs={names}"
 
     def test_function_inside_with_block(self):
         """``with contextlib.suppress(Exception): def helper(): ...`` —
@@ -225,9 +212,7 @@ class TestParseDefinitions:
         """).lstrip()
         defs = parse_definitions(src)
         names = {d.name for d in defs}
-        assert "helper" in names, (
-            f"with-wrapped def invisible. names={names}"
-        )
+        assert "helper" in names, f"with-wrapped def invisible. names={names}"
 
     def test_nested_if_class_inside_class(self):
         """if -> if -> def: nested wrapper, all module-scope."""
@@ -298,9 +283,7 @@ class TestFindDefinitionAtLine:
                     return "in body"
         """).lstrip()
         d = find_definition_at_line(src, 4)  # line of "return"
-        assert d is not None and d.name == "wrapped_def", (
-            f"wrapped def invisible to find_definition_at_line. got={d}"
-        )
+        assert d is not None and d.name == "wrapped_def", f"wrapped def invisible to find_definition_at_line. got={d}"
 
 
 # ── find_import_boundary_ast ───────────────────────────────────────────────
@@ -352,9 +335,7 @@ class TestFindImportBoundary:
         # Find the line number of "def f" and "import sys" for assert.
         lines = src.splitlines()
         def_line = next(i + 1 for i, ln in enumerate(lines) if ln.strip().startswith("def f"))
-        import_sys_line = next(
-            i + 1 for i, ln in enumerate(lines) if "import sys" in ln
-        )
+        import_sys_line = next(i + 1 for i, ln in enumerate(lines) if "import sys" in ln)
         assert boundary > import_sys_line, (
             f"boundary {boundary} fell before 'import sys' line {import_sys_line} "
             f"— try-except import truncated the import region. def line={def_line}"
@@ -404,9 +385,7 @@ class TestSymbolExistsInModule:
                 def stub():
                     return None
         """).lstrip()
-        assert symbol_exists_in_module(src, "stub"), (
-            "TYPE_CHECKING-wrapped def not detected as module-level"
-        )
+        assert symbol_exists_in_module(src, "stub"), "TYPE_CHECKING-wrapped def not detected as module-level"
 
     def test_try_except_assign_is_module_level(self):
         """Optional-dep pattern: try: SECRET = lookup() ; except: SECRET = ''
@@ -417,9 +396,7 @@ class TestSymbolExistsInModule:
             except KeyError:
                 SECRET = ''
         """).lstrip()
-        assert symbol_exists_in_module(src, "SECRET"), (
-            "try-except assign not detected as module-level"
-        )
+        assert symbol_exists_in_module(src, "SECRET"), "try-except assign not detected as module-level"
 
     def test_version_gated_class_is_module_level(self):
         src = textwrap.dedent("""
@@ -487,21 +464,13 @@ class TestTSSymbolDefinedAnywhere:
     """symbol_defined_anywhere with file_path for TS/JS — comment-safe."""
 
     def test_comment_mentioned_symbol_is_not_defined(self):
-        src = (
-            "// const fakeSymbol = 1;\n"
-            "// function fakeFunc() {}\n"
-            "export function realFunc() { return 1; }\n"
-        )
+        src = "// const fakeSymbol = 1;\n// function fakeFunc() {}\nexport function realFunc() { return 1; }\n"
         assert not symbol_defined_anywhere(src, "fakeSymbol", "app.ts")
         assert not symbol_defined_anywhere(src, "fakeFunc", "app.ts")
         assert symbol_defined_anywhere(src, "realFunc", "app.ts")
 
     def test_class_and_method(self):
-        src = (
-            "export class Foo {\n"
-            "  getBar(): string { return ''; }\n"
-            "}\n"
-        )
+        src = "export class Foo {\n  getBar(): string { return ''; }\n}\n"
         assert symbol_defined_anywhere(src, "Foo", "app.ts")
         assert symbol_defined_anywhere(src, "getBar", "app.ts")
         assert symbol_defined_anywhere(src, "Foo.getBar", "app.ts")
@@ -512,10 +481,7 @@ class TestTSSymbolDefinedAnywhere:
         assert not symbol_defined_anywhere(src, "missing", "app.js")
 
     def test_collect_excludes_comments(self):
-        src = (
-            "// function fakeFunc() {}\n"
-            "export function realFunc() {}\n"
-        )
+        src = "// function fakeFunc() {}\nexport function realFunc() {}\n"
         names = collect_defined_names(src, "app.ts")
         assert "realFunc" in names
         assert "fakeFunc" not in names
@@ -538,11 +504,7 @@ class TestGoSymbolDefinedAnywhere:
         assert symbol_defined_anywhere(src, "realType", "app.go")
 
     def test_method_bare_and_dotted(self):
-        src = (
-            "package main\n"
-            "type Foo struct{}\n"
-            "func (f *Foo) GetBar() string { return \"\" }\n"
-        )
+        src = 'package main\ntype Foo struct{}\nfunc (f *Foo) GetBar() string { return "" }\n'
         # bare method name
         assert symbol_defined_anywhere(src, "GetBar", "app.go")
         # dotted (regex fallback — Go methods aren't nested in type range)
@@ -550,11 +512,7 @@ class TestGoSymbolDefinedAnywhere:
         assert symbol_defined_anywhere(src, "Foo", "app.go")
 
     def test_collect_excludes_comments(self):
-        src = (
-            "package main\n"
-            "// func fakeFunc() {}\n"
-            "func realFunc() {}\n"
-        )
+        src = "package main\n// func fakeFunc() {}\nfunc realFunc() {}\n"
         names = collect_defined_names(src, "app.go")
         assert "realFunc" in names
         assert "fakeFunc" not in names
@@ -603,21 +561,13 @@ class TestJvmSymbolDefinedAnywhere:
         assert not symbol_defined_anywhere(src, "NoClass.add", "App.java")
 
     def test_java_interface_and_enum(self):
-        src = (
-            "package com.example;\n"
-            "interface Runnable { void run(); }\n"
-            "enum Color { RED, GREEN, BLUE }\n"
-        )
+        src = "package com.example;\ninterface Runnable { void run(); }\nenum Color { RED, GREEN, BLUE }\n"
         assert symbol_defined_anywhere(src, "Runnable", "App.java")
         assert symbol_defined_anywhere(src, "run", "App.java")
         assert symbol_defined_anywhere(src, "Color", "App.java")
 
     def test_java_collect_excludes_comments(self):
-        src = (
-            "package com.example;\n"
-            "// public class FakeClass {}\n"
-            "public class RealClass {}\n"
-        )
+        src = "package com.example;\n// public class FakeClass {}\npublic class RealClass {}\n"
         names = collect_defined_names(src, "App.java")
         assert "RealClass" in names
         assert "FakeClass" not in names
@@ -629,7 +579,7 @@ class TestJvmSymbolDefinedAnywhere:
             "class Calculator(val x: Int) {\n"
             "    fun add(b: Int): Int = x + b\n"
             "}\n"
-            "object Singleton { val name = \"x\" }\n"
+            'object Singleton { val name = "x" }\n'
         )
         assert symbol_defined_anywhere(src, "Calculator", "App.kt")
         assert symbol_defined_anywhere(src, "add", "App.kt")
@@ -638,12 +588,7 @@ class TestJvmSymbolDefinedAnywhere:
         assert not symbol_defined_anywhere(src, "missing", "App.kt")
 
     def test_kotlin_collect(self):
-        src = (
-            "package com.example\n"
-            "class Calculator {\n"
-            "    fun add(b: Int): Int = x + b\n"
-            "}\n"
-        )
+        src = "package com.example\nclass Calculator {\n    fun add(b: Int): Int = x + b\n}\n"
         names = collect_defined_names(src, "App.kt")
         assert "Calculator" in names
         assert "add" in names
@@ -653,12 +598,7 @@ class TestSymbolExistsInModuleNonPython:
     """symbol_exists_in_module module-level detection for TS/Go."""
 
     def test_ts_module_level_excludes_nested_methods(self):
-        src = (
-            "export class Foo {\n"
-            "  method() {}\n"
-            "}\n"
-            "export function topLevel() {}\n"
-        )
+        src = "export class Foo {\n  method() {}\n}\nexport function topLevel() {}\n"
         assert symbol_exists_in_module(src, "topLevel", "app.ts")
         assert symbol_exists_in_module(src, "Foo", "app.ts")
         # method is nested inside Foo → NOT module-level
@@ -670,7 +610,7 @@ class TestSymbolExistsInModuleNonPython:
         src = (
             "package main\n"
             "type Foo struct{}\n"
-            "func (f *Foo) GetBar() string { return \"\" }\n"
+            'func (f *Foo) GetBar() string { return "" }\n'
             "func TopLevel() {}\n"
             "var GlobalVar = 42\n"
             "const Pi = 3.14\n"
@@ -729,6 +669,7 @@ class TestIterModuleScopeNodes:
 
     def _names_yielded(self, src: str):
         import ast as _ast
+
         tree = _ast.parse(src)
         return [
             getattr(n, "name", None) or getattr(n, "id", None)
@@ -741,26 +682,18 @@ class TestIterModuleScopeNodes:
         must yield exactly the same starting set (children of the module)
         and NOT yield the Module node itself."""
         import ast as _ast
+
         tree = _ast.parse("def f(): pass\n")
         nodes = list(iter_module_scope_nodes(tree))
         assert tree not in nodes
         assert any(isinstance(n, _ast.FunctionDef) and n.name == "f" for n in nodes)
 
     def test_wrapper_descent_if(self):
-        names = self._names_yielded(
-            "from typing import TYPE_CHECKING\n"
-            "if TYPE_CHECKING:\n"
-            "    def helper(): pass\n"
-        )
+        names = self._names_yielded("from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    def helper(): pass\n")
         assert "helper" in names
 
     def test_wrapper_descent_try(self):
-        names = self._names_yielded(
-            "try:\n"
-            "    def fast(): pass\n"
-            "except ImportError:\n"
-            "    def fast(): pass\n"
-        )
+        names = self._names_yielded("try:\n    def fast(): pass\nexcept ImportError:\n    def fast(): pass\n")
         assert names.count("fast") >= 1
 
     def test_wrapper_descent_with_async_for_while(self):
@@ -779,29 +712,23 @@ class TestIterModuleScopeNodes:
         binding) and stop — inner must not appear as if it were
         module-level."""
         import ast as _ast
-        tree = _ast.parse(
-            "def outer():\n"
-            "    def inner():\n"
-            "        pass\n"
-        )
+
+        tree = _ast.parse("def outer():\n    def inner():\n        pass\n")
         names = [
-            n.name for n in iter_module_scope_nodes(tree)
+            n.name
+            for n in iter_module_scope_nodes(tree)
             if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
         ]
-        assert names == ["outer"], (
-            f"walker entered function body — inner leaked to module scope. names={names}"
-        )
+        assert names == ["outer"], f"walker entered function body — inner leaked to module scope. names={names}"
 
     def test_class_body_NOT_entered(self):
         """``class C: def m(self): ...`` — m is class-scope, not module."""
         import ast as _ast
-        tree = _ast.parse(
-            "class C:\n"
-            "    def method(self):\n"
-            "        pass\n"
-        )
+
+        tree = _ast.parse("class C:\n    def method(self):\n        pass\n")
         names = [
-            n.name for n in iter_module_scope_nodes(tree)
+            n.name
+            for n in iter_module_scope_nodes(tree)
             if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
         ]
         assert names == ["C"]
@@ -814,11 +741,9 @@ class TestIterModuleScopeNodes:
         refactor stops at stmt level, the walrus capture regresses
         silently."""
         import ast as _ast
+
         tree = _ast.parse("if (n := 1):\n    pass\n")
-        named_exprs = [
-            n for n in iter_module_scope_nodes(tree)
-            if isinstance(n, _ast.NamedExpr)
-        ]
+        named_exprs = [n for n in iter_module_scope_nodes(tree) if isinstance(n, _ast.NamedExpr)]
         assert len(named_exprs) == 1
         assert isinstance(named_exprs[0].target, _ast.Name)
         assert named_exprs[0].target.id == "n"
@@ -827,21 +752,11 @@ class TestIterModuleScopeNodes:
         """Two consecutive runs over the same source yield identical
         sequences (no nondeterministic ordering in the DFS)."""
         import ast as _ast
-        src = (
-            "def a(): pass\n"
-            "if True:\n"
-            "    def b(): pass\n"
-            "def c(): pass\n"
-        )
+
+        src = "def a(): pass\nif True:\n    def b(): pass\ndef c(): pass\n"
         tree = _ast.parse(src)
-        run1 = [
-            n.name for n in iter_module_scope_nodes(tree)
-            if isinstance(n, _ast.FunctionDef)
-        ]
-        run2 = [
-            n.name for n in iter_module_scope_nodes(tree)
-            if isinstance(n, _ast.FunctionDef)
-        ]
+        run1 = [n.name for n in iter_module_scope_nodes(tree) if isinstance(n, _ast.FunctionDef)]
+        run2 = [n.name for n in iter_module_scope_nodes(tree) if isinstance(n, _ast.FunctionDef)]
         assert run1 == run2
         # Source order: a, b, c
         assert run1 == ["a", "b", "c"]
@@ -852,15 +767,18 @@ class TestIterModuleScopeNodes:
         ast.TryStar in), this test forces the maintainer to update the
         canonical set rather than drift silently."""
         import ast as _ast
+
         expected = {
-            _ast.If, _ast.Try,
-            _ast.With, _ast.AsyncWith,
-            _ast.For, _ast.AsyncFor,
+            _ast.If,
+            _ast.Try,
+            _ast.With,
+            _ast.AsyncWith,
+            _ast.For,
+            _ast.AsyncFor,
             _ast.While,
         }
         assert set(NON_SCOPE_COMPOUND_STMTS) == expected, (
-            f"NON_SCOPE_COMPOUND_STMTS drift detected. "
-            f"current={set(NON_SCOPE_COMPOUND_STMTS)}, expected={expected}"
+            f"NON_SCOPE_COMPOUND_STMTS drift detected. current={set(NON_SCOPE_COMPOUND_STMTS)}, expected={expected}"
         )
 
 
@@ -876,12 +794,8 @@ class TestExtractFunctionSignatureExtras:
 
     def test_signature_stable_under_rename(self):
         """Refactor rename should produce identical signature."""
-        sig_a = extract_function_signature(
-            "def old_name(x: int) -> int: return x\n", "old_name"
-        )
-        sig_b = extract_function_signature(
-            "def new_name(x: int) -> int: return x\n", "new_name"
-        )
+        sig_a = extract_function_signature("def old_name(x: int) -> int: return x\n", "old_name")
+        sig_b = extract_function_signature("def new_name(x: int) -> int: return x\n", "new_name")
         assert sig_a == sig_b
         assert sig_a is not None
 
@@ -891,6 +805,7 @@ class TestExtractFunctionSignatureDetailed:
 
     def test_separated_fields(self):
         from external_llm.code_structure_utils import FunctionSignature, extract_function_signature_detailed
+
         src = "def foo(a: int, b: str) -> bool: return True\n"
         sig = extract_function_signature_detailed(src, "foo")
         assert sig is not None
@@ -901,6 +816,7 @@ class TestExtractFunctionSignatureDetailed:
 
     def test_canonical_equals_legacy(self):
         from external_llm.code_structure_utils import extract_function_signature, extract_function_signature_detailed
+
         src = "def bar(x: int = 5) -> str: return str(x)\n"
         detailed = extract_function_signature_detailed(src, "bar")
         legacy = extract_function_signature(src, "bar")
@@ -910,6 +826,7 @@ class TestExtractFunctionSignatureDetailed:
 
     def test_return_type_only_change(self):
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         before = "def f(a: int) -> str: return ''\n"
         after = "def f(a: int) -> int: return 0\n"
         pre = extract_function_signature_detailed(before, "f")
@@ -923,6 +840,7 @@ class TestExtractFunctionSignatureDetailed:
 
     def test_no_return_annotation(self):
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         src = "def g(a): pass\n"
         sig = extract_function_signature_detailed(src, "g")
         assert sig is not None
@@ -931,6 +849,7 @@ class TestExtractFunctionSignatureDetailed:
 
     def test_async_function(self):
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         src = "async def h(x: float) -> None: return\n"
         sig = extract_function_signature_detailed(src, "h")
         assert sig is not None
@@ -939,11 +858,13 @@ class TestExtractFunctionSignatureDetailed:
 
     def test_missing_symbol_returns_none(self):
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig = extract_function_signature_detailed("def other(): pass\n", "missing")
         assert sig is None
 
     def test_kwargs_and_vararg(self):
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         src = "def f(*args, **kwargs): pass\n"
         sig = extract_function_signature_detailed(src, "f")
         assert sig is not None
@@ -960,6 +881,7 @@ class TestExtractFunctionSignatureDetailed:
         (positional ↔ keyword-only) from change-detection consumers.
         """
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig_plain = extract_function_signature_detailed("def f(a, b): pass\n", "f")
         sig_kwonly = extract_function_signature_detailed("def f(a, *, b): pass\n", "f")
         assert sig_plain is not None and sig_kwonly is not None
@@ -970,6 +892,7 @@ class TestExtractFunctionSignatureDetailed:
     def test_kwonly_bare_star_present(self):
         """A keyword-only boundary (no vararg) renders the bare ``*`` marker."""
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig = extract_function_signature_detailed("def f(a, *, b, c): pass\n", "f")
         assert sig is not None
         assert sig.param_sig == "a:,*,b:,c:"
@@ -979,6 +902,7 @@ class TestExtractFunctionSignatureDetailed:
         """When ``*vararg`` is present its leading '*' already separates, so no
         bare marker is added (avoids ``**`` doubling)."""
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig = extract_function_signature_detailed("def f(a, *args, b): pass\n", "f")
         assert sig is not None
         assert "*args:" in sig.param_sig
@@ -989,6 +913,7 @@ class TestExtractFunctionSignatureDetailed:
         after the positional-or-keyword args (posonly boundary itself is out of
         scope for CS-B1 and preserved as-is)."""
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig = extract_function_signature_detailed("def f(a, /, b, *, c): pass\n", "f")
         assert sig is not None
         assert sig.param_sig == "a:,b:,*,c:"
@@ -996,6 +921,7 @@ class TestExtractFunctionSignatureDetailed:
     def test_plain_signature_has_no_bare_star(self):
         """A plain positional signature must not gain a stray bare '*' marker."""
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig = extract_function_signature_detailed("def f(a, b, c): pass\n", "f")
         assert sig is not None
         assert sig.param_sig == "a:,b:,c:"
@@ -1004,6 +930,7 @@ class TestExtractFunctionSignatureDetailed:
     def test_async_kwonly_separator(self):
         """Async functions render the bare '*' separator identically."""
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         sig = extract_function_signature_detailed("async def g(a, *, b): pass\n", "g")
         assert sig is not None
         assert sig.param_sig == "a:,*,b:"
@@ -1012,6 +939,7 @@ class TestExtractFunctionSignatureDetailed:
         """End-to-end change detection: promoting ``b`` to keyword-only is now
         visible as a signature difference (the CS-B1 false-negative scenario)."""
         from external_llm.code_structure_utils import extract_function_signature_detailed
+
         before = extract_function_signature_detailed("def f(a, b): pass\n", "f")
         after = extract_function_signature_detailed("def f(a, *, b): pass\n", "f")
         assert before is not None and after is not None
@@ -1021,6 +949,7 @@ class TestExtractFunctionSignatureDetailed:
         """``extract_function_signature`` (legacy wrapper) must surface the bare
         '*' so change-detection through the canonical form also works."""
         from external_llm.code_structure_utils import extract_function_signature
+
         legacy_plain = extract_function_signature("def f(a, b): pass\n", "f")
         legacy_kwonly = extract_function_signature("def f(a, *, b): pass\n", "f")
         assert legacy_plain is not None and legacy_kwonly is not None
@@ -1085,8 +1014,7 @@ class TestTsClassHeaderRegexBacktracking:
     def test_extends_implements_headers_still_match(self, monkeypatch):
         # Force the regex fallback (tree-sitter path disabled) so the
         # equivalence of the rewritten pattern is what is actually tested.
-        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
-                            lambda content, lid: None)
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts", lambda content, lid: None)
         for header in [
             "export class A extends B implements C {",
             "abstract class A extends B<X,Y> {",
@@ -1099,8 +1027,7 @@ class TestTsClassHeaderRegexBacktracking:
     def test_dotted_member_no_closing_brace_returns_fast(self, monkeypatch):
         import time
 
-        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
-                            lambda content, lid: None)
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts", lambda content, lid: None)
         t0 = time.monotonic()
         assert symbol_defined_anywhere(self._catastrophic_content(), "Foo.m", "dummy.ts") is False
         assert time.monotonic() - t0 < 2.0, "no-brace extends list must not backtrack exponentially"
@@ -1108,8 +1035,7 @@ class TestTsClassHeaderRegexBacktracking:
     def test_bare_name_scan_no_closing_brace_returns_fast(self, monkeypatch):
         import time
 
-        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
-                            lambda content, lid: None)
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts", lambda content, lid: None)
         t0 = time.monotonic()
         # Bare-name path runs _RE_TS_CLASS_BODY.finditer over the WHOLE file —
         # the no-brace catastrophic line must not blow that up either.
@@ -1123,16 +1049,10 @@ class TestTsRegexFallbackClassScopeIsLiteralAware:
     not truncate the body (the old hand-rolled depth loop ended the body at
     the string, losing every method after it)."""
 
-    _SRC = (
-        "class A {\n"
-        '  s = "}"\n'
-        "  real() { return 1; }\n"
-        "}\n"
-    )
+    _SRC = 'class A {\n  s = "}"\n  real() { return 1; }\n}\n'
 
     def _force_regex_fallback(self, monkeypatch):
-        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts",
-                            lambda content, lid: None)
+        monkeypatch.setattr("external_llm.code_structure_utils._collect_symbols_via_ts", lambda content, lid: None)
 
     def test_dotted_member_after_string_brace_found(self, monkeypatch):
         self._force_regex_fallback(monkeypatch)
@@ -1144,12 +1064,7 @@ class TestTsRegexFallbackClassScopeIsLiteralAware:
 
     def test_member_in_comment_brace_comment_found(self, monkeypatch):
         self._force_regex_fallback(monkeypatch)
-        src = (
-            "class A {\n"
-            "  /* } */\n"
-            "  real() { return 1; }\n"
-            "}\n"
-        )
+        src = "class A {\n  /* } */\n  real() { return 1; }\n}\n"
         assert symbol_defined_anywhere(src, "A.real", "app.ts") is True
 
 

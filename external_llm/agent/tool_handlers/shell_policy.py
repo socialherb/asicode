@@ -14,7 +14,7 @@ import re as _re
 # ran unprompted while sed's identical form was rejected with "Use apply_patch"
 # (measured by dispatching both). Same act, same answer.
 FORBIDDEN_FLAGS: dict = {
-    "sed": {"-i", "--in-place"},   # in-place edit bypasses apply_patch pipeline
+    "sed": {"-i", "--in-place"},  # in-place edit bypasses apply_patch pipeline
     "perl": {"-i", "--in-place"},  # perl -i / -i.bak / -pi -e — same act as sed -i
     "ruby": {"-i", "--in-place"},  # ruby -i -pe — the third spelling of the same
 }
@@ -71,18 +71,18 @@ NON_OVERWRITING_FLAGS: dict[str, frozenset[str]] = {
 # set of single-letter flags covers every spelling without enumerating them.
 DANGEROUS_FLAG_COMBOS: dict[str, list[frozenset[str]]] = {
     "git": [
-        frozenset({"--hard"}),          # git reset --hard — discards the worktree
-        frozenset({"--force"}),         # git push --force — rewrites remote history
-        frozenset({"push", "-f"}),      # git push -f — the short form of --force
-        frozenset({"clean", "-f"}),     # git clean -f — removes untracked files (short form alone)
-        frozenset({"-f", "-d"}),        # git clean -fd/-fdx — removes untracked files+dirs
+        frozenset({"--hard"}),  # git reset --hard — discards the worktree
+        frozenset({"--force"}),  # git push --force — rewrites remote history
+        frozenset({"push", "-f"}),  # git push -f — the short form of --force
+        frozenset({"clean", "-f"}),  # git clean -f — removes untracked files (short form alone)
+        frozenset({"-f", "-d"}),  # git clean -fd/-fdx — removes untracked files+dirs
         frozenset({"checkout", "--"}),  # git checkout -- . — discards uncommitted edits (long form)
-        frozenset({"checkout", "."}),   # git checkout . — discards uncommitted edits
+        frozenset({"checkout", "."}),  # git checkout . — discards uncommitted edits
         frozenset({"checkout", "-f"}),  # git checkout -f — force-switch discarding changes
-        frozenset({"restore", "--"}),   # git restore -- . — the modern equivalent (long form)
-        frozenset({"restore", "."}),    # git restore . — discards uncommitted edits
-        frozenset({"restore", "-W"}),   # git restore -W . — discards worktree changes (BSD compat)
-        frozenset({"branch", "-f"}),    # git branch -f — force-reassign a branch ref
+        frozenset({"restore", "--"}),  # git restore -- . — the modern equivalent (long form)
+        frozenset({"restore", "."}),  # git restore . — discards uncommitted edits
+        frozenset({"restore", "-W"}),  # git restore -W . — discards worktree changes (BSD compat)
+        frozenset({"branch", "-f"}),  # git branch -f — force-reassign a branch ref
     ],
     # ``find -delete`` removes every match, with no confirmation of its own.
     "find": [
@@ -112,38 +112,40 @@ DANGEROUS_FLAG_COMBOS: dict[str, list[frozenset[str]]] = {
 #
 # Matching is on the reduced basename, EXACT — see DANGEROUS_EXECUTABLE_PREFIXES
 # for the one family where exact matching was the wrong test.
-DANGEROUS_SHELL_COMMANDS: frozenset = frozenset({
-    "rm",
-    # Process killers that select targets by NAME or PATTERN, not by PID: their
-    # blast radius is the whole machine and cannot be narrowed by inspecting
-    # arguments. A `pkill -f "sleep 30"` meant to reap one test child also kills
-    # an unrelated build script, another agent session, or the parent shell whose
-    # cmdline merely contains the pattern.
-    # `kill` is deliberately absent: it takes explicit PIDs, which is the narrow,
-    # legitimate form an agent needs for reaping jobs it started. Prompting on it
-    # would train the user to approve reflexively, which is worse than the
-    # residual `kill -9 -1` risk (that one is target-shaped, not name-shaped, so
-    # this executable-name set cannot express it anyway).
-    "pkill",
-    "killall",
-    # Whole-device / filesystem destroyers. A coding agent never legitimately
-    # needs these, so the prompt costs nothing and the mistake is unrecoverable.
-    "mkfs",
-    "dd",
-    # Secure / unrecoverable FILE erasure. `shred` overwrites in place (and
-    # `-u` deletes afterwards) so the original bytes are gone; `srm` is the
-    # secure-delete equivalent. The same "unrecoverable, agent never needs it"
-    # argument as dd/mkfs applies — the survey at the bottom of this file
-    # previously listed these as a deliberate omission; promoted because the
-    # mistake is just as permanent and the false-positive cost is nil.
-    "shred",
-    "srm",
-    # Machine-level state changes. These normally need sudo and would fail, but
-    # passwordless sudo exists and the confirmation is free.
-    "shutdown",
-    "reboot",
-    "halt",
-})
+DANGEROUS_SHELL_COMMANDS: frozenset = frozenset(
+    {
+        "rm",
+        # Process killers that select targets by NAME or PATTERN, not by PID: their
+        # blast radius is the whole machine and cannot be narrowed by inspecting
+        # arguments. A `pkill -f "sleep 30"` meant to reap one test child also kills
+        # an unrelated build script, another agent session, or the parent shell whose
+        # cmdline merely contains the pattern.
+        # `kill` is deliberately absent: it takes explicit PIDs, which is the narrow,
+        # legitimate form an agent needs for reaping jobs it started. Prompting on it
+        # would train the user to approve reflexively, which is worse than the
+        # residual `kill -9 -1` risk (that one is target-shaped, not name-shaped, so
+        # this executable-name set cannot express it anyway).
+        "pkill",
+        "killall",
+        # Whole-device / filesystem destroyers. A coding agent never legitimately
+        # needs these, so the prompt costs nothing and the mistake is unrecoverable.
+        "mkfs",
+        "dd",
+        # Secure / unrecoverable FILE erasure. `shred` overwrites in place (and
+        # `-u` deletes afterwards) so the original bytes are gone; `srm` is the
+        # secure-delete equivalent. The same "unrecoverable, agent never needs it"
+        # argument as dd/mkfs applies — the survey at the bottom of this file
+        # previously listed these as a deliberate omission; promoted because the
+        # mistake is just as permanent and the false-positive cost is nil.
+        "shred",
+        "srm",
+        # Machine-level state changes. These normally need sudo and would fail, but
+        # passwordless sudo exists and the confirmation is free.
+        "shutdown",
+        "reboot",
+        "halt",
+    }
+)
 
 # Executable-name PREFIXES that are dangerous for the same reason their base
 # name is, spelled as a family rather than enumerated.
@@ -159,9 +161,11 @@ DANGEROUS_SHELL_COMMANDS: frozenset = frozenset({
 # future `mkfs.*`, which is the point here but would be reckless for, say,
 # `rm`), so a name belongs here only when the suffix is a VARIANT SELECTOR for
 # the same operation rather than a different program.
-DANGEROUS_EXECUTABLE_PREFIXES: frozenset = frozenset({
-    "mkfs.",
-})
+DANGEROUS_EXECUTABLE_PREFIXES: frozenset = frozenset(
+    {
+        "mkfs.",
+    }
+)
 
 # Builtins that re-parse their ARGUMENTS as a command line. Unlike the
 # SHELL_INTERPRETERS `-c` form there is no flag marking the payload: `eval`
@@ -186,9 +190,11 @@ DANGEROUS_EXECUTABLE_PREFIXES: frozenset = frozenset({
 # therefore correct, not a false positive. Quotes that survive into the payload
 # (`eval "echo 'reset --hard'"`) are re-parsed by shlex and stay one token, so
 # the "quoted prose never counts" contract above still holds.
-EVAL_BUILTINS: frozenset = frozenset({
-    "eval",
-})
+EVAL_BUILTINS: frozenset = frozenset(
+    {
+        "eval",
+    }
+)
 
 # Builtins whose *first operand* is a command string the shell runs later.
 #
@@ -209,9 +215,11 @@ EVAL_BUILTINS: frozenset = frozenset({
 # A cleanup trap is the reason this matters in practice rather than in theory:
 # `trap 'rm -rf "$workdir"' EXIT` is the idiomatic way to write one, so the
 # model reaches for it without any intent to evade a gate.
-COMMAND_STRING_BUILTINS: frozenset = frozenset({
-    "trap",
-})
+COMMAND_STRING_BUILTINS: frozenset = frozenset(
+    {
+        "trap",
+    }
+)
 
 # ─── Executable-position tracking (danger-gate support) ───────────────────
 # The gate identifies the *executable* of each command segment, so anything that
@@ -220,24 +228,43 @@ COMMAND_STRING_BUILTINS: frozenset = frozenset({
 # `xargs rm -rf` classified as harmless `sudo`/`xargs` invocations.
 
 # Programs that execute the command that follows them.
-COMMAND_WRAPPERS: frozenset = frozenset({
-    "sudo", "doas", "env", "nohup", "setsid", "stdbuf", "nice", "ionice",
-    "time", "timeout", "gtimeout", "xargs", "command", "exec", "builtin",
-    "chroot",
-    # Same slot-swallowing shape as the above, measured running unprompted
-    # before they were listed (`flock /tmp/l rm -rf x`, `parallel rm -rf ::: x`,
-    # `unbuffer rm -rf x`, `watch rm -rf x`, `runuser -u nobody rm -rf x`).
-    # `flock` also takes a positional lock file first — see
-    # WRAPPER_POSITIONAL_ARGS.
-    "flock", "parallel", "unbuffer", "watch", "runuser",
-    # `script` covers BOTH of its divergent spellings once it carries a
-    # positional arity of 1 (see WRAPPER_POSITIONAL_ARGS): BSD's
-    # `script <file> <command>` puts the command in the slot after the operand
-    # is consumed, and GNU's `script -c <command> [file]` is caught by the
-    # payload re-entry below. A GNU user writing `script out.log` simply has
-    # the log name consumed as the operand, which is harmless.
-    "script",
-})
+COMMAND_WRAPPERS: frozenset = frozenset(
+    {
+        "sudo",
+        "doas",
+        "env",
+        "nohup",
+        "setsid",
+        "stdbuf",
+        "nice",
+        "ionice",
+        "time",
+        "timeout",
+        "gtimeout",
+        "xargs",
+        "command",
+        "exec",
+        "builtin",
+        "chroot",
+        # Same slot-swallowing shape as the above, measured running unprompted
+        # before they were listed (`flock /tmp/l rm -rf x`, `parallel rm -rf ::: x`,
+        # `unbuffer rm -rf x`, `watch rm -rf x`, `runuser -u nobody rm -rf x`).
+        # `flock` also takes a positional lock file first — see
+        # WRAPPER_POSITIONAL_ARGS.
+        "flock",
+        "parallel",
+        "unbuffer",
+        "watch",
+        "runuser",
+        # `script` covers BOTH of its divergent spellings once it carries a
+        # positional arity of 1 (see WRAPPER_POSITIONAL_ARGS): BSD's
+        # `script <file> <command>` puts the command in the slot after the operand
+        # is consumed, and GNU's `script -c <command> [file]` is caught by the
+        # payload re-entry below. A GNU user writing `script out.log` simply has
+        # the log name consumed as the operand, which is harmless.
+        "script",
+    }
+)
 
 # Wrappers whose ``-c`` argument is a SHELL command line, exactly like
 # SHELL_INTERPRETERS' — but which also occupy the executable slot, so they are
@@ -253,21 +280,39 @@ COMMAND_WRAPPERS: frozenset = frozenset({
 # is platform-divergent (GNU takes a typescript FILE, BSD takes file + command),
 # so the operand count cannot be stated once. The `-c` form is unambiguous on
 # both, and the positional form stays a known gap rather than a guess.
-WRAPPER_SHELL_C_PAYLOAD: frozenset = frozenset({
-    "runuser", "script", "flock",
-})
+WRAPPER_SHELL_C_PAYLOAD: frozenset = frozenset(
+    {
+        "runuser",
+        "script",
+        "flock",
+    }
+)
 
 # Shell keywords after which a command begins (handled separately from
 # COMMAND_WRAPPERS: these are syntax, and the scan already reduces basenames
 # before consulting them).
-COMMAND_INTRODUCING_KEYWORDS: frozenset = frozenset({
-    "if", "while", "until", "then", "do", "else", "elif", "!",
-})
+COMMAND_INTRODUCING_KEYWORDS: frozenset = frozenset(
+    {
+        "if",
+        "while",
+        "until",
+        "then",
+        "do",
+        "else",
+        "elif",
+        "!",
+    }
+)
 
 # Flags whose *value* is a command, reached from argument position.
-ARG_COMMAND_INTRODUCERS: frozenset = frozenset({
-    "-exec", "-execdir", "-ok", "-okdir",
-})
+ARG_COMMAND_INTRODUCERS: frozenset = frozenset(
+    {
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+    }
+)
 
 # Shells whose `-c` argument is another command line. The scan re-enters that
 # payload rather than treating it as an opaque string, so `bash -c "rm -rf x"`
@@ -280,11 +325,17 @@ ARG_COMMAND_INTRODUCERS: frozenset = frozenset({
 # `-c`/`-e` payload is not shell code, so re-entering it as a shell command line
 # would classify its contents wrongly. Kept separate from SHELL_INTERPRETERS for
 # that reason: the two sets differ in which rules apply.
-STDIN_INTERPRETERS: frozenset = frozenset({
-    "python3", "python", "python2",
-    "perl", "ruby", "lua",
-    "node",
-})
+STDIN_INTERPRETERS: frozenset = frozenset(
+    {
+        "python3",
+        "python",
+        "python2",
+        "perl",
+        "ruby",
+        "lua",
+        "node",
+    }
+)
 # ── `python -c` — the one non-shell payload that CAN be read ────────────────
 # The comment above is still true (a Python payload is not shell code and must
 # not be scanned with shell rules), but "not shell" was being read as "not
@@ -311,42 +362,59 @@ PYTHON_INTERPRETERS: frozenset = frozenset({"python", "python3", "python2"})
 #
 # Deliberately narrow. Writing, creating and reading are what the agent is for;
 # only deletion and in-place truncation are here, mirroring `rm` / `truncate -s 0`.
-PYTHON_DESTRUCTIVE_CALLS: frozenset = frozenset({
-    "shutil.rmtree",
-    "os.remove",
-    "os.unlink",
-    "os.rmdir",
-    "os.removedirs",
-    "os.truncate",
-    "pathlib.Path.unlink",
-    "pathlib.Path.rmdir",
-})
+PYTHON_DESTRUCTIVE_CALLS: frozenset = frozenset(
+    {
+        "shutil.rmtree",
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.removedirs",
+        "os.truncate",
+        "pathlib.Path.unlink",
+        "pathlib.Path.rmdir",
+    }
+)
 
 # Calls that hand a command back to the shell. Their argument is re-entered
 # through the SAME token scan as a `bash -c` payload, so `python3 -c
 # "os.system('rm -rf x')"` reaches every rule the un-nested spelling does
 # instead of getting a second, poorer copy of them.
-PYTHON_SHELL_ESCAPES: frozenset = frozenset({
-    "os.system",
-    "os.popen",
-    "os.execv", "os.execve", "os.execvp", "os.execvpe", "os.spawnv",
-    "subprocess.run",
-    "subprocess.call",
-    "subprocess.check_call",
-    "subprocess.check_output",
-    "subprocess.Popen",
-    "subprocess.getoutput",
-    "subprocess.getstatusoutput",
-})
+PYTHON_SHELL_ESCAPES: frozenset = frozenset(
+    {
+        "os.system",
+        "os.popen",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.spawnv",
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+    }
+)
 
-SHELL_INTERPRETERS: frozenset = frozenset({
-    "sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "busybox",
-    # `su -c "rm -rf x"` hands its payload to the target user's shell, so the
-    # payload is shell code by the same argument. `su someuser -c "..."` works
-    # too — the scan looks for `-c` anywhere in the segment, not at a fixed
-    # position — and a `su` with no `-c` simply has no payload to re-enter.
-    "su",
-})
+SHELL_INTERPRETERS: frozenset = frozenset(
+    {
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "ash",
+        "mksh",
+        "busybox",
+        # `su -c "rm -rf x"` hands its payload to the target user's shell, so the
+        # payload is shell code by the same argument. `su someuser -c "..."` works
+        # too — the scan looks for `-c` anywhere in the segment, not at a fixed
+        # position — and a `su` with no `-c` simply has no payload to re-enter.
+        "su",
+    }
+)
 
 # Wrapper flags that consume the NEXT token as their value. Without this the
 # value lands in the executable slot and the real command behind it is read as a
@@ -359,11 +427,28 @@ SHELL_INTERPRETERS: frozenset = frozenset({
 # the executable slot. Exact-token matching therefore covers the gap without
 # needing per-flag arity for the glued forms.
 WRAPPER_VALUE_FLAGS: dict = {
-    "sudo": frozenset({
-        "-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-U",
-        "--user", "--group", "--prompt", "--close-from", "--chdir",
-        "--host", "--role", "--type", "--other-user",
-    }),
+    "sudo": frozenset(
+        {
+            "-u",
+            "-g",
+            "-p",
+            "-C",
+            "-D",
+            "-h",
+            "-r",
+            "-t",
+            "-U",
+            "--user",
+            "--group",
+            "--prompt",
+            "--close-from",
+            "--chdir",
+            "--host",
+            "--role",
+            "--type",
+            "--other-user",
+        }
+    ),
     "doas": frozenset({"-u", "-C"}),
     "env": frozenset({"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}),
     "timeout": frozenset({"-s", "-k", "--signal", "--kill-after"}),
@@ -371,21 +456,48 @@ WRAPPER_VALUE_FLAGS: dict = {
     "nice": frozenset({"-n", "--adjustment"}),
     "ionice": frozenset({"-c", "-n", "-p", "-P", "--class", "--classdata", "--pid"}),
     "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
-    "xargs": frozenset({
-        "-I", "-i", "-n", "-P", "-d", "-E", "-L", "-s", "-a",
-        "--replace", "--max-args", "--max-procs", "--delimiter", "--eof",
-        "--max-lines", "--max-chars", "--arg-file",
-    }),
+    "xargs": frozenset(
+        {
+            "-I",
+            "-i",
+            "-n",
+            "-P",
+            "-d",
+            "-E",
+            "-L",
+            "-s",
+            "-a",
+            "--replace",
+            "--max-args",
+            "--max-procs",
+            "--delimiter",
+            "--eof",
+            "--max-lines",
+            "--max-chars",
+            "--arg-file",
+        }
+    ),
     "time": frozenset({"-o", "-f", "--output", "--format"}),
     # Separated-spelling flag values for the wrappers added above; without
     # these the value lands in the executable slot and the real command behind
     # it reads as an argument (the `sudo -u me rm` shape).
     "flock": frozenset({"-w", "-E", "--wait", "--timeout", "--conflict-exit-code"}),
     "watch": frozenset({"-n", "--interval"}),
-    "parallel": frozenset({
-        "-j", "-N", "-n", "-L", "-S", "-d", "-a",
-        "--jobs", "--delimiter", "--max-lines", "--arg-file",
-    }),
+    "parallel": frozenset(
+        {
+            "-j",
+            "-N",
+            "-n",
+            "-L",
+            "-S",
+            "-d",
+            "-a",
+            "--jobs",
+            "--delimiter",
+            "--max-lines",
+            "--arg-file",
+        }
+    ),
     "runuser": frozenset({"-u", "-g", "-s", "--user", "--group", "--shell"}),
 }
 
@@ -544,9 +656,7 @@ _VERIFICATION_RUNNERS = (
     r"(?:uv|poetry|pdm|hatch|rye)\s+run\s+(?:python\S*\s+-m\s+)?(?:pytest|ruff|mypy|flake8|pylint|eslint|tsc|vitest|jest|unittest|pyright|py\.test|tox|nox)",
 )
 
-VERIFICATION_CMD_RE = _re.compile(
-    r"(?:^|[|;&\n]|&&|\|\|)\s*(?:" + "|".join(_VERIFICATION_RUNNERS) + r")(?=\s|$)"
-)
+VERIFICATION_CMD_RE = _re.compile(r"(?:^|[|;&\n]|&&|\|\|)\s*(?:" + "|".join(_VERIFICATION_RUNNERS) + r")(?=\s|$)")
 
 
 def is_verification_command(command: str) -> bool:

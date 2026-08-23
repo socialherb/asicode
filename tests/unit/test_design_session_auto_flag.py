@@ -2,6 +2,7 @@
 self-driven steps can be reconstructed post-hoc (and later feed loop/repetition
 detection). The `auto` flag is persisted only when True to keep manual turns lean.
 """
+
 from external_llm.design_session import DesignSessionManager
 
 

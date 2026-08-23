@@ -4,6 +4,7 @@ Focus: atomic_write_bytes — the bytes analogue of atomic_write_text (content
 replacement, existing-mode preservation, repo-file-index invalidation through
 the atomic funnel). The text/json writers are exercised end-to-end elsewhere.
 """
+
 from __future__ import annotations
 
 import os

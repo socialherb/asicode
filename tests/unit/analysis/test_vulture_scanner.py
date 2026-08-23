@@ -1,11 +1,12 @@
-'''Tests for external_llm/analysis/vulture_scanner.py.
+"""Tests for external_llm/analysis/vulture_scanner.py.
 
 Focus: the ``exclude_kinds`` overlap filter (Option B). vulture's per-file view
 of module-level functions/classes is redundant with ``public_dead_code_scanner``
 (which resolves cross-file references), so those kinds are excluded by default.
 vulture's UNIQUE value — class-level ``method``/``variable``/``property`` — must
 survive the default filter. (vulture distinguishes ``function`` from ``method``.)
-'''
+"""
+
 from __future__ import annotations
 
 import os
@@ -40,7 +41,7 @@ class SomeClass:
 
 
 def _scan(tmp_path, **kwargs):
-    '''Write _SAMPLE into tmp_path and run the scanner with min_confidence=0.'''
+    """Write _SAMPLE into tmp_path and run the scanner with min_confidence=0."""
     repo_root = str(tmp_path)
     (tmp_path / "probe.py").write_text(_SAMPLE)
     return scan_vulture_dead_code(
@@ -60,17 +61,17 @@ def test_overlap_constant_is_exactly_function_and_class():
 
 
 def test_kind_map_distinguishes_function_from_method():
-    '''Critical: vulture's ``method`` typ must map distinctly from ``function``.
-    If they collapsed to one kind, the overlap filter would wrongly drop
-class-level methods (which public_dead_code_scanner does NOT cover).'''
+    """Critical: vulture's ``method`` typ must map distinctly from ``function``.
+        If they collapsed to one kind, the overlap filter would wrongly drop
+    class-level methods (which public_dead_code_scanner does NOT cover)."""
     assert _VULTURE_KIND_MAP["function"] == "function"
     assert _VULTURE_KIND_MAP["method"] == "method"
     assert "method" not in _PUBLIC_DEAD_CODE_OVERLAP_KINDS
 
 
 def test_vulture_code_by_kind_matches_cli_codes():
-    '''The scanner's noqa contract must mirror vulture CLI codes (core.py:32-38)
-    so a "# noqa: V1xx" comment suppresses the same candidate in both paths.'''
+    """The scanner's noqa contract must mirror vulture CLI codes (core.py:32-38)
+    so a "# noqa: V1xx" comment suppresses the same candidate in both paths."""
     assert _VULTURE_CODE_BY_KIND == {
         "attribute": "V101",
         "class": "V102",
@@ -86,9 +87,9 @@ def test_vulture_code_by_kind_matches_cli_codes():
 
 
 def test_v_code_noqa_suppresses_matching_candidate(tmp_path):
-    '''A "# noqa: V105" on an unused method suppresses it — vulture's own
+    """A "# noqa: V105" on an unused method suppresses it — vulture's own
     get_unused_code() applies no noqa filtering (that lives in its CLI), so the
-    scanner must honor the flake8-style code itself.'''
+    scanner must honor the flake8-style code itself."""
     src = """\
 class C:
     def dead_method(self):  # noqa: V105 — documented intentional
@@ -96,16 +97,18 @@ class C:
 """
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "dead_method" not in names
 
 
 def test_v_code_noqa_does_not_suppress_other_kind(tmp_path):
-    '''Code matching is kind-precise: a V101 (attribute) noqa must NOT suppress
-    an unused method (V105).'''
+    """Code matching is kind-precise: a V101 (attribute) noqa must NOT suppress
+    an unused method (V105)."""
     src = """\
 class C:
     def dead_method(self):  # noqa: V101 — wrong kind, must not match
@@ -113,8 +116,10 @@ class C:
 """
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "dead_method" in names
@@ -131,8 +136,8 @@ def test_default_excludes_module_level_function_and_class(tmp_path):
 
 
 def test_method_kind_survives_default_filter(tmp_path):
-    '''The pivotal regression guard: class methods are vulture-only signal and
-    MUST survive the default overlap filter.'''
+    """The pivotal regression guard: class methods are vulture-only signal and
+    MUST survive the default overlap filter."""
     cands = _scan(tmp_path)
     names = {c.name for c in cands}
     assert "method_inside_class" in names
@@ -156,7 +161,7 @@ def test_exclude_kinds_empty_keeps_everything(tmp_path):
 
 
 def test_exclude_kinds_custom_replaces_default(tmp_path):
-    '''Passing exclude_kinds replaces the default set (does not augment it).'''
+    """Passing exclude_kinds replaces the default set (does not augment it)."""
     cands = _scan(tmp_path, exclude_kinds={"method"})
     kinds = {c.kind for c in cands}
     assert "method" not in kinds
@@ -169,7 +174,7 @@ def test_exclude_kinds_custom_replaces_default(tmp_path):
 
 
 def test_always_live_dunder_still_filtered(tmp_path):
-    '''The kind-filter reorder must not break the _ALWAYS_LIVE name filter.'''
+    """The kind-filter reorder must not break the _ALWAYS_LIVE name filter."""
     src = """\
 class C:
     def __init__(self):
@@ -177,8 +182,10 @@ class C:
 """
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "__init__" not in names
@@ -191,6 +198,7 @@ def test_always_live_includes_framework_protocols():
     """Non-dunder protocol methods invoked by a framework with no static caller
     (Enum._missing_, HTMLParser.handle_*) must be filtered like dunders."""
     from external_llm.analysis.vulture_scanner import _ALWAYS_LIVE
+
     assert "_missing_" in _ALWAYS_LIVE
     assert "handle_starttag" in _ALWAYS_LIVE
 
@@ -200,6 +208,7 @@ def test_always_live_includes_framework_protocols():
 
 def test_is_test_path_classifies_correctly():
     from external_llm.analysis.vulture_scanner import _is_test_path
+
     # test files
     assert _is_test_path("tests/unit/test_foo.py")
     assert _is_test_path("tests/conftest.py")
@@ -215,18 +224,13 @@ def test_test_file_candidates_suppressed(tmp_path):
     candidates (fixtures/parametrize) are dropped; a production sibling's
     candidates survive."""
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_noise.py").write_text(
-        "unused_fixture_in_test = 123\n"
-    )
-    (tmp_path / "probe.py").write_text(
-        "class C:\n"
-        "    def dead_method(self):\n"
-        "        pass\n"
-    )
+    (tmp_path / "tests" / "test_noise.py").write_text("unused_fixture_in_test = 123\n")
+    (tmp_path / "probe.py").write_text("class C:\n    def dead_method(self):\n        pass\n")
     cands = scan_vulture_dead_code(
         repo_root=str(tmp_path),
         file_paths=["probe.py", "tests/test_noise.py"],
-        repo_graph=None, min_confidence=0,
+        repo_graph=None,
+        min_confidence=0,
     )
     files = {c.file for c in cands}
     assert not any("test_noise" in f for f in files)
@@ -250,8 +254,10 @@ def test_string_dispatch_live_method_suppressed(tmp_path):
     )
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "_dispatched_handler" not in names
@@ -265,15 +271,9 @@ def test_string_dispatch_cross_file_suppressed_in_file_paths_scope(tmp_path):
     dynamically dispatched method in a leaf-scanned file came back as a false
     positive (e.g. tool_registry.py's ``{"search_web": "_tool_search_web"}``
     referencing a method in web_search_tools.py)."""
-    (tmp_path / "registry.py").write_text(
-        'HANDLER_MAP = {"web": "_dispatched_handler"}\n'
-    )
+    (tmp_path / "registry.py").write_text('HANDLER_MAP = {"web": "_dispatched_handler"}\n')
     (tmp_path / "probe.py").write_text(
-        "class Tools:\n"
-        "    def _dispatched_handler(self):\n"
-        "        pass\n\n"
-        "    def _truly_dead(self):\n"
-        "        pass\n"
+        "class Tools:\n    def _dispatched_handler(self):\n        pass\n\n    def _truly_dead(self):\n        pass\n"
     )
 
     class _LeafGraph:  # get_importers → [] ⇒ file_paths_only scope
@@ -312,7 +312,7 @@ def test_cross_file_usage_suppressed_in_file_paths_scope(tmp_path):
         "        pass\n\n"
         "    def _truly_dead(self):\n"
         "        pass\n\n"
-        "def _make() -> \"AnnotOnly\":\n"
+        'def _make() -> "AnnotOnly":\n'
         "    ...\n"
     )
 
@@ -359,10 +359,7 @@ def test_cross_file_value_ref_suppressed_in_file_paths_scope(tmp_path):
     neither. The injected ``cross_file_referenced_names`` (whole-repo set, the
     same contract public_dead_code_scanner uses) must suppress it; a name not
     in that set must STILL be reported."""
-    (tmp_path / "probe.py").write_text(
-        "SCAN_LANGUAGES = frozenset({'python'})\n\n"
-        "TRULY_DEAD = frozenset({'gone'})\n"
-    )
+    (tmp_path / "probe.py").write_text("SCAN_LANGUAGES = frozenset({'python'})\n\nTRULY_DEAD = frozenset({'gone'})\n")
 
     class _LeafGraph:  # get_importers → [] ⇒ file_paths_only scope
         @staticmethod
@@ -385,10 +382,7 @@ def test_cross_file_value_ref_ignored_in_full_project_scope(tmp_path):
     """In full_project scope vulture scans every project file itself, so the
     injected cross-file set must NOT suppress anything — a name in the set but
     unused in the scanned corpus is genuinely dead (no double-suppression)."""
-    (tmp_path / "probe.py").write_text(
-        "SCAN_LANGUAGES = frozenset({'python'})\n\n"
-        "OTHER_DEAD = frozenset({'gone'})\n"
-    )
+    (tmp_path / "probe.py").write_text("SCAN_LANGUAGES = frozenset({'python'})\n\nOTHER_DEAD = frozenset({'gone'})\n")
     cands = scan_vulture_dead_code(
         repo_root=str(tmp_path),
         file_paths=["probe.py"],
@@ -428,8 +422,10 @@ def test_visitor_protocol_methods_suppressed(tmp_path):
     )
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "visit_FunctionDef" not in names
@@ -444,14 +440,16 @@ def test_visitor_hook_not_suppressed_in_non_visitor_class(tmp_path):
     structural base-class check must NOT suppress it (over-suppression guard
     against a naive name-prefix rule)."""
     src = (
-        "class HttpClient:\n"            # NOT a visitor subclass
+        "class HttpClient:\n"  # NOT a visitor subclass
         "    def visit_url(self, url):\n"  # coincidentally named, truly dead
         "        x = 1\n"
     )
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "visit_url" in names
@@ -471,8 +469,10 @@ def test_visitor_subclass_via_same_file_ancestor(tmp_path):
     )
     (tmp_path / "probe.py").write_text(src)
     cands = scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"],
-        repo_graph=None, min_confidence=0,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
     )
     names = {c.name for c in cands}
     assert "visit_Module" not in names
@@ -489,18 +489,14 @@ def test_visitor_subclass_via_same_file_ancestor(tmp_path):
 
 
 def test_full_project_skips_vendored_dirs(tmp_path):
-    '''full_project mode must enumerate the project .py set explicitly, never
+    """full_project mode must enumerate the project .py set explicitly, never
     walking into .venv. We place a dead-code file under .venv AND list it in
     file_paths: if vulture scanned it it would be reported; the skip keeps it
-    absent from results.'''
-    (tmp_path / "real.py").write_text(
-        "class C:\n    def unused_method(self):\n        pass\n"
-    )
+    absent from results."""
+    (tmp_path / "real.py").write_text("class C:\n    def unused_method(self):\n        pass\n")
     vendored_dir = tmp_path / ".venv" / "site-packages" / "somepkg"
     vendored_dir.mkdir(parents=True)
-    (vendored_dir / "vendored.py").write_text(
-        "def totally_dead_vendored():\n    pass\n"
-    )
+    (vendored_dir / "vendored.py").write_text("def totally_dead_vendored():\n    pass\n")
     cands = scan_vulture_dead_code(
         repo_root=str(tmp_path),
         file_paths=["real.py", ".venv/site-packages/somepkg/vendored.py"],
@@ -513,18 +509,16 @@ def test_full_project_skips_vendored_dirs(tmp_path):
 
 
 def test_full_project_scans_entire_project_when_no_targets(tmp_path):
-    '''With no file_paths targets, full_project must walk the whole project
+    """With no file_paths targets, full_project must walk the whole project
     (via _collect_project_py_files) and report dead code from any project file
     — not scan nothing. This locks in that the fix enumerates the project set
-    instead of relying on the caller-supplied file_paths.'''
-    (tmp_path / "dead.py").write_text(
-        "class C:\n    def unused_method(self):\n        pass\n"
-    )
+    instead of relying on the caller-supplied file_paths."""
+    (tmp_path / "dead.py").write_text("class C:\n    def unused_method(self):\n        pass\n")
     (tmp_path / "alive.py").write_text("x = 1\nprint(x)\n")
     cands = scan_vulture_dead_code(
         repo_root=str(tmp_path),
-        file_paths=[],          # no targets → full_project walks everything
-        repo_graph=None,        # → full_project
+        file_paths=[],  # no targets → full_project walks everything
+        repo_graph=None,  # → full_project
         min_confidence=0,
     )
     files = {c.file for c in cands}
@@ -574,13 +568,14 @@ def test_cancelled_scan_returns_empty_without_scavenge(tmp_path, monkeypatch):
     ev = threading.Event()
     ev.set()
     result = vs.scan_vulture_dead_code(
-        repo_root=str(tmp_path), file_paths=["probe.py"], repo_graph=None,
-        min_confidence=0, cancel_event=ev,
+        repo_root=str(tmp_path),
+        file_paths=["probe.py"],
+        repo_graph=None,
+        min_confidence=0,
+        cancel_event=ev,
     )
     assert result == []
-    assert scavenge_calls == [], (
-        f"scavenge ran {len(scavenge_calls)} time(s) despite cancel_event being set"
-    )
+    assert scavenge_calls == [], f"scavenge ran {len(scavenge_calls)} time(s) despite cancel_event being set"
 
 
 def test_scavenge_with_cancel_aborts_promptly():
@@ -689,9 +684,7 @@ def test_source_lines_cache_fifo_evicts_oldest_and_stays_correct(tmp_path, monke
 
     assert _SOURCE_LINES_CACHE_MAX_ENTRIES > 0
     _source_lines_cache.clear()
-    monkeypatch.setattr(
-        "external_llm.analysis.vulture_scanner._SOURCE_LINES_CACHE_MAX_ENTRIES", 2
-    )
+    monkeypatch.setattr("external_llm.analysis.vulture_scanner._SOURCE_LINES_CACHE_MAX_ENTRIES", 2)
     try:
         files = {}
         for i, tagged in enumerate((False, False, True)):
@@ -745,11 +738,7 @@ def test_visitor_hooks_collector_reuses_cache_and_invalidates_on_edit(tmp_path):
     import external_llm.analysis.vulture_scanner as vs
 
     probe = tmp_path / "probe.py"
-    probe.write_text(
-        "class V(NodeVisitor):\n"
-        "    def visit_Module(self, node):\n"
-        "        x = 1\n"
-    )
+    probe.write_text("class V(NodeVisitor):\n    def visit_Module(self, node):\n        x = 1\n")
     expected = {(os.path.abspath(str(probe)), 2)}
     first = vs._collect_visitor_hook_linenos([str(probe)])
     assert first == expected
@@ -782,7 +771,7 @@ def test_syntax_error_file_cached_empty_then_recomputed_after_fix(tmp_path):
 
 
 def _framework_scan(tmp_path, src: str) -> list:
-    '''Run the scanner over a single probe file, min_confidence=0.'''
+    """Run the scanner over a single probe file, min_confidence=0."""
     (tmp_path / "probe.py").write_text(src)
     return scan_vulture_dead_code(
         repo_root=str(tmp_path),
@@ -793,7 +782,7 @@ def _framework_scan(tmp_path, src: str) -> list:
 
 
 def test_enum_members_suppressed(tmp_path):
-    '''Enum members are consumed by the Enum machinery — never dead code.'''
+    """Enum members are consumed by the Enum machinery — never dead code."""
     src = """\
 import enum
 
@@ -807,7 +796,7 @@ class Status(enum.Enum):
 
 
 def test_pydantic_fields_validator_suppressed(tmp_path):
-    '''BaseModel fields / model_config / @model_validator are pydantic contracts.'''
+    """BaseModel fields / model_config / @model_validator are pydantic contracts."""
     src = """\
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -828,7 +817,7 @@ class Req(BaseModel):
 
 
 def test_pydantic_through_local_base_chain(tmp_path):
-    '''Inheritance through a same-file base (``_BaseModel`` → ``BaseModel``).'''
+    """Inheritance through a same-file base (``_BaseModel`` → ``BaseModel``)."""
     src = """\
 from pydantic import BaseModel
 
@@ -845,7 +834,7 @@ class Concrete(_BaseModel):
 
 
 def test_dataclass_fields_suppressed(tmp_path):
-    '''@dataclass annotated assignments are instance fields, not dead vars.'''
+    """@dataclass annotated assignments are instance fields, not dead vars."""
     src = """\
 from dataclasses import dataclass
 
@@ -860,7 +849,7 @@ class Spec:
 
 
 def test_http_handler_protocol_suppressed(tmp_path):
-    '''BaseHTTPRequestHandler verbs/protocol attrs are dispatched by http.server.'''
+    """BaseHTTPRequestHandler verbs/protocol attrs are dispatched by http.server."""
     src = """\
 from http.server import BaseHTTPRequestHandler
 
@@ -880,12 +869,55 @@ class Handler(BaseHTTPRequestHandler):
 """
     cands = _framework_scan(tmp_path, src)
     names = {c.name for c in cands}
-    assert not (names & {"server_version", "protocol_version", "log_message",
-                         "do_GET", "do_POST", "close_connection"})
+    assert not (names & {"server_version", "protocol_version", "log_message", "do_GET", "do_POST", "close_connection"})
+
+
+def test_http_handler_wrapper_across_files_suppressed(tmp_path):
+    """A local wrapper around BaseHTTPRequestHandler keeps the protocol surface
+    framework-live even when the inheritance chain crosses a file boundary.
+
+    Regression: mcp/_session_queue.QuietHttpHandler wraps BaseHTTPRequestHandler
+    (quiet disconnect handling); its subclasses in sse_server.py /
+    streamable_server.py must still get do_VERB / server_version /
+    close_connection suppressed.  _inherits_from is same-file only, so the
+    wrapper's name must itself be registered in _HTTP_BASE_NAMES.
+    """
+    (tmp_path / "_base.py").write_text(
+        "from http.server import BaseHTTPRequestHandler\n"
+        "\n"
+        "\n"
+        "class QuietHttpHandler(BaseHTTPRequestHandler):\n"
+        "    def handle_one_request(self):\n"
+        "        try:\n"
+        "            super().handle_one_request()\n"
+        "        except (ConnectionResetError, BrokenPipeError):\n"
+        "            self.close_connection = True\n",
+        encoding="utf-8",
+    )
+    src = """\
+from _base import QuietHttpHandler
+
+
+class Handler(QuietHttpHandler):
+    server_version = "probe/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        self.close_connection = True
+
+    def do_POST(self):
+        pass
+"""
+    cands = _framework_scan(tmp_path, src)
+    names = {c.name for c in cands}
+    assert not (names & {"server_version", "protocol_version", "log_message", "do_GET", "do_POST", "close_connection"})
 
 
 def test_foreign_object_attribute_assignment_suppressed(tmp_path):
-    '''``obj.attr = ...`` (obj not bare ``self``) is library-object config.'''
+    """``obj.attr = ...`` (obj not bare ``self``) is library-object config."""
     src = """\
 import sqlite3
 
@@ -900,7 +932,7 @@ def open_db():
 
 
 def test_self_attribute_assign_still_reported(tmp_path):
-    '''Bare ``self.x = ...`` stays vulture-checkable — not framework-live.'''
+    """Bare ``self.x = ...`` stays vulture-checkable — not framework-live."""
     src = """\
 class C:
     def __init__(self):
@@ -911,7 +943,7 @@ class C:
 
 
 def test_framework_filter_not_name_based(tmp_path):
-    '''A ``do_``-named method OUTSIDE an HTTP handler is still reported.'''
+    """A ``do_``-named method OUTSIDE an HTTP handler is still reported."""
     src = """\
 class Business:
     def do_something(self):
@@ -922,7 +954,7 @@ class Business:
 
 
 def test_framework_live_cache_invalidates_on_edit(tmp_path):
-    '''_framework_live_for_file must drop stale entries when the file changes.'''
+    """_framework_live_for_file must drop stale entries when the file changes."""
     from external_llm.analysis.vulture_scanner import _framework_live_for_file
 
     p = tmp_path / "probe.py"
@@ -1008,12 +1040,8 @@ def _vulture_files(tmp_path):
         "class C:\n"
         "    def dead_m(self):\n        return 4\n"
     )
-    (tmp_path / "main.py").write_text(
-        "from pkg.mod import live_fn\nlive_fn()\n"
-    )
-    (tmp_path / "enumfile.py").write_text(
-        "import enum\n\nclass E(enum.Enum):\n    A = 1\n"
-    )
+    (tmp_path / "main.py").write_text("from pkg.mod import live_fn\nlive_fn()\n")
+    (tmp_path / "enumfile.py").write_text("import enum\n\nclass E(enum.Enum):\n    A = 1\n")
     return [
         str(tmp_path / "pkg" / "mod.py"),
         str(tmp_path / "main.py"),
@@ -1033,10 +1061,7 @@ def _scan_unused(tmp_path, paths, **kw):
 
 
 def _unused_names(v):
-    return sorted(
-        (i.name, i.typ, i.first_lineno)
-        for i in v.get_unused_code(min_confidence=0)
-    )
+    return sorted((i.name, i.typ, i.first_lineno) for i in v.get_unused_code(min_confidence=0))
 
 
 def test_scan_cache_hot_run_matches_cold_and_reuses_all_entries(tmp_path):
@@ -1054,9 +1079,7 @@ def test_scan_cache_hot_run_matches_cold_and_reuses_all_entries(tmp_path):
 
     hot = _scan_unused(tmp_path, paths)
     assert hot.scans == [], "hot run must re-parse nothing"
-    assert _unused_names(hot) == cold_results, (
-        "cache-rehydrated run must match the full scan"
-    )
+    assert _unused_names(hot) == cold_results, "cache-rehydrated run must match the full scan"
 
 
 def test_scan_cache_reparses_only_edited_file(tmp_path):
@@ -1066,14 +1089,10 @@ def test_scan_cache_reparses_only_edited_file(tmp_path):
     _scan_unused(tmp_path, paths)
 
     (tmp_path / "pkg" / "mod.py").write_text(
-        "def live_fn():\n    return 1\n\n"
-        "def dead_fn():\n    return 2\n\n"
-        "def newly_dead():\n    return 9\n"
+        "def live_fn():\n    return 1\n\ndef dead_fn():\n    return 2\n\ndef newly_dead():\n    return 9\n"
     )
     v = _scan_unused(tmp_path, paths)
-    assert v.scans == [str(tmp_path / "pkg" / "mod.py")], (
-        "only the edited file must be re-scanned"
-    )
+    assert v.scans == [str(tmp_path / "pkg" / "mod.py")], "only the edited file must be re-scanned"
     names = {i.name for i in v.get_unused_code(min_confidence=0)}
     assert "newly_dead" in names
 
@@ -1112,9 +1131,7 @@ def test_scan_cache_vulture_version_mismatch_discarded(tmp_path):
     p.write_text(json.dumps(payload))
 
     v = _scan_unused(tmp_path, paths)
-    assert len(v.scans) == len(paths), (
-        "a vulture-version mismatch must discard the cache"
-    )
+    assert len(v.scans) == len(paths), "a vulture-version mismatch must discard the cache"
 
 
 def test_scan_cache_skips_vanished_file(tmp_path):
@@ -1130,9 +1147,7 @@ def test_scan_cache_skips_vanished_file(tmp_path):
     # identical (the whole-set SystemExit abort cannot happen per-file).
     v2 = _scan_unused(tmp_path, [*paths, str(tmp_path / "gone.py")])
     assert "gone.py" not in [os.path.basename(s) for s in v2.scans]
-    assert _unused_names(v2) == results_before, (
-        "a vanished file must be skipped, not abort the scan"
-    )
+    assert _unused_names(v2) == results_before, "a vanished file must be skipped, not abort the scan"
 
 
 def test_scan_cache_used_set_is_order_independent(tmp_path):
@@ -1150,12 +1165,9 @@ def test_scan_cache_used_set_is_order_independent(tmp_path):
 
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("")
-    (tmp_path / "pkg" / "a.py").write_text(
-        "import logging\nlogging.getLogger(__name__)\n"
-    )
+    (tmp_path / "pkg" / "a.py").write_text("import logging\nlogging.getLogger(__name__)\n")
     (tmp_path / "pkg" / "b.py").write_text(
-        "import ast\nimport logging\n\n"
-        "def f():\n    return ast.parse('x'), logging.getLogger(__name__)\n"
+        "import ast\nimport logging\n\ndef f():\n    return ast.parse('x'), logging.getLogger(__name__)\n"
     )
     a = str(tmp_path / "pkg" / "a.py")
     b = str(tmp_path / "pkg" / "b.py")
@@ -1167,21 +1179,15 @@ def test_scan_cache_used_set_is_order_independent(tmp_path):
     rel_b = os.path.relpath(b, str(tmp_path))
     import vulture as _vulture_pkg
 
-    b_used = set(
-        _load_vulture_scan_cache(str(tmp_path), _vulture_pkg.__version__)[rel_b]["used"]
-    )
-    assert {"logging", "ast"} <= b_used, (
-        "b's cached used set must be absolute, not a scan-order delta"
-    )
+    b_used = set(_load_vulture_scan_cache(str(tmp_path), _vulture_pkg.__version__)[rel_b]["used"])
+    assert {"logging", "ast"} <= b_used, "b's cached used set must be absolute, not a scan-order delta"
 
     # Restore ONLY b (per-file mode) — no false unused-import verdicts.
     v2 = _CountingVulture()
     assert _scan_vulture_files_with_cache(v2, [b], [], str(tmp_path))
     assert v2.scans == [], "b must be served from the cache"
     unused = {(i.name, i.typ) for i in v2.get_unused_code(min_confidence=0)}
-    assert not any(typ == "import" for _name, typ in unused), (
-        "restoring b alone must not flag its imports as unused"
-    )
+    assert not any(typ == "import" for _name, typ in unused), "restoring b alone must not flag its imports as unused"
 
 
 def test_scan_cache_exclude_pattern_skips_matching_files(tmp_path):
@@ -1213,9 +1219,7 @@ def test_scan_cache_pre_set_cancel_returns_false(tmp_path):
     ev = threading.Event()
     ev.set()
     v = _CountingVulture()
-    ok = _scan_vulture_files_with_cache(
-        v, paths, [], str(tmp_path), cancel_event=ev
-    )
+    ok = _scan_vulture_files_with_cache(v, paths, [], str(tmp_path), cancel_event=ev)
     assert ok is False
     assert v.scans == []
 
@@ -1250,6 +1254,7 @@ def test_preprocess_cache_skips_recomputation_on_second_scan(tmp_path, monkeypat
             if fp is None or cache.get(path, fp) is None:
                 misses[key] = misses.get(key, 0) + 1
             return fn(path)
+
         return wrapper
 
     monkeypatch.setattr(
@@ -1272,18 +1277,12 @@ def test_preprocess_cache_skips_recomputation_on_second_scan(tmp_path, monkeypat
 
     misses.clear()
     second = scan_vulture_dead_code(repo_root=str(tmp_path), file_paths=paths)
-    assert misses.get("dispatch", 0) == 0, (
-        f"dispatch recomputed on warm scan ({misses.get('dispatch', 0)} misses)"
-    )
-    assert misses.get("vhooks", 0) == 0, (
-        f"visitor hooks recomputed on warm scan ({misses.get('vhooks', 0)} misses)"
-    )
+    assert misses.get("dispatch", 0) == 0, f"dispatch recomputed on warm scan ({misses.get('dispatch', 0)} misses)"
+    assert misses.get("vhooks", 0) == 0, f"visitor hooks recomputed on warm scan ({misses.get('vhooks', 0)} misses)"
     assert misses.get("framework", 0) == 0, (
         f"framework-live recomputed on warm scan ({misses.get('framework', 0)} misses)"
     )
-    assert [c.name for c in first] == [c.name for c in second], (
-        "warm scan must reproduce the cold candidate set"
-    )
+    assert [c.name for c in first] == [c.name for c in second], "warm scan must reproduce the cold candidate set"
 
 
 def test_preprocess_cache_invalidates_only_edited_file(tmp_path, monkeypatch):
@@ -1317,13 +1316,9 @@ def test_preprocess_cache_invalidates_only_edited_file(tmp_path, monkeypatch):
             misses["dispatch"] = misses.get("dispatch", 0) + 1
         return real(path)
 
-    monkeypatch.setattr(
-        "external_llm.analysis.vulture_scanner._dispatch_names_for_file", counting
-    )
+    monkeypatch.setattr("external_llm.analysis.vulture_scanner._dispatch_names_for_file", counting)
     scan_vulture_dead_code(repo_root=str(tmp_path), file_paths=paths)
-    assert misses["dispatch"] == 1, (
-        f"expected exactly the edited file to be recomputed, got {misses['dispatch']}"
-    )
+    assert misses["dispatch"] == 1, f"expected exactly the edited file to be recomputed, got {misses['dispatch']}"
 
 
 def test_vulture_cache_path_goes_through_path_guard(tmp_path, monkeypatch):
@@ -1388,23 +1383,15 @@ def test_scan_cache_partial_update_of_large_corpus_skips_save(tmp_path, monkeypa
     saved_mtime = os.stat(cache_file).st_mtime_ns
 
     (tmp_path / "pkg" / "mod.py").write_text(
-        "def live_fn():\n    return 1\n\n"
-        "def dead_fn():\n    return 2\n\n"
-        "def newly_dead():\n    return 9\n"
+        "def live_fn():\n    return 1\n\ndef dead_fn():\n    return 2\n\ndef newly_dead():\n    return 9\n"
     )
     v = _scan_unused(tmp_path, paths)
-    assert os.stat(cache_file).st_mtime_ns == saved_mtime, (
-        "a partial update of a large corpus must skip the save"
-    )
-    assert v.scans == [str(tmp_path / "pkg" / "mod.py")], (
-        "the edited file was still rescanned in-memory"
-    )
+    assert os.stat(cache_file).st_mtime_ns == saved_mtime, "a partial update of a large corpus must skip the save"
+    assert v.scans == [str(tmp_path / "pkg" / "mod.py")], "the edited file was still rescanned in-memory"
 
     # The skip costs one bounded rescan on the NEXT run — fail-open.
     v2 = _scan_unused(tmp_path, paths)
-    assert v2.scans == [str(tmp_path / "pkg" / "mod.py")], (
-        "next process must recompute the skipped entry"
-    )
+    assert v2.scans == [str(tmp_path / "pkg" / "mod.py")], "next process must recompute the skipped entry"
 
 
 def test_cold_full_scan_writes_payload_exactly_once(tmp_path, monkeypatch):
@@ -1427,9 +1414,7 @@ def test_cold_full_scan_writes_payload_exactly_once(tmp_path, monkeypatch):
     assert len(saves) == 1, "cold run must write the payload exactly once"
 
 
-def test_preprocess_warm_rehydrate_keeps_visitor_hooks_with_relative_repo_root(
-    tmp_path, monkeypatch
-):
+def test_preprocess_warm_rehydrate_keeps_visitor_hooks_with_relative_repo_root(tmp_path, monkeypatch):
     """Regression (round 32-F2): ``_warm_preprocess_caches`` built vhook
     tuples from ``normpath(join(repo_root, rel))`` — RELATIVE when repo_root
     is relative — while the fresh path (``_visitor_hooks_for_file``) and the
@@ -1448,9 +1433,7 @@ def test_preprocess_warm_rehydrate_keeps_visitor_hooks_with_relative_repo_root(
     monkeypatch.chdir(tmp_path)
 
     cold = vs.scan_vulture_dead_code(repo_root=".")
-    assert all(c.name != "visit_ClassDef" for c in cold), (
-        "cold run must suppress the visitor hook"
-    )
+    assert all(c.name != "visit_ClassDef" for c in cold), "cold run must suppress the visitor hook"
 
     # Emulate a fresh process: the module-level in-memory fingerprint caches
     # are what a new interpreter would NOT have — only the DISK cache remains.

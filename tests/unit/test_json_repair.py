@@ -7,6 +7,7 @@ patterns before falling back to an error.
 
 Run: pytest tests/unit/test_json_repair.py -v
 """
+
 from __future__ import annotations
 
 import json
@@ -35,8 +36,8 @@ def loop(tmp_path):
 
 # ── _repair_json_brackets unit tests ────────────────────────────────────────
 
-class TestRepairJsonBrackets:
 
+class TestRepairJsonBrackets:
     def test_valid_json_unchanged(self, loop):
         text = '{"a": 1, "b": [1, 2, 3]}'
         assert loop._repair_json_brackets(text) == text
@@ -96,7 +97,6 @@ class TestRepairJsonBrackets:
         parsed = json.loads(repaired)
         assert parsed["num"] == 42
 
-
     def test_unterminated_string_closed(self, loop):
         """String that never closes → closing quote appended."""
         malformed = '{"key": "unterminated'
@@ -113,6 +113,7 @@ class TestRepairJsonBrackets:
 
 
 # ── Shared module-level function tests ──────────────────────────────────────
+
 
 class TestSharedRepairJsonBrackets:
     """Direct tests for module-level repair_json_brackets."""
@@ -158,13 +159,15 @@ class TestSharedTryParseJson:
 
     def test_empty_string_returns_none(self):
         assert try_parse_json("") is None
+
+
 # ── _repair_truncated_json unit tests ──────────────────────────────────────
 
-class TestRepairTruncatedJson:
 
+class TestRepairTruncatedJson:
     def test_truncated_operations_array(self):
         """Operations array with incomplete last object → last complete op recovered."""
-        malformed = '''{
+        malformed = """{
   "analysis": "fix imports",
   "operations": [
     {
@@ -176,10 +179,11 @@ class TestRepairTruncatedJson:
       "kind": "insert_after_symbol",
       "path": "test.py",
       "intent": "add test"
-  ]}'''
+  ]}"""
         result = repair_truncated_json(malformed)
         assert result is not None
         import json
+
         parsed = json.loads(result)
         assert len(parsed["operations"]) == 1
         assert parsed["operations"][0]["kind"] == "insert_import"
@@ -203,6 +207,7 @@ class TestRepairTruncatedJson:
         result = repair_truncated_json(malformed)
         assert result is not None
         import json
+
         parsed = json.loads(result)
         assert parsed["operations"] == []
 
@@ -226,14 +231,15 @@ class TestRepairTruncatedJson:
         result = loop._try_parse_json(malformed)
         assert result is not None, "_try_parse_json should recover truncated JSON"
         assert len(result["operations"]) == 1, (
-            "Only 1 complete op should be recovered; "
-            "the second has an unterminated string"
+            "Only 1 complete op should be recovered; the second has an unterminated string"
         )
         assert result["operations"][0]["kind"] == "insert_import"
+
+
 # ── _try_parse_json unit tests ───────────────────────────────────────────────
 
-class TestTryParseJson:
 
+class TestTryParseJson:
     def test_valid_json_parses_directly(self, loop):
         result = loop._try_parse_json('{"a": 1}')
         assert result == {"a": 1}

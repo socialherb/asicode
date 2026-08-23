@@ -8,6 +8,7 @@
   ``(main_text, token_line)`` tuple computed a status summary + textwrap of
   up to 8000 chars that its only caller discarded).
 """
+
 from __future__ import annotations
 
 import threading
@@ -32,9 +33,7 @@ def test_stderr_spinner_ticks_until_stopped(capsys):
     """While running, the helper writes spinner frames with the message."""
     stop = threading.Event()
     t0 = time.monotonic()
-    t = threading.Thread(
-        target=repl_impl._stderr_spinner, args=(stop, t0, "Compacting…"), daemon=True
-    )
+    t = threading.Thread(target=repl_impl._stderr_spinner, args=(stop, t0, "Compacting…"), daemon=True)
     t.start()
     # Wait for at least one tick (0.1s cadence) instead of a fixed sleep — a
     # fixed sleep flakes when the spinner thread is starved under load.
@@ -63,8 +62,11 @@ def test_format_result_returns_token_line_only():
         error=None,
         metadata={
             "tokens": {
-                "prompt": 1000, "completion": 200, "total": 1200,
-                "last_call_prompt": 500, "last_call_completion": 50,
+                "prompt": 1000,
+                "completion": 200,
+                "total": 1200,
+                "last_call_prompt": 500,
+                "last_call_completion": 50,
             }
         },
     )
@@ -76,7 +78,10 @@ def test_format_result_returns_token_line_only():
 
 def test_format_result_total_branch_without_last_call():
     result = SimpleNamespace(
-        status="success", applied_patches=[], turns=[], final_message="",
+        status="success",
+        applied_patches=[],
+        turns=[],
+        final_message="",
         error=None,
         metadata={"tokens": {"prompt": 1000, "completion": 200}},
     )
@@ -87,7 +92,11 @@ def test_format_result_total_branch_without_last_call():
 
 def test_format_result_without_metadata_returns_empty():
     result = SimpleNamespace(
-        status="success", applied_patches=[], turns=[], final_message="",
-        error=None, metadata=None,
+        status="success",
+        applied_patches=[],
+        turns=[],
+        final_message="",
+        error=None,
+        metadata=None,
     )
     assert repl_impl._format_result(result) == ""

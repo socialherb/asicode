@@ -8,6 +8,7 @@ production classes); the lookup must disambiguate by file exactly like the
 bare-name branch, and return ``None`` under strict scoping when no candidate
 resides in the requested file.
 """
+
 import shutil
 import tempfile
 from pathlib import Path

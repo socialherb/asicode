@@ -1,4 +1,5 @@
 """Unit tests for import_normalizer.py"""
+
 import os
 import tempfile
 import textwrap
@@ -419,6 +420,7 @@ def test_normalize_rewrite_parse_failure_skips_write(monkeypatch):
 def test_normalize_write_failure_returns_false(monkeypatch):
     """A failed atomic write returns False and keeps the original file
     (L360-362)."""
+
     def _boom(*_a, **_k):
         raise OSError("disk full")
 

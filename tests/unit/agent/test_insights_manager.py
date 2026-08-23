@@ -8,6 +8,7 @@ silently alters or drops content. Both on-disk shapes are covered: the
 hand-edited ``#`` title + ``>`` blockquote "principle" preamble that coexists in the
 wild.
 """
+
 from __future__ import annotations
 
 import os
@@ -92,6 +93,7 @@ def test_roundtrip_lossless(content):
 
 # ── parse_insights structure ──────────────────────────────────────────────────
 
+
 def test_parse_separates_preamble_from_entries():
     preamble, entries = parse_insights(MIXED)
     assert "".join(preamble) == HAND_EDITED
@@ -131,6 +133,7 @@ def test_entry_text_includes_header_line():
 
 # ── drop_entry ────────────────────────────────────────────────────────────────
 
+
 def test_drop_removes_entry_by_1based_index():
     _, entries = parse_insights(MACHINE_EMITTED)
     dropped = drop_entry(entries, 2)
@@ -163,6 +166,7 @@ def test_drop_then_serialize_preserves_rest():
 
 # ── compute_stats ─────────────────────────────────────────────────────────────
 
+
 def test_stats_missing_file(tmp_repo):
     stats = compute_stats(tmp_repo)
     assert stats.exists is False
@@ -190,6 +194,7 @@ def test_stats_preamble_only_counts_zero_entries(tmp_repo):
 
 
 # ── should_nudge ──────────────────────────────────────────────────────────────
+
 
 def test_nudge_silent_when_file_missing(tmp_repo):
     stats = compute_stats(tmp_repo)
@@ -265,6 +270,7 @@ def test_nudge_message_lists_all_crossed_thresholds():
 
 # ── atomic_write_text ─────────────────────────────────────────────────────────
 
+
 def test_atomic_write_creates_and_overwrites(tmp_repo):
     path = insights_path(tmp_repo)
     atomic_write_text(path, "first content")
@@ -290,6 +296,7 @@ def test_atomic_write_preserves_unicode(tmp_repo):
 
 
 # ── build_compact_messages ────────────────────────────────────────────────────
+
 
 def test_compact_messages_structure():
     msgs = build_compact_messages(MACHINE_EMITTED)
@@ -358,8 +365,7 @@ def test_compact_messages_no_budget_directive_when_under_or_unset():
     assert "BUDGET ENFORCEMENT" not in build_compact_messages("x")[0]["content"]
     # Budget passed but content well under it → no directive.
     under = "### [architecture] 2026-06-01 00:00\nshort invariant\n"
-    assert "BUDGET ENFORCEMENT" not in build_compact_messages(
-        under, budget_bytes=10_000)[0]["content"]
+    assert "BUDGET ENFORCEMENT" not in build_compact_messages(under, budget_bytes=10_000)[0]["content"]
 
 
 def test_compact_messages_enforces_budget_when_over():
@@ -389,6 +395,7 @@ def test_compact_budget_bytes_equals_nudge_bytes_threshold():
 
 # ── Integration with the real _save_insight_to_file shape ─────────────────────
 
+
 def test_real_saved_file_roundtrips(tmp_repo):
     """The file _save_insight_to_file actually produces must round-trip."""
     from external_llm.agent.design_chat_loop import _save_insight_to_file
@@ -404,6 +411,7 @@ def test_real_saved_file_roundtrips(tmp_repo):
 
 
 # ── CLI edit reconstruction round-trip (regression for body= crash + line damage) ──
+
 
 def test_edit_reconstruction_roundtrips():
     """Simulate what ``/insights edit <n> <new_body>`` reconstructs and verify
@@ -444,6 +452,7 @@ def test_edit_roundtrip_no_body_kwarg():
     import pytest as _pytest
 
     from external_llm.agent.insights_manager import InsightEntry
+
     with _pytest.raises(TypeError):
         InsightEntry(
             lines=["### [x] 2025\n", "body\n"],
@@ -492,11 +501,7 @@ def test_entry_age_days_none_without_timestamp():
 
 
 def test_select_entries_older_than_picks_only_old():
-    content = (
-        "### [a] 2026-01-01 00:00\nold\n"
-        "### [b] 2026-06-01 00:00\nrecent\n"
-        "### hand-written\nno timestamp\n"
-    )
+    content = "### [a] 2026-01-01 00:00\nold\n### [b] 2026-06-01 00:00\nrecent\n### hand-written\nno timestamp\n"
     _, ents = parse_insights(content)
     now = _epoch("2026-06-10 00:00")
     # 90-day cutoff: only the Jan entry (#1) qualifies; #3 has no ts → never selected
@@ -515,7 +520,7 @@ def test_age_reference_block_lists_ages_and_marks_do_not_copy():
     block = _age_reference_block(content, now=now)
     assert "DO NOT copy" in block
     assert "10d old" in block  # entry a
-    assert "2d old" in block   # entry b
+    assert "2d old" in block  # entry b
 
 
 def test_age_reference_block_empty_when_no_entries():
@@ -533,7 +538,9 @@ def test_compact_messages_include_age_reference_when_timestamped():
 def test_nudge_uses_oldest_entry_age_over_mtime():
     # oldest_age_days present → drives the age trigger (mtime ignored for age)
     stats = InsightsStats(
-        exists=True, count=1, bytes_size=100,
+        exists=True,
+        count=1,
+        bytes_size=100,
         age_days=0,  # file just modified
         oldest_age_days=NUDGE_AGE_DAYS_THRESHOLD + 3,
     )
@@ -552,26 +559,28 @@ def test_nudge_uses_oldest_entry_age_over_mtime():
 #   * promotion is cheap, local, and silent when nothing matches.
 
 
-
-def _ts_entry(days_ago: int, body: str, category: str = "architecture",
-              now: float | None = None) -> object:
+def _ts_entry(days_ago: int, body: str, category: str = "architecture", now: float | None = None) -> object:
     """Build a timestamped InsightEntry `days_ago` in the past."""
     from external_llm.agent.insights_manager import InsightEntry
+
     now = now if now is not None else _time.time()
     ts = now - days_ago * 86400
     header = f"### [{category}] " + _time.strftime("%Y-%m-%d %H:%M", _time.gmtime(ts))
     return InsightEntry(
         lines=[header + "\n", body + "\n\n"],
-        header_line=header, category=category,
+        header_line=header,
+        category=category,
     )
 
 
 def _principle_entry(body: str = "Never use str.startswith for path containment.") -> object:
     """A timestamp-less, hand-written principle entry — must never be demoted."""
     from external_llm.agent.insights_manager import InsightEntry
+
     return InsightEntry(
         lines=["### Hand-written principle\n", body + "\n\n"],
-        header_line="### Hand-written principle", category="",
+        header_line="### Hand-written principle",
+        category="",
     )
 
 
@@ -586,8 +595,8 @@ def test_select_demotion_protets_timestampless_principles():
     big = "durable invariant body " * 200
     entries = [_ts_entry(40, big), _ts_entry(10, big), _principle_entry(big)]
     idx = select_demotion_candidates(entries, budget_bytes=500)
-    assert 3 not in idx           # principle protected
-    assert idx == [1, 2]          # both timestamped demoted (deeply over budget)
+    assert 3 not in idx  # principle protected
+    assert idx == [1, 2]  # both timestamped demoted (deeply over budget)
 
 
 def test_select_demotion_oldest_first():
@@ -611,8 +620,7 @@ def test_select_demotion_all_timestampless_returns_empty():
 def test_enforce_budget_demotes_to_archive_and_hits_budget(tmp_repo):
     big = "durable invariant about FileLockManager single identity " * 40
     entries = [_ts_entry(40, big, "a"), _ts_entry(10, big, "b"), _ts_entry(2, big, "c")]
-    content = "# Design Chat Insights\n\n> Principle\n\n" + "".join(
-        "".join(e.lines) for e in entries)
+    content = "# Design Chat Insights\n\n> Principle\n\n" + "".join("".join(e.lines) for e in entries)
     atomic_write_text(insights_path(tmp_repo), content)
     total = len(content.encode("utf-8"))
     assert total > COMPACT_BUDGET_BYTES
@@ -648,9 +656,10 @@ def test_enforce_budget_closes_preamble_band(tmp_repo):
     n, remaining = enforce_budget_by_demotion(tmp_repo, budget)
     assert n >= 1, "must demote at least one entry in the preamble band"
     assert remaining <= budget, "file must fit budget after demotion"
+
+
 def test_enforce_budget_idempotent(tmp_repo):
-    content = "# Design Chat Insights\n\n" + "".join(
-        "".join(e.lines) for e in [_ts_entry(5, "small entry")])
+    content = "# Design Chat Insights\n\n" + "".join("".join(e.lines) for e in [_ts_entry(5, "small entry")])
     atomic_write_text(insights_path(tmp_repo), content)
     n1, r1 = enforce_budget_by_demotion(tmp_repo, COMPACT_BUDGET_BYTES)
     assert n1 == 0  # under budget → no-op
@@ -663,8 +672,7 @@ def test_enforce_budget_idempotent(tmp_repo):
 def test_enforce_budget_preserves_principle_in_active(tmp_repo):
     big = "durable invariant body " * 200
     entries = [_ts_entry(40, big), _principle_entry(big)]
-    content = "# Design Chat Insights\n\n> P\n\n" + "".join(
-        "".join(e.lines) for e in entries)
+    content = "# Design Chat Insights\n\n> P\n\n" + "".join("".join(e.lines) for e in entries)
     atomic_write_text(insights_path(tmp_repo), content)
     enforce_budget_by_demotion(tmp_repo, COMPACT_BUDGET_BYTES)
     # Principle must still be in the ACTIVE file, never in the archive.
@@ -676,6 +684,7 @@ def test_enforce_budget_preserves_principle_in_active(tmp_repo):
 
 def test_append_entries_to_archive_creates_with_preamble_and_roundtrips(tmp_repo):
     from external_llm.agent.insights_manager import append_entries_to_archive
+
     e = _ts_entry(5, "demoted durable body", "pattern")
     append_entries_to_archive(tmp_repo, [e])
     arc = load_archive_file(tmp_repo)
@@ -690,6 +699,7 @@ def test_append_entries_to_archive_creates_with_preamble_and_roundtrips(tmp_repo
 
 def test_append_entries_to_archive_empty_is_noop(tmp_repo):
     from external_llm.agent.insights_manager import append_entries_to_archive
+
     append_entries_to_archive(tmp_repo, [])
     assert load_archive_file(tmp_repo) == ""
 
@@ -703,12 +713,14 @@ def test_build_archive_index_lists_and_caps(tmp_repo):
         ARCHIVE_INDEX_MAX_ENTRIES,
         append_entries_to_archive,
     )
+
     many = [_ts_entry(i, f"entry number {i} body", "pattern") for i in range(1, 25)]
     append_entries_to_archive(tmp_repo, many)
     idx = build_archive_index(tmp_repo)
     assert "ARCHIVED INSIGHTS" in idx
     # capped at ARCHIVE_INDEX_MAX_ENTRIES visible entry-lines + "and N more" note
     import re
+
     visible = len(re.findall(r"^  A\d+\.", idx, re.MULTILINE))
     assert visible <= ARCHIVE_INDEX_MAX_ENTRIES
     assert "more" in idx  # truncation note present (>15 archived)
@@ -726,6 +738,7 @@ def test_build_archive_index_labels_match_file_order(tmp_repo):
         load_archive_file,
         parse_insights,
     )
+
     # Add 3 distinct entries with unique bodies
     entries = [
         _ts_entry(100, "first entry body about alpha", "pattern"),
@@ -754,6 +767,7 @@ def test_build_archive_index_labels_match_file_order(tmp_repo):
 
 def test_select_promotable_empty_when_no_query_or_no_archive(tmp_repo):
     from external_llm.agent.insights_manager import append_entries_to_archive
+
     append_entries_to_archive(tmp_repo, [_ts_entry(5, "body about FileLockManager")])
     assert select_promotable_entries(tmp_repo, "") == []
     # Non-overlapping query → []
@@ -762,16 +776,17 @@ def test_select_promotable_empty_when_no_query_or_no_archive(tmp_repo):
 
 def test_select_promotable_matches_by_token_overlap(tmp_repo):
     from external_llm.agent.insights_manager import append_entries_to_archive
+
     e = _ts_entry(60, "FileLockManager uses WeakValueDictionary for lock identity")
     append_entries_to_archive(tmp_repo, [e])
-    promoted = select_promotable_entries(
-        tmp_repo, "FileLockManager lock identity WeakValueDictionary")
+    promoted = select_promotable_entries(tmp_repo, "FileLockManager lock identity WeakValueDictionary")
     assert len(promoted) == 1
     assert "FileLockManager" in promoted[0].body
 
 
 def test_select_promotable_respects_min_overlap(tmp_repo):
     from external_llm.agent.insights_manager import PROMOTE_MIN_SCORE, append_entries_to_archive
+
     e = _ts_entry(60, "alpha beta gamma delta epsilon")
     append_entries_to_archive(tmp_repo, [e])
     # Single shared token leads to BM25 score ≈ 0.287 (< PROMOTE_MIN_SCORE=0.5)
@@ -789,13 +804,16 @@ def test_select_promotable_score_scales_with_token_overlap(tmp_repo):
     token baseline and is reliably promoted. A hoist that dropped tf_norm or
     double-counted would distort the score and break this monotonicity."""
     from external_llm.agent.insights_manager import append_entries_to_archive
+
     e = _ts_entry(
-        60, "lock identity WeakValueDictionary thread safety guard reset pool",
+        60,
+        "lock identity WeakValueDictionary thread safety guard reset pool",
     )
     append_entries_to_archive(tmp_repo, [e])
     # 5-token overlap → score ≈ 5 x idf ≫ PROMOTE_MIN_SCORE (0.5).
     promoted = select_promotable_entries(
-        tmp_repo, "lock identity WeakValueDictionary thread safety",
+        tmp_repo,
+        "lock identity WeakValueDictionary thread safety",
     )
     assert len(promoted) == 1
     assert "WeakValueDictionary" in promoted[0].body
@@ -837,9 +855,7 @@ def test_enforce_budget_demotion_is_archive_first(tmp_repo):
         im.enforce_budget_by_demotion(tmp_repo, budget)
 
     arch = load_archive_file(tmp_repo)
-    assert "durable entry body" in arch, (
-        "demoted entries lost — archive was not written before the active truncate"
-    )
+    assert "durable entry body" in arch, "demoted entries lost — archive was not written before the active truncate"
 
 
 def test_append_entries_to_archive_dedups_exact_duplicates(tmp_repo):
@@ -901,12 +917,10 @@ def test_enforce_budget_crash_recovery_leaves_no_archive_duplicates(tmp_repo):
     _, arch_after = parse_insights(load_archive_file(tmp_repo))
 
     headers = [e.header_line for e in arch_after]
-    assert len(headers) == len(set(headers)), (
-        f"crash recovery duplicated archive entries: {headers}"
-    )
-    assert len(arch_after) == len(arch_before), (
-        "recovery run changed archive membership beyond absorbing the re-append"
-    )
+    assert len(headers) == len(set(headers)), f"crash recovery duplicated archive entries: {headers}"
+    assert len(arch_after) == len(arch_before), "recovery run changed archive membership beyond absorbing the re-append"
+
+
 # ── B2: 0c archive index is byte-stable across the wall clock ────────────────
 
 
@@ -1030,6 +1044,7 @@ def test_active_cache_mtime_change_invalidates_without_explicit_call(tmp_repo):
     atomic_write_text(insights_path(tmp_repo), "### [pattern] 2026-01-01 00:00\nbody-A\n\n")
     assert "body-A" in load_active_insights_cached(tmp_repo)
     import time
+
     time.sleep(0.02)  # ensure distinct st_mtime_ns
     atomic_write_text(insights_path(tmp_repo), "### [pattern] 2026-01-02 00:00\nbody-B\n\n")
     result = load_active_insights_cached(tmp_repo)

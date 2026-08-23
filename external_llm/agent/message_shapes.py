@@ -39,11 +39,7 @@ def is_tool_call(m) -> bool:
     """Detect a tool-calling assistant message in any provider format."""
     if getattr(m, "role", "") != "assistant":
         return False
-    return (
-        bool(getattr(m, "tool_calls", None))
-        or _is_anthropic_tool_call(m)
-        or _is_gemini_tool_call(m)
-    )
+    return bool(getattr(m, "tool_calls", None)) or _is_anthropic_tool_call(m) or _is_gemini_tool_call(m)
 
 
 def _is_anthropic_tool_call(m) -> bool:
@@ -67,9 +63,7 @@ def _has_raw_content(m, role: str, predicate) -> bool:
     if getattr(m, "role", "") != role:
         return False
     raw = getattr(m, "raw_content", None)
-    return isinstance(raw, list) and any(
-        isinstance(b, dict) and predicate(b) for b in raw
-    )
+    return isinstance(raw, list) and any(isinstance(b, dict) and predicate(b) for b in raw)
 
 
 def _has_raw_blocks(m, role: str, block_type: str) -> bool:

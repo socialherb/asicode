@@ -1,5 +1,6 @@
 """RED→GREEN: GoogleClient (Gemini) — chat / chat_with_tools /
 _chat_with_tools_streaming_gemini full branch coverage via fake sessions."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -207,9 +208,9 @@ def test_tools_default_model_and_message_kinds() -> None:
     assert parts[0]["inlineData"]["mimeType"] == "image/jpeg"
     assert parts[1]["text"] == "img"
     # tools → functionDeclarations
-    assert payload["tools"] == [{"functionDeclarations": [
-        {"name": "get_weather", "description": "d", "parameters": {"type": "object"}}
-    ]}]
+    assert payload["tools"] == [
+        {"functionDeclarations": [{"name": "get_weather", "description": "d", "parameters": {"type": "object"}}]}
+    ]
 
 
 def test_tools_generation_config_and_errors() -> None:
@@ -226,9 +227,12 @@ def test_tools_generation_config_and_errors() -> None:
     assert gc["thinkingConfig"] == {"thinkingBudget": -1}
 
     for status, exc in [
-        (401, LLMAuthenticationError), (403, LLMAuthenticationError),
-        (429, LLMRateLimitError), (402, LLMQuotaExceededError),
-        (500, LLMServerUnavailableError), (400, LLMAPIError),
+        (401, LLMAuthenticationError),
+        (403, LLMAuthenticationError),
+        (429, LLMRateLimitError),
+        (402, LLMQuotaExceededError),
+        (500, LLMServerUnavailableError),
+        (400, LLMAPIError),
     ]:
         c2 = _client(_resp(status=status, text="e"))
         with pytest.raises(exc):
@@ -242,10 +246,16 @@ def test_tools_no_candidates() -> None:
 
 
 def test_tools_function_call_extraction() -> None:
-    c = _client(_resp(json_data=_ok_json(parts=[
-        {"text": "thinking"},
-        {"functionCall": {"name": "f", "args": {"a": 1}}},
-    ])))
+    c = _client(
+        _resp(
+            json_data=_ok_json(
+                parts=[
+                    {"text": "thinking"},
+                    {"functionCall": {"name": "f", "args": {"a": 1}}},
+                ]
+            )
+        )
+    )
     r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash")
     assert r.content == "thinking"
     assert r.is_final is False
@@ -286,41 +296,61 @@ def test_streaming_post_connection_and_timeout() -> None:
         c._session.post.side_effect = exc
         with pytest.raises(expected):
             c.chat_with_tools(
-                [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+                [LLMMessage(role="user", content="x")],
+                tools=[],
+                model="gemini-2.5-flash",
                 token_callback=lambda _c: None,
             )
 
 
 def test_streaming_status_errors() -> None:
     for status, exc in [
-        (401, LLMAuthenticationError), (403, LLMAuthenticationError),
-        (429, LLMRateLimitError), (402, LLMQuotaExceededError),
-        (500, LLMServerUnavailableError), (400, LLMAPIError),
+        (401, LLMAuthenticationError),
+        (403, LLMAuthenticationError),
+        (429, LLMRateLimitError),
+        (402, LLMQuotaExceededError),
+        (500, LLMServerUnavailableError),
+        (400, LLMAPIError),
     ]:
         c = _stream_client([], status=status)
         with pytest.raises(exc):
             c.chat_with_tools(
-                [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+                [LLMMessage(role="user", content="x")],
+                tools=[],
+                model="gemini-2.5-flash",
                 token_callback=lambda _c: None,
             )
 
 
 def test_streaming_full_flow() -> None:
     chunks = [
-        "data: " + __import__("json").dumps({"candidates": [
-            {"content": {"parts": [{"text": "hel"}]}, "finishReason": None}
-        ], "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}}) + "\n\n",
-        "data: " + __import__("json").dumps({"candidates": [
-            {"content": {"parts": [{"text": "lo"}, {"functionCall": {"name": "f", "args": {"a": 1}}}]}}
-        ]}) + "\n\n",
-        "data: " + __import__("json").dumps({"candidates": [
-            {"content": {"parts": []}, "finishReason": "STOP"}
-        ]}) + "\n\n",
+        "data: "
+        + __import__("json").dumps(
+            {
+                "candidates": [{"content": {"parts": [{"text": "hel"}]}, "finishReason": None}],
+                "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5},
+            }
+        )
+        + "\n\n",
+        "data: "
+        + __import__("json").dumps(
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "lo"}, {"functionCall": {"name": "f", "args": {"a": 1}}}]}}
+                ]
+            }
+        )
+        + "\n\n",
+        "data: "
+        + __import__("json").dumps({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]})
+        + "\n\n",
     ]
     c = _stream_client([ch.encode() for ch in chunks])
     got: list[str] = []
     r = c.chat_with_tools(
-        [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+        [LLMMessage(role="user", content="x")],
+        tools=[],
+        model="gemini-2.5-flash",
         token_callback=got.append,
     )
     assert r.content == "hello"
@@ -342,13 +372,15 @@ def test_streaming_iteration_failures() -> None:
     c._session.post.return_value = _resp(sse=_boom_chunked())
     with pytest.raises(LLMServerUnavailableError):
         c.chat_with_tools(
-            [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+            [LLMMessage(role="user", content="x")],
+            tools=[],
+            model="gemini-2.5-flash",
             token_callback=lambda _c: None,
         )
 
     # plain RequestException → LLMAPIError
     def _boom_req():
-        yield b'data: {}\n'
+        yield b"data: {}\n"
         raise requests.RequestException("net")
 
     c2 = GoogleClient(api_key="k")
@@ -356,13 +388,15 @@ def test_streaming_iteration_failures() -> None:
     c2._session.post.return_value = _resp(sse=_boom_req())
     with pytest.raises(LLMAPIError):
         c2.chat_with_tools(
-            [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+            [LLMMessage(role="user", content="x")],
+            tools=[],
+            model="gemini-2.5-flash",
             token_callback=lambda _c: None,
         )
 
     # typed LLMClientError passes through unchanged
     def _boom_typed():
-        yield b'data: {}\n'
+        yield b"data: {}\n"
         raise LLMRateLimitError("rl")
 
     c3 = GoogleClient(api_key="k")
@@ -370,13 +404,15 @@ def test_streaming_iteration_failures() -> None:
     c3._session.post.return_value = _resp(sse=_boom_typed())
     with pytest.raises(LLMRateLimitError):
         c3.chat_with_tools(
-            [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+            [LLMMessage(role="user", content="x")],
+            tools=[],
+            model="gemini-2.5-flash",
             token_callback=lambda _c: None,
         )
 
     # non-requests Exception → LLMAPIError via raise_sse_iteration_failure
     def _boom_plain():
-        yield b'data: {}\n'
+        yield b"data: {}\n"
         raise RuntimeError("weird")
 
     c4 = GoogleClient(api_key="k")
@@ -384,7 +420,9 @@ def test_streaming_iteration_failures() -> None:
     c4._session.post.return_value = _resp(sse=_boom_plain())
     with pytest.raises(LLMAPIError, match="SSE stream iteration failed"):
         c4.chat_with_tools(
-            [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+            [LLMMessage(role="user", content="x")],
+            tools=[],
+            model="gemini-2.5-flash",
             token_callback=lambda _c: None,
         )
 
@@ -400,7 +438,9 @@ def test_streaming_null_candidate_content_is_skipped() -> None:
     ]
     c = _stream_client([ch.encode() for ch in chunks])
     r = c.chat_with_tools(
-        [LLMMessage(role="user", content="x")], tools=[], model="gemini-2.5-flash",
+        [LLMMessage(role="user", content="x")],
+        tools=[],
+        model="gemini-2.5-flash",
         token_callback=lambda _c: None,
     )
     assert r.content == ""

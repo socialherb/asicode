@@ -17,9 +17,8 @@ queries and ``comment_syntax`` all existed, but no provider was registered, so
 ``.lua`` files — ``find_symbol``/``modify_symbol`` returned empty with no
 signal.  Registering this provider closes that silent-empty-results gap.
 """
-from __future__ import annotations
 
-from typing import Optional
+from __future__ import annotations
 
 from .base import SyntaxProvider, tree_sitter_syntax_fallback
 from .models import (
@@ -68,18 +67,22 @@ class LuaSyntaxProvider(SyntaxProvider):
             # full qualified name so both dotted (M.foo) and colon (Account:withdraw)
             # methods index under their complete name rather than being truncated at
             # the separator.
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"\bfunction\s+{name}\s*\(",
-                description="Lua function definition (function name(...))",
-                name_capture=r"[\w.:]+",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"\bfunction\s+{name}\s*\(",
+                    description="Lua function definition (function name(...))",
+                    name_capture=r"[\w.:]+",
+                )
+            )
             # local name = function(...)  — anonymous function bound to a local
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"\blocal\s+{name}\s*=\s*function\b",
-                description="Lua local function expression (local name = function)",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"\blocal\s+{name}\s*=\s*function\b",
+                    description="Lua local function expression (local name = function)",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -91,17 +94,13 @@ class LuaSyntaxProvider(SyntaxProvider):
         # TestGrammarMapConsistency.test_provider_globs_cover_ext_map.
         return ["*.lua"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

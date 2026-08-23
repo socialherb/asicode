@@ -5,6 +5,7 @@ project-context summarization, and LLM plan parsing branches.
 Complements test_multi_planner.py (null-coercion regressions) by covering the
 rule-based planner surface with fake analyzers so no filesystem scan is needed.
 """
+
 from external_llm.multi_planner import (
     FileOperation,
     LLMEnhancedMultiFilePlanner,
@@ -77,9 +78,7 @@ def test_create_plan_simple_with_suggested_files():
 
 
 def test_create_plan_simple_no_suggested_files():
-    analysis = RequestAnalysis(
-        original_request="hello", intent="general", needs_planning=False
-    )
+    analysis = RequestAnalysis(original_request="hello", intent="general", needs_planning=False)
     plan = _planner(analysis).create_plan("hello")
     assert plan.operations == []
     assert plan.complexity == "simple"
@@ -132,9 +131,7 @@ def test_create_plan_complex_suggested_files():
 
 def test_plan_generic_feature_with_test_dir():
     structure = ProjectStructure(test_dir="tests")
-    ops = _planner(
-        RequestAnalysis(original_request="r"), structure
-    )._plan_generic_feature("widget", structure)
+    ops = _planner(RequestAnalysis(original_request="r"), structure)._plan_generic_feature("widget", structure)
     assert [o.file_path for o in ops] == ["widget.py", "tests/test_widget.py"]
     assert ops[1].dependencies == ["widget.py"]
     assert ops[1].priority == 1
@@ -142,9 +139,7 @@ def test_plan_generic_feature_with_test_dir():
 
 def test_plan_generic_feature_no_test_dir():
     structure = ProjectStructure(test_dir=None)
-    ops = _planner(
-        RequestAnalysis(original_request="r"), structure
-    )._plan_generic_feature("widget", structure)
+    ops = _planner(RequestAnalysis(original_request="r"), structure)._plan_generic_feature("widget", structure)
     assert [o.file_path for o in ops] == ["widget.py"]
 
 
@@ -205,9 +200,7 @@ def test_order_operations_empty():
 
 def test_order_operations_dependency_respected():
     ops = [
-        FileOperation(
-            file_path="b.py", operation="create", description="", dependencies=["a.py"], priority=0
-        ),
+        FileOperation(file_path="b.py", operation="create", description="", dependencies=["a.py"], priority=0),
         FileOperation(file_path="a.py", operation="create", description="", priority=0),
     ]
     ordered = _planner(RequestAnalysis(original_request="r"))._order_operations(ops)
@@ -227,12 +220,7 @@ def test_order_operations_circular_dependency_breaks():
 def test_assess_complexity_boundaries():
     p = _planner(RequestAnalysis(original_request="r"))
     assert p._assess_complexity([]) == "simple"
-    assert (
-        p._assess_complexity(
-            [FileOperation(file_path="a", operation="create", description="")]
-        )
-        == "simple"
-    )
+    assert p._assess_complexity([FileOperation(file_path="a", operation="create", description="")]) == "simple"
     two = [
         FileOperation(file_path="a", operation="create", description=""),
         FileOperation(file_path="b", operation="create", description=""),
@@ -258,9 +246,7 @@ def test_define_success_criteria():
 
 def test_llm_enhanced_init(tmp_path):
     client = object()
-    p = LLMEnhancedMultiFilePlanner(
-        str(tmp_path), llm_client=client, llm_model="m", temperature=0.5
-    )
+    p = LLMEnhancedMultiFilePlanner(str(tmp_path), llm_client=client, llm_model="m", temperature=0.5)
     assert p.llm_client is client
     assert p.llm_model == "m"
     assert p.temperature == 0.5
@@ -299,9 +285,7 @@ plan:
 
 
 def test_llm_create_plan_success():
-    analysis = RequestAnalysis(
-        original_request="add feature", intent="create_feature", needs_planning=True
-    )
+    analysis = RequestAnalysis(original_request="add feature", intent="create_feature", needs_planning=True)
     p = _planner(analysis, cls=LLMEnhancedMultiFilePlanner)
     p.llm_client = _StubClient(response=_SimpleResponse(_LLM_PLAN))
     p.llm_model = "m"
@@ -314,9 +298,7 @@ def test_llm_create_plan_success():
 
 
 def test_llm_create_plan_falls_back_when_client_none():
-    analysis = RequestAnalysis(
-        original_request="add feature", intent="create_feature", needs_planning=True
-    )
+    analysis = RequestAnalysis(original_request="add feature", intent="create_feature", needs_planning=True)
     p = _planner(analysis, cls=LLMEnhancedMultiFilePlanner)
     p.llm_client = None
     plan = p.create_plan("add feature")
@@ -326,9 +308,7 @@ def test_llm_create_plan_falls_back_when_client_none():
 
 
 def test_llm_create_plan_falls_back_when_llm_returns_none():
-    analysis = RequestAnalysis(
-        original_request="add feature", intent="create_feature", needs_planning=True
-    )
+    analysis = RequestAnalysis(original_request="add feature", intent="create_feature", needs_planning=True)
     p = _planner(analysis, cls=LLMEnhancedMultiFilePlanner)
     p.llm_client = _StubClient(response=_SimpleResponse("no plan here"))
     p.llm_model = "m"
@@ -338,9 +318,7 @@ def test_llm_create_plan_falls_back_when_llm_returns_none():
 
 
 def test_llm_create_plan_falls_back_on_exception():
-    analysis = RequestAnalysis(
-        original_request="add feature", intent="create_feature", needs_planning=True
-    )
+    analysis = RequestAnalysis(original_request="add feature", intent="create_feature", needs_planning=True)
     p = _planner(analysis, cls=LLMEnhancedMultiFilePlanner)
     p.llm_client = _StubClient(exc=RuntimeError("boom"))
     p.llm_model = "m"
@@ -350,9 +328,7 @@ def test_llm_create_plan_falls_back_on_exception():
 
 
 def test_llm_create_plan_skips_llm_when_not_needed():
-    analysis = RequestAnalysis(
-        original_request="hi", intent="general", needs_planning=False
-    )
+    analysis = RequestAnalysis(original_request="hi", intent="general", needs_planning=False)
     p = _planner(analysis, cls=LLMEnhancedMultiFilePlanner)
     p.llm_client = _StubClient(response=_SimpleResponse(_LLM_PLAN))
     plan = p.create_plan("hi")
@@ -439,16 +415,10 @@ def test_build_llm_planning_prompt_includes_context():
 
 def test_parse_plan_without_yaml_backticks():
     """No ``` fences -> locate 'plan:' marker and parse from there."""
-    text = (
-        "Here is my plan:\n"
-        "plan:\n"
-        "  operations:\n"
-        "    - file_path: nf.py\n"
-        "      operation: create\n"
+    text = "Here is my plan:\nplan:\n  operations:\n    - file_path: nf.py\n      operation: create\n"
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
     )
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
     assert plan is not None
     assert plan.operations[0].file_path == "nf.py"
 
@@ -456,9 +426,9 @@ def test_parse_plan_without_yaml_backticks():
 def test_parse_direct_operations_dict_without_plan_key():
     """Response shaped as {'operations': [...]} with no 'plan' key."""
     text = "```yaml\noperations:\n  - file_path: d.py\n    operation: create\n```"
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
+    )
     assert plan is not None
     assert plan.operations[0].file_path == "d.py"
 
@@ -469,9 +439,9 @@ def test_parse_skips_bad_yaml_then_accepts_good():
         "```yaml\nplan: [unclosed\n```\n"
         "```yaml\nplan:\n  operations:\n    - file_path: ok.py\n      operation: create\n```"
     )
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
+    )
     assert plan is not None
     assert plan.operations[0].file_path == "ok.py"
 
@@ -479,9 +449,9 @@ def test_parse_skips_bad_yaml_then_accepts_good():
 def test_parse_plan_without_operations_returns_empty_plan():
     """plan exists but lacks operations -> empty ExecutionPlan (not None)."""
     text = "```yaml\nplan:\n  strategy: sequential\n```"
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
+    )
     assert plan is not None
     assert plan.operations == []
 
@@ -489,9 +459,9 @@ def test_parse_plan_without_operations_returns_empty_plan():
 def test_parse_skips_operation_entries_with_non_dict_data():
     """op_data that is not a dict (e.g. null) -> exception -> continue -> None."""
     text = "```yaml\nplan:\n  operations:\n    - null\n```"
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
+    )
     assert plan is None
 
 
@@ -503,9 +473,9 @@ def test_parse_generic_error_returns_none(monkeypatch):
         safe_load = staticmethod(lambda text: (_ for _ in ()).throw(RuntimeError("load failed")))
 
     monkeypatch.setitem(sys.modules, "yaml", _BoomYaml)
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(_LLM_PLAN, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        _LLM_PLAN, "req"
+    )
     assert plan is None
 
 
@@ -521,9 +491,9 @@ plan:
           description: Legacy
           template_file: tpl.py
 ```"""
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
+    )
     assert plan is not None
     op = plan.operations[0]
     assert op.file_path == "legacy.py"
@@ -533,9 +503,7 @@ plan:
 def test_llm_create_plan_falls_back_when_context_build_raises(monkeypatch):
     """create_plan's own except (L378-379): exception escaping
     _create_llm_based_plan's inner try (context build runs before it)."""
-    analysis = RequestAnalysis(
-        original_request="add feature", intent="create_feature", needs_planning=True
-    )
+    analysis = RequestAnalysis(original_request="add feature", intent="create_feature", needs_planning=True)
     p = _planner(analysis, cls=LLMEnhancedMultiFilePlanner)
     p.llm_client = _StubClient(response=_SimpleResponse(_LLM_PLAN))
     p.llm_model = "m"
@@ -553,7 +521,7 @@ def test_llm_create_plan_falls_back_when_context_build_raises(monkeypatch):
 def test_parse_skips_non_plan_dict_without_operations():
     """parsed dict without 'plan' and without 'operations' -> continue -> None."""
     text = "```yaml\njust: a string\n```"
-    plan = _planner(
-        RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner
-    )._parse_llm_plan_response(text, "req")
+    plan = _planner(RequestAnalysis(original_request="req"), cls=LLMEnhancedMultiFilePlanner)._parse_llm_plan_response(
+        text, "req"
+    )
     assert plan is None

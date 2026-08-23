@@ -10,13 +10,13 @@ Features:
 - Tech stack detection via project file inspection
 - Confidence calculation with a normalized 0.0-1.0 score
 """
+
 from __future__ import annotations
 
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,7 @@ class IntentClassifierRule:
     Replaces the ad-hoc _INTENT_CLASSIFIER dict-of-sets with a structured
     rule that includes per-keyword weight and priority scoring.
     """
+
     intent: str
     keywords: set  # exact word boundaries checked
     priority: float = 1.0  # base confidence contribution
@@ -77,6 +78,7 @@ class FeaturePattern:
     Replaces the ad-hoc FEATURE_PATTERNS dict-of-regex with a structured
     pattern that supports multi-language detection and context weighting.
     """
+
     feature: str
     keywords: set  # set of lowercase keyword strings
     weight: float = 1.0
@@ -90,6 +92,7 @@ class TechDetector:
     Replaces the ad-hoc TECH_PATTERNS dict-of-regex with a structured
     detector that specifies which files to check and what to look for.
     """
+
     tech: str
     files: tuple = ()  # file paths to check for existence
     content_patterns: tuple = ()  # regex patterns to match in file content
@@ -110,7 +113,7 @@ class RequestAnalysis:
     intent: str = "general"  # create_feature, fix_bug, refactor, modify_feature, add_test, general
 
     # Feature/component name
-    feature_name: Optional[str] = None
+    feature_name: str | None = None
 
     # Suggested files to create/modify
     suggested_files: list[str] = field(default_factory=list)
@@ -138,36 +141,63 @@ class RequestAnalysis:
 _INTENT_RULES: list[IntentClassifierRule] = [
     # create_feature (highest priority — creation detected before modification)
     IntentClassifierRule(
-        intent="create_feature", priority=0.9,
-        keywords={"create", "add", "implement", "build", "develop", "generate",
-                   "new", "write", "make", "produce", "construct", "introduce"},
+        intent="create_feature",
+        priority=0.9,
+        keywords={
+            "create",
+            "add",
+            "implement",
+            "build",
+            "develop",
+            "generate",
+            "new",
+            "write",
+            "make",
+            "produce",
+            "construct",
+            "introduce",
+        },
         description="Feature creation intent",
     ),
     # fix_bug
     IntentClassifierRule(
-        intent="fix_bug", priority=0.85,
-        keywords={"fix", "repair", "bug", "error", "broken", "crash",
-                   "incorrect", "wrong", "patch", "regression"},
+        intent="fix_bug",
+        priority=0.85,
+        keywords={"fix", "repair", "bug", "error", "broken", "crash", "incorrect", "wrong", "patch", "regression"},
         description="Bug fix intent",
     ),
     # refactor
     IntentClassifierRule(
-        intent="refactor", priority=0.8,
-        keywords={"refactor", "restructure", "clean", "simplify", "organize",
-                   "consolidate", "deduplicate", "reorganize", "split",
-                   "decouple", "inline", "extract", "rearrange"},
+        intent="refactor",
+        priority=0.8,
+        keywords={
+            "refactor",
+            "restructure",
+            "clean",
+            "simplify",
+            "organize",
+            "consolidate",
+            "deduplicate",
+            "reorganize",
+            "split",
+            "decouple",
+            "inline",
+            "extract",
+            "rearrange",
+        },
         description="Code refactoring intent",
     ),
     # modify_feature
     IntentClassifierRule(
-        intent="modify_feature", priority=0.7,
-        keywords={"modify", "change", "improve", "update", "enhance",
-                   "adjust", "revise", "amend", "alter", "upgrade"},
+        intent="modify_feature",
+        priority=0.7,
+        keywords={"modify", "change", "improve", "update", "enhance", "adjust", "revise", "amend", "alter", "upgrade"},
         description="Feature modification intent",
     ),
     # add_test (lowest priority — "test" appears in many contexts)
     IntentClassifierRule(
-        intent="add_test", priority=0.5,
+        intent="add_test",
+        priority=0.5,
         keywords={"test", "spec", "unittest", "coverage", "assertion"},
         description="Test addition intent",
     ),
@@ -178,45 +208,42 @@ _INTENT_RULES: list[IntentClassifierRule] = [
 # (e.g., "login", "password", "profile", "admin"). For other languages,
 # downstream LLM-based intent extraction handles the semantic mapping.
 _FEATURE_PATTERNS: list[FeaturePattern] = [
-      FeaturePattern(feature="login",
-                     keywords={"login", "sign in", "signin", "authentication"},
-                     weight=1.0, description="Login/authentication feature"),
-      FeaturePattern(feature="signup",
-                     keywords={"signup", "sign up", "register", "registration"},
-                     weight=1.0, description="Signup/registration feature"),
-      FeaturePattern(feature="logout",
-                     keywords={"logout", "sign out", "signout"},
-                     weight=1.0, description="Logout feature"),
-      FeaturePattern(feature="password",
-                     keywords={"password", "pwd"},
-                     weight=0.9, description="Password management feature"),
-      FeaturePattern(feature="user",
-                     keywords={"user", "account"},
-                     weight=0.8, description="User/account feature"),
-      FeaturePattern(feature="profile",
-                     keywords={"profile"},
-                     weight=1.0, description="Profile feature"),
-      FeaturePattern(feature="dashboard",
-                     keywords={"dashboard"},
-                     weight=1.0, description="Dashboard feature"),
-      FeaturePattern(feature="admin",
-                     keywords={"admin", "administrator"},
-                     weight=0.9, description="Admin feature"),
-      FeaturePattern(feature="api",
-                     keywords={"api", "endpoint", "rest"},
-                     weight=0.8, description="API/endpoint feature"),
-      FeaturePattern(feature="database",
-                     keywords={"db", "database"},
-                     weight=0.8, description="Database feature"),
-      FeaturePattern(feature="auth",
-                     keywords={"auth", "authorization"},
-                     weight=1.0, description="Authentication/authorization"),
-      FeaturePattern(feature="editor",
-                     keywords={"editor", "line number", "linenumber", "line numbers", "linenumbers"},
-                     weight=1.0, description="Code editor/line numbers feature"),
-      FeaturePattern(feature="ui",
-                     keywords={"ui", "interface", "screen", "frontend"},
-                     weight=0.8, description="UI/frontend feature"),
+    FeaturePattern(
+        feature="login",
+        keywords={"login", "sign in", "signin", "authentication"},
+        weight=1.0,
+        description="Login/authentication feature",
+    ),
+    FeaturePattern(
+        feature="signup",
+        keywords={"signup", "sign up", "register", "registration"},
+        weight=1.0,
+        description="Signup/registration feature",
+    ),
+    FeaturePattern(
+        feature="logout", keywords={"logout", "sign out", "signout"}, weight=1.0, description="Logout feature"
+    ),
+    FeaturePattern(
+        feature="password", keywords={"password", "pwd"}, weight=0.9, description="Password management feature"
+    ),
+    FeaturePattern(feature="user", keywords={"user", "account"}, weight=0.8, description="User/account feature"),
+    FeaturePattern(feature="profile", keywords={"profile"}, weight=1.0, description="Profile feature"),
+    FeaturePattern(feature="dashboard", keywords={"dashboard"}, weight=1.0, description="Dashboard feature"),
+    FeaturePattern(feature="admin", keywords={"admin", "administrator"}, weight=0.9, description="Admin feature"),
+    FeaturePattern(feature="api", keywords={"api", "endpoint", "rest"}, weight=0.8, description="API/endpoint feature"),
+    FeaturePattern(feature="database", keywords={"db", "database"}, weight=0.8, description="Database feature"),
+    FeaturePattern(
+        feature="auth", keywords={"auth", "authorization"}, weight=1.0, description="Authentication/authorization"
+    ),
+    FeaturePattern(
+        feature="editor",
+        keywords={"editor", "line number", "linenumber", "line numbers", "linenumbers"},
+        weight=1.0,
+        description="Code editor/line numbers feature",
+    ),
+    FeaturePattern(
+        feature="ui", keywords={"ui", "interface", "screen", "frontend"}, weight=0.8, description="UI/frontend feature"
+    ),
 ]
 
 # Key files probed for content-pattern tech detection. Read ONCE per
@@ -227,34 +254,27 @@ _KEY_PROBE_FILES: tuple[str, ...] = ("main.py", "package.json", "setup.py", "pyp
 
 # Typed tech stack detectors (project file inspection)
 _TECH_DETECTORS: list[TechDetector] = [
-    TechDetector(tech="django",
-                 files=("manage.py",),
-                 content_patterns=("django", "views.py"),
-                 description="Django web framework"),
-    TechDetector(tech="fastapi",
-                 files=(),
-                 content_patterns=("fastapi", "uvicorn"),
-                 description="FastAPI web framework"),
-    TechDetector(tech="flask",
-                 files=("app.py",),
-                 content_patterns=("flask",),
-                 description="Flask web framework"),
-    TechDetector(tech="react",
-                 files=("package.json",),
-                 content_patterns=("react", "react-dom", "jsx", "tsx"),
-                 description="React frontend framework"),
-    TechDetector(tech="vue",
-                 files=(),
-                 content_patterns=("vue", ".vue"),
-                 description="Vue frontend framework"),
-    TechDetector(tech="python",
-                 files=(),
-                 content_patterns=(".py",),
-                 description="Python project"),
-    TechDetector(tech="typescript",
-                 files=("tsconfig.json",),
-                 content_patterns=(".ts", "typescript"),
-                 description="TypeScript project"),
+    TechDetector(
+        tech="django", files=("manage.py",), content_patterns=("django", "views.py"), description="Django web framework"
+    ),
+    TechDetector(
+        tech="fastapi", files=(), content_patterns=("fastapi", "uvicorn"), description="FastAPI web framework"
+    ),
+    TechDetector(tech="flask", files=("app.py",), content_patterns=("flask",), description="Flask web framework"),
+    TechDetector(
+        tech="react",
+        files=("package.json",),
+        content_patterns=("react", "react-dom", "jsx", "tsx"),
+        description="React frontend framework",
+    ),
+    TechDetector(tech="vue", files=(), content_patterns=("vue", ".vue"), description="Vue frontend framework"),
+    TechDetector(tech="python", files=(), content_patterns=(".py",), description="Python project"),
+    TechDetector(
+        tech="typescript",
+        files=("tsconfig.json",),
+        content_patterns=(".ts", "typescript"),
+        description="TypeScript project",
+    ),
 ]
 
 
@@ -325,7 +345,7 @@ class SmartRequestAnalyzer:
 
     # ── Feature detection ─────────────────────────────────────────
 
-    def _detect_feature(self, req_lower: str) -> Optional[str]:
+    def _detect_feature(self, req_lower: str) -> str | None:
         """Detect feature name using typed, language-neutral patterns.
 
         Returns the first matching feature pattern's feature name.
@@ -393,7 +413,7 @@ class SmartRequestAnalyzer:
     def _suggest_files(
         self,
         intent: str,
-        feature: Optional[str],
+        feature: str | None,
         tech_stack: list[str],
     ) -> tuple[list[str], dict[str, str]]:
         """Suggest files to create/modify based on intent and feature.
@@ -417,7 +437,7 @@ class SmartRequestAnalyzer:
 
         return files, operations
 
-    def _detect_feature_from_context(self, intent: str, tech_stack: list[str]) -> Optional[str]:
+    def _detect_feature_from_context(self, intent: str, tech_stack: list[str]) -> str | None:
         if intent == "create_feature" and self._has_web_framework(tech_stack):
             return "ui"
         return None
@@ -448,7 +468,7 @@ class SmartRequestAnalyzer:
         self,
         original: str,
         intent: str,
-        feature: Optional[str],
+        feature: str | None,
         tech_stack: list[str],
     ) -> str:
         parts = [original]
@@ -474,7 +494,7 @@ class SmartRequestAnalyzer:
         return len(suggested_files) > 1
 
     @staticmethod
-    def _calculate_confidence(intent: str, feature: Optional[str], suggested_files: list[str]) -> float:
+    def _calculate_confidence(intent: str, feature: str | None, suggested_files: list[str]) -> float:
         """Calculate a normalized confidence score.
 
         - Intent detected: +0.3

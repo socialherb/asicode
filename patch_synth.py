@@ -3,11 +3,10 @@ from __future__ import annotations
 import logging
 import re
 from difflib import SequenceMatcher
-from typing import Optional
 
-from common import EDIT_TARGET_MAX_BYTES, normalize_rel_path_fast
+from common import EDIT_TARGET_MAX_BYTES
 from external_llm.common.indent_utils import detect_indent_char, min_indent, shift_block
-from path_security import resolve_inside_repo
+from path_security import normalize_rel_path, resolve_inside_repo
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ def _strip_prompt_tail_markers(block: str) -> str:
 # ============================================================
 # File IO
 # ============================================================
-def _read_text_lines(repo_root: str, rel_path: str) -> Optional[list[str]]:
+def _read_text_lines(repo_root: str, rel_path: str) -> list[str] | None:
     """
     Read file lines safely, returning the line list only.
 
@@ -85,9 +84,7 @@ def _split_diff_lines(raw: str) -> tuple[list[str], bool]:
     return parts, ends_with_newline
 
 
-def _read_text_lines_with_eof(
-    repo_root: str, rel_path: str
-) -> Optional[tuple[list[str], bool]]:
+def _read_text_lines_with_eof(repo_root: str, rel_path: str) -> tuple[list[str], bool] | None:
     """
     Read file lines safely, also reporting whether the file ends with ``\\n``.
 
@@ -99,7 +96,7 @@ def _read_text_lines_with_eof(
         (List[str], bool)  -> success (lines, ends_with_newline); empty file -> ([], False)
         None               -> read failure / path violation
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not rel:
         return None
 
@@ -123,7 +120,10 @@ def _read_text_lines_with_eof(
     if _sz > _EDIT_TARGET_MAX_BYTES:
         logger.warning(
             "edit_target_too_large: rel_path=%r abs_path=%s size=%d (cap %d)",
-            rel_path, str(fp), _sz, _EDIT_TARGET_MAX_BYTES,
+            rel_path,
+            str(fp),
+            _sz,
+            _EDIT_TARGET_MAX_BYTES,
         )
         return None
 
@@ -162,7 +162,6 @@ def _read_text_lines_with_eof(
 # ============================================================
 
 
-
 def _norm_line_for_match(s: str) -> str:
     """
     Normalization for robust anchor matching:
@@ -172,7 +171,7 @@ def _norm_line_for_match(s: str) -> str:
     if s is None:
         return ""
     s = s.replace("\r", "")
-    return ' '.join(s.split())
+    return " ".join(s.split())
 
 
 def _find_line_matches(lines: list[str], rx: re.Pattern, *, normalized: bool = False) -> list[int]:
@@ -219,7 +218,7 @@ def _find_multiline_matches(
     return out
 
 
-def _pick_unique_or_fail(matches: list[int], require_unique: bool) -> Optional[int]:
+def _pick_unique_or_fail(matches: list[int], require_unique: bool) -> int | None:
     if not matches:
         return None
     if require_unique and len(matches) != 1:
@@ -227,7 +226,7 @@ def _pick_unique_or_fail(matches: list[int], require_unique: bool) -> Optional[i
     return matches[0]
 
 
-def _compile_anchor_regex(pattern: str, *, dotall: bool = False) -> Optional[re.Pattern]:
+def _compile_anchor_regex(pattern: str, *, dotall: bool = False) -> re.Pattern | None:
     """Compile regex with MULTILINE; add DOTALL when dotall=True (for multi-line windows)."""
     if not pattern:
         return None
@@ -245,7 +244,7 @@ def _resolve_anchor_index(
     *,
     require_unique: bool = True,
     multiline_window_max_lines: int = 12,
-) -> Optional[int]:
+) -> int | None:
     """
     Resolve anchor match index with fallbacks:
       1) direct line regex on raw lines
@@ -274,6 +273,7 @@ def _resolve_anchor_index(
         return None
     m3 = _find_multiline_matches(lines, rx2, window_max_lines=multiline_window_max_lines)
     return _pick_unique_or_fail(m3, require_unique)
+
 
 # ============================================================
 # EOF-no-newline helpers (shared across all synth/difflib paths)
@@ -335,12 +335,7 @@ def _emit_hunk_replace_body(
     if old_idx is None and new_idx is None:
         return list(body_lines)
 
-    same_line = (
-        old_idx is not None
-        and new_idx is not None
-        and old_idx == new_idx
-        and body_lines[old_idx][:1] == " "
-    )
+    same_line = old_idx is not None and new_idx is not None and old_idx == new_idx and body_lines[old_idx][:1] == " "
 
     out: list[str] = []
 
@@ -365,8 +360,8 @@ def _emit_hunk_replace_body(
         for i, line in enumerate(body_lines):
             if i == new_idx:
                 content = line[1:]
-                out.append("-" + content)            # old: had newline (no marker)
-                out.append("+" + content)            # new: no newline
+                out.append("-" + content)  # old: had newline (no marker)
+                out.append("+" + content)  # new: no newline
                 out.append(_NO_NL_MARKER)
             else:
                 out.append(line)
@@ -390,9 +385,7 @@ def _emit_hunk_replace_body(
     return out
 
 
-def _emit_insert_at_eof_restate(
-    out: list[str], body: list[str], old_last: str, line: str
-) -> None:
+def _emit_insert_at_eof_restate(out: list[str], body: list[str], old_last: str, line: str) -> None:
     """Insert AT EOF on a no-trailing-newline file: re-state the old last line.
 
     Used by the insert synth paths (core helper + the line-no wrapper) when the
@@ -426,9 +419,7 @@ def _insert_marker_after_last_minus(out: list[str]) -> None:
             return
 
 
-def _difflib_apply_eof_markers(
-    body: list[str], *, old_eof_no_newline: bool, new_eof_no_newline: bool
-) -> list[str]:
+def _difflib_apply_eof_markers(body: list[str], *, old_eof_no_newline: bool, new_eof_no_newline: bool) -> list[str]:
     """Post-process a difflib unified-diff body to add EOF-no-newline markers.
 
     ``difflib.unified_diff`` NEVER emits ``\\ No newline at end of file``, so for
@@ -480,12 +471,13 @@ def _difflib_apply_eof_markers(
             new_hunk.append(_NO_NL_MARKER)
     return body[:hs] + new_hunk
 
+
 # ============================================================
 # Diff synth
 # ============================================================
 def synthesize_append_line_unified_diff(repo_root: str, rel_path: str, line: str) -> str:
     """Append exactly one line to EOF (deterministic unified diff)."""
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     line = (line or "").rstrip("\r\n")
     if not rel or line == "":
         return ""
@@ -548,11 +540,11 @@ def _synthesize_insert_with_context_unified_diff(
     repo_root: str,
     rel_path: str,
     *,
-    insert_pos: int,          # 0..len(lines)
+    insert_pos: int,  # 0..len(lines)
     insert_line: str,
     context_lines: int = 12,
-    lines: Optional[list[str]] = None,  # pre-fetched lines (avoid double read)
-    ends_with_newline: Optional[bool] = None,  # pre-fetched EOF flag
+    lines: list[str] | None = None,  # pre-fetched lines (avoid double read)
+    ends_with_newline: bool | None = None,  # pre-fetched EOF flag
 ) -> str:
     """
     Core helper: create a robust unified diff hunk with +/- context_lines around insert_pos.
@@ -564,7 +556,7 @@ def _synthesize_insert_with_context_unified_diff(
     emit the ``\\ No newline at end of file`` marker when the context reaches a
     no-trailing-newline EOF.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     line = (insert_line or "").rstrip("\r\n")
     if not rel or line == "":
         return ""
@@ -594,7 +586,7 @@ def _synthesize_insert_with_context_unified_diff(
 
         def _lead_ws(s: str) -> str:
             s = s or ""
-            return s[:len(s) - len(s.lstrip("\t "))]
+            return s[: len(s) - len(s.lstrip("\t "))]
 
         ia = _lead_ws(ref_after)
         ib = _lead_ws(ref_before)
@@ -642,11 +634,13 @@ def _synthesize_insert_with_context_unified_diff(
         else:
             # Insert BEFORE the EOF line: the trailing context (the old last line)
             # keeps its no-newline state on both sides -> a single marker after it.
-            out.extend(_emit_hunk_replace_body(
-                body,
-                old_eof_no_newline=True,
-                new_eof_no_newline=True,
-            ))
+            out.extend(
+                _emit_hunk_replace_body(
+                    body,
+                    old_eof_no_newline=True,
+                    new_eof_no_newline=True,
+                )
+            )
     else:
         out.extend(body)
 
@@ -662,8 +656,8 @@ def synthesize_insert_line_before_first_match_unified_diff(
     *,
     multiline_window_max_lines: int = 12,
     context_lines: int = 12,
-    lines: Optional[list[str]] = None,  # pre-fetched lines (avoid double read)
-    ends_with_newline: Optional[bool] = None,  # pre-fetched EOF flag (avoid double read)
+    lines: list[str] | None = None,  # pre-fetched lines (avoid double read)
+    ends_with_newline: bool | None = None,  # pre-fetched EOF flag (avoid double read)
 ) -> str:
     """
     Insert exactly one line BEFORE the first line matching before_regex.
@@ -675,7 +669,7 @@ def synthesize_insert_line_before_first_match_unified_diff(
     ``ends_with_newline`` is threaded to the core helper so the EOF-no-newline
     marker is emitted without a re-read when ``lines`` is pre-fetched.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     line = (insert_line or "").rstrip("\r\n")
     if not rel or line == "" or not before_regex:
         return ""
@@ -721,8 +715,8 @@ def synthesize_insert_line_after_first_match_unified_diff(
     *,
     multiline_window_max_lines: int = 12,
     context_lines: int = 12,
-    lines: Optional[list[str]] = None,  # pre-fetched lines (avoid double read)
-    ends_with_newline: Optional[bool] = None,  # pre-fetched EOF flag (avoid double read)
+    lines: list[str] | None = None,  # pre-fetched lines (avoid double read)
+    ends_with_newline: bool | None = None,  # pre-fetched EOF flag (avoid double read)
 ) -> str:
     """
     Insert exactly one line AFTER the first line matching after_regex.
@@ -734,7 +728,7 @@ def synthesize_insert_line_after_first_match_unified_diff(
     ``ends_with_newline`` is threaded to the core helper so the EOF-no-newline
     marker is emitted without a re-read when ``lines`` is pre-fetched.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     line = (insert_line or "").rstrip("\r\n")
     if not rel or line == "" or not after_regex:
         return ""
@@ -783,9 +777,9 @@ def synthesize_replace_first_exact_block_unified_diff(
     # - selected_start_line_1: 1-based start line number to force-pick among multiple hits
     # - selected_indices_0: pick Nth hit (0-based index into "hits" list)
     # - prompt_lines: if provided, we will also try to parse "start_line_1: N" / "start_line: N"
-    selected_start_line_1: Optional[int] = None,
-    selected_indices_0: Optional[list[int]] = None,
-    prompt_lines: Optional[list[str]] = None,
+    selected_start_line_1: int | None = None,
+    selected_indices_0: list[int] | None = None,
+    prompt_lines: list[str] | None = None,
     **_ignored: object,
 ) -> str:
     """
@@ -800,7 +794,7 @@ def synthesize_replace_first_exact_block_unified_diff(
       (NOT str.splitlines(), which would over-split on U+2028/NEL/FF and disagree
       with git's line counting). Matching is exact on line sequences.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel or before_block is None:
         return ""
 
@@ -817,8 +811,7 @@ def synthesize_replace_first_exact_block_unified_diff(
     if not before_lines:
         return ""
 
-
-    def _extract_start_line_hint_1(plines: Optional[list[str]]) -> Optional[int]:
+    def _extract_start_line_hint_1(plines: list[str] | None) -> int | None:
         if not plines:
             return None
 
@@ -874,7 +867,6 @@ def synthesize_replace_first_exact_block_unified_diff(
     if selected_start_line_1 is None:
         selected_start_line_1 = _extract_start_line_hint_1(prompt_lines)
 
-
     # --- find all exact matches of before_lines in lines ---
     n = len(lines)
     m = len(before_lines)
@@ -898,6 +890,7 @@ def synthesize_replace_first_exact_block_unified_diff(
     best_idx = None
 
     if not hits:
+
         def _block_similarity(a: list[str], b: list[str]) -> float:
             sa = "\n".join(a)
             sb = "\n".join(b)
@@ -959,7 +952,6 @@ def synthesize_replace_first_exact_block_unified_diff(
         else:
             return ""
 
-
     start_idx = hits[0]
     end_idx = start_idx + m  # exclusive
 
@@ -995,11 +987,13 @@ def synthesize_replace_first_exact_block_unified_diff(
     # differs in the delete-at-EOF case, which _emit_hunk_replace_body handles.
     if hi == n:
         old_eof_no_newline = not ends_with_newline
-        out.extend(_emit_hunk_replace_body(
-            body,
-            old_eof_no_newline=old_eof_no_newline,
-            new_eof_no_newline=old_eof_no_newline,
-        ))
+        out.extend(
+            _emit_hunk_replace_body(
+                body,
+                old_eof_no_newline=old_eof_no_newline,
+                new_eof_no_newline=old_eof_no_newline,
+            )
+        )
     else:
         out.extend(body)
 
@@ -1024,7 +1018,7 @@ def synthesize_replace_selected_matching_blocks_unified_diff(
 
     Includes the same per-occurrence indent-heal behavior as replace-all.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel or before_block is None:
         return ""
     if not selected_start_lines_1:
@@ -1078,6 +1072,7 @@ def synthesize_replace_selected_matching_blocks_unified_diff(
     after_text = "\n".join(new_lines) + "\n"
     return synthesize_replace_file_unified_diff(repo_root, rel, after_text)
 
+
 def synthesize_replace_line_range_unified_diff(
     repo_root: str,
     rel_path: str,
@@ -1086,8 +1081,8 @@ def synthesize_replace_line_range_unified_diff(
     after_block: str,
     *,
     context_lines: int = 1,
-    lines: Optional[list[str]] = None,
-    ends_with_newline: Optional[bool] = None,
+    lines: list[str] | None = None,
+    ends_with_newline: bool | None = None,
 ) -> str:
     """
     Deterministically replace an inclusive 1-based line range [start_line_1, end_line_1]
@@ -1099,7 +1094,7 @@ def synthesize_replace_line_range_unified_diff(
     ``ends_with_newline`` is the pre-fetched trailing-newline flag for ``lines``;
     when ``lines`` is None it is read from disk along with the content.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel:
         return ""
 
@@ -1161,11 +1156,13 @@ def synthesize_replace_line_range_unified_diff(
         # detects and re-states. (Whole-file rewrite via replace_file is a
         # separate difflib path and is handled there.)
         old_eof_no_newline = not ends_with_newline
-        out.extend(_emit_hunk_replace_body(
-            body,
-            old_eof_no_newline=old_eof_no_newline,
-            new_eof_no_newline=old_eof_no_newline,
-        ))
+        out.extend(
+            _emit_hunk_replace_body(
+                body,
+                old_eof_no_newline=old_eof_no_newline,
+                new_eof_no_newline=old_eof_no_newline,
+            )
+        )
     else:
         out.extend(body)
 
@@ -1180,7 +1177,7 @@ def synthesize_delete_line_unified_diff(
     require_unique: bool = True,
     context_lines: int = 1,
 ) -> str:
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel:
         return ""
 
@@ -1227,8 +1224,8 @@ def synthesize_replace_line_unified_diff(
     *,
     require_unique: bool = True,
     context_lines: int = 3,
-    lines: Optional[list[str]] = None,
-    ends_with_newline: Optional[bool] = None,
+    lines: list[str] | None = None,
+    ends_with_newline: bool | None = None,
 ) -> str:
     """
     Replace exactly one line (before_line) with after_line.
@@ -1238,7 +1235,7 @@ def synthesize_replace_line_unified_diff(
     ``ends_with_newline`` is the pre-fetched trailing-newline flag; threaded to
     the range synth so EOF-no-newline markers are emitted without a re-read.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel:
         return ""
 
@@ -1277,7 +1274,6 @@ def synthesize_replace_line_unified_diff(
         lines=lines,
         ends_with_newline=ends_with_newline,
     )
-
 
 
 def synthesize_delete_first_exact_block_unified_diff(
@@ -1347,7 +1343,7 @@ def find_replace_block_hits_tolerant(
     Return 0-based start indices where before_block matches (tolerant whitespace).
     UI/diagnostics use (shows locations when multiple matches occur).
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel or before_block is None:
         return []
     file_lines = _read_text_lines(repo_root, rel)
@@ -1379,7 +1375,7 @@ def find_closest_replace_block_candidates(
         "excerpt": "  121 | ...\\n>>>123 | ...",
       }
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel:
         return []
     if before_block is None:
@@ -1469,7 +1465,7 @@ def synthesize_replace_all_matching_blocks_unified_diff(
     - Safety guard: returns "" when matches exceed max_replacements
     - indent-heal: shift the AFTER block's min indent to match each BEFORE slice's min indent
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not repo_root or not rel or before_block is None:
         return ""
 
@@ -1532,10 +1528,6 @@ def synthesize_replace_all_matching_blocks_unified_diff(
     return "\n".join(out) + "\n"
 
 
-
-
-
-
 # ============================================================
 # Whole-file rewrite (difflib)
 # ============================================================
@@ -1549,7 +1541,7 @@ def synthesize_replace_file_unified_diff(
     This is deterministic and avoids asking the LLM to format unified diff hunks.
     Returns an empty string if no changes are needed or if file path is invalid.
     """
-    rel = normalize_rel_path_fast(rel_path)
+    rel = normalize_rel_path(rel_path)
     if not rel:
         return ""
 

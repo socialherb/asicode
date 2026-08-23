@@ -9,6 +9,7 @@ indent at the edit site (``matched_indent`` / ``symbol_def_indent``), mirroring
 the gutter — so the LLM can self-verify it matched the file's depth without a
 read_file round-trip.
 """
+
 from pathlib import Path
 
 import pytest
@@ -118,18 +119,17 @@ class TestEditTextMatchedIndentMetadata:
     def test_matched_indent_reflects_edit_site(self, harness, tmp_path):
         target = tmp_path / "t.py"
         target.write_text(
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        x = 1\n"
-            "        return x\n",
+            "class Foo:\n    def bar(self):\n        x = 1\n        return x\n",
             encoding="utf-8",
         )
         # Edit the line at indent 8 (inside the method body).
-        result = harness._tool_edit_text({
-            "file_path": "t.py",
-            "old_string": "        x = 1",
-            "new_string": "        x = 2",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "old_string": "        x = 1",
+                "new_string": "        x = 2",
+            }
+        )
         assert result.ok
         assert result.metadata["matched_line"] == 3
         assert result.metadata["matched_indent"] == 8
@@ -137,18 +137,18 @@ class TestEditTextMatchedIndentMetadata:
     def test_matched_indent_top_level_is_zero(self, harness, tmp_path):
         target = tmp_path / "t.py"
         target.write_text("ALPHA = 1\nBETA = 2\n", encoding="utf-8")
-        result = harness._tool_edit_text({
-            "file_path": "t.py",
-            "old_string": "ALPHA = 1",
-            "new_string": "ALPHA = 10",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "old_string": "ALPHA = 1",
+                "new_string": "ALPHA = 10",
+            }
+        )
         assert result.ok
         assert result.metadata["matched_indent"] == 0
         assert result.metadata["matched_line"] == 1
 
-    def test_reindent_applied_flag_set_when_new_string_indent_corrected(
-        self, harness, tmp_path
-    ):
+    def test_reindent_applied_flag_set_when_new_string_indent_corrected(self, harness, tmp_path):
         # Multi-line block where the LLM strips ALL indentation from old_string.
         # The fallback matcher reconstructs old_string at the file's actual
         # indent (12), and _reindent_to_match shifts new_string to match — so
@@ -156,20 +156,17 @@ class TestEditTextMatchedIndentMetadata:
         # reindent because they match exactly regardless of indent.)
         target = tmp_path / "t.py"
         target.write_text(
-            "class C:\n"
-            "    def m(self):\n"
-            "        if flag:\n"
-            "            a = 1\n"
-            "            b = 2\n"
-            "        after()\n",
+            "class C:\n    def m(self):\n        if flag:\n            a = 1\n            b = 2\n        after()\n",
             encoding="utf-8",
         )
         # Both old and new sent flush-LEFT (wrong) — the file's block is at 12.
-        result = harness._tool_edit_text({
-            "file_path": "t.py",
-            "old_string": "a = 1\nb = 2",
-            "new_string": "a = 10\nb = 20",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "old_string": "a = 1\nb = 2",
+                "new_string": "a = 10\nb = 20",
+            }
+        )
         assert result.ok
         # Reindent fired: new_string shifted from 0 to 12.
         assert result.metadata.get("reindent_applied") is True
@@ -178,16 +175,16 @@ class TestEditTextMatchedIndentMetadata:
         written = target.read_text(encoding="utf-8")
         assert "            a = 10\n            b = 20" in written
 
-    def test_reindent_applied_absent_when_indent_already_correct(
-        self, harness, tmp_path
-    ):
+    def test_reindent_applied_absent_when_indent_already_correct(self, harness, tmp_path):
         target = tmp_path / "t.py"
         target.write_text("    x = 1\n", encoding="utf-8")
-        result = harness._tool_edit_text({
-            "file_path": "t.py",
-            "old_string": "    x = 1",
-            "new_string": "    x = 2",  # same indent → no reindent
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "old_string": "    x = 1",
+                "new_string": "    x = 2",  # same indent → no reindent
+            }
+        )
         assert result.ok
         assert "reindent_applied" not in result.metadata
         assert result.metadata["matched_indent"] == 4
@@ -196,13 +193,15 @@ class TestEditTextMatchedIndentMetadata:
         # Batch mode does not surface per-edit matched_indent (diff carries it).
         target = tmp_path / "t.py"
         target.write_text("a = 1\nb = 2\n", encoding="utf-8")
-        result = harness._tool_edit_text({
-            "file_path": "t.py",
-            "edits": [
-                {"old_string": "a = 1", "new_string": "a = 10"},
-                {"old_string": "b = 2", "new_string": "b = 20"},
-            ],
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "edits": [
+                    {"old_string": "a = 1", "new_string": "a = 10"},
+                    {"old_string": "b = 2", "new_string": "b = 20"},
+                ],
+            }
+        )
         assert result.ok
         assert "matched_indent" not in result.metadata
         assert "matched_line" not in result.metadata
@@ -215,16 +214,16 @@ class TestModifySymbolDefIndentMetadata:
     def test_method_def_indent_reported(self, harness, tmp_path):
         target = tmp_path / "t.py"
         target.write_text(
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        return 1\n",
+            "class Foo:\n    def bar(self):\n        return 1\n",
             encoding="utf-8",
         )
-        result = harness._tool_modify_symbol({
-            "file_path": "t.py",
-            "symbol": "bar",
-            "code": "    def bar(self):\n        return 2\n",
-        })
+        result = harness._tool_modify_symbol(
+            {
+                "file_path": "t.py",
+                "symbol": "bar",
+                "code": "    def bar(self):\n        return 2\n",
+            }
+        )
         assert result.ok
         # bar's def line is line 2 at indent 4.
         assert result.metadata["symbol_def_line"] == 2
@@ -233,19 +232,16 @@ class TestModifySymbolDefIndentMetadata:
     def test_top_level_def_indent_is_zero(self, harness, tmp_path):
         target = tmp_path / "t.py"
         target.write_text(
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        return 1\n"
-            "\n"
-            "def baz():\n"
-            "    pass\n",
+            "class Foo:\n    def bar(self):\n        return 1\n\ndef baz():\n    pass\n",
             encoding="utf-8",
         )
-        result = harness._tool_modify_symbol({
-            "file_path": "t.py",
-            "symbol": "baz",
-            "code": "def baz():\n    return 2\n",
-        })
+        result = harness._tool_modify_symbol(
+            {
+                "file_path": "t.py",
+                "symbol": "baz",
+                "code": "def baz():\n    return 2\n",
+            }
+        )
         assert result.ok
         assert result.metadata["symbol_def_indent"] == 0
         assert result.metadata["symbol_def_line"] == 5
@@ -280,17 +276,16 @@ class TestReadSymbolIndentGutter:
     def _build(self, tmp_path, src, sym_line, sym_end=None):
         (tmp_path / "t.py").write_text(src, encoding="utf-8")
         sym = SymbolDef(
-            file="t.py", line=sym_line, kind="function",
-            name="bar", end_line=sym_end,
+            file="t.py",
+            line=sym_line,
+            kind="function",
+            name="bar",
+            end_line=sym_end,
         )
         return _ReadHarness(tmp_path, sym)
 
     def test_lines_carry_indent_gutter(self, tmp_path):
-        src = (
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        return 1\n"
-        )
+        src = "class Foo:\n    def bar(self):\n        return 1\n"
         harness = self._build(tmp_path, src, sym_line=2, sym_end=3)
         result = harness._tool_read_symbol({"name": "bar", "context_lines": 0})
         assert result.ok
@@ -300,13 +295,7 @@ class TestReadSymbolIndentGutter:
 
     def test_line_numbers_start_at_window_start(self, tmp_path):
         # context_lines=1 → start = sym.line-1-1 = line 1 (1-based).
-        src = (
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        return 1\n"
-            "    def baz(self):\n"
-            "        return 2\n"
-        )
+        src = "class Foo:\n    def bar(self):\n        return 1\n    def baz(self):\n        return 2\n"
         harness = self._build(tmp_path, src, sym_line=2, sym_end=3)
         result = harness._tool_read_symbol({"name": "bar", "context_lines": 1})
         # First numbered line must be line 1, not line 2.

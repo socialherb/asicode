@@ -56,9 +56,7 @@ def test_empty_task_is_rendered_unconditionally(tmp_path):
 
 
 def test_function_signature_section(tmp_path):
-    pack = _builder(tmp_path).build(
-        task="t", function_signature="def f() -> int:\n    return 1"
-    )
+    pack = _builder(tmp_path).build(task="t", function_signature="def f() -> int:\n    return 1")
     assert "### Function Signature" in pack.content
     assert "```python\ndef f() -> int:\n    return 1\n```" in pack.content
     assert pack.metadata["has_signature"] is True
@@ -87,9 +85,7 @@ def test_constraints_section_is_plain_text(tmp_path):
 def test_empty_optional_strings_are_excluded(tmp_path):
     # consumer passes `... or None`, but the direct contract is truthiness:
     # "" must not create a section nor set its metadata flag.
-    pack = _builder(tmp_path).build(
-        task="t", function_signature="", local_snippet="", constraints=""
-    )
+    pack = _builder(tmp_path).build(task="t", function_signature="", local_snippet="", constraints="")
     assert pack.content == "## Task\nt\n"
     assert pack.metadata["has_signature"] is False
     assert pack.metadata["has_snippet"] is False
@@ -144,12 +140,8 @@ def test_section_order_is_task_signature_snippet_constraints(tmp_path):
         constraints="cons",
     )
     assert pack.content.index("## Task") < pack.content.index("### Function Signature")
-    assert pack.content.index("### Function Signature") < pack.content.index(
-        "### Local Context"
-    )
-    assert pack.content.index("### Local Context") < pack.content.index(
-        "### Constraints"
-    )
+    assert pack.content.index("### Function Signature") < pack.content.index("### Local Context")
+    assert pack.content.index("### Local Context") < pack.content.index("### Constraints")
 
 
 # ---------------------------------------------------------------------------

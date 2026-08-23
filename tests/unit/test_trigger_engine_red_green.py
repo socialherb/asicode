@@ -219,7 +219,7 @@ class TestScheduler:
                 return orig_emit(self, ev)
             finally:
                 emit_returned.set()  # emit (incl. callback stop()) finished
-                gate.wait(5)         # hold the timer thread before its re-arm check
+                gate.wait(5)  # hold the timer thread before its re-arm check
 
         monkeypatch.setattr(TriggerEngine, "emit", slow_emit)
 
@@ -235,9 +235,9 @@ class TestScheduler:
             first = q.get(timeout=3.0)
             assert first.kind is TriggerKind.SCHEDULE
             assert emit_returned.wait(3.0)  # timer thread parked before re-arm
-            engine.start()                   # restart before the re-arm check
-            gate.set()                       # release the in-flight tick
-            time.sleep(0.5)                  # a resurrected 0.1s timer would fire here
+            engine.start()  # restart before the re-arm check
+            gate.set()  # release the in-flight tick
+            time.sleep(0.5)  # a resurrected 0.1s timer would fire here
             assert _drain(q) == [], "schedule must not resurrect on restart"
             assert engine._schedule_timers == []
         finally:

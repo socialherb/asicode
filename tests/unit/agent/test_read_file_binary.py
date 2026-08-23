@@ -17,6 +17,7 @@ Pinned here:
   6. ``metadata`` is always a dict — a handler returning None crashes the
      result cache in ToolRegistry._dispatch_impl.
 """
+
 from __future__ import annotations
 
 import codecs

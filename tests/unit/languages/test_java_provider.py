@@ -4,6 +4,7 @@ Covers the graceful-degrade contract: when ``javac`` is not on ``$PATH``
 the provider must fall back to tree-sitter syntax checking rather than
 silently returning ``ok=True``.
 """
+
 from unittest.mock import patch
 
 from external_llm.languages.java_provider import JavaSyntaxProvider
@@ -22,17 +23,13 @@ class TestJavacAbsentDegrade:
 
     def test_valid_passes_tree_sitter_fallback(self):
         with self._tool_absent():
-            r = JavaSyntaxProvider().validate_syntax(
-                "Foo.java", "class Foo {}"
-            )
+            r = JavaSyntaxProvider().validate_syntax("Foo.java", "class Foo {}")
         assert r.ok is True
         assert r.language is LanguageId.JAVA
 
     def test_syntax_error_caught_by_tree_sitter(self):
         with self._tool_absent():
-            r = JavaSyntaxProvider().validate_syntax(
-                "Foo.java", "class Foo {"
-            )
+            r = JavaSyntaxProvider().validate_syntax("Foo.java", "class Foo {")
         assert r.ok is False
         assert r.language is LanguageId.JAVA
         assert len(r.errors) >= 1
@@ -42,6 +39,7 @@ class TestJavacAbsentDegrade:
 class TestJavaRegistryWiring:
     def test_java_provider_registered(self):
         from external_llm.languages.registry import LanguageRegistry
+
         r = LanguageRegistry.instance()
         prov = r.get("Foo.java")
         assert prov.__class__.__name__ == "JavaSyntaxProvider"

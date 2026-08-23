@@ -6,6 +6,7 @@ the small list's (10x+ smaller) token count -- an under-count that inflates
 ``context_message_cap`` and risks prompt overflow. The key is now a content
 fingerprint ``(len, names)`` which is immune to GC address reuse.
 """
+
 from __future__ import annotations
 
 from external_llm.agent import _shared_utils as su
@@ -57,8 +58,7 @@ def test_openai_style_function_name_wrappers():
     """OpenAI tool schemas wrap the name under ``function.name``; the fingerprint
     must still extract it so the cache hits."""
     _clear_cache()
-    su.estimate_tokens_from_tool_schemas(
-        [{"function": {"name": "wrapped"}}, {"name": "flat"}])
+    su.estimate_tokens_from_tool_schemas([{"function": {"name": "wrapped"}}, {"name": "flat"}])
     fp = next(iter(su._tool_schema_token_cache.keys()))
     assert fp[1] == ("wrapped", "flat")
 
@@ -87,6 +87,5 @@ def test_cjk_description_not_undercounted():
     # Distinct names: the content fingerprint keys on names only, so same-name
     # schemas would share a cache entry and mask the estimator difference.
     cjk = su.estimate_tokens_from_tool_schemas([{"name": "t_cjk", "description": _text}])
-    ascii_ = su.estimate_tokens_from_tool_schemas(
-        [{"name": "t_ascii", "description": "x" * len(_text)}])
+    ascii_ = su.estimate_tokens_from_tool_schemas([{"name": "t_ascii", "description": "x" * len(_text)}])
     assert cjk > ascii_, "CJK (3 bytes/char) must cost MORE than same-length ASCII"

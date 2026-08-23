@@ -12,6 +12,7 @@ SymbolSearcher(repo_root)
   .get_symbol_info(name, *, file_path, kind, defs) -> Optional[dict]
 get_symbol_searcher(repo_root)             -> process-shared pooled SymbolSearcher
 """
+
 from __future__ import annotations
 
 import ast
@@ -29,7 +30,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any
 
 from ..common.text_reading import read_line_window
 from ..common.walk_policy import _WALK_SKIP_DIRS
@@ -159,19 +160,20 @@ def _python_ts_parse_too_costly(source: str) -> bool:
 # Data classes
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class SymbolDef:
     file: str
     line: int
-    kind: str   # function | async_function | method | class | variable | import
+    kind: str  # function | async_function | method | class | variable | import
     name: str
-    signature: Optional[str] = None
-    docstring: Optional[str] = None
-    bases: Optional[list[str]] = None        # class base classes
-    methods: Optional[list[str]] = None      # class method names
-    decorators: Optional[list[str]] = None
-    end_line: Optional[int] = None           # 1-indexed inclusive end (from AST end_lineno)
-    parent_class: Optional[str] = None      # set when symbol is a method inside a class
+    signature: str | None = None
+    docstring: str | None = None
+    bases: list[str] | None = None  # class base classes
+    methods: list[str] | None = None  # class method names
+    decorators: list[str] | None = None
+    end_line: int | None = None  # 1-indexed inclusive end (from AST end_lineno)
+    parent_class: str | None = None  # set when symbol is a method inside a class
 
 
 @dataclass
@@ -186,6 +188,7 @@ class SymbolRef:
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _is_definition_line(file_path: str, line: str, name: str) -> bool:
     """Check whether *line* defines *name* using language-aware patterns.
 
@@ -198,7 +201,9 @@ def _is_definition_line(file_path: str, line: str, name: str) -> bool:
     escaped = re.escape(name)
 
     # ── Primary: language-provider patterns (language-agnostic) ──────────
-    with contextlib.suppress(KeyError, TypeError, ValueError, AttributeError, re.error):  # fall through to heuristic fallback
+    with contextlib.suppress(
+        KeyError, TypeError, ValueError, AttributeError, re.error
+    ):  # fall through to heuristic fallback
         registry = LanguageRegistry.instance()
         provider = registry.get(file_path)
         if provider is not None:
@@ -216,6 +221,8 @@ def _is_definition_line(file_path: str, line: str, name: str) -> bool:
         stripped.startswith((f"def {name}", f"async def {name}", f"class {name}"))
         or re.match(rf"^(function\s+{escaped}|const\s+{escaped}\s*=)", stripped)
     )
+
+
 def _unparse(node: ast.AST) -> str:
     try:
         return ast.unparse(node)
@@ -297,7 +304,7 @@ def _build_ts_method_signature(class_name: str, method: Any) -> str:
     return f"{class_name}.{static}{prefix}{method.name}({', '.join(params)}){ret}"
 
 
-def _ts_node_end_line(node: Any) -> Optional[int]:
+def _ts_node_end_line(node: Any) -> int | None:
     """Extent of a TS/JS IR node, or None when it carries no usable one.
 
     Mirrors the ``meta or bare attribute`` shape the start lines already use,
@@ -349,9 +356,7 @@ def _nonpy_index_globs() -> list[str]:
     """
     globs: list[str] = []
     registry = LanguageRegistry.instance()
-    for provider in sorted(
-        set(registry._providers.values()), key=lambda p: p.language_id().value
-    ):
+    for provider in sorted(set(registry._providers.values()), key=lambda p: p.language_id().value):
         lang_id = provider.language_id().value
         if lang_id in ("python", "typescript", "javascript"):
             continue
@@ -404,9 +409,13 @@ def _too_big_to_parse_inproc(st_size: int, file_path: Any) -> bool:
         return False
     logger.debug(
         "[symbol-search] skipping in-process parse of %s (%d bytes > %d)",
-        file_path, st_size, _NONPY_INPROC_MAX_BYTES,
+        file_path,
+        st_size,
+        _NONPY_INPROC_MAX_BYTES,
     )
     return True
+
+
 # Stream size for _word_in_files. A whole-word match needs at most
 # len(token) + 2 bytes of context (one word char on each side), so carrying
 # that many trailing bytes across the seam keeps the lookarounds exact.
@@ -415,7 +424,7 @@ _NONPY_SCAN_CHUNK = 64 * 1024
 _NONPY_FILES_CACHE: dict[str, tuple] = {}
 
 
-def _nonpy_indexable_files(root: Path) -> Optional[tuple[list[str], int]]:
+def _nonpy_indexable_files(root: Path) -> tuple[list[str], int] | None:
     """TTL-cached ``(paths, total_bytes)`` of files the non-Python index reads.
 
     One ``rg --files`` walk shared across every token, where the probe's own
@@ -441,7 +450,10 @@ def _nonpy_indexable_files(root: Path) -> Optional[tuple[list[str], int]]:
     try:
         proc = subprocess.run(
             [rg, "--files", "--no-ignore-vcs", *glob_args, "."],
-            cwd=str(root), capture_output=True, text=True, timeout=10,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=10,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -525,7 +537,7 @@ def _word_in_files(files: list[str], token: str) -> bool:
 # FIFO-capped BELOW the sibling caches on purpose: a value is content (up to
 # _NONPY_INPROC_MAX_BYTES each), not paths, so the cap is also the memory
 # bound (4 x 8 MB worst case).
-_NONPY_BLOB_CACHE: dict[tuple, tuple[float, dict[str, Optional[tuple[int, int]]], str]] = {}
+_NONPY_BLOB_CACHE: dict[tuple, tuple[float, dict[str, tuple[int, int] | None], str]] = {}
 _NONPY_BLOB_MAX_ENTRIES: int = 4
 
 # The lookaround form (?<!\w)...(?!\w) costs ~16 ns/byte (the engine visits
@@ -556,15 +568,13 @@ def _blob_contains_word(blob: str, token: str) -> bool:
         if m is None:
             return False
         _s, _e = m.start(), m.end()
-        if (_s == 0 or not _WORD_CHAR.match(blob, _s - 1)) and (
-            _e == len(blob) or not _WORD_CHAR.match(blob, _e)
-        ):
+        if (_s == 0 or not _WORD_CHAR.match(blob, _s - 1)) and (_e == len(blob) or not _WORD_CHAR.match(blob, _e)):
             return True
         _pos = _s + 1
     return False
 
 
-def _path_sig(path: str) -> Optional[tuple[int, int]]:
+def _path_sig(path: str) -> tuple[int, int] | None:
     """(st_mtime_ns, st_size) of *path*, or None when it cannot be stat-ed."""
     try:
         st = os.stat(path)
@@ -574,7 +584,7 @@ def _path_sig(path: str) -> Optional[tuple[int, int]]:
     return (st.st_mtime_ns, st.st_size)
 
 
-def _sigs_valid(sigs: dict[str, Optional[tuple[int, int]]], files: list[str]) -> bool:
+def _sigs_valid(sigs: dict[str, tuple[int, int] | None], files: list[str]) -> bool:
     """Whether every *file* still matches its cached signature.
 
     A stored None (file was missing at build time) stays valid while the file
@@ -587,7 +597,7 @@ def _sigs_valid(sigs: dict[str, Optional[tuple[int, int]]], files: list[str]) ->
     return all(sigs.get(f) == _path_sig(f) for f in files)
 
 
-def _nonpy_blob(files: list[str]) -> tuple[dict[str, Optional[tuple[int, int]]], str]:
+def _nonpy_blob(files: list[str]) -> tuple[dict[str, tuple[int, int] | None], str]:
     """``(sigs, content)`` — one full read of *files* joined by ``"\\n"``.
 
     Unreadable files are skipped with their signature still recorded, matching
@@ -596,7 +606,7 @@ def _nonpy_blob(files: list[str]) -> tuple[dict[str, Optional[tuple[int, int]]],
     boundary: whole-word semantics survive the join. (Hence the newline guard
     in the caller — a token containing one could otherwise match across seams.)
     """
-    sigs: dict[str, Optional[tuple[int, int]]] = {}
+    sigs: dict[str, tuple[int, int] | None] = {}
     parts: list[str] = []
     for f in files:
         try:
@@ -633,12 +643,11 @@ def _word_in_files_cached(root: Path, files: list[str], token: str) -> bool:
     # is hidden by the speculative probe, and it turns every later token into
     # a no-I/O literal search).
     _sigs, _blob = _nonpy_blob(files)
-    _capped_put(_NONPY_BLOB_CACHE, key, (_time.monotonic(), _sigs, _blob),
-                _NONPY_BLOB_MAX_ENTRIES)
+    _capped_put(_NONPY_BLOB_CACHE, key, (_time.monotonic(), _sigs, _blob), _NONPY_BLOB_MAX_ENTRIES)
     return _blob_contains_word(_blob, token)
 
 
-def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
+def _rg_token_in_nonpy_files(root: Path, token: str) -> bool | None:
     """Whether *token* appears as a bare word in any indexed non-Python file.
 
     Companion to :func:`_rg_py_files_containing` for the non-Python index: a
@@ -676,10 +685,12 @@ def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
         return None  # no non-Python providers -> nothing to assert; build as before
     try:
         proc = subprocess.run(
-            [rg, "--quiet", "--no-ignore-vcs", "--word-regexp", "--fixed-strings",
-                *glob_args, "--", token, "."],
-            cwd=str(root), capture_output=True, text=True, timeout=10,
-                check=False,
+            [rg, "--quiet", "--no-ignore-vcs", "--word-regexp", "--fixed-strings", *glob_args, "--", token, "."],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("nonpy index probe: rg failed (%s) — building index", e)
@@ -692,7 +703,7 @@ def _rg_token_in_nonpy_files(root: Path, token: str) -> Optional[bool]:
     return None
 
 
-def _rg_py_files_containing(root: Path, token: str) -> Optional[set[str]]:
+def _rg_py_files_containing(root: Path, token: str) -> set[str] | None:
     """Absolute paths of .py files under *root* containing *token* as a word.
 
     A prefilter for the Python symbol scan: a file that DEFINES ``token`` must
@@ -743,7 +754,7 @@ def invalidate_py_prefilter_cache() -> None:
     _RG_PY_FILTER_CACHE.clear()
 
 
-def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]:
+def _rg_list_py_files(root: Path, matcher_args: list[str]) -> set[str] | None:
     """Core rg runner for the find_symbol prefilters.
 
     Returns absolute paths of .py files under *root* that rg matches with
@@ -791,19 +802,19 @@ def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]
         for _d in _WALK_SKIP_DIRS:
             _skip_globs.extend(["--glob", f"!**/{_d}/**"])
         proc = subprocess.run(
-            [rg, "--files-with-matches", "--type", "py",
-             "--no-ignore-vcs", *_skip_globs, *matcher_args, "."],
-            cwd=str(root), capture_output=True, text=True, timeout=10,
-             check=False,
+            [rg, "--files-with-matches", "--type", "py", "--no-ignore-vcs", *_skip_globs, *matcher_args, "."],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.debug("find_symbol prefilter: rg failed (%s) — scanning all files", e)
         return None
     # 0 = matches, 1 = no matches (a real, trustworthy empty answer), 2+ = error.
     if proc.returncode not in (0, 1):
-        logger.debug(
-            "find_symbol prefilter: rg exit %s — scanning all files", proc.returncode
-        )
+        logger.debug("find_symbol prefilter: rg exit %s — scanning all files", proc.returncode)
         return None
     out: set[str] = set()
     for line in proc.stdout.splitlines():
@@ -815,8 +826,7 @@ def _rg_list_py_files(root: Path, matcher_args: list[str]) -> Optional[set[str]]
             # root makes them string-identical; per-path realpath() here cost
             # ~1,150 lstat-walking calls per find_symbol on this repo.
             out.add(str(root / line))
-    _capped_put(_RG_PY_FILTER_CACHE, _key, (_time.monotonic(), set(out)),
-                _RG_PY_FILTER_MAX_ENTRIES)
+    _capped_put(_RG_PY_FILTER_CACHE, _key, (_time.monotonic(), set(out)), _RG_PY_FILTER_MAX_ENTRIES)
     return out
 
 
@@ -837,7 +847,7 @@ _DEF_PATTERNS["constant"] = _DEF_PATTERNS["variable"]
 _PLAIN_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
-def _rg_py_files_defining(root: Path, token: str, kind: str) -> Optional[set[str]]:
+def _rg_py_files_defining(root: Path, token: str, kind: str) -> set[str] | None:
     """Files that can DEFINE *token* (per kind), or None when not answerable.
 
     A strict subset of :func:`_rg_py_files_containing`: a definition line
@@ -862,9 +872,7 @@ def _rg_py_files_defining(root: Path, token: str, kind: str) -> Optional[set[str
         return None
     pattern = _DEF_PATTERNS.get(kind)
     if pattern is None:  # "any" or an unrecognized kind → union of all shapes
-        pattern = "|".join(
-            _DEF_PATTERNS[k] for k in ("class", "function", "variable")
-        )
+        pattern = "|".join(_DEF_PATTERNS[k] for k in ("class", "function", "variable"))
     return _rg_list_py_files(root, ["--", pattern.replace("{t}", token)])
 
 
@@ -881,6 +889,7 @@ def _walk_ts_js_files(root: Path) -> list[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tree-sitter helpers (Python symbol extraction)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _ts_build_py_function_signature(node, code_bytes: bytes) -> str:
     """Build function signature from a tree-sitter function_definition node.
@@ -923,7 +932,7 @@ def _ts_extract_decorators(node, code_bytes: bytes) -> list[str]:
     if node.type == "decorated_definition":
         for child in node.children:
             if child.type == "decorator":
-                d_text = code_bytes[child.start_byte:child.end_byte].decode("utf-8")
+                d_text = code_bytes[child.start_byte : child.end_byte].decode("utf-8")
                 decs.append(d_text.lstrip("@").strip())
     else:
         # Function may have decorator_list child
@@ -936,7 +945,7 @@ def _ts_extract_decorators(node, code_bytes: bytes) -> list[str]:
     return decs
 
 
-def _ts_extract_docstring(node, code_bytes: bytes) -> Optional[str]:
+def _ts_extract_docstring(node, code_bytes: bytes) -> str | None:
     """Extract docstring from a function/class tree-sitter node.
 
     Two independent shape problems are handled here:
@@ -957,9 +966,7 @@ def _ts_extract_docstring(node, code_bytes: bytes) -> Optional[str]:
     if body and body.children:
         first = body.children[0]
         if first.type in ("expression_statement", "string"):
-            expr = first if first.type == "string" else (
-                first.children[0] if first.children else None
-            )
+            expr = first if first.type == "string" else (first.children[0] if first.children else None)
             if expr is not None and expr.type == "string":
                 text = _ts_get_node_text(code_bytes, expr)
                 # Strip quotes
@@ -1125,8 +1132,7 @@ class SymbolSearcher:
             resolved = os.path.realpath(raw)
         except OSError:
             resolved = raw
-        _cache_put_lru(self._realpath_memo, raw, resolved,
-                       _REALPATH_MEMO_MAX_ENTRIES)
+        _cache_put_lru(self._realpath_memo, raw, resolved, _REALPATH_MEMO_MAX_ENTRIES)
         return resolved
 
     # ── public API ───────────────────────────────────────────────────────────
@@ -1136,8 +1142,8 @@ class SymbolSearcher:
         name: str,
         *,
         kind: str = "any",
-        search_path: Optional[str] = None,
-    ) -> Optional[SymbolDef]:
+        search_path: str | None = None,
+    ) -> SymbolDef | None:
         """
         Fuzzy match symbol names using difflib.
         """
@@ -1148,12 +1154,7 @@ class SymbolSearcher:
 
         names = [c.name for c in candidates]
 
-        matches = difflib.get_close_matches(
-            name,
-            names,
-            n=1,
-            cutoff=0.6
-        )
+        matches = difflib.get_close_matches(name, names, n=1, cutoff=0.6)
 
         if not matches:
             return None
@@ -1164,14 +1165,13 @@ class SymbolSearcher:
 
         return None
 
-
     def find_symbol(
         self,
         name: str,
         *,
         kind: str = "any",
-        search_path: Optional[str] = None,
-        prefer_files: Optional[list[str]] = None,
+        search_path: str | None = None,
+        prefer_files: list[str] | None = None,
     ) -> list[SymbolDef]:
         """
         Find definition(s) of a symbol by name.
@@ -1205,11 +1205,9 @@ class SymbolSearcher:
             # Guard: root may be a directory (e.g. "playground/galaga"), not a file.
             # _find_in_python calls read_text() which raises IsADirectoryError.
             if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON:
-                parent_results = self._find_in_python_cached(root, search_name, kind,
-                                                             parent_class=parent_class)
+                parent_results = self._find_in_python_cached(root, search_name, kind, parent_class=parent_class)
             elif root.is_file() and LanguageId.from_path(str(root)) == LanguageId.GO:
-                parent_results = self._find_in_go(root, search_name, kind,
-                                                  parent_class=parent_class)
+                parent_results = self._find_in_go(root, search_name, kind, parent_class=parent_class)
             else:
                 parent_results = []
             if parent_results:
@@ -1225,8 +1223,9 @@ class SymbolSearcher:
                 if parent_file and not parent_file.is_absolute():
                     parent_file = self.repo_root / parent_file
                 if parent_file and parent_file.exists():
-                    parent_results = self._find_in_python_cached(parent_file, search_name, kind,
-                                                                parent_class=parent_class)
+                    parent_results = self._find_in_python_cached(
+                        parent_file, search_name, kind, parent_class=parent_class
+                    )
                     if parent_results:
                         return parent_results[:20]
 
@@ -1238,8 +1237,7 @@ class SymbolSearcher:
                     # _is_dataclass helper).
                     if search_name == "__init__" and parent_defs[0].kind == "class":
                         _is_dataclass = any(
-                            d.startswith(("dataclass", "@dataclass"))
-                            for d in (parent_defs[0].decorators or [])
+                            d.startswith(("dataclass", "@dataclass")) for d in (parent_defs[0].decorators or [])
                         )
                         if _is_dataclass:
                             logger.info(
@@ -1266,16 +1264,16 @@ class SymbolSearcher:
         _nonpy_probe = None
         if kind == "any":
             try:
-                _nonpy_probe = _shared_pool.submit(
-                    self._nonpy_index_worth_building, root, search_name
-                )
+                _nonpy_probe = _shared_pool.submit(self._nonpy_index_worth_building, root, search_name)
             except RuntimeError:
                 # Pool shut down (interpreter teardown) — fall back to the
                 # inline call at the collection point.
                 _nonpy_probe = None
 
         # ── Python AST scan ──────────────────────────────────────────────────
-        py_files = [root] if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON else _walk_py_files(root)
+        py_files = (
+            [root] if root.is_file() and LanguageId.from_path(str(root)) == LanguageId.PYTHON else _walk_py_files(root)
+        )
         # Narrow to files that actually contain the name before parsing any of
         # them. Intersecting (rather than using rg's list directly) keeps
         # _walk_py_files as the sole authority on which files are in scope, so
@@ -1305,6 +1303,7 @@ class SymbolSearcher:
 
         # ── TS/JS rich scan via TSSemanticTracer ─────────────────────────────
         from config import MULTILANG_SYMBOL_SEARCH as _ML_SYM  # config defines it — no fallback needed
+
         if _ML_SYM and not results:
             if root.is_file() and LanguageId.from_path(str(root)) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT):
                 results.extend(self._find_in_ts_js(root, search_name, kind))
@@ -1454,8 +1453,8 @@ class SymbolSearcher:
         _prefer_basenames = {os.path.basename(f): f for f in prefer_files}
         _prefer_dirs = {os.path.dirname(f) for f in prefer_files if f}
 
-        _test_patterns = ('/test', '_test', '/tests/', 'test_', '/fixtures/')
-        _strong_kinds = {'class', 'function', 'async_function', 'method'}
+        _test_patterns = ("/test", "_test", "/tests/", "test_", "/fixtures/")
+        _strong_kinds = {"class", "function", "async_function", "method"}
 
         scores: dict[int, float] = {}
         for i, d in enumerate(results):
@@ -1491,7 +1490,7 @@ class SymbolSearcher:
         self,
         name: str,
         *,
-        search_path: Optional[str] = None,
+        search_path: str | None = None,
         include_definitions: bool = False,
     ) -> list[SymbolRef]:
         """
@@ -1505,12 +1504,20 @@ class SymbolSearcher:
         pattern = rf"\b{re.escape(name)}\b"
         try:
             cmd = [
-                "rg", "--no-heading", "--line-number",
-                "-m", "5", pattern, str(root),
+                "rg",
+                "--no-heading",
+                "--line-number",
+                "-m",
+                "5",
+                pattern,
+                str(root),
             ]
             proc = subprocess.run(
-                cmd, cwd=str(self.repo_root),
-                capture_output=True, text=True, timeout=10,
+                cmd,
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=10,
                 check=False,
             )
             refs: list[SymbolRef] = []
@@ -1547,11 +1554,7 @@ class SymbolSearcher:
                     # Sort by score only — SymbolRef has no ordering, so a
                     # plain reverse sort would compare SymbolRef on score ties
                     # and raise TypeError ('<' not supported).
-                    refs = [
-                        r for _, r in sorted(
-                            zip(_scores, refs, strict=False), key=lambda x: x[0], reverse=True
-                        )
-                    ]
+                    refs = [r for _, r in sorted(zip(_scores, refs, strict=False), key=lambda x: x[0], reverse=True)]
             return refs[:40]
         except FileNotFoundError:
             # rg not installed — graceful skip
@@ -1564,10 +1567,10 @@ class SymbolSearcher:
         self,
         name: str,
         *,
-        file_path: Optional[str] = None,
+        file_path: str | None = None,
         kind: str = "any",
-        defs: Optional[list[SymbolDef]] = None,
-    ) -> Optional[dict[str, Any]]:
+        defs: list[SymbolDef] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Returns symbol metadata including definitions, references, and callers.
         Includes signature, docstring, bases/methods (for classes), subclasses, reference count.
@@ -1610,16 +1613,10 @@ class SymbolSearcher:
         if refs:
             ref_files = list(dict.fromkeys(r.file for r in refs))[:5]
             info["referenced_in"] = ref_files
-            info["sample_references"] = [
-                {"file": r.file, "line": r.line, "context": r.context[:400]}
-                for r in refs[:4]
-            ]
+            info["sample_references"] = [{"file": r.file, "line": r.line, "context": r.context[:400]} for r in refs[:4]]
 
         if len(defs) > 1:
-            info["other_definitions"] = [
-                {"file": d.file, "line": d.line, "kind": d.kind}
-                for d in defs[1:5]
-            ]
+            info["other_definitions"] = [{"file": d.file, "line": d.line, "kind": d.kind} for d in defs[1:5]]
 
         # NOTE: no "read_guidance" key. It used to be built here on every call
         # and no caller ever read it — both consumers cherry-pick specific keys
@@ -1657,6 +1654,7 @@ class SymbolSearcher:
             return self._outline_python(p, rel)
         if LanguageId.from_path(str(p)) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT):
             from config import MULTILANG_OUTLINE as _ML_OL  # config defines it — no fallback needed
+
             if _ML_OL:
                 _ts_outline = self._outline_ts_js(p, rel)
                 if _ts_outline:
@@ -1695,10 +1693,7 @@ class SymbolSearcher:
         method lists at 25 entries, exactly as the map already stores them.
         """
         full_map = self._python_symbol_map(file_path)
-        out = [
-            d for defs in full_map.values() for d in defs
-            if d.parent_class is None
-        ]
+        out = [d for defs in full_map.values() for d in defs if d.parent_class is None]
         out.sort(key=lambda s: s.line)
         return out
 
@@ -1724,10 +1719,7 @@ class SymbolSearcher:
         lang_id = LanguageId.from_path(str(file_path)).value
         # Non-Python only (Python has _outline_python). TS/JS keep their richer
         # TSSemanticTracer path via _outline_ts_js.
-        if (
-            lang_id not in _TS_LANG_MODULE_MAP
-            or lang_id in ("python", "typescript", "javascript")
-        ):
+        if lang_id not in _TS_LANG_MODULE_MAP or lang_id in ("python", "typescript", "javascript"):
             return []
         if not _ts_language_available(lang_id):
             return []  # grammar mapped but not installed → caller falls back
@@ -1739,8 +1731,9 @@ class SymbolSearcher:
             syms = _ts_find_all_symbols(content, lang_id)
         except Exception as _err:
             logger.debug(
-                "[symbol-search] tree-sitter outline failed for %s (%s) — "
-                "falling back to ripgrep outline", file_path, _err,
+                "[symbol-search] tree-sitter outline failed for %s (%s) — falling back to ripgrep outline",
+                file_path,
+                _err,
             )
             return []  # non-critical — fall back to _outline_ripgrep
         src_lines = content.splitlines()
@@ -1749,10 +1742,16 @@ class SymbolSearcher:
             sig = None
             if 0 < start_line <= len(src_lines):
                 sig = src_lines[start_line - 1].strip() or None
-            results.append(SymbolDef(
-                file=rel, line=start_line, kind=kind, name=name,
-                signature=sig, end_line=end_line,
-            ))
+            results.append(
+                SymbolDef(
+                    file=rel,
+                    line=start_line,
+                    kind=kind,
+                    name=name,
+                    signature=sig,
+                    end_line=end_line,
+                )
+            )
         results.sort(key=lambda s: s.line)
         return results
 
@@ -1783,9 +1782,9 @@ class SymbolSearcher:
         else:
             # Fallback for languages without a registered provider (Rust, etc.)
             patterns = [
-                (r"^\s*(?:pub\s+)?fn\s+(\w+)", "function"),   # Rust
-                (r"^\s*(?:pub\s+)?struct\s+(\w+)", "class"),   # Rust
-                (r"^\s*(?:pub\s+)?enum\s+(\w+)", "enum"),      # Rust
+                (r"^\s*(?:pub\s+)?fn\s+(\w+)", "function"),  # Rust
+                (r"^\s*(?:pub\s+)?struct\s+(\w+)", "class"),  # Rust
+                (r"^\s*(?:pub\s+)?enum\s+(\w+)", "enum"),  # Rust
             ]
 
         for pat, kind in patterns:
@@ -1800,7 +1799,9 @@ class SymbolSearcher:
                 # match — see `_index_via_treesitter` which uses the same flag.
                 proc = subprocess.run(
                     ["rg", "--no-heading", "--with-filename", "--line-number", "-m", "50", pat, str(file_path)],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                     check=False,
                 )
                 for line in (proc.stdout or "").splitlines():
@@ -1828,15 +1829,20 @@ class SymbolSearcher:
                     if key in seen:
                         continue
                     seen.add(key)
-                    results.append(SymbolDef(
-                        file=rel, line=lineno, kind=kind, name=name,
-                        signature=ctx,
-                    ))
+                    results.append(
+                        SymbolDef(
+                            file=rel,
+                            line=lineno,
+                            kind=kind,
+                            name=name,
+                            signature=ctx,
+                        )
+                    )
 
         results.sort(key=lambda s: s.line)
         return results
 
-    def _resolve_search_root(self, search_path: Optional[str]) -> Optional[Path]:
+    def _resolve_search_root(self, search_path: str | None) -> Path | None:
         if not search_path:
             return self.repo_root
         with contextlib.suppress(OSError, RuntimeError):  # resolve() on broken path / symlink loop
@@ -1845,7 +1851,7 @@ class SymbolSearcher:
                 return p
         return None
 
-    def index_was_truncated(self, search_path: Optional[str] = None) -> bool:
+    def index_was_truncated(self, search_path: str | None = None) -> bool:
         """True if the most recent file walk for *search_path* hit the cap.
 
         find_symbol walks the candidate file set lazily; on a MISS the result
@@ -1862,9 +1868,8 @@ class SymbolSearcher:
         root = self._resolve_search_root(search_path)
         if root is None:
             return False
-        return (
-            _shared_walk_truncated_for(root, _SHARED_PY_WALK_CACHE, _MAX_PY_FILES)
-            or _shared_walk_truncated_for(root, _SHARED_TS_WALK_CACHE, _MAX_TS_FILES)
+        return _shared_walk_truncated_for(root, _SHARED_PY_WALK_CACHE, _MAX_PY_FILES) or _shared_walk_truncated_for(
+            root, _SHARED_TS_WALK_CACHE, _MAX_TS_FILES
         )
 
     # ── Python per-file symbol extraction + mtime cache ────────────────────
@@ -1874,7 +1879,9 @@ class SymbolSearcher:
     # every lookup. Invalidated by mtime.
 
     def _extract_all_python_symbols(
-        self, file_path: Path, rel: str,
+        self,
+        file_path: Path,
+        rel: str,
     ) -> dict[str, list[SymbolDef]]:
         """Extract ALL symbols from a Python file into a {name: [defs]} map.
 
@@ -1948,7 +1955,10 @@ class SymbolSearcher:
 
     @staticmethod
     def _ast_add_func(
-        out: dict[str, list[SymbolDef]], node: ast.AST, rel: str, parent_class: str,
+        out: dict[str, list[SymbolDef]],
+        node: ast.AST,
+        rel: str,
+        parent_class: str,
     ) -> None:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return
@@ -1956,63 +1966,97 @@ class SymbolSearcher:
         doc = (ast.get_docstring(node) or "")[:150] or None
         decs = [_unparse(d) for d in node.decorator_list if d] or None
         nk = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
-        out.setdefault(node.name, []).append(SymbolDef(
-            file=rel, line=node.lineno, kind=nk, name=node.name,
-            signature=sig, docstring=doc, decorators=decs,
-            end_line=getattr(node, "end_lineno", None),
-            parent_class=parent_class or None,
-        ))
+        out.setdefault(node.name, []).append(
+            SymbolDef(
+                file=rel,
+                line=node.lineno,
+                kind=nk,
+                name=node.name,
+                signature=sig,
+                docstring=doc,
+                decorators=decs,
+                end_line=getattr(node, "end_lineno", None),
+                parent_class=parent_class or None,
+            )
+        )
 
     @staticmethod
     def _ast_add_class(
-        out: dict[str, list[SymbolDef]], node: ast.ClassDef, rel: str, parent_class: str,
+        out: dict[str, list[SymbolDef]],
+        node: ast.ClassDef,
+        rel: str,
+        parent_class: str,
     ) -> None:
         bases = [_unparse(b) for b in node.bases] or None
-        methods = [
-            n.name for n in node.body
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
+        methods = [n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         doc = (ast.get_docstring(node) or "")[:150] or None
         decs = [_unparse(d) for d in node.decorator_list if d] or None
-        out.setdefault(node.name, []).append(SymbolDef(
-            file=rel, line=node.lineno, kind="class", name=node.name,
-            bases=bases, methods=methods[:25] or None, docstring=doc,
-            decorators=decs,
-            end_line=getattr(node, "end_lineno", None),
-            parent_class=parent_class or None,
-        ))
+        out.setdefault(node.name, []).append(
+            SymbolDef(
+                file=rel,
+                line=node.lineno,
+                kind="class",
+                name=node.name,
+                bases=bases,
+                methods=methods[:25] or None,
+                docstring=doc,
+                decorators=decs,
+                end_line=getattr(node, "end_lineno", None),
+                parent_class=parent_class or None,
+            )
+        )
 
     @staticmethod
     def _ast_add_assign(
-        out: dict[str, list[SymbolDef]], node: ast.Assign, rel: str, parent_class: str,
+        out: dict[str, list[SymbolDef]],
+        node: ast.Assign,
+        rel: str,
+        parent_class: str,
     ) -> None:
         for target in node.targets:
             if isinstance(target, ast.Name):
                 val = _unparse(node.value)[:80]
-                out.setdefault(target.id, []).append(SymbolDef(
-                    file=rel, line=node.lineno, kind="constant", name=target.id,
-                    signature=f"{target.id} = {val}" if val else None,
-                    end_line=getattr(node, "end_lineno", None),
-                    parent_class=parent_class or None,
-                ))
+                out.setdefault(target.id, []).append(
+                    SymbolDef(
+                        file=rel,
+                        line=node.lineno,
+                        kind="constant",
+                        name=target.id,
+                        signature=f"{target.id} = {val}" if val else None,
+                        end_line=getattr(node, "end_lineno", None),
+                        parent_class=parent_class or None,
+                    )
+                )
 
     @staticmethod
     def _ast_add_annassign(
-        out: dict[str, list[SymbolDef]], node: ast.AnnAssign, rel: str, parent_class: str,
+        out: dict[str, list[SymbolDef]],
+        node: ast.AnnAssign,
+        rel: str,
+        parent_class: str,
     ) -> None:
         if isinstance(node.target, ast.Name):
             ann = _unparse(node.annotation)
             val = _unparse(node.value)[:60] if node.value else ""
             sig = f"{node.target.id}: {ann}" + (f" = {val}" if val else "")
-            out.setdefault(node.target.id, []).append(SymbolDef(
-                file=rel, line=node.lineno, kind="constant", name=node.target.id,
-                signature=sig,
-                end_line=getattr(node, "end_lineno", None),
-                parent_class=parent_class or None,
-            ))
+            out.setdefault(node.target.id, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=node.lineno,
+                    kind="constant",
+                    name=node.target.id,
+                    signature=sig,
+                    end_line=getattr(node, "end_lineno", None),
+                    parent_class=parent_class or None,
+                )
+            )
 
     def _ts_collect_all(
-        self, node, code_bytes: bytes, rel: str, parent_class: str,
+        self,
+        node,
+        code_bytes: bytes,
+        rel: str,
+        parent_class: str,
         out: dict[str, list[SymbolDef]],
     ) -> None:
         """tree-sitter counterpart of _extract_all_python_symbols AST pass.
@@ -2028,14 +2072,19 @@ class SymbolSearcher:
                 sig = _ts_build_py_function_signature(node, code_bytes)
                 doc = _ts_extract_docstring(node, code_bytes)
                 decs = _ts_extract_decorators(node, code_bytes)
-                out.setdefault(fn_name, []).append(SymbolDef(
-                    file=rel, line=node.start_point.row + 1,
-                    kind="function" if not parent_class else "method",
-                    name=fn_name, signature=sig or None,
-                    docstring=doc, decorators=decs or None,
-                    end_line=node.end_point.row + 1,
-                    parent_class=parent_class or None,
-                ))
+                out.setdefault(fn_name, []).append(
+                    SymbolDef(
+                        file=rel,
+                        line=node.start_point.row + 1,
+                        kind="function" if not parent_class else "method",
+                        name=fn_name,
+                        signature=sig or None,
+                        docstring=doc,
+                        decorators=decs or None,
+                        end_line=node.end_point.row + 1,
+                        parent_class=parent_class or None,
+                    )
+                )
             return  # do not descend into function bodies
 
         if node.type == "class_definition":
@@ -2052,13 +2101,20 @@ class SymbolSearcher:
                 _parent = getattr(node, "parent", None)
                 if _parent is not None and _parent.type == "decorated_definition":
                     decs = _ts_extract_decorators(_parent, code_bytes) or None
-                out.setdefault(cls_name, []).append(SymbolDef(
-                    file=rel, line=node.start_point.row + 1,
-                    kind="class", name=cls_name,
-                    bases=bases, methods=methods, docstring=doc, decorators=decs,
-                    end_line=node.end_point.row + 1,
-                    parent_class=parent_class or None,
-                ))
+                out.setdefault(cls_name, []).append(
+                    SymbolDef(
+                        file=rel,
+                        line=node.start_point.row + 1,
+                        kind="class",
+                        name=cls_name,
+                        bases=bases,
+                        methods=methods,
+                        docstring=doc,
+                        decorators=decs,
+                        end_line=node.end_point.row + 1,
+                        parent_class=parent_class or None,
+                    )
+                )
             new_parent = f"{parent_class}.{cls_name}" if parent_class else cls_name
             for child in node.children:
                 self._ts_collect_all(child, code_bytes, rel, new_parent, out)
@@ -2073,63 +2129,68 @@ class SymbolSearcher:
         if node.type in ("expression_statement", "assignment"):
             # Bare `assignment` is the language-pack grammar's shape for the same
             # statement the standalone grammar wraps in `expression_statement`.
-            expr = node if node.type == "assignment" else (
-                node.children[0] if node.children else None
-            )
+            expr = node if node.type == "assignment" else (node.children[0] if node.children else None)
             if expr and expr.type == "assignment":
                 left = expr.child_by_field_name("left")
                 right = expr.child_by_field_name("right")
                 if left and left.type == "identifier":
                     var_name = _ts_get_node_text(code_bytes, left)
                     val = _ts_get_node_text(code_bytes, right)[:80] if right else ""
-                    out.setdefault(var_name, []).append(SymbolDef(
-                        file=rel, line=node.start_point.row + 1,
-                        kind="constant", name=var_name,
-                        signature=f"{var_name} = {val}" if val else None,
-                        end_line=node.end_point.row + 1,
-                        parent_class=parent_class or None,
-                    ))
+                    out.setdefault(var_name, []).append(
+                        SymbolDef(
+                            file=rel,
+                            line=node.start_point.row + 1,
+                            kind="constant",
+                            name=var_name,
+                            signature=f"{var_name} = {val}" if val else None,
+                            end_line=node.end_point.row + 1,
+                            parent_class=parent_class or None,
+                        )
+                    )
             return
 
         for child in node.children:
             self._ts_collect_all(child, code_bytes, rel, parent_class, out)
 
     def _python_symbol_map(self, file_path: Path) -> dict[str, list[SymbolDef]]:
-            """Return the per-file ``{name -> [SymbolDef]}`` map, building and
-            caching it on miss.
+        """Return the per-file ``{name -> [SymbolDef]}`` map, building and
+        caching it on miss.
 
-            Shared by ``_find_in_python_cached`` and ``_outline_python`` so both
-            warm the same ``_py_file_cache``: a find_symbol + get_file_outline pair
-            on one file parses it once instead of twice, in either order. The
-            key/signature semantics are identical to the former inline code in
-            ``_find_in_python_cached``: ``(st_mtime_ns, st_size)`` signature plus
-            explicit per-path drops via :meth:`invalidate_file_caches` for the
-            agent's own writes. The cache is LRU-capped at
-            ``_PY_FILE_CACHE_MAX_ENTRIES`` — the least-recently-used file is
-            evicted on overflow, so long sessions cannot grow memory without
-            limit.
-            """
-            key = self._cache_key(file_path)
-            try:
-                _st = file_path.stat()
-                sig = (_st.st_mtime_ns, _st.st_size)
-            except OSError:
-                return {}
-            if _too_big_to_parse_inproc(_st.st_size, file_path):
-                return {}
-            cached = _cache_get_lru(self._py_file_cache, key)
-            if cached is not None and cached[0] == sig:
-                return cached[1]
-            try:
-                rel = str(file_path.relative_to(self.repo_root))
-            except ValueError:
-                rel = str(file_path)
-            full_map = self._extract_all_python_symbols(file_path, rel)
-            _cache_put_lru(self._py_file_cache, key, (sig, full_map),
-                           _PY_FILE_CACHE_MAX_ENTRIES)
-            return full_map
+        Shared by ``_find_in_python_cached`` and ``_outline_python`` so both
+        warm the same ``_py_file_cache``: a find_symbol + get_file_outline pair
+        on one file parses it once instead of twice, in either order. The
+        key/signature semantics are identical to the former inline code in
+        ``_find_in_python_cached``: ``(st_mtime_ns, st_size)`` signature plus
+        explicit per-path drops via :meth:`invalidate_file_caches` for the
+        agent's own writes. The cache is LRU-capped at
+        ``_PY_FILE_CACHE_MAX_ENTRIES`` — the least-recently-used file is
+        evicted on overflow, so long sessions cannot grow memory without
+        limit.
+        """
+        key = self._cache_key(file_path)
+        try:
+            _st = file_path.stat()
+            sig = (_st.st_mtime_ns, _st.st_size)
+        except OSError:
+            return {}
+        if _too_big_to_parse_inproc(_st.st_size, file_path):
+            return {}
+        cached = _cache_get_lru(self._py_file_cache, key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        try:
+            rel = str(file_path.relative_to(self.repo_root))
+        except ValueError:
+            rel = str(file_path)
+        full_map = self._extract_all_python_symbols(file_path, rel)
+        _cache_put_lru(self._py_file_cache, key, (sig, full_map), _PY_FILE_CACHE_MAX_ENTRIES)
+        return full_map
+
     def _find_in_python_cached(
-        self, file_path: Path, name: str, kind: str,
+        self,
+        file_path: Path,
+        name: str,
+        kind: str,
         parent_class: str = "",
     ) -> list[SymbolDef]:
         """Signature-cached wrapper around per-file full symbol extraction.
@@ -2172,7 +2233,8 @@ class SymbolSearcher:
 
     # ── Go dotted name resolution via GoSyntaxProvider ─────────────────────
     def _go_class_methods_map(
-        self, file_path: Path,
+        self,
+        file_path: Path,
     ) -> dict[str, list[tuple[str, int, int]]]:
         """Return ``{class_name: [(method_name, start_line, end_line)]}`` for a
         Go file, ``(st_mtime_ns, st_size)``-cached in ``_go_file_cache``.
@@ -2207,15 +2269,18 @@ class SymbolSearcher:
         except Exception as _err:
             logger.debug(
                 "[symbol-search] Go class-methods parse failed for %s (%s)",
-                file_path, _err,
+                file_path,
+                _err,
             )
             return {}
-        _cache_put_lru(self._go_file_cache, key, (sig, methods_map),
-                       _GO_FILE_CACHE_MAX_ENTRIES)
+        _cache_put_lru(self._go_file_cache, key, (sig, methods_map), _GO_FILE_CACHE_MAX_ENTRIES)
         return methods_map
 
     def _find_in_go(
-        self, file_path: Path, name: str, kind: str,
+        self,
+        file_path: Path,
+        name: str,
+        kind: str,
         parent_class: str = "",
     ) -> list[SymbolDef]:
         """Find a Go method scoped to a specific struct.
@@ -2247,12 +2312,17 @@ class SymbolSearcher:
                 sig_line = window[0].strip() if window else ""
             except Exception as e:
                 logger.debug("Go signature line read failed for %s: %s", file_path, e)
-            results.append(SymbolDef(
-                file=rel, line=mstart, kind="method",
-                name=name, signature=sig_line,
-                end_line=mend,
-                parent_class=parent_class,
-            ))
+            results.append(
+                SymbolDef(
+                    file=rel,
+                    line=mstart,
+                    kind="method",
+                    name=name,
+                    signature=sig_line,
+                    end_line=mend,
+                    parent_class=parent_class,
+                )
+            )
             break  # only the first match
 
         return results
@@ -2296,14 +2366,14 @@ class SymbolSearcher:
             from external_llm.editor.semantic.ts_semantic_tracer import TSSemanticTracer
 
             from ..languages.models import LanguageId as _LID  # noqa: N814 — private lazy-import alias
+
             content = file_path.read_text(encoding="utf-8", errors="replace")
             rel = str(file_path.relative_to(self.repo_root))
             lang_str = "typescript" if _LID.from_path(str(file_path)) == _LID.TYPESCRIPT else "javascript"
             tracer = TSSemanticTracer(language=lang_str)
             module = tracer.analyze_core(content, str(file_path))
             full_map = self._ts_extract_all(module, rel)
-        _cache_put_lru(self._ts_file_cache, key, (sig, full_map),
-                       _TS_FILE_CACHE_MAX_ENTRIES)
+        _cache_put_lru(self._ts_file_cache, key, (sig, full_map), _TS_FILE_CACHE_MAX_ENTRIES)
         return full_map
 
     def _ts_extract_all(self, module, rel: str) -> dict[str, list[SymbolDef]]:
@@ -2316,66 +2386,90 @@ class SymbolSearcher:
 
         for fn in module.functions:
             sig = _build_ts_function_signature(fn)
-            out.setdefault(fn.name, []).append(SymbolDef(
-                file=rel,
-                line=fn.meta.start_line if fn.meta else fn.start_line,
-                kind="async_function" if fn.is_async else "function",
-                name=fn.name, signature=sig,
-                end_line=_ts_node_end_line(fn),
-            ))
+            out.setdefault(fn.name, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=fn.meta.start_line if fn.meta else fn.start_line,
+                    kind="async_function" if fn.is_async else "function",
+                    name=fn.name,
+                    signature=sig,
+                    end_line=_ts_node_end_line(fn),
+                )
+            )
         for cls in module.classes:
             methods = [m.name for m in cls.methods]
             bases = []
             if cls.extends:
                 bases.append(cls.extends)
             bases.extend(cls.implements or [])
-            out.setdefault(cls.name, []).append(SymbolDef(
-                file=rel,
-                line=cls.meta.start_line if cls.meta else cls.start_line,
-                kind="class", name=cls.name,
-                methods=methods[:25] or None, bases=bases or None,
-                end_line=_ts_node_end_line(cls),
-            ))
+            out.setdefault(cls.name, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=cls.meta.start_line if cls.meta else cls.start_line,
+                    kind="class",
+                    name=cls.name,
+                    methods=methods[:25] or None,
+                    bases=bases or None,
+                    end_line=_ts_node_end_line(cls),
+                )
+            )
             for method in cls.methods:
                 msig = _build_ts_method_signature(cls.name, method)
-                out.setdefault(method.name, []).append(SymbolDef(
-                    file=rel,
-                    line=method.meta.start_line if method.meta else method.start_line,
-                    kind="method", name=f"{cls.name}.{method.name}", signature=msig,
-                    end_line=_ts_node_end_line(method),
-                ))
+                out.setdefault(method.name, []).append(
+                    SymbolDef(
+                        file=rel,
+                        line=method.meta.start_line if method.meta else method.start_line,
+                        kind="method",
+                        name=f"{cls.name}.{method.name}",
+                        signature=msig,
+                        end_line=_ts_node_end_line(method),
+                    )
+                )
         for iface in module.interfaces:
-            out.setdefault(iface.name, []).append(SymbolDef(
-                file=rel,
-                line=iface.meta.start_line if iface.meta else iface.start_line,
-                kind="interface", name=iface.name,
-                methods=iface.methods[:25] or None,
-                end_line=_ts_node_end_line(iface),
-            ))
+            out.setdefault(iface.name, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=iface.meta.start_line if iface.meta else iface.start_line,
+                    kind="interface",
+                    name=iface.name,
+                    methods=iface.methods[:25] or None,
+                    end_line=_ts_node_end_line(iface),
+                )
+            )
         for ta in module.type_aliases:
-            out.setdefault(ta.name, []).append(SymbolDef(
-                file=rel,
-                line=ta.meta.start_line if ta.meta else ta.start_line,
-                kind="type", name=ta.name,
-                end_line=_ts_node_end_line(ta),
-            ))
+            out.setdefault(ta.name, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=ta.meta.start_line if ta.meta else ta.start_line,
+                    kind="type",
+                    name=ta.name,
+                    end_line=_ts_node_end_line(ta),
+                )
+            )
         for en in module.enums:
-            out.setdefault(en.name, []).append(SymbolDef(
-                file=rel,
-                line=en.meta.start_line if en.meta else en.start_line,
-                kind="enum", name=en.name,
-                end_line=_ts_node_end_line(en),
-            ))
+            out.setdefault(en.name, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=en.meta.start_line if en.meta else en.start_line,
+                    kind="enum",
+                    name=en.name,
+                    end_line=_ts_node_end_line(en),
+                )
+            )
         for var in module.variables:
             sig = f"{var.decl_kind} {var.name}"
             if var.type_ref:
                 sig += f": {var.type_ref.name}"
-            out.setdefault(var.name, []).append(SymbolDef(
-                file=rel,
-                line=var.meta.start_line if var.meta else var.start_line,
-                kind="variable", name=var.name, signature=sig,
-                end_line=_ts_node_end_line(var),
-            ))
+            out.setdefault(var.name, []).append(
+                SymbolDef(
+                    file=rel,
+                    line=var.meta.start_line if var.meta else var.start_line,
+                    kind="variable",
+                    name=var.name,
+                    signature=sig,
+                    end_line=_ts_node_end_line(var),
+                )
+            )
         return out
 
     def _find_in_ts_js(self, file_path: Path, name: str, kind: str) -> list[SymbolDef]:
@@ -2424,10 +2518,7 @@ class SymbolSearcher:
         takes over, exactly as it does when the tracer yields nothing.
         """
         full_map = self._ts_module_map(file_path)
-        out = [
-            d for defs in full_map.values() for d in defs
-            if d.kind != "method"
-        ]
+        out = [d for defs in full_map.values() for d in defs if d.kind != "method"]
         out.sort(key=lambda s: s.line)
         return out
 
@@ -2450,8 +2541,11 @@ class SymbolSearcher:
         return s
 
     def _index_via_treesitter_batch(
-        self, providers: list, search_root: Path,
-        index: dict[str, list[SymbolDef]], seen: set,
+        self,
+        providers: list,
+        search_root: Path,
+        index: dict[str, list[SymbolDef]],
+        seen: set,
     ) -> None:
         """Index every provider's files from a SINGLE ``rg --files`` walk.
 
@@ -2486,8 +2580,11 @@ class SymbolSearcher:
                 cmd += ["--glob", g]
             cmd += ["--glob", "!node_modules*", str(search_root)]
             proc = subprocess.run(
-                cmd, cwd=str(self.repo_root),
-                capture_output=True, text=True, timeout=8,
+                cmd,
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=8,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as _err:
@@ -2498,16 +2595,18 @@ class SymbolSearcher:
             logger.debug(
                 "[symbol-search] batched rg --files failed for %d glob(s) "
                 "under %s: %s — tree-sitter index will be empty this pass",
-                len(glob_lang), search_root, _err,
+                len(glob_lang),
+                search_root,
+                _err,
             )
             return
         if proc.returncode not in (0, 1):
             # rg exit 2+ (regex/flag error) yields empty stdout and would otherwise
             # silently produce an empty index with no signal.
             logger.debug(
-                "[symbol-search] batched rg --files exit %s under %s — "
-                "tree-sitter index will be empty this pass",
-                proc.returncode, search_root,
+                "[symbol-search] batched rg --files exit %s under %s — tree-sitter index will be empty this pass",
+                proc.returncode,
+                search_root,
             )
             return
 
@@ -2523,7 +2622,8 @@ class SymbolSearcher:
             except OSError as _err:
                 logger.debug(
                     "[symbol-search] stat failed for %s (%s) — skipped",
-                    fpath, _err,
+                    fpath,
+                    _err,
                 )
                 continue
             # P26-4: sibling _rg_token_in_nonpy_files bounds the indexable set
@@ -2534,14 +2634,16 @@ class SymbolSearcher:
             if _size > _NONPY_INPROC_MAX_BYTES:
                 logger.debug(
                     "[symbol-search] skipping oversized %s (%d bytes > %d)",
-                    fpath, _size, _NONPY_INPROC_MAX_BYTES,
+                    fpath,
+                    _size,
+                    _NONPY_INPROC_MAX_BYTES,
                 )
                 continue
             if _total_batch_bytes + _size > _NONPY_INPROC_MAX_BYTES:
                 logger.debug(
-                    "[symbol-search] batch byte budget exhausted at %s "
-                    "(cumulative %d bytes) — stopping walk",
-                    fpath, _total_batch_bytes,
+                    "[symbol-search] batch byte budget exhausted at %s (cumulative %d bytes) — stopping walk",
+                    fpath,
+                    _total_batch_bytes,
                 )
                 break
             if _batch_file_count >= _NONPY_INPROC_MAX_FILES:
@@ -2563,7 +2665,9 @@ class SymbolSearcher:
                 content = abs_path.read_text(encoding="utf-8", errors="replace")
             except (OSError, UnicodeDecodeError) as _err:
                 logger.debug(
-                    "[symbol-search] unreadable %s (%s) — skipped", fpath, _err,
+                    "[symbol-search] unreadable %s (%s) — skipped",
+                    fpath,
+                    _err,
                 )
                 continue
             _total_batch_bytes += _size
@@ -2572,8 +2676,10 @@ class SymbolSearcher:
                 syms = _ts_find_all_symbols(content, lang_id)
             except Exception as _err:
                 logger.debug(
-                    "[symbol-search] tree-sitter parse failed for %s (%s): %s "
-                    "— skipped", fpath, lang_id, _err,
+                    "[symbol-search] tree-sitter parse failed for %s (%s): %s — skipped",
+                    fpath,
+                    lang_id,
+                    _err,
                 )
                 continue
             rel = self._rg_path_to_rel(fpath)
@@ -2593,21 +2699,36 @@ class SymbolSearcher:
                 # regardless of whether the caller includes the dashes.
                 if kind == "css_variable" and name.startswith("--"):
                     norm_name = name[2:]
-                    index.setdefault(norm_name, []).append(SymbolDef(
-                        file=rel, line=start_line, kind=kind, name=norm_name,
-                        signature="",
-                    ))
+                    index.setdefault(norm_name, []).append(
+                        SymbolDef(
+                            file=rel,
+                            line=start_line,
+                            kind=kind,
+                            name=norm_name,
+                            signature="",
+                        )
+                    )
                     # Also index under the dashed form so "--primary-color"
                     # lookups resolve too.
-                    index.setdefault(name, []).append(SymbolDef(
-                        file=rel, line=start_line, kind=kind, name=name,
-                        signature="",
-                    ))
+                    index.setdefault(name, []).append(
+                        SymbolDef(
+                            file=rel,
+                            line=start_line,
+                            kind=kind,
+                            name=name,
+                            signature="",
+                        )
+                    )
                 else:
-                    index.setdefault(name, []).append(SymbolDef(
-                        file=rel, line=start_line, kind=kind, name=name,
-                        signature="",
-                    ))
+                    index.setdefault(name, []).append(
+                        SymbolDef(
+                            file=rel,
+                            line=start_line,
+                            kind=kind,
+                            name=name,
+                            signature="",
+                        )
+                    )
 
     def _nonpy_index_worth_building(self, search_root: Path, token: str) -> bool:
         """Whether consulting the non-Python index for *token* is worth its cost.
@@ -2660,7 +2781,7 @@ class SymbolSearcher:
         _NONPY_FILES_CACHE.clear()
         _NONPY_BLOB_CACHE.clear()
 
-    def invalidate_file_caches(self, paths: Optional[Iterable[str]] = None) -> None:
+    def invalidate_file_caches(self, paths: Iterable[str] | None = None) -> None:
         """Drop the per-file symbol maps for *paths* after they were written.
 
         The companion to :meth:`invalidate_nonpy_caches`, for the three
@@ -2819,8 +2940,11 @@ class SymbolSearcher:
                 # OSError covers rg-absent FileNotFoundError (rg is OPTIONAL —
                 # pyproject [search]). Graceful: skip this provider.
                 proc = subprocess.run(
-                    cmd, cwd=str(self.repo_root),
-                    capture_output=True, text=True, timeout=8,
+                    cmd,
+                    cwd=str(self.repo_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
                     check=False,
                 )
                 for line in (proc.stdout or "").splitlines()[:_line_cap]:
@@ -2853,10 +2977,15 @@ class SymbolSearcher:
                             cap_name = m.group(1) if m else ""
                         if not cap_name:
                             continue
-                        index.setdefault(cap_name, []).append(SymbolDef(
-                            file=rel, line=lineno, kind=kind, name=cap_name,
-                            signature=ctx,
-                        ))
+                        index.setdefault(cap_name, []).append(
+                            SymbolDef(
+                                file=rel,
+                                line=lineno,
+                                kind=kind,
+                                name=cap_name,
+                                signature=ctx,
+                            )
+                        )
 
         # One rg --files walk for every tree-sitter-capable provider at once.
         # Runs after the regex loop rather than inside it; the two paths key
@@ -2865,7 +2994,10 @@ class SymbolSearcher:
         # them does not affect the result.
         if _ts_providers:
             self._index_via_treesitter_batch(
-                _ts_providers, search_root, index, seen,
+                _ts_providers,
+                search_root,
+                index,
+                seen,
             )
 
         self._nonpy_index_cache[cache_key] = (_time.monotonic(), index)
@@ -2878,8 +3010,11 @@ class SymbolSearcher:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             cmd = ["rg", "--no-heading", "-m", "3", pattern, str(self.repo_root)]
             proc = subprocess.run(
-                cmd, cwd=str(self.repo_root),
-                capture_output=True, text=True, timeout=5,
+                cmd,
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=5,
                 check=False,
             )
             for line in (proc.stdout or "").splitlines()[:20]:

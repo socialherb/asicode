@@ -9,6 +9,7 @@ invalidated.  Externally-modified files (edits outside the process write
 funnel) are picked up by that reconciliation, preserving the freshness a
 per-instance fresh build used to provide.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -36,16 +37,12 @@ def _reset_shared_indexes():
 
 def _seed(root: Path, n: int) -> None:
     for k in range(n):
-        (root / f"doc{k}.py").write_text(
-            f"# unique_token_doc{k}\ndef function_{k}(x, y):\n    return x + y\n"
-        )
+        (root / f"doc{k}.py").write_text(f"# unique_token_doc{k}\ndef function_{k}(x, y):\n    return x + y\n")
 
 
 def _build(root: Path) -> RAGSearcher:
     s = RAGSearcher(str(root), vector_cache_enabled=False)
-    assert s.find_relevant_files("unique_token_doc0", top_k=5), (
-        "seed repo must be searchable"
-    )
+    assert s.find_relevant_files("unique_token_doc0", top_k=5), "seed repo must be searchable"
     return s
 
 
@@ -111,9 +108,7 @@ def test_external_edit_reconciled_without_full_reread(tmp_path: Path, monkeypatc
     fresh = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
     res = fresh.find_relevant_files("fresh_external_marker_zzz", top_k=5)
     assert any(r.file == "doc0.py" for r in res), "external edit must be searchable"
-    assert len(reads) == 1, (
-        f"reconciliation must re-read ONLY the changed file; read {len(reads)}: {reads}"
-    )
+    assert len(reads) == 1, f"reconciliation must re-read ONLY the changed file; read {len(reads)}: {reads}"
 
 
 def test_external_delete_removed_by_new_instance(tmp_path: Path) -> None:
@@ -168,9 +163,7 @@ def test_invalidate_refreshes_fingerprints_for_next_instance(tmp_path: Path, mon
     reads = _counting_read_text(monkeypatch)
     b = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
     assert b.find_relevant_files("edited_via_invalidate", top_k=5)
-    assert reads == [], (
-        "invalidate_files must update fingerprints so the next instance skips the file"
-    )
+    assert reads == [], "invalidate_files must update fingerprints so the next instance skips the file"
 
 
 def test_invalidate_delete_drops_fingerprint(tmp_path: Path, monkeypatch) -> None:
@@ -201,9 +194,7 @@ def test_mutation_by_one_instance_visible_to_another(tmp_path: Path) -> None:
     a.invalidate_files(["doc4.py"])
 
     res = b.find_relevant_files("propagated_token_abc", top_k=5)
-    assert any(r.file == "doc4.py" for r in res), (
-        "A's invalidation must be visible to B through the shared index"
-    )
+    assert any(r.file == "doc4.py" for r in res), "A's invalidation must be visible to B through the shared index"
 
 
 def test_cross_instance_invalidation_not_served_from_sibling_cache(tmp_path: Path) -> None:
@@ -221,9 +212,7 @@ def test_cross_instance_invalidation_not_served_from_sibling_cache(tmp_path: Pat
     a.invalidate_files(["doc0.py"])
 
     res = b.find_relevant_files("unique_token_doc0", top_k=5)
-    assert not any(r.file == "doc0.py" for r in res), (
-        "sibling cache served a stale pre-invalidation result"
-    )
+    assert not any(r.file == "doc0.py" for r in res), "sibling cache served a stale pre-invalidation result"
 
 
 # ── cap-mode fallback + registry bound ────────────────────────────────────────

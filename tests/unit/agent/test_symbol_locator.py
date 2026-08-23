@@ -9,14 +9,7 @@ def _by_qual(spans):
 
 class TestPythonAstLocator:
     def test_top_level_functions_and_classes(self):
-        src = (
-            "def foo():\n"
-            "    return 1\n"
-            "\n"
-            "class Bar:\n"
-            "    def m(self):\n"
-            "        return 2\n"
-        )
+        src = "def foo():\n    return 1\n\nclass Bar:\n    def m(self):\n        return 2\n"
         spans = _by_qual(PythonAstLocator().locate(src))
         assert set(spans) == {"foo", "Bar", "Bar.m"}
         assert spans["foo"].kind == "function" and spans["foo"].top_level
@@ -31,11 +24,7 @@ class TestPythonAstLocator:
         assert s.end_line == 3
 
     def test_decorator_included_in_span(self):
-        src = (
-            "@decorator\n"
-            "def foo():\n"
-            "    return 1\n"
-        )
+        src = "@decorator\ndef foo():\n    return 1\n"
         s = _by_qual(PythonAstLocator().locate(src))["foo"]
         assert s.start_line == 1  # decorator line, not the def line
 

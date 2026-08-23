@@ -11,6 +11,7 @@ Without the clear it reintroduces "find_symbol answers 'No definitions found'
 for a function that is on disk" (commit 77008787) on the Python side, so the
 staleness case is asserted here as explicitly as the hit case.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -120,7 +121,7 @@ def test_warm_memo_hides_a_file_written_afterwards(repo):
 
 
 def test_a_warm_memo_never_masks_a_missing_rg(repo, monkeypatch):
-    """"rg is gone" must still answer None, not a stale set.
+    """ "rg is gone" must still answer None, not a stale set.
 
     The memo lookup has to sit AFTER the ``shutil.which`` check. Put before it,
     a warm entry answers on a machine where ripgrep has since disappeared, and
@@ -150,7 +151,9 @@ def test_memo_is_bounded():
     _RG_PY_FILTER_CACHE.clear()
     for i in range(_RG_PY_FILTER_MAX_ENTRIES * 2):
         _capped_put(
-            _RG_PY_FILTER_CACHE, ("/repo", (f"tok{i}",)), (0.0, set()),
+            _RG_PY_FILTER_CACHE,
+            ("/repo", (f"tok{i}",)),
+            (0.0, set()),
             _RG_PY_FILTER_MAX_ENTRIES,
         )
     assert len(_RG_PY_FILTER_CACHE) <= _RG_PY_FILTER_MAX_ENTRIES

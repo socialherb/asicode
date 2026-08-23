@@ -8,6 +8,7 @@ silently dropping the fallback call's token consumption from cost/token
 accounting. This test pins the invariant: every real LLM call is reflected in
 the per-bucket counters.
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -49,31 +50,43 @@ def _make_loop_with_fallback_trigger(fallback_tokens: dict) -> DesignChatLoop:
     _resp.raw_response = {"choices": [{"message": {}}]}
     loop.llm_client.chat.return_value = _resp
 
-    # _call_llm_with_retry just calls the passed callable (no retry logic)
-    loop._call_llm_with_retry = lambda fn: fn()
+    # _call_llm_with_retry just calls the passed callable (no retry logic).
+    # Accept **kwargs: the production signature grew _estimated_prompt_tokens /
+    # overflow_retry_cb keyword args; a 1-arg lambda only *looked* right — the
+    # TypeError it raised on the keyword call accidentally forced the fallback
+    # path, masking the mismatch (false-positive fixture).
+    loop._call_llm_with_retry = lambda fn, **kwargs: fn()
 
     return loop
 
 
 def test_fallback_path_accumulates_split_tokens():
     """The fallback path must accumulate prompt/completion/cache tokens into result."""
-    loop = _make_loop_with_fallback_trigger({
-        "tokens_used": 100,
-        "prompt_tokens": 80,
-        "completion_tokens": 20,
-        "cache_read_tokens": 5,
-        "cache_creation_tokens": 2,
-        "provider": "test-provider",
-    })
+    loop = _make_loop_with_fallback_trigger(
+        {
+            "tokens_used": 100,
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "cache_read_tokens": 5,
+            "cache_creation_tokens": 2,
+            "provider": "test-provider",
+        }
+    )
 
     result = DesignChatResult()
     msgs = [LLMMessage(role="user", content="hello")]
 
-    with mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs), \
-         mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs):
+    with (
+        mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs),
+        mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs),
+    ):
         loop._respond_impl(
-            msgs, stream_callback=None, reasoning_callback=None,
-            max_tool_iterations=1, token_callback=None, result=result,
+            msgs,
+            stream_callback=None,
+            reasoning_callback=None,
+            max_tool_iterations=1,
+            token_callback=None,
+            result=result,
         )
 
     # The fallback call's tokens must be reflected in the per-bucket counters.
@@ -95,22 +108,30 @@ def test_fallback_path_accumulates_split_tokens():
 
 def test_fallback_path_tokens_not_silently_dropped():
     """Regression guard: before the fix, fallback tokens were 0 (silently dropped)."""
-    loop = _make_loop_with_fallback_trigger({
-        "tokens_used": 500,
-        "prompt_tokens": 400,
-        "completion_tokens": 100,
-        "cache_read_tokens": 50,
-        "cache_creation_tokens": 10,
-    })
+    loop = _make_loop_with_fallback_trigger(
+        {
+            "tokens_used": 500,
+            "prompt_tokens": 400,
+            "completion_tokens": 100,
+            "cache_read_tokens": 50,
+            "cache_creation_tokens": 10,
+        }
+    )
 
     result = DesignChatResult()
     msgs = [LLMMessage(role="user", content="hello")]
 
-    with mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs), \
-         mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs):
+    with (
+        mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs),
+        mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs),
+    ):
         loop._respond_impl(
-            msgs, stream_callback=None, reasoning_callback=None,
-            max_tool_iterations=1, token_callback=None, result=result,
+            msgs,
+            stream_callback=None,
+            reasoning_callback=None,
+            max_tool_iterations=1,
+            token_callback=None,
+            result=result,
         )
 
     # The key invariant: tokens_used must NOT be 0 when the fallback call

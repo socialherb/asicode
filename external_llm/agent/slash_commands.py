@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
@@ -33,16 +33,17 @@ class SlashCommandRegistry:
 
     def _register_builtins(self) -> None:
         builtins = [
-            SlashCommand("fix", "Fix bugs or issues in code",
-                         "Fix the following issue: {args}", ["f", "fixit", "bug"], "code"),
-            SlashCommand("refactor", "Refactor code for better structure",
-                         "Refactor the following: {args}", ["rf"], "code"),
-            SlashCommand("test", "Add or improve tests",
-                         "Add tests for: {args}", ["t"], "code"),
-            SlashCommand("explain", "Explain what code does",
-                         "Explain this: {args}", ["ex"], "analysis"),
-            SlashCommand("review", "Review code for issues",
-                         "Review the following for issues: {args}", ["rv"], "analysis"),
+            SlashCommand(
+                "fix", "Fix bugs or issues in code", "Fix the following issue: {args}", ["f", "fixit", "bug"], "code"
+            ),
+            SlashCommand(
+                "refactor", "Refactor code for better structure", "Refactor the following: {args}", ["rf"], "code"
+            ),
+            SlashCommand("test", "Add or improve tests", "Add tests for: {args}", ["t"], "code"),
+            SlashCommand("explain", "Explain what code does", "Explain this: {args}", ["ex"], "analysis"),
+            SlashCommand(
+                "review", "Review code for issues", "Review the following for issues: {args}", ["rv"], "analysis"
+            ),
         ]
         for cmd in builtins:
             self.register(cmd)
@@ -52,7 +53,7 @@ class SlashCommandRegistry:
         for alias in cmd.aliases:
             self._commands[alias] = cmd
 
-    def get_command(self, name: str) -> Optional[SlashCommand]:
+    def get_command(self, name: str) -> SlashCommand | None:
         return self._commands.get(name)
 
     def all_commands(self) -> list[SlashCommand]:
@@ -64,7 +65,8 @@ class SlashCommandRegistry:
                 result.append(cmd)
         return result
 
-_registry: Optional[SlashCommandRegistry] = None
+
+_registry: SlashCommandRegistry | None = None
 
 
 def get_registry() -> SlashCommandRegistry:

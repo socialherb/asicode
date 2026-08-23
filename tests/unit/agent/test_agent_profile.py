@@ -100,11 +100,16 @@ class TestAgentProfileLoad:
         agents_dir = tmp_path / ".asicode" / "agents"
         agents_dir.mkdir(parents=True)
         profile_file = agents_dir / "myagent.json"
-        profile_file.write_text(json.dumps({
-            "name": "myagent",
-            "allowed_tools": ["grep", "read_file"],
-            "blocked_tools": [],
-        }), encoding="utf-8")
+        profile_file.write_text(
+            json.dumps(
+                {
+                    "name": "myagent",
+                    "allowed_tools": ["grep", "read_file"],
+                    "blocked_tools": [],
+                }
+            ),
+            encoding="utf-8",
+        )
 
         profile = AgentProfile.load("myagent", str(tmp_path))
         assert profile.name == "myagent"
@@ -211,10 +216,15 @@ class TestLoadProfile:
         agents_dir = tmp_path / ".asicode" / "agents"
         agents_dir.mkdir(parents=True)
         profile_file = agents_dir / "reviewer.json"  # same name as built-in
-        profile_file.write_text(json.dumps({
-            "name": "custom-reviewer",
-            "allowed_tools": ["bash"],
-        }), encoding="utf-8")
+        profile_file.write_text(
+            json.dumps(
+                {
+                    "name": "custom-reviewer",
+                    "allowed_tools": ["bash"],
+                }
+            ),
+            encoding="utf-8",
+        )
 
         profile = load_profile("reviewer", str(tmp_path))
         assert profile.name == "custom-reviewer"  # file version, not built-in

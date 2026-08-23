@@ -49,8 +49,11 @@ class TestPathFamilyAliases:
 class TestFilePathFamilyAliases:
     def test_path_to_file_path_for_file_path_tools(self):
         for tool in (
-            "modify_symbol", "edit_ast", "edit_text",
-            "read_symbol", "analyze_change_impact",
+            "modify_symbol",
+            "edit_ast",
+            "edit_text",
+            "read_symbol",
+            "analyze_change_impact",
         ):
             r = _repaired(tool, {"path": "a.py"})
             assert r.repaired_args.get("file_path") == "a.py", tool
@@ -62,27 +65,33 @@ class TestCustomAliases:
 
     def test_custom_alias_added(self):
         """Custom alias for an un-mapped tool."""
-        r = ArgumentRepairer(custom_aliases={
-            "new_tool": {"old_arg": "new_arg"},
-        }).repair("new_tool", {"old_arg": "val"})
+        r = ArgumentRepairer(
+            custom_aliases={
+                "new_tool": {"old_arg": "new_arg"},
+            }
+        ).repair("new_tool", {"old_arg": "val"})
         assert r.repaired
         assert r.repaired_args == {"new_arg": "val"}
         assert "old_arg" not in r.repaired_args
 
     def test_custom_alias_overrides_default(self):
         """Custom alias for an existing tool merges with defaults."""
-        r = ArgumentRepairer(custom_aliases={
-            "read_file": {"filename": "path"},
-        }).repair("read_file", {"filename": "test.py"})
+        r = ArgumentRepairer(
+            custom_aliases={
+                "read_file": {"filename": "path"},
+            }
+        ).repair("read_file", {"filename": "test.py"})
         assert r.repaired
         assert r.repaired_args == {"path": "test.py"}
         assert "filename" not in r.repaired_args
 
     def test_custom_alias_does_not_break_defaults(self):
         """Default aliases still work when custom_aliases is provided."""
-        r = ArgumentRepairer(custom_aliases={
-            "read_file": {"filename": "path"},
-        }).repair("read_file", {"file_path": "a.py"})
+        r = ArgumentRepairer(
+            custom_aliases={
+                "read_file": {"filename": "path"},
+            }
+        ).repair("read_file", {"file_path": "a.py"})
         assert r.repaired
         assert r.repaired_args == {"path": "a.py"}
 

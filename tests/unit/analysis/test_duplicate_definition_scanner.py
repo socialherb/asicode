@@ -3,6 +3,7 @@ detection — covers the Go false-positive fixes:
   1. Go method-receiver disambiguation (interface impls no longer collide).
   2. Language-agnostic test-file conventions (_is_dynamic_invocation_file).
 """
+
 from __future__ import annotations
 
 import os
@@ -71,6 +72,7 @@ def _scan(content: str, fname: str):
 
 # ── duplicate_definition_scanner: Go receiver disambiguation ───────────────
 
+
 @pytest.mark.skipif(not _HAS_TS, reason="tree-sitter not installed")
 class TestGoReceiverDisambiguation:
     """``func (a *A) Render`` and ``func (b *B) Render`` are distinct symbols —
@@ -94,8 +96,8 @@ class TestGoReceiverDisambiguation:
         src = (
             "package main\n"
             "type A struct{}\n"
-            "func (a *A) Render() string { return \"ptr\" }\n"
-            "func (b A) Render() string { return \"val\" }\n"
+            'func (a *A) Render() string { return "ptr" }\n'
+            'func (b A) Render() string { return "val" }\n'
         )
         cands = _scan(src, "amb.go")
         assert len(cands) == 1
@@ -151,36 +153,40 @@ class TestPythonDuplicateRegression:
 
 # ── _is_dynamic_invocation_file: language-agnostic test-file detection ─────
 
-@pytest.mark.parametrize("path, expected", [
-    # Python
-    ("tests/test_foo.py", True),
-    ("pkg/test_bar.py", True),
-    ("pkg/bar_test.py", True),
-    ("conftest.py", True),
-    ("pkg/utils.py", False),
-    # Go (the core fix — was False before, flooding 642 public "dead")
-    ("cmd/main_test.go", True),
-    ("cmd/main.go", False),
-    # Java (JUnit)
-    ("src/FooTest.java", True),
-    ("src/FooTests.java", True),
-    ("src/TestFoo.java", True),
-    ("src/Foo.java", False),
-    # Kotlin
-    ("src/FooTest.kt", True),
-    ("src/Foo.kt", False),
-    # TS/JS (Jest/Mocha/Vitest)
-    ("src/foo.test.ts", True),
-    ("src/foo.spec.ts", True),
-    ("src/foo.test.js", True),
-    ("src/foo.spec.jsx", True),
-    ("src/foo.ts", False),
-    # Rust
-    ("src/foo_test.rs", True),
-    ("src/main.rs", False),
-    # directory-based (already language-agnostic)
-    ("__tests__/helper.go", True),
-    ("tests/sub/main.go", True),
-])
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        # Python
+        ("tests/test_foo.py", True),
+        ("pkg/test_bar.py", True),
+        ("pkg/bar_test.py", True),
+        ("conftest.py", True),
+        ("pkg/utils.py", False),
+        # Go (the core fix — was False before, flooding 642 public "dead")
+        ("cmd/main_test.go", True),
+        ("cmd/main.go", False),
+        # Java (JUnit)
+        ("src/FooTest.java", True),
+        ("src/FooTests.java", True),
+        ("src/TestFoo.java", True),
+        ("src/Foo.java", False),
+        # Kotlin
+        ("src/FooTest.kt", True),
+        ("src/Foo.kt", False),
+        # TS/JS (Jest/Mocha/Vitest)
+        ("src/foo.test.ts", True),
+        ("src/foo.spec.ts", True),
+        ("src/foo.test.js", True),
+        ("src/foo.spec.jsx", True),
+        ("src/foo.ts", False),
+        # Rust
+        ("src/foo_test.rs", True),
+        ("src/main.rs", False),
+        # directory-based (already language-agnostic)
+        ("__tests__/helper.go", True),
+        ("tests/sub/main.go", True),
+    ],
+)
 def test_is_dynamic_invocation_file_multilang(path, expected):
     assert _is_dynamic_invocation_file(path) is expected

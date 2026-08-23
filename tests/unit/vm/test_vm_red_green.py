@@ -12,6 +12,7 @@ Branches the earlier vm test files left open:
   guards in the shared repair helpers, plus the Go argument-mismatch
   zero-value fill and the Go case-correction path guards.
 """
+
 from __future__ import annotations
 
 from external_llm.editor._editor_core.vm.classification import (
@@ -40,6 +41,7 @@ from external_llm.languages.tree_sitter_utils import SyntaxErrorNode
 
 # ── helpers (mirror tests/unit/vm/test_repair_strategies.py) ───────────────
 
+
 def _cls(symbol=None, ftype=FailureType.UNKNOWN_SYMBOL):
     return Classification(type=ftype, source=EvidenceSource.NONE, symbol=symbol)
 
@@ -49,6 +51,7 @@ def _err(message, line=None):
 
 
 # ── failure_classifier.py ──────────────────────────────────────────────────
+
 
 class TestClassifierEmptyAndFallbacks:
     """Empty-error lists + non-typed and typed fallback paths."""
@@ -98,13 +101,15 @@ class TestClassifierTreeSitterLayerA:
         import external_llm.languages.tree_sitter_utils as tsu
 
         monkeypatch.setattr(
-            tsu, "find_error_nodes",
+            tsu,
+            "find_error_nodes",
             lambda code, lang: [SyntaxErrorNode(kind="ERROR", missing_token="", line=0, column=0)],
         )
         cls = PythonFailureClassifier()
         result = cls.classify_typed(
             [VerifyError(message="x = ", line=1, column=1)],
-            code="x = \n", language="python",
+            code="x = \n",
+            language="python",
         )
         assert result.type is FailureType.SYNTAX_ERROR
         assert result.source is EvidenceSource.TREE_SITTER
@@ -114,13 +119,15 @@ class TestClassifierTreeSitterLayerA:
         import external_llm.languages.tree_sitter_utils as tsu
 
         monkeypatch.setattr(
-            tsu, "find_error_nodes",
+            tsu,
+            "find_error_nodes",
             lambda code, lang: [SyntaxErrorNode(kind="MISSING", missing_token=";", line=1, column=1)],
         )
         cls = PythonFailureClassifier()
         result = cls.classify_typed(
             [VerifyError(message="x = 1", line=2, column=2)],
-            code="x = 1", language="python",
+            code="x = 1",
+            language="python",
         )
         assert result.type is FailureType.SYNTAX_ERROR
         assert result.source is EvidenceSource.TREE_SITTER
@@ -136,7 +143,8 @@ class TestClassifierTreeSitterLayerA:
 
         monkeypatch.setattr(tsu, "find_error_nodes", lambda code, lang: [])
         monkeypatch.setattr(
-            tsu, "extract_symbol_at_position",
+            tsu,
+            "extract_symbol_at_position",
             lambda code, lang, line, col: "foo",
         )
         cls = PythonFailureClassifier()
@@ -149,6 +157,7 @@ class TestClassifierTreeSitterLayerA:
 
 
 # ── repair_registry.py ─────────────────────────────────────────────────────
+
 
 class TestRepairRegistryRealClass:
     """register()/get() on the real registry (tool_registry tests fake it)."""
@@ -169,6 +178,7 @@ class TestRepairRegistryRealClass:
 
 # ── repair_strategies.py ───────────────────────────────────────────────────
 
+
 class TestSharedGuardBranches:
     """Out-of-range error lines and paren-mismatch guards in shared helpers."""
 
@@ -177,9 +187,14 @@ class TestSharedGuardBranches:
         assert _trim_call_arguments(["foo(a\n"], 0) is None
 
     def test_argument_mismatch_line_out_of_range(self):
-        assert py_repair_argument_mismatch(
-            "f(a)\n", _err("takes 1 positional argument but 2 were given", 5), None,
-        ) is None
+        assert (
+            py_repair_argument_mismatch(
+                "f(a)\n",
+                _err("takes 1 positional argument but 2 were given", 5),
+                None,
+            )
+            is None
+        )
 
     def test_py_syntax_error_line_out_of_range(self):
         assert py_repair_syntax_error("x = 1\n", _err("expected ':'", 5), None) is None
@@ -190,23 +205,38 @@ class TestSharedGuardBranches:
 
     def test_missing_return_body_not_indented(self):
         # Body line at column 0 → not a real body → cannot determine indent.
-        assert py_repair_missing_return(
-            "def f():\nx = 1", _err("missing return", 2), None,
-        ) is None
+        assert (
+            py_repair_missing_return(
+                "def f():\nx = 1",
+                _err("missing return", 2),
+                None,
+            )
+            is None
+        )
 
     def test_missing_semicolon_line_out_of_range(self):
         assert java_repair_syntax_error("x;\n", _err("';' expected", 5), None) is None
 
     def test_duplicate_identifier_line_out_of_range(self):
-        assert java_repair_duplicate_identifier(
-            "class Foo {}\n", _err("duplicate class", 5), None,
-        ) is None
+        assert (
+            java_repair_duplicate_identifier(
+                "class Foo {}\n",
+                _err("duplicate class", 5),
+                None,
+            )
+            is None
+        )
 
     def test_duplicate_identifier_no_pattern_match(self):
         # Marker present, line in range, but no "class X" pattern on the line.
-        assert java_repair_duplicate_identifier(
-            "Foo x;\n", _err("duplicate class", 1), None,
-        ) is None
+        assert (
+            java_repair_duplicate_identifier(
+                "Foo x;\n",
+                _err("duplicate class", 1),
+                None,
+            )
+            is None
+        )
 
 
 class TestGoRepairGuardBranches:
@@ -214,38 +244,73 @@ class TestGoRepairGuardBranches:
 
     def test_unknown_symbol_no_line_after_import_lookup(self):
         # symbol not in the import map and error carries no line → Path 2 guard.
-        assert go_repair_unknown_symbol(
-            "x := 1\n", _err("undefined: myvar"), _cls("myvar"),
-        ) is None
+        assert (
+            go_repair_unknown_symbol(
+                "x := 1\n",
+                _err("undefined: myvar"),
+                _cls("myvar"),
+            )
+            is None
+        )
 
     def test_unknown_symbol_line_out_of_range(self):
-        assert go_repair_unknown_symbol(
-            "x := 1\n", _err("undefined: myvar", 5), _cls("myvar"),
-        ) is None
+        assert (
+            go_repair_unknown_symbol(
+                "x := 1\n",
+                _err("undefined: myvar", 5),
+                _cls("myvar"),
+            )
+            is None
+        )
 
     def test_syntax_error_line_out_of_range(self):
         # Semicolon helper returns None (L357), then the '{' branch hits the
         # same out-of-range guard (L594).
-        assert go_repair_syntax_error(
-            "x := 1\n", _err("expected newline", 5), None,
-        ) is None
+        assert (
+            go_repair_syntax_error(
+                "x := 1\n",
+                _err("expected newline", 5),
+                None,
+            )
+            is None
+        )
 
     def test_argument_mismatch_line_out_of_range(self):
-        assert go_repair_argument_mismatch(
-            "foo(a)\n", _err("too many arguments", 5), None,
-        ) is None
+        assert (
+            go_repair_argument_mismatch(
+                "foo(a)\n",
+                _err("too many arguments", 5),
+                None,
+            )
+            is None
+        )
 
     def test_argument_mismatch_not_enough_no_parens(self):
-        assert go_repair_argument_mismatch(
-            "foo\n", _err("not enough arguments in call to foo", 1), None,
-        ) is None
+        assert (
+            go_repair_argument_mismatch(
+                "foo\n",
+                _err("not enough arguments in call to foo", 1),
+                None,
+            )
+            is None
+        )
 
     def test_argument_mismatch_not_enough_unclosed_paren(self):
-        assert go_repair_argument_mismatch(
-            "foo(a\n", _err("not enough arguments in call to foo", 1), None,
-        ) is None
+        assert (
+            go_repair_argument_mismatch(
+                "foo(a\n",
+                _err("not enough arguments in call to foo", 1),
+                None,
+            )
+            is None
+        )
 
     def test_type_mismatch_line_out_of_range(self):
-        assert go_repair_type_mismatch(
-            "x := 1\n", _err("cannot use t as string value in assignment", 5), None,
-        ) is None
+        assert (
+            go_repair_type_mismatch(
+                "x := 1\n",
+                _err("cannot use t as string value in assignment", 5),
+                None,
+            )
+            is None
+        )

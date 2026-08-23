@@ -15,6 +15,7 @@ NOTE: ``lane_hint == "clarify"`` maps to ``explore_and_edit`` (not ``read_only``
 Clarification means the edit intent is present but needs more info — the agent
 should proceed to the CLARIFY verdict path, not block execution entirely.
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,17 +27,25 @@ RoutingIntent = Literal["read_only", "clarification_needed", "explore_and_edit"]
 # Keys are possible LLM spellings; values are the canonical RoutingIntent.
 # Used to absorb label drift without silently changing behavior.
 _ROUTING_INTENT_NORMALIZE: dict = {
-    "read_only": "read_only", "readonly": "read_only", "read-only": "read_only",
-    "read only": "read_only", "ReadOnly": "read_only",
-    "explore_and_edit": "explore_and_edit", "explore-and-edit": "explore_and_edit",
+    "read_only": "read_only",
+    "readonly": "read_only",
+    "read-only": "read_only",
+    "read only": "read_only",
+    "ReadOnly": "read_only",
+    "explore_and_edit": "explore_and_edit",
+    "explore-and-edit": "explore_and_edit",
     "exploreandedit": "explore_and_edit",
     # IntentResolver lane_hint values — all are edit intents
-    "planner": "explore_and_edit", "main_agent": "explore_and_edit",
+    "planner": "explore_and_edit",
+    "main_agent": "explore_and_edit",
     # IntentResolver intent_type values — all are edit intents, except "question"
     # which is handled separately (routing_intent_from_intent_result maps it to read_only)
-    "bugfix": "explore_and_edit", "feature": "explore_and_edit",
-    "refactor": "explore_and_edit", "exploration": "explore_and_edit",
-    "modify": "explore_and_edit", "extend": "explore_and_edit",
+    "bugfix": "explore_and_edit",
+    "feature": "explore_and_edit",
+    "refactor": "explore_and_edit",
+    "exploration": "explore_and_edit",
+    "modify": "explore_and_edit",
+    "extend": "explore_and_edit",
     "create": "explore_and_edit",
     # IntentResult default / classification-failure sentinel (IntentResolver emits
     # intent_type="unknown" on every failure path: LLM-unavailable, parse failure,
@@ -57,6 +66,7 @@ def normalize_routing_label(label: str) -> str:
     returned as-is so the caller can apply its own fallback.
     """
     from external_llm.languages._normalize import normalize_key
+
     _key = normalize_key(label)
     _canonical = _ROUTING_INTENT_NORMALIZE.get(_key)
     if _canonical is not None:
@@ -80,9 +90,13 @@ def is_non_edit_intent(intent: RoutingIntent) -> bool:
 # All three are failure paths, not classifications: minimal_fallback (LLM call
 # raised / no client), llm_parse_failed (response was not parseable JSON),
 # empty_request (nothing to classify). See intent_resolver.py (`_create_empty_result` + the `_resolve_with_llm` failure paths).
-_UNDETERMINED_INTENT_SOURCES = frozenset({
-    "minimal_fallback", "llm_parse_failed", "empty_request",
-})
+_UNDETERMINED_INTENT_SOURCES = frozenset(
+    {
+        "minimal_fallback",
+        "llm_parse_failed",
+        "empty_request",
+    }
+)
 
 
 def intent_is_undetermined(intent_result: object) -> bool:

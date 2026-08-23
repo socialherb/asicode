@@ -1,4 +1,5 @@
 """Tests for search_design_history improvements (P0 + P2)."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -49,11 +50,27 @@ def populated_session_mgr(session_mgr, tmp_repo):
     # Add turns (some compressed/old)
     session.turns = [
         {"role": "user", "content": "I want to add logging to the handler module.", "timestamp": 1000000.0},
-        {"role": "assistant", "content": "Let me look at the handler.py file for existing logging patterns.", "timestamp": 1000010.0},
-        {"role": "user", "content": "Actually, can we add validation for empty inputs instead?", "timestamp": 1000020.0},
-        {"role": "assistant", "content": "Sure, let's add input validation using the existing validator pattern.", "timestamp": 1000030.0},
+        {
+            "role": "assistant",
+            "content": "Let me look at the handler.py file for existing logging patterns.",
+            "timestamp": 1000010.0,
+        },
+        {
+            "role": "user",
+            "content": "Actually, can we add validation for empty inputs instead?",
+            "timestamp": 1000020.0,
+        },
+        {
+            "role": "assistant",
+            "content": "Sure, let's add input validation using the existing validator pattern.",
+            "timestamp": 1000030.0,
+        },
         {"role": "user", "content": "Also need to handle the edge case for None values.", "timestamp": 1000040.0},
-        {"role": "assistant", "content": "The None handler is in utils.py. Let's add a guard clause there.", "timestamp": 1000050.0},
+        {
+            "role": "assistant",
+            "content": "The None handler is in utils.py. Let's add a guard clause there.",
+            "timestamp": 1000050.0,
+        },
     ]
 
     # Add compressed summary (covers first 4 turns)
@@ -133,43 +150,33 @@ class TestFieldSpecificSearchP2:
 
     def test_search_decisions_field(self, loop_with_session):
         """Search decisions field finds matching decisions."""
-        result = loop_with_session._search_design_history(
-            "validation", search_field="decisions"
-        )
+        result = loop_with_session._search_design_history("validation", search_field="decisions")
         assert "Found 1 match(es) in decisions" in result
         assert "[Decision]" in result
         assert "validator pattern" in result
 
     def test_search_decisions_field_no_match(self, loop_with_session):
         """Search decisions field with non-matching keyword."""
-        result = loop_with_session._search_design_history(
-            "database", search_field="decisions"
-        )
+        result = loop_with_session._search_design_history("database", search_field="decisions")
         assert "No matches found" in result
         assert "decisions" in result
 
     def test_search_summary_field(self, loop_with_session):
         """Search summary field finds matching summary."""
-        result = loop_with_session._search_design_history(
-            "logging", search_field="summary"
-        )
+        result = loop_with_session._search_design_history("logging", search_field="summary")
         assert "Found 1 match(es) in summary" in result
         assert "[Summary]" in result
         assert "handler" in result
 
     def test_search_summary_field_no_match(self, loop_with_session):
         """Search summary field with non-matching keyword."""
-        result = loop_with_session._search_design_history(
-            "database", search_field="summary"
-        )
+        result = loop_with_session._search_design_history("database", search_field="summary")
         assert "No matches found" in result
         assert "summary" in result
 
     def test_search_content_field_explicit(self, loop_with_session):
         """Explicit search_field='content' works same as default."""
-        result = loop_with_session._search_design_history(
-            "validation", search_field="content"
-        )
+        result = loop_with_session._search_design_history("validation", search_field="content")
         assert "turn(s)" in result
         assert "validation" in result.lower()
 
@@ -180,25 +187,19 @@ class TestFieldSpecificSearchP2:
 
     def test_invalid_search_field_fallback(self, loop_with_session):
         """Invalid search_field falls back to content search."""
-        result = loop_with_session._search_design_history(
-            "handler", search_field="nonexistent"
-        )
+        result = loop_with_session._search_design_history("handler", search_field="nonexistent")
         assert "turn(s)" in result
 
     def test_search_all_field_combines(self, loop_with_session):
         """search_field='all' searches turn content (compressed portion)."""
-        result = loop_with_session._search_design_history(
-            "logging", search_field="all"
-        )
+        result = loop_with_session._search_design_history("logging", search_field="all")
         assert "turn(s)" in result
         assert "Found" in result
 
     def test_no_decisions_available(self, session_mgr):
         """Search decisions when none exist returns appropriate message."""
         loop = _make_loop(session_mgr, "no-decision-session")
-        result = loop._search_design_history(
-            "validation", search_field="decisions"
-        )
+        result = loop._search_design_history("validation", search_field="decisions")
         assert "No matches found" in result
 
     def test_no_summary_available(self, session_mgr):
@@ -208,9 +209,7 @@ class TestFieldSpecificSearchP2:
         session_mgr._save(session)
 
         loop = _make_loop(session_mgr, "no-summary-session")
-        result = loop._search_design_history(
-            "logging", search_field="summary"
-        )
+        result = loop._search_design_history("logging", search_field="summary")
         assert "No compressed summary available" in result
 
     def test_decisions_summary_search_skips_archive_load(self, populated_session_mgr, monkeypatch):
@@ -260,7 +259,8 @@ class TestCrossSessionSearch:
 
         # Search beta's decisions from alpha's session
         result = loop._search_design_history(
-            "logging", search_field="decisions",
+            "logging",
+            search_field="decisions",
             target_session_id="session-beta",
         )
         assert "Found 1 match(es) in decisions" in result
@@ -353,10 +353,7 @@ class TestSemanticRerankCorpusGate:
         monkeypatch.setattr(_dcl, "_get_session_vcm", lambda: calls.append(1))
 
         session = session_mgr.get_or_create("small")
-        session.turns = [
-            {"role": "user", "content": f"turn {i} about topic", "timestamp": float(i)}
-            for i in range(6)
-        ]
+        session.turns = [{"role": "user", "content": f"turn {i} about topic", "timestamp": float(i)} for i in range(6)]
         session.compressed_up_to = 6
         session_mgr._save(session)
 
@@ -387,8 +384,7 @@ class TestSemanticRerankCorpusGate:
         n = _dcl._SEMANTIC_RERANK_MIN_CORPUS + 5
         session = session_mgr.get_or_create("large")
         session.turns = [
-            {"role": "user", "content": f"turn {i} about topic keyword", "timestamp": float(i)}
-            for i in range(n)
+            {"role": "user", "content": f"turn {i} about topic keyword", "timestamp": float(i)} for i in range(n)
         ]
         session.compressed_up_to = n
         session_mgr._save(session)
@@ -414,4 +410,3 @@ class TestSemanticRerankCorpusGate:
         loop = _make_loop(session_mgr, "dec")
         loop._search_design_history("decision", search_field="decisions")
         assert calls == [], "typical decisions corpus (3 items) must stay BM25-only"
-

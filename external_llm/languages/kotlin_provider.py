@@ -4,6 +4,7 @@ Kotlin syntax provider.
 Uses ``kotlinc`` for validation and regex-based symbol detection.
 Gracefully degrades when Kotlin toolchain is not installed.
 """
+
 from __future__ import annotations
 
 import logging
@@ -11,7 +12,6 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Optional
 
 from .base import (
     SyntaxProvider,
@@ -54,9 +54,7 @@ def _make_capabilities() -> LanguageCapabilities:
 
 
 # kotlinc error: file.kt:10:5: error: expecting member declaration
-_KOTLINC_ERROR_RE = re.compile(
-    r"^(.+?):(\d+):(\d+):\s+error:\s+(.+)$"
-)
+_KOTLINC_ERROR_RE = re.compile(r"^(.+?):(\d+):(\d+):\s+error:\s+(.+)$")
 
 # JVM startup flags passed to every kotlinc invocation (-J passthrough).
 # kotlinc is a JVM compiler: each call pays a full JVM boot (~2.2s here vs
@@ -80,7 +78,7 @@ KOTLINC_JVM_FLAGS = (
 class KotlinSyntaxProvider(SyntaxProvider):
     """Kotlin language support (regex + tree-sitter symbols, kotlinc validation)."""
 
-    _caps: Optional[LanguageCapabilities] = None
+    _caps: LanguageCapabilities | None = None
 
     def language_id(self) -> LanguageId:
         return LanguageId.KOTLIN
@@ -126,15 +124,17 @@ class KotlinSyntaxProvider(SyntaxProvider):
         # TemporaryDirectory via ``-d``.
         _out_dir = tempfile.TemporaryDirectory()
         _cmd = _replace_last_cmd_path(
-            ["kotlinc", "-J-Duser.language=en", *KOTLINC_JVM_FLAGS,
-             "-d", _out_dir.name, file_path],
-            file_path, _tmp_path,
+            ["kotlinc", "-J-Duser.language=en", *KOTLINC_JVM_FLAGS, "-d", _out_dir.name, file_path],
+            file_path,
+            _tmp_path,
         )
         try:
             try:
                 proc = subprocess.run(
                     _cmd,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                     cwd=os.path.dirname(_tmp_path) or ".",
                     env=_compile_env(),
                     check=False,
@@ -156,12 +156,14 @@ class KotlinSyntaxProvider(SyntaxProvider):
             for line in (proc.stdout + proc.stderr).splitlines():
                 m = _KOTLINC_ERROR_RE.match(line)
                 if m:
-                    errors.append(SyntaxError_(
-                        file=m.group(1),
-                        line=int(m.group(2)),
-                        col=int(m.group(3)),
-                        message=m.group(4),
-                    ))
+                    errors.append(
+                        SyntaxError_(
+                            file=m.group(1),
+                            line=int(m.group(2)),
+                            col=int(m.group(3)),
+                            message=m.group(4),
+                        )
+                    )
             # Drop resolution/semantic failures (the isolated temp file has no
             # classpath, so any non-JDK import fails to resolve). Only genuine
             # syntax errors gate the edit; validate_semantics re-checks from the
@@ -177,15 +179,14 @@ class KotlinSyntaxProvider(SyntaxProvider):
             # co-occurring unresolved reference is cascade noise; otherwise a
             # bare unresolved reference is a real typo that MUST gate.
             _import_lines = frozenset(
-                i + 1 for i, ln in enumerate(content.splitlines())
-                if ln.lstrip().startswith("import ")
+                i + 1 for i, ln in enumerate(content.splitlines()) if ln.lstrip().startswith("import ")
             )
             _has_import_failure = any(
-                "unresolved reference" in e.message.lower() and e.line in _import_lines
-                for e in errors
+                "unresolved reference" in e.message.lower() and e.line in _import_lines for e in errors
             )
             errors = _filter_genuine_syntax_errors(
-                errors, LanguageId.KOTLIN,
+                errors,
+                LanguageId.KOTLIN,
                 has_resolution_context=_has_import_failure,
             )
             if not errors:
@@ -217,6 +218,7 @@ class KotlinSyntaxProvider(SyntaxProvider):
         - Skips (``checked=False``) when kotlinc is missing/timed out
           (non-blocking, and never reported as a clean verdict it did not reach).
         """
+
         def _skip(reason: str) -> SyntaxValidationResult:
             return SyntaxValidationResult.unchecked(LanguageId.KOTLIN, reason)
 
@@ -228,12 +230,8 @@ class KotlinSyntaxProvider(SyntaxProvider):
             markers=("build.gradle.kts", "pom.xml", "build.gradle", "settings.gradle.kts"),
         )
         _markers = ("build.gradle.kts", "pom.xml", "build.gradle", "settings.gradle.kts")
-        if not any(
-            os.path.isfile(os.path.join(project_root, m)) for m in _markers
-        ):
-            return _skip(
-                "no build.gradle / pom.xml above this file, so kotlinc has no project root"
-            )
+        if not any(os.path.isfile(os.path.join(project_root, m)) for m in _markers):
+            return _skip("no build.gradle / pom.xml above this file, so kotlinc has no project root")
 
         target_norm = os.path.normpath(os.path.abspath(file_path))
         out_dir = tempfile.TemporaryDirectory()
@@ -245,13 +243,16 @@ class KotlinSyntaxProvider(SyntaxProvider):
                 "kotlinc",
                 "-J-Duser.language=en",
                 *KOTLINC_JVM_FLAGS,
-                "-d", out_dir.name,
+                "-d",
+                out_dir.name,
                 file_path,
             ]
             try:
                 proc = subprocess.run(
                     cmd,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                     cwd=project_root,
                     env=_compile_env(),
                     check=False,
@@ -279,13 +280,16 @@ class KotlinSyntaxProvider(SyntaxProvider):
                 # Only report the file we asked about
                 if _file and os.path.normpath(os.path.abspath(_file)) != target_norm:
                     continue
-                errors.append(SyntaxError_(
-                    file=file_path,
-                    line=int(_line), col=int(_col),
-                    message=_msg,
-                    severity="error",
-                    code="",
-                ))
+                errors.append(
+                    SyntaxError_(
+                        file=file_path,
+                        line=int(_line),
+                        col=int(_col),
+                        message=_msg,
+                        severity="error",
+                        code="",
+                    )
+                )
                 has_error = True
             return SyntaxValidationResult(
                 ok=not has_error,
@@ -300,40 +304,52 @@ class KotlinSyntaxProvider(SyntaxProvider):
     def get_symbol_patterns(self, kind: str = "any") -> list[SymbolPattern]:
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"(?:(?:public|private|protected|internal|override)\s+)*fun\s+{name}\s*[\(<]",
-                description="Kotlin function declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"fun\s+\w+\.{name}\s*\(",
-                description="Kotlin extension function",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"(?:(?:public|private|protected|internal|override)\s+)*fun\s+{name}\s*[\(<]",
+                    description="Kotlin function declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"fun\s+\w+\.{name}\s*\(",
+                    description="Kotlin extension function",
+                )
+            )
         if kind in ("class", "any"):
-            patterns.append(SymbolPattern(
-                kind="class",
-                regex=r"(?:(?:data|sealed|abstract|open|inner)\s+)*class\s+{name}\s*(?:\(|<|:|\{)",
-                description="Kotlin class declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="class",
+                    regex=r"(?:(?:data|sealed|abstract|open|inner)\s+)*class\s+{name}\s*(?:\(|<|:|\{)",
+                    description="Kotlin class declaration",
+                )
+            )
         if kind in ("interface", "any"):
-            patterns.append(SymbolPattern(
-                kind="interface",
-                regex=r"interface\s+{name}\s*(?:<|:|\{)",
-                description="Kotlin interface declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="interface",
+                    regex=r"interface\s+{name}\s*(?:<|:|\{)",
+                    description="Kotlin interface declaration",
+                )
+            )
         if kind in ("type", "any"):
-            patterns.append(SymbolPattern(
-                kind="type",
-                regex=r"object\s+{name}\s*(?::|\{)",
-                description="Kotlin object declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="type",
+                    regex=r"object\s+{name}\s*(?::|\{)",
+                    description="Kotlin object declaration",
+                )
+            )
         if kind in ("enum", "any"):
-            patterns.append(SymbolPattern(
-                kind="enum",
-                regex=r"enum\s+class\s+{name}\s*(?:\(|\{)",
-                description="Kotlin enum class",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="enum",
+                    regex=r"enum\s+class\s+{name}\s*(?:\(|\{)",
+                    description="Kotlin enum class",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -343,23 +359,20 @@ class KotlinSyntaxProvider(SyntaxProvider):
 
     # ── Lint / test commands ──────────────────────────────────────────────
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return ["ktlint", file_path]
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         """Auto-detect Gradle."""
-        if os.path.isfile(os.path.join(repo_root, "build.gradle.kts")) or \
-           os.path.isfile(os.path.join(repo_root, "build.gradle")):
+        if os.path.isfile(os.path.join(repo_root, "build.gradle.kts")) or os.path.isfile(
+            os.path.join(repo_root, "build.gradle")
+        ):
             return ["./gradlew", "test"] + (test_args or [])
         return ["./gradlew", "test"] + (test_args or [])
 
     # ── Symbol finder (tree-sitter → regex fallback) ──────────────────────
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         from .tree_sitter_utils import find_symbol_range, is_available
 
         if is_available():
@@ -386,43 +399,48 @@ class KotlinSyntaxProvider(SyntaxProvider):
     # ── Regex fallback for structural queries ─────────────────────────────
 
     def _find_top_level_definitions_regex(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level Kotlin definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
         nl = build_line_index(content)
         # Top-level functions: fun Name()  (not indented)
-        for m in re.finditer(r'^fun\s+(\w+)\s*[\(<]', content, re.MULTILINE):
+        for m in re.finditer(r"^fun\s+(\w+)\s*[\(<]", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         # Classes: (modifiers) class Name
         for m in re.finditer(
-            r'^(?:(?:data|sealed|abstract|open|inner|public|private|protected|internal)\s+)*'
-            r'class\s+(\w+)', content, re.MULTILINE,
+            r"^(?:(?:data|sealed|abstract|open|inner|public|private|protected|internal)\s+)*"
+            r"class\s+(\w+)",
+            content,
+            re.MULTILINE,
         ):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "class", start_line, end_line))
         # Interfaces
-        for m in re.finditer(r'^interface\s+(\w+)', content, re.MULTILINE):
+        for m in re.finditer(r"^interface\s+(\w+)", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "interface", start_line, end_line))
         # Objects: object Name
-        for m in re.finditer(r'^object\s+(\w+)\s*(?::|\{|$)', content, re.MULTILINE):
+        for m in re.finditer(r"^object\s+(\w+)\s*(?::|\{|$)", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "object", start_line, end_line))
         # Enum classes
-        for m in re.finditer(r'^enum\s+class\s+(\w+)', content, re.MULTILINE):
+        for m in re.finditer(r"^enum\s+class\s+(\w+)", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "enum", start_line, end_line))
         return results
 
     def _find_class_methods_regex(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         """Regex fallback: find methods inside a Kotlin class body."""
         results: list[tuple[str, int, int]] = []
@@ -430,8 +448,8 @@ class KotlinSyntaxProvider(SyntaxProvider):
         esc = re.escape(class_name)
         # Find class definition: class Name ... {
         pat = (
-            r'(?:(?:data|sealed|abstract|open|inner|public|private|protected|internal)\s+)*'
-            r'class\s+' + esc + r'\s*(?:\(|<|:|\{)'
+            r"(?:(?:data|sealed|abstract|open|inner|public|private|protected|internal)\s+)*"
+            r"class\s+" + esc + r"\s*(?:\(|<|:|\{)"
         )
         for cm in re.finditer(pat, content):
             class_body_start = content.find("{", cm.start())
@@ -441,8 +459,8 @@ class KotlinSyntaxProvider(SyntaxProvider):
             class_body = content[class_body_start:class_end]
             # Scan for method definitions inside class body
             for mm in re.finditer(
-                r'(?:(?:public|private|protected|internal|override|suspend)\s+)*'
-                r'fun\s+(\w+)\s*[\(<]',
+                r"(?:(?:public|private|protected|internal|override|suspend)\s+)*"
+                r"fun\s+(\w+)\s*[\(<]",
                 class_body,
             ):
                 method_start = class_body_start + mm.start()
@@ -464,27 +482,35 @@ class KotlinSyntaxProvider(SyntaxProvider):
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         from .tree_sitter_utils import find_all_symbols, is_available
+
         result = find_all_symbols(content, "kotlin") if is_available() else None
         if result:
             return result
         return self._find_top_level_definitions_regex(content)
 
     def find_class_methods(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         from .tree_sitter_utils import extract_class_methods, is_available
+
         result = extract_class_methods(content, class_name, "kotlin") if is_available() else None
         if result:
             return result
         return self._find_class_methods_regex(content, class_name)
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         from .tree_sitter_utils import extract_symbol_body, is_available
+
         result = extract_symbol_body(content, symbol_name, "kotlin") if is_available() else None
         if result:
             return result
@@ -492,9 +518,18 @@ class KotlinSyntaxProvider(SyntaxProvider):
 
     def get_definition_keywords(self) -> list[str]:
         return [
-            "fun ", "class ", "interface ", "object ",
-            "data class ", "sealed class ", "enum class ",
-            "abstract class ", "open class ",
-            "private fun ", "public fun ", "internal fun ",
-            "override fun ", "suspend fun ",
+            "fun ",
+            "class ",
+            "interface ",
+            "object ",
+            "data class ",
+            "sealed class ",
+            "enum class ",
+            "abstract class ",
+            "open class ",
+            "private fun ",
+            "public fun ",
+            "internal fun ",
+            "override fun ",
+            "suspend fun ",
         ]

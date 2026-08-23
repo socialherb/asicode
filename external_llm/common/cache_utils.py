@@ -14,6 +14,7 @@ unboundedly unless FIFO-bounded. Eviction order is ``dict`` insertion order
 (3.7+): the oldest entry is ``next(iter(cache))``, and a re-inserted key is
 popped first so it lands at the back (most-recently-used).
 """
+
 from __future__ import annotations
 
 import logging
@@ -54,6 +55,7 @@ def _capped_put(cache: dict, key: Any, value: Any, cap: int = _WALK_CACHE_MAX_EN
         except (RuntimeError, StopIteration):
             logger.debug(
                 "_capped_put: concurrent dict resize, stopping eviction (cap=%s, size=%s)",
-                cap, len(cache),
+                cap,
+                len(cache),
             )
             break  # concurrent dict resize or empty — give up eviction

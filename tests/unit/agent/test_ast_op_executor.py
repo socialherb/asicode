@@ -7,6 +7,7 @@ module-level guard-idempotency helper, and the name-safety machinery.
 
 All ops are pure AST transformations on source strings — no I/O, no mocking.
 """
+
 from __future__ import annotations
 
 import ast
@@ -47,12 +48,7 @@ class TestSafeUnparseIter:
 
 
 class TestGuardAlreadyPresent:
-    SRC = (
-        "def f(x):\n"
-        "    if x is None:\n"
-        "        return None\n"
-        "    return x + 1\n"
-    )
+    SRC = "def f(x):\n    if x is None:\n        return None\n    return x + 1\n"
 
     def test_present_returns_true(self):
         stmt = "if x is None:\n    return None"
@@ -72,13 +68,7 @@ class TestGuardAlreadyPresent:
         assert _guard_already_present(src, stmt, "f") is False
 
     def test_loop_body_scope(self):
-        src = (
-            "def f(xs):\n"
-            "    for x in xs:\n"
-            "        if x is None:\n"
-            "            continue\n"
-            "        print(x)\n"
-        )
+        src = "def f(xs):\n    for x in xs:\n        if x is None:\n            continue\n        print(x)\n"
         stmt = "if x is None:\n    continue"
         assert _guard_already_present(src, stmt, "f") is True
 
@@ -129,14 +119,7 @@ class TestApplyDispatch:
         assert r.success is False and r.ops_applied == 0 and r.changed is False
 
     def test_qualified_symbol_parsing(self):
-        src = (
-            "class A:\n"
-            "    def m(self):\n"
-            "        return 1\n"
-            "class B:\n"
-            "    def m(self):\n"
-            "        return 2\n"
-        )
+        src = "class A:\n    def m(self):\n        return 1\nclass B:\n    def m(self):\n        return 2\n"
         # Bare "m" matches FIRST (A.m). "B.m" must resolve to B.m.
         r_bare = EX.apply(src, [{"type": "replace_expr", "old": "return 1", "new": "return 10"}], symbol="m")
         assert r_bare.success and "return 10" in r_bare.new_source
@@ -149,8 +132,8 @@ class TestApplyDispatch:
         src = "def f():\n    pass\n"
         r = EX.apply(src, [{"type": "replace_expr", "old": "pass", "new": "continue"}], symbol="f")
         assert r.success is False
-        assert r.new_source == src           # rolled back to original
-        assert r.ops_applied == 0            # reported as 0 on rollback
+        assert r.new_source == src  # rolled back to original
+        assert r.ops_applied == 0  # reported as 0 on rollback
         assert r.ops_failed and "syntax error" in r.ops_failed[0]
 
     def test_changed_flag_distinguishes_effect(self):
@@ -184,23 +167,14 @@ class TestFindFuncNode:
         assert isinstance(node, ast.FunctionDef)
 
     def test_parent_class_scoping(self):
-        tree = ast.parse(
-            "class A:\n"
-            "    def m(self):\n        return 1\n"
-            "class B:\n"
-            "    def m(self):\n        return 2\n"
-        )
+        tree = ast.parse("class A:\n    def m(self):\n        return 1\nclass B:\n    def m(self):\n        return 2\n")
         node = ASTOpExecutor._find_func_node(tree, "m", parent_class="B")
         assert isinstance(node, ast.FunctionDef)
         # Verify it's B.m by checking body
         assert isinstance(node.body[0], ast.Return)
 
     def test_nested_class_chain(self):
-        tree = ast.parse(
-            "class Outer:\n"
-            "    class Inner:\n"
-            "        def m(self):\n            return 1\n"
-        )
+        tree = ast.parse("class Outer:\n    class Inner:\n        def m(self):\n            return 1\n")
         node = ASTOpExecutor._find_func_node(tree, "m", parent_class="Outer.Inner")
         assert isinstance(node, ast.FunctionDef)
 
@@ -220,7 +194,7 @@ class TestWsTolerantSpan:
     def test_exact_unique_match(self):
         text = "line one   \nline two\n"
         span = ASTOpExecutor._ws_tolerant_span(text, "line one")
-        assert span == "line one   "   # original span incl trailing ws
+        assert span == "line one   "  # original span incl trailing ws
 
     def test_multi_match_returns_none(self):
         text = "dup\nfoo\ndup\n"
@@ -257,7 +231,7 @@ class TestReplaceExpr:
         assert ok is False and new == "x = 1\n"
 
     def test_ws_tolerant_fallback(self):
-        src = "def f():\n    return 1  \n"   # trailing spaces
+        src = "def f():\n    return 1  \n"  # trailing spaces
         new, ok = EX._replace_expr(src, {"old": "return 1", "new": "return 2"}, "f")
         assert ok and "return 2" in new
 
@@ -407,7 +381,9 @@ class TestAddClassField:
 
     def test_add_after_docstring(self):
         src = 'class C:\n    """doc."""\n\n    def m(self):\n        pass\n'
-        new, ok = EX._add_class_field(src, {"class_name": "C", "field_name": "x", "field_type": "float", "field_default": "1.0"})
+        new, ok = EX._add_class_field(
+            src, {"class_name": "C", "field_name": "x", "field_type": "float", "field_default": "1.0"}
+        )
         assert ok and "x: float = 1.0" in new
 
     def test_idempotent(self):
@@ -421,7 +397,9 @@ class TestAddClassField:
         assert ok is False and new == src
 
     def test_missing_required_field(self):
-        _new, ok = EX._add_class_field("class C:\n    pass\n", {"class_name": "C", "field_name": "", "field_type": "int"})
+        _new, ok = EX._add_class_field(
+            "class C:\n    pass\n", {"class_name": "C", "field_name": "", "field_type": "int"}
+        )
         assert ok is False
 
 
@@ -458,7 +436,9 @@ class TestAddGuard:
 
     def test_for_loop_scope(self):
         src = "def f(xs):\n    for x in xs:\n        print(x)\n"
-        new, ok = EX._add_guard(src, {"statement": "if x is None:\n    continue", "insert_scope": "for_loop", "loop_variable": "x"}, "f")
+        new, ok = EX._add_guard(
+            src, {"statement": "if x is None:\n    continue", "insert_scope": "for_loop", "loop_variable": "x"}, "f"
+        )
         assert ok
         # guard is first statement of loop body
         loop_body = new.split("for x in xs:")[1]
@@ -473,7 +453,9 @@ class TestAddGuard:
 
     def test_ambiguous_loops_returns_false(self):
         src = "def f():\n    for x in a:\n        pass\n    for x in b:\n        pass\n"
-        new, ok = EX._add_guard(src, {"statement": "if x:\n    continue", "insert_scope": "for_loop", "loop_variable": "x"}, "f")
+        new, ok = EX._add_guard(
+            src, {"statement": "if x:\n    continue", "insert_scope": "for_loop", "loop_variable": "x"}, "f"
+        )
         assert ok is False and new == src
 
     def test_loop_iterable_src_disambiguates(self):
@@ -625,6 +607,7 @@ class TestAddGuardDiagnostics:
         # op["_error"], not the generic "no match found" fallback in apply().
         def _boom(*a, **kw):
             raise RuntimeError("internal kaboom")
+
         monkeypatch.setattr(EX, "_find_func_node", _boom)
         op = {"statement": "if x:\n    return"}
         _new, ok = EX._add_guard("def f():\n    pass\n", op, "f")
@@ -663,6 +646,8 @@ class TestAddGuardDiagnostics:
         _new, ok = EX._add_guard(src, op, "f")
         assert ok is False
         assert "no safe insertion point" in op["_error"]
+
+
 # ── delete_stmt ─────────────────────────────────────────────────────────────
 
 
@@ -715,7 +700,9 @@ class TestResolveModuleLevelList:
         assert EX._resolve_module_level_list("def f(:\n", "__all__") is None
 
     def test_missing_name_returns_none(self):
-        assert EX._resolve_module_level_list('x = 1\n', "__all__") is None
+        assert EX._resolve_module_level_list("x = 1\n", "__all__") is None
+
+
 class TestListAppend:
     def test_inline_list_append(self):
         src = '__all__ = ["a", "b"]\n'
@@ -731,8 +718,7 @@ class TestListAppend:
         assert ok
         tree = ast.parse(new)
         all_node = next(
-            n for n in ast.walk(tree)
-            if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "__all__"
+            n for n in ast.walk(tree) if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "__all__"
         )
         elts = [e.value for e in all_node.value.elts]
         assert elts == ["a", "b", "c"]  # no "bc" implicit concatenation
@@ -742,14 +728,12 @@ class TestListAppend:
         src = '__all__ = [\n    "a",\n    "b",\n]\n'
         new, ok = EX._list_append(src, {"list_name": "__all__", "value": "c"})
         assert ok and '"c"' in new and ",," not in new
-        elts = [
-            e.value for e in ast.parse(new).body[0].value.elts
-        ]
+        elts = [e.value for e in ast.parse(new).body[0].value.elts]
         assert elts == ["a", "b", "c"]
 
     def test_empty_inline_list_append(self):
         # Regression: previously produced '[, "z"]' (leading comma) → ok=False.
-        src = '__all__ = []\n'
+        src = "__all__ = []\n"
         new, ok = EX._list_append(src, {"list_name": "__all__", "value": "z"})
         assert ok and '"z"' in new and "[," not in new
         elts = [e.value for e in ast.parse(new).body[0].value.elts]
@@ -758,7 +742,7 @@ class TestListAppend:
     def test_empty_tuple_append_keeps_tuple(self):
         # Empty tuple () needs a trailing comma to remain a single-element tuple
         # (() → ("z",)); without it the assignment collapses to a plain string.
-        src = '__all__ = ()\n'
+        src = "__all__ = ()\n"
         new, ok = EX._list_append(src, {"list_name": "__all__", "value": "z"})
         assert ok
         val = ast.parse(new).body[0].value
@@ -771,10 +755,10 @@ class TestListAppend:
         assert ok and new == src
 
     def test_list_not_found_returns_false(self):
-        assert EX._list_append('x = 1\n', {"list_name": "__all__", "value": "z"})[1] is False
+        assert EX._list_append("x = 1\n", {"list_name": "__all__", "value": "z"})[1] is False
 
     def test_missing_args_returns_false(self):
-        assert EX._list_append('__all__ = []\n', {"list_name": "", "value": "z"})[1] is False
+        assert EX._list_append("__all__ = []\n", {"list_name": "", "value": "z"})[1] is False
 
     def test_nested_scope_list_ignored(self):
         # Regression: ast.walk descended into function bodies, so a nested
@@ -859,13 +843,15 @@ class TestListRemove:
         src = 'def f():\n    __all__ = ["a"]\n    return __all__\n'
         new, ok = EX._list_remove(src, {"list_name": "__all__", "value": "a"})
         assert ok is False and new == src
+
     class TestRewriteModuleLevelListContract:
         """Direct tests of the shared _list_append/_list_remove skeleton."""
 
         def test_rewrite_none_rolls_back(self):
             src = '__all__ = ["a"]\n'
             new, ok = EX._rewrite_module_level_list(
-                src, {"list_name": "__all__", "value": "z"},
+                src,
+                {"list_name": "__all__", "value": "z"},
                 lambda lines, node, value: None,
             )
             assert ok is False and new == src
@@ -873,7 +859,8 @@ class TestListRemove:
         def test_rewrite_noop_is_idempotent_success(self):
             src = '__all__ = ["a"]\n'
             new, ok = EX._rewrite_module_level_list(
-                src, {"list_name": "__all__", "value": "z"},
+                src,
+                {"list_name": "__all__", "value": "z"},
                 lambda lines, node, value: (lines, False),
             )
             assert ok is True and new == src
@@ -881,7 +868,8 @@ class TestListRemove:
         def test_rewrite_apply_validates(self):
             src = '__all__ = ["a"]\n'
             new, ok = EX._rewrite_module_level_list(
-                src, {"list_name": "__all__", "value": "z"},
+                src,
+                {"list_name": "__all__", "value": "z"},
                 lambda lines, node, value: ([lines[0].rstrip() + ', "z"\n'], True),
             )
             assert ok is True and '"z"' in new
@@ -889,7 +877,8 @@ class TestListRemove:
         def test_rewrite_invalid_lines_roll_back(self):
             src = '__all__ = ["a"]\n'
             new, ok = EX._rewrite_module_level_list(
-                src, {"list_name": "__all__", "value": "z"},
+                src,
+                {"list_name": "__all__", "value": "z"},
                 lambda lines, node, value: (["def f(:\n"], True),
             )
             assert ok is False and new == src
@@ -901,20 +890,24 @@ class TestListRemove:
                 raise TypeError("boom")
 
             new, ok = EX._rewrite_module_level_list(
-                src, {"list_name": "__all__", "value": "z"}, boom,
+                src,
+                {"list_name": "__all__", "value": "z"},
+                boom,
             )
             assert ok is False and new == src
 
         def test_rewrite_missing_op_keys_roll_back(self):
             src = '__all__ = ["a"]\n'
             new, ok = EX._rewrite_module_level_list(
-                src, {"list_name": "", "value": "z"},
+                src,
+                {"list_name": "", "value": "z"},
                 lambda lines, node, value: (lines, True),
             )
             assert ok is False and new == src
 
 
 # ── RED→GREEN gap coverage (round 32-6 tool_handlers) ───────────────────────
+
 
 class TestRedGreenGaps:
     """Edge branches not hit by the suites above (dispatch, name-safety, and
@@ -926,12 +919,21 @@ class TestRedGreenGaps:
 
     def test_apply_dispatch_remaining_op_types(self):
         src = "from m import a, b\nclass C:\n    x: int = 1\n\nL = ['a', 'b']\n"
-        out = EX.apply(src, [
-            {"type": "remove_import_name", "module": "m", "name": "a"},
-            {"type": "add_class_field", "class_name": "C", "field_name": "y", "field_type": "float", "field_default": "2.0"},
-            {"type": "delete_stmt", "pattern": "x: int = 1"},
-            {"type": "list_remove", "list_name": "L", "value": "a"},
-        ])
+        out = EX.apply(
+            src,
+            [
+                {"type": "remove_import_name", "module": "m", "name": "a"},
+                {
+                    "type": "add_class_field",
+                    "class_name": "C",
+                    "field_name": "y",
+                    "field_type": "float",
+                    "field_default": "2.0",
+                },
+                {"type": "delete_stmt", "pattern": "x: int = 1"},
+                {"type": "list_remove", "list_name": "L", "value": "a"},
+            ],
+        )
         assert out.success, out.ops_failed
         assert "from m import b" in out.new_source
         assert "y: float = 2.0" in out.new_source
@@ -1076,7 +1078,14 @@ class TestRedGreenGaps:
         src = "def f(items):\n    for it in items:\n        print(it)\n"
         out = EX.apply(
             src,
-            [{"type": "add_guard", "insert_scope": "for_loop", "statement": "if True:\n            pass", "loop_variable": "it"}],
+            [
+                {
+                    "type": "add_guard",
+                    "insert_scope": "for_loop",
+                    "statement": "if True:\n            pass",
+                    "loop_variable": "it",
+                }
+            ],
             symbol="f",
         )
         assert out.success, out.ops_failed

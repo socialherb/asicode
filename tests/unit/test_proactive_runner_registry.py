@@ -12,6 +12,7 @@ This is the same leak class as _GRAPH_FACADE_CACHE / _ACTIVE_ENGINES
 Mutation guard: if _runners is reverted to a plain dict, the OrderedDict
 assertion fails (plain dict has no move_to_end → LRU silently disabled).
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -76,8 +77,7 @@ class TestProactiveRunnerRegistryLRU:
         for i in range(cap + 1):
             get_or_create_runner(f"/repo-{i}")
         assert len(_runners) == cap, (
-            f"_runners must be bounded at {cap}, got {len(_runners)} "
-            "(unbounded leak regression)"
+            f"_runners must be bounded at {cap}, got {len(_runners)} (unbounded leak regression)"
         )
         assert "/repo-0" not in _runners, "oldest entry must be evicted"
         assert f"/repo-{cap}" in _runners, "newest entry must be retained"
@@ -110,9 +110,7 @@ class TestProactiveRunnerRegistryLRU:
             victim = _runners["/repo-0"]
         drain_thread = victim._drain_thread
         assert victim._running is True, "precondition: victim is running"
-        assert drain_thread is not None and drain_thread.is_alive(), (
-            "precondition: victim has a live drain thread"
-        )
+        assert drain_thread is not None and drain_thread.is_alive(), "precondition: victim has a live drain thread"
         # Overflow → evicts /repo-0 (LRU) and stop()'s it (outside the lock).
         get_or_create_runner("/repo-2")
         assert "/repo-0" not in _runners, "victim must be evicted from registry"
@@ -124,8 +122,7 @@ class TestProactiveRunnerRegistryLRU:
         if drain_thread is not None:
             drain_thread.join(timeout=5.0)
             assert not drain_thread.is_alive(), (
-                "evicted runner's drain daemon thread must terminate after stop(); "
-                "a live thread here is a thread leak"
+                "evicted runner's drain daemon thread must terminate after stop(); a live thread here is a thread leak"
             )
         assert len(_runners) == cap
 
@@ -167,6 +164,7 @@ def _cleanup_repo(repo_root: str) -> None:
 
 def test_get_or_create_updates_llm_invoke_fn():
     """Re-access with a new llm_invoke_fn updates the existing runner (L100)."""
+
     def fn1(**kw):
         return {"status": "first"}
 
@@ -189,6 +187,7 @@ def test_evicted_runner_stop_failure_logged(monkeypatch, caplog):
     get_or_create_runner("/repo-1")
     with _runners_lock:
         victim = _runners["/repo-0"]
+
     # Stop failure is injected on the victim itself, not by swapping its
     # engine: the drain daemon thread can touch _engine at any time, so a
     # half-broken engine object makes the failure a race (flake under load).
@@ -201,9 +200,7 @@ def test_evicted_runner_stop_failure_logged(monkeypatch, caplog):
     try:
         import logging
 
-        with caplog.at_level(
-            logging.WARNING, logger="external_llm.editor.agent.autonomous.proactive_runner"
-        ):
+        with caplog.at_level(logging.WARNING, logger="external_llm.editor.agent.autonomous.proactive_runner"):
             get_or_create_runner("/repo-2")  # evicts /repo-0 → stop() raises
         assert any("Failed to stop evicted" in r.message for r in caplog.records)
         assert "/repo-0" not in _runners
@@ -263,20 +260,17 @@ def test_stream_callback_interceptor_forwards_and_routes():
     try:
         with _runners_lock:
             _runners["/cb-repo"]._engine = _FakeEngine()
-        cb = make_stream_callback_interceptor(
-            "/cb-repo", lambda ev, d: forwarded.append((ev, d))
-        )
+        cb = make_stream_callback_interceptor("/cb-repo", lambda ev, d: forwarded.append((ev, d)))
         cb("complete", {"x": 1})
         assert forwarded == [("complete", {"x": 1})]
         assert notified == [("complete", {"x": 1})]
         # original_cb failure is swallowed (L174-175).
-        cb2 = make_stream_callback_interceptor(
-            "/cb-repo", lambda ev, d: (_ for _ in ()).throw(RuntimeError("cb boom"))
-        )
+        cb2 = make_stream_callback_interceptor("/cb-repo", lambda ev, d: (_ for _ in ()).throw(RuntimeError("cb boom")))
         cb2("complete", {"x": 2})  # must not raise
         # Unknown repo → forwarded only; no engine lookup result (L179-181).
         cb3 = make_stream_callback_interceptor("/nope", None)
         cb3("fail_loop_detected", {"x": 3})  # must not raise
+
         # Engine notify failure is swallowed (L184-185).
         class _BoomEngine:
             def notify_agent_event(self, *a):
@@ -367,9 +361,7 @@ def test_on_trigger_routes_ignore_escalate_and_enqueue():
         assert fake_push.broadcasts == []
         assert r._queue.qsize() == 0
         # ESCALATE → immediate broadcast, not queued (L281-290).
-        r.policy = _FakePolicy(
-            ActionDecision(kind=ActionKind.ESCALATE, message="urgent", priority=1)
-        )
+        r.policy = _FakePolicy(ActionDecision(kind=ActionKind.ESCALATE, message="urgent", priority=1))
         r._on_trigger(event)
         assert fake_push.broadcasts and fake_push.broadcasts[0][0] == "proactive_escalation"
         assert fake_push.broadcasts[0][1]["priority"] == 1
@@ -409,9 +401,7 @@ def test_execute_task_suggest_and_llm_paths():
 
         fake_push = _FakePush()
         r.push = fake_push
-        event = TriggerEvent(
-            kind=TriggerKind.FILE_MODIFIED, repo_root="/exec-repo", source_file="f.py"
-        )
+        event = TriggerEvent(kind=TriggerKind.FILE_MODIFIED, repo_root="/exec-repo", source_file="f.py")
         task = AutonomousTask(
             priority=2,
             created_at=0.0,
@@ -427,24 +417,30 @@ def test_execute_task_suggest_and_llm_paths():
         # llm_invoke_fn success (L385-390).
         r.llm_invoke_fn = lambda **kw: {"status": "ok", "text": kw["request_text"]}
         task2 = AutonomousTask(
-            priority=2, created_at=0.0, event=event,
+            priority=2,
+            created_at=0.0,
+            event=event,
             action=ActionDecision(kind=ActionKind.AUTO_FIX, message="m", prompt="p2"),
             task_id="t2",
         )
         r._execute_task(task2)
         assert fake_push.broadcasts[-1][1]["result"]["status"] == "ok"
+
         # llm_invoke_fn failure → error result (L391-393).
         def _boom_llm(**kw):
             raise RuntimeError("llm down")
 
         r.llm_invoke_fn = _boom_llm
         task3 = AutonomousTask(
-            priority=2, created_at=0.0, event=event,
+            priority=2,
+            created_at=0.0,
+            event=event,
             action=ActionDecision(kind=ActionKind.SUGGEST, message="m", prompt="p3"),
             task_id="t3",
         )
         r._execute_task(task3)
         assert fake_push.broadcasts[-1][1]["result"]["status"] == "error"
+
         # Broadcast failure inside execution → warning + proactive_error
         # (L360-362).
         class _FlakyPush:
@@ -458,7 +454,9 @@ def test_execute_task_suggest_and_llm_paths():
 
         r.push = _FlakyPush()
         task4 = AutonomousTask(
-            priority=2, created_at=0.0, event=event,
+            priority=2,
+            created_at=0.0,
+            event=event,
             action=ActionDecision(kind=ActionKind.NOTIFY, message="n"),
             task_id="t4",
         )

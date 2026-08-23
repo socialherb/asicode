@@ -20,6 +20,7 @@ This pins three layers:
   2. ``_apply_thinking_mode`` payload mutation (unit).
   3. The full ``chat()`` / ``chat_with_tools()`` payload (integration).
 """
+
 from __future__ import annotations
 
 import json
@@ -36,6 +37,7 @@ from external_llm.openai_client import (
 )
 
 # ── 1. classifier ──────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize(
     ("model", "expected"),
@@ -61,6 +63,7 @@ def test_is_deepseek_v4(model: str, expected: bool) -> None:
 
 # ── kimi-k3 classifier ────────────────────────────────────────────────────
 
+
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
@@ -81,7 +84,10 @@ def test_is_deepseek_v4(model: str, expected: bool) -> None:
 )
 def test_is_kimi_k3(model: str, expected: bool) -> None:
     assert _is_kimi_k3(model) is expected
+
+
 # ── 2. payload mutation (unit) ─────────────────────────────────────────────
+
 
 def test_apply_thinking_deepseek_off_sends_disabled_no_effort() -> None:
     """DeepSeek v4 OFF = native thinking:disabled + NO reasoning_effort.
@@ -129,6 +135,7 @@ def test_apply_thinking_none_is_noop() -> None:
 
 # ── kimi-k3 payload mutation ──────────────────────────────────────────────
 
+
 def test_apply_thinking_kimi_k3_always_max() -> None:
     """Kimi K3 always sends reasoning_effort="max", even with effort_override="low".
 
@@ -161,6 +168,7 @@ def test_apply_thinking_kimi_k3_always_max() -> None:
 
 # ── 3. full path: chat() / chat_with_tools() payload ───────────────────────
 
+
 class _FakeResp:
     status_code: int = 200
     headers: ClassVar[dict] = {}
@@ -179,6 +187,7 @@ class _FakeResp:
 def _capture_client(monkeypatch):
     """OpenAIClient whose session POST records each payload body."""
     import external_llm.openai_client as oc
+
     monkeypatch.setattr(oc.time, "sleep", lambda *_a, **_k: None)
     c = OpenAIClient(api_key="test")
     c.base_url = "https://opencode.ai/v1"
@@ -188,7 +197,7 @@ def _capture_client(monkeypatch):
         pass
 
     c._session = _S()
-    c._session.post = lambda *a, **k: (captured.append(k.get("json")) or _FakeResp())
+    c._session.post = lambda *a, **k: captured.append(k.get("json")) or _FakeResp()
     return c, captured
 
 
@@ -196,8 +205,12 @@ def test_chat_deepseek_off_sends_thinking_disabled(monkeypatch):
     """THE BUG: chat() with DeepSeek v4 + thinking_mode=False must send the
     native thinking:disabled (0 reasoning tokens), not reasoning_effort='low'."""
     c, cap = _capture_client(monkeypatch)
-    c.chat([LLMMessage(role="user", content="hi")],
-           model="deepseek/deepseek-v4-flash", thinking_mode=False, max_tokens=1000)
+    c.chat(
+        [LLMMessage(role="user", content="hi")],
+        model="deepseek/deepseek-v4-flash",
+        thinking_mode=False,
+        max_tokens=1000,
+    )
     p = cap[-1]
     assert p.get("thinking") == {"type": "disabled"}
     assert "reasoning_effort" not in p, (
@@ -208,16 +221,16 @@ def test_chat_deepseek_off_sends_thinking_disabled(monkeypatch):
 
 def test_chat_deepseek_on_sends_thinking_enabled(monkeypatch):
     c, cap = _capture_client(monkeypatch)
-    c.chat([LLMMessage(role="user", content="hi")],
-           model="deepseek/deepseek-v4-flash", thinking_mode=True, max_tokens=1000)
+    c.chat(
+        [LLMMessage(role="user", content="hi")], model="deepseek/deepseek-v4-flash", thinking_mode=True, max_tokens=1000
+    )
     assert cap[-1].get("thinking") == {"type": "enabled"}
 
 
 def test_chat_o3_off_keeps_reasoning_effort(monkeypatch):
     """OpenAI o3 has no `thinking` param — must stay on reasoning_effort."""
     c, cap = _capture_client(monkeypatch)
-    c.chat([LLMMessage(role="user", content="hi")],
-           model="o3", thinking_mode=False, max_tokens=1000)
+    c.chat([LLMMessage(role="user", content="hi")], model="o3", thinking_mode=False, max_tokens=1000)
     p = cap[-1]
     assert p.get("reasoning_effort") == "low"
     assert "thinking" not in p
@@ -226,8 +239,13 @@ def test_chat_o3_off_keeps_reasoning_effort(monkeypatch):
 def test_chat_with_tools_deepseek_off_sends_thinking_disabled(monkeypatch):
     """chat_with_tools() parity with chat() — same dispatch helper."""
     c, cap = _capture_client(monkeypatch)
-    c.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[],
-                      model="deepseek/deepseek-v4-flash", thinking_mode=False, max_tokens=1000)
+    c.chat_with_tools(
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="deepseek/deepseek-v4-flash",
+        thinking_mode=False,
+        max_tokens=1000,
+    )
     p = cap[-1]
     assert p.get("thinking") == {"type": "disabled"}
     assert "reasoning_effort" not in p
@@ -240,9 +258,11 @@ def test_chat_with_tools_deepseek_off_sends_thinking_disabled(monkeypatch):
 # would make reasoning run unbounded and time out). Drift between the two
 # methods = the token-estimator wire-drift class.
 
+
 def _capture_client_with_base(monkeypatch, base_url):
     """OpenAIClient with a configurable base_url, recording POST payloads."""
     import external_llm.openai_client as oc
+
     monkeypatch.setattr(oc.time, "sleep", lambda *_a, **_k: None)
     c = OpenAIClient(api_key="test")
     c.base_url = base_url
@@ -252,7 +272,7 @@ def _capture_client_with_base(monkeypatch, base_url):
         pass
 
     c._session = _S()
-    c._session.post = lambda *a, **k: (captured.append(k.get("json")) or _FakeResp())
+    c._session.post = lambda *a, **k: captured.append(k.get("json")) or _FakeResp()
     return c, captured
 
 
@@ -290,8 +310,7 @@ def test_chat_with_tools_max_tokens_dispatch_parity(monkeypatch, model, base_url
     diverge, one path times out while the other works.
     """
     c, cap = _capture_client_with_base(monkeypatch, base_url)
-    c.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[],
-                      model=model, max_tokens=1000)
+    c.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[], model=model, max_tokens=1000)
     p = cap[-1]
     assert p.get(expect_key) == 1000, f"{model} @ {base_url}: expected {expect_key}=1000, got {p}"
     other = "max_tokens" if expect_key == "max_completion_tokens" else "max_completion_tokens"

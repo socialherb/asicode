@@ -29,7 +29,7 @@ def test_resolve_scan_paths_normalizes_abs_and_relative():
 
 def test_resolve_scan_paths_rejects_out_of_repo_and_non_py():
     assert g._resolve_scan_paths(["/etc/passwd"]) is None  # '..' → rejected
-    assert g._resolve_scan_paths(["README.md"]) is None     # not .py → full scan
+    assert g._resolve_scan_paths(["README.md"]) is None  # not .py → full scan
 
 
 @pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff not on PATH")

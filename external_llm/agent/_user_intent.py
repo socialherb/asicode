@@ -25,7 +25,6 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +70,7 @@ class IntentPattern:
     Each pattern holds a set of keywords matched at word boundaries
     (anchored to start of line).
     """
+
     name: str
     keywords: set[str]
 
@@ -102,7 +102,7 @@ class IntentPattern:
             # Keyword is a prefix — require a word boundary right after it so
             # we never match "y" in "you" or "no" in "now". A non-alphanumeric
             # char after the keyword (space, punctuation, ...) is a boundary.
-            next_char = stripped[len(kw_l):len(kw_l) + 1]
+            next_char = stripped[len(kw_l) : len(kw_l) + 1]
             if not next_char or not next_char.isalnum():
                 return True
         return False
@@ -144,44 +144,115 @@ class IntentPattern:
 _AFFIRMATIVE_PATTERN = IntentPattern(
     name="affirmative",
     keywords={
-        "yes", "y", "yeah", "yep", "sure", "ok", "okay",
-        "go ahead", "do it", "proceed", "approve", "allow", "run it",
-        "correct", "right", "that's right", "that is right", "of course",
-        "absolutely", "indeed",
-        "네", "응", "맞아", "그래", "좋아", "응응", "넵", "예",
-        "당연", "그렇지", "오케이", "ㅇㅇ", "ㅇ",
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "sure",
+        "ok",
+        "okay",
+        "go ahead",
+        "do it",
+        "proceed",
+        "approve",
+        "allow",
+        "run it",
+        "correct",
+        "right",
+        "that's right",
+        "that is right",
+        "of course",
+        "absolutely",
+        "indeed",
+        "네",
+        "응",
+        "맞아",
+        "그래",
+        "좋아",
+        "응응",
+        "넵",
+        "예",
+        "당연",
+        "그렇지",
+        "오케이",
+        "ㅇㅇ",
+        "ㅇ",
         # Korean inflected/verb forms. Hangul syllables are alnum for str, so a
- # bare keyword like "그래" does NOT boundary-match "그래요" (요 is alnum);
+        # bare keyword like "그래" does NOT boundary-match "그래요" (요 is alnum);
         # the politeness/verb-ending forms must be enumerated explicitly.
-        "좋아요", "그래요", "맞아요", "그럼", "네네", "ㄱㄱ",
-        "진행", "진행해", "해줘", "실행", "실행해", "시작해", "가요",
+        "좋아요",
+        "그래요",
+        "맞아요",
+        "그럼",
+        "네네",
+        "ㄱㄱ",
+        "진행",
+        "진행해",
+        "해줘",
+        "실행",
+        "실행해",
+        "시작해",
+        "가요",
     },
 )
 
 _DENIAL_PATTERN = IntentPattern(
     name="denial",
     keywords={
-        "no", "n", "nope", "nah", "don't", "dont", "stop", "cancel",
-        "deny", "false", "abort", "never mind", "nevermind",
-        "아니", "안 돼", "안돼", "하지마", "그만", "싫어", "노", "ㄴㄴ",
+        "no",
+        "n",
+        "nope",
+        "nah",
+        "don't",
+        "dont",
+        "stop",
+        "cancel",
+        "deny",
+        "false",
+        "abort",
+        "never mind",
+        "nevermind",
+        "아니",
+        "안 돼",
+        "안돼",
+        "하지마",
+        "그만",
+        "싫어",
+        "노",
+        "ㄴㄴ",
         # Politeness/verb-ending forms — see the affirmative block note.
-        "아니요", "아니오", "아뇨", "안돼요", "하지마요",
-        "취소", "취소해", "그만둬", "중단", "중단해",
+        "아니요",
+        "아니오",
+        "아뇨",
+        "안돼요",
+        "하지마요",
+        "취소",
+        "취소해",
+        "그만둬",
+        "중단",
+        "중단해",
         # Explicit negation constructions. These are added (rather than bare
         # "not"/"but") because they are unambiguously negative/withholding, so a
         # legitimate affirmation like "sure, not a problem" / "ok, no worries"
         # is NOT falsely denied — "not a problem" contains no such construction.
         # Word-boundary matching keeps them safe ("do not" won't fire inside
         # "do nothing"; "never" won't fire inside "nevertheless").
-        "do not", "not yet", "should not", "shouldn't",
-        "won't", "will not", "can't", "cannot", "never",
+        "do not",
+        "not yet",
+        "should not",
+        "shouldn't",
+        "won't",
+        "will not",
+        "can't",
+        "cannot",
+        "never",
     },
 )
 
 
 def classify_user_approval(
     response: str,
-    judge_fn: Optional[Callable[[str], str]] = None,
+    judge_fn: Callable[[str], str] | None = None,
 ) -> UserApproval:
     """Interpret a user's free-text response as approval, denial, or ambiguous.
 

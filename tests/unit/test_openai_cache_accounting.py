@@ -11,6 +11,7 @@ Covers three layers:
 The normalization is what keeps the ⚡ cache-hit display and cost math correct
 when the design-chat failover flips from the Anthropic facade to the OpenAI one.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,8 +38,7 @@ from external_llm.openai_client import (
 
 
 def _usage(prompt=10000, cached=None, completion=50):
-    u = {"prompt_tokens": prompt, "completion_tokens": completion,
-         "total_tokens": prompt + completion}
+    u = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
     if cached is not None:
         u["prompt_tokens_details"] = {"cached_tokens": cached}
     return u
@@ -110,7 +110,8 @@ def _payload(content="hi", finish="stop", usage=None, tool_calls=None):
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return {
-        "id": "x", "object": "chat.completion",
+        "id": "x",
+        "object": "chat.completion",
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
         "usage": usage or _usage(),
     }
@@ -134,7 +135,9 @@ def test_chat_nonstream_populates_cache_field(monkeypatch):
 def test_chat_with_tools_nonstream_populates_cache_field(monkeypatch):
     client = _parent(monkeypatch, _OK(_payload(usage=_usage(prompt=10000, cached=8500))))
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[], model="gpt-4",
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="gpt-4",
     )
     assert resp.cache_read_input_tokens == 8500
     # prompt_tokens stays as the OpenAI subset total here (parent = subset).
@@ -144,14 +147,15 @@ def test_chat_with_tools_nonstream_populates_cache_field(monkeypatch):
 def test_streaming_populates_cache_field(monkeypatch):
     # Final usage chunk carries prompt_tokens_details.cached_tokens.
     usage_chunk = {
-        "usage": {"prompt_tokens": 10000, "completion_tokens": 50,
-                  "prompt_tokens_details": {"cached_tokens": 8500}},
+        "usage": {"prompt_tokens": 10000, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 8500}},
     }
     sse = ["data: " + json.dumps(usage_chunk), "data: [DONE]"]
     client = _parent(monkeypatch, _Stream(sse))
     captured = []
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[], model="gpt-4",
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="gpt-4",
         token_callback=captured.append,
     )
     assert resp.cache_read_input_tokens == 8500
@@ -163,18 +167,24 @@ def test_streaming_populates_cache_field(monkeypatch):
 
 def _resp(prompt=10000, cached=8500, completion=50):
     return ToolCallResponse(
-        content="x", model="glm-5.2", provider="zai",
-        tokens_used=prompt + completion, finish_reason="stop",
-        raw_response={}, tool_calls=[], is_final=True,
-        prompt_tokens=prompt, completion_tokens=completion,
+        content="x",
+        model="glm-5.2",
+        provider="zai",
+        tokens_used=prompt + completion,
+        finish_reason="stop",
+        raw_response={},
+        tool_calls=[],
+        is_final=True,
+        prompt_tokens=prompt,
+        completion_tokens=completion,
         cache_read_input_tokens=cached,
     )
 
 
 def test_normalize_splits_subset_into_separate():
     resp = ZAIClient._normalize_cache_accounting(_resp(prompt=10000, cached=8500))
-    assert resp.cache_read_input_tokens == 8500          # unchanged
-    assert resp.prompt_tokens == 10000 - 8500            # uncached-only
+    assert resp.cache_read_input_tokens == 8500  # unchanged
+    assert resp.prompt_tokens == 10000 - 8500  # uncached-only
 
 
 def test_normalize_noop_without_cache():
@@ -196,11 +206,14 @@ def test_zai_chat_with_tools_normalizes_to_separate(monkeypatch):
     client = ZAIClient(api_key="test")
     monkeypatch.setattr(oc.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        client._session, "post",
+        client._session,
+        "post",
         lambda *a, **k: _OK(_payload(usage=_usage(prompt=10000, cached=8500))),
     )
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[], model="glm-5.2",
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="glm-5.2",
     )
     # Parent filled cache_read from usage; ZAIClient then normalized prompt.
     assert resp.cache_read_input_tokens == 8500
@@ -227,13 +240,15 @@ def test_normalize_cost_matches_subset_formula():
 
     # Separate-accounting cost on the NORMALIZED (uncached) prompt.
     separate = estimate_cache_adjusted_cost(
-        "zai", uncached, completion, cache_read_tok=cached, model="glm-5.2",
+        "zai",
+        uncached,
+        completion,
+        cache_read_tok=cached,
+        model="glm-5.2",
         base_url="https://api.z.ai/paas/v4/chat",
     )
     # Equivalent subset re-price done by hand on the raw inclusive prompt.
-    subset_manual = (
-        prompt * in_rate + completion * out_rate - cached * (in_rate - cached_rate)
-    ) / 1_000_000
+    subset_manual = (prompt * in_rate + completion * out_rate - cached * (in_rate - cached_rate)) / 1_000_000
     assert separate == pytest.approx(subset_manual, rel=1e-9)
 
 
@@ -246,11 +261,13 @@ def test_openrouter_does_not_normalize_prompt(monkeypatch):
     client = OpenRouterClient(api_key="sk-test")
     monkeypatch.setattr(oc.time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        client._session, "post",
+        client._session,
+        "post",
         lambda *a, **k: _OK(_payload(usage=_usage(prompt=10000, cached=8500))),
     )
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[],
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
         model="deepseek/deepseek-v4-flash",
     )
     assert resp.cache_read_input_tokens == 8500

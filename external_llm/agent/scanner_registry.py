@@ -19,7 +19,7 @@ import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from ..analysis.scan_walk import SCAN_LANGUAGES
 from ..languages import LanguageId
@@ -48,7 +48,7 @@ class ScannerSpec:
     When both are set, ``supported_languages`` takes precedence at run() time.
     """
 
-    supported_languages: Optional[set["LanguageId"]] = None
+    supported_languages: set[LanguageId] | None = None
     """Languages this scanner can meaningfully analyze.
 
     ``None`` (default) = no language constraint — scan any code file the
@@ -115,16 +115,12 @@ def _scanner_accepts_cancel_event(fn: Callable[..., Any]) -> bool:
         sig = inspect.signature(fn)
     except (ValueError, TypeError):
         return False
-    return (
-        "cancel_event" in sig.parameters
-        or any(
-            p.kind is inspect.Parameter.VAR_KEYWORD
-            for p in sig.parameters.values()
-        )
+    return "cancel_event" in sig.parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
     )
 
 
-def _hash_source_file(path: str) -> Optional[str]:
+def _hash_source_file(path: str) -> str | None:
     """sha256 hex digest of *path*, or None when the file cannot be read.
 
     Used by the scanner source-freshness check: the digest IS the logical
@@ -161,10 +157,7 @@ class ScannerRegistry:
         # ``ASICODE_SCANNER_AUTO_RELOAD=1``; hosts may also flip the attribute
         # on the shared registry at any time. Default keeps the warning-only
         # design (reload mutates live code and must be explicitly opted into).
-        self.auto_reload_stale = (
-            os.environ.get("ASICODE_SCANNER_AUTO_RELOAD", "0")
-            in {"1", "true", "yes"}
-        )
+        self.auto_reload_stale = os.environ.get("ASICODE_SCANNER_AUTO_RELOAD", "0") in {"1", "true", "yes"}
 
     def register(self, spec: ScannerSpec, fn: Callable[..., Any]) -> None:
         """Register a scanner function under the given spec."""
@@ -173,18 +166,19 @@ class ScannerRegistry:
         self._run_locks[spec.name] = threading.Lock()
         # Cache whether fn accepts a cancel_event kwarg (cooperative cancel).
         # Inspected once at registration to avoid per-run signature overhead.
-        fn._accepts_cancel_event = _scanner_accepts_cancel_event(fn)
+        fn._accepts_cancel_event = _scanner_accepts_cancel_event(fn)  # type: ignore[attr-defined]  # dynamic scanner attribute
         self._record_source_fingerprints(fn)
         logger.info(
             "[SCANNER_REGISTRY] registered '%s' (%s)",
-            spec.name, spec.description,
+            spec.name,
+            spec.description,
         )
 
-    def get(self, name: str) -> Optional[Callable[..., Any]]:
+    def get(self, name: str) -> Callable[..., Any] | None:
         """Return the scanner function for *name*, or None."""
         return self._scanners.get(name)
 
-    def get_spec(self, name: str) -> Optional[ScannerSpec]:
+    def get_spec(self, name: str) -> ScannerSpec | None:
         """Return the scanner spec for *name*, or None."""
         return self._specs.get(name)
 
@@ -251,9 +245,9 @@ class ScannerRegistry:
         self,
         name: str,
         repo_root: str = "",
-        file_paths: Optional[list[str]] = None,
+        file_paths: list[str] | None = None,
         *,
-        cancel_event: Optional[Any] = None,
+        cancel_event: Any | None = None,
         **kwargs: Any,
     ) -> ScannerResult:
         """Invoke a scanner and wrap the result.
@@ -293,18 +287,12 @@ class ScannerRegistry:
         if file_paths:
             if spec.supported_languages is not None:
                 _supported = spec.supported_languages
-                file_paths = [
-                    p for p in file_paths
-                    if LanguageId.from_path(p) in _supported
-                ]
+                file_paths = [p for p in file_paths if LanguageId.from_path(p) in _supported]
             elif spec.file_filter:
                 _ext = spec.file_filter
                 if _ext and not _ext.startswith("."):
                     _ext = "." + _ext
-                file_paths = [
-                    p for p in file_paths
-                    if p.endswith(_ext)
-                ]
+                file_paths = [p for p in file_paths if p.endswith(_ext)]
 
         # Size the shared AST cache to this scanner's file set so the next
         # scanner over the same set hits the cache instead of re-parsing.
@@ -312,6 +300,7 @@ class ScannerRegistry:
         if file_paths:
             with contextlib.suppress(OSError, ValueError):  # pragma: no cover - cache sizing is best-effort
                 from ..analysis import parse_cache
+
                 parse_cache.ensure_capacity(len(file_paths))
 
         # ── Critical section: truncation is out-of-band state on the shared ──
@@ -327,7 +316,7 @@ class ScannerRegistry:
         with self._run_locks[name]:
             # Reset per-call truncation tracker (set by scanner function on self).
             with contextlib.suppress(AttributeError):
-                del fn._truncated
+                del fn._truncated  # type: ignore[attr-defined]  # dynamic scanner attribute
 
             # Forward cancel_event only to scanners that accept it, so
             # cooperative cancellation reaches opt-in scanners (e.g. vulture)
@@ -368,7 +357,6 @@ class ScannerRegistry:
             affected_files=affected,
             truncated_count=truncated_count,
         )
-
 
     # ── Scanner source freshness (R12-2) ─────────────────────────────────────
     # A long-lived server (MCP / REPL / webapp) imports scanner modules once
@@ -411,7 +399,7 @@ class ScannerRegistry:
             )
 
     @staticmethod
-    def _normalize_source_path(src: str) -> Optional[str]:
+    def _normalize_source_path(src: str) -> str | None:
         """Map a module ``__file__`` to its on-disk ``.py`` path (or None).
 
         Non-editable installs expose ``.pyc`` — hash/reload the sibling ``.py``.
@@ -435,7 +423,7 @@ class ScannerRegistry:
         if digest is not None:
             self._loaded_fingerprints[src] = digest
 
-    def _module_for_source(self, path: str) -> Optional[Any]:
+    def _module_for_source(self, path: str) -> Any | None:
         """Return the loaded module whose source file is *path* (or None)."""
         for mod in list(sys.modules.values()):
             src = getattr(mod, "__file__", None)
@@ -468,8 +456,7 @@ class ScannerRegistry:
         entry_mods = {
             sys.modules[fn.__module__]
             for fn in self._scanners.values()
-            if isinstance(getattr(fn, "__module__", None), str)
-            and fn.__module__ in sys.modules
+            if isinstance(getattr(fn, "__module__", None), str) and fn.__module__ in sys.modules
         }
         stale_mods: list[tuple[str, Any]] = []
         for path in stale:
@@ -485,7 +472,8 @@ class ScannerRegistry:
             except Exception:
                 logger.warning(
                     "[SCANNER_REGISTRY] reload failed for %s (keeping old code)",
-                    path, exc_info=True,
+                    path,
+                    exc_info=True,
                 )
             else:
                 reloaded.append(path)
@@ -552,7 +540,11 @@ class ScannerRegistry:
         server also logs at boot).
         """
         # None (deleted/unreadable) never equals a recorded digest → stale.
-        stale: list[str] = [path for path in sorted(self._loaded_fingerprints) if _hash_source_file(path) != self._loaded_fingerprints[path]]
+        stale: list[str] = [
+            path
+            for path in sorted(self._loaded_fingerprints)
+            if _hash_source_file(path) != self._loaded_fingerprints[path]
+        ]
         return stale
 
     def source_versions(self) -> dict[str, str]:
@@ -560,10 +552,7 @@ class ScannerRegistry:
 
         Diagnostic view of the logical version of every fingerprinted module.
         """
-        return {
-            path: digest[:8]
-            for path, digest in sorted(self._loaded_fingerprints.items())
-        }
+        return {path: digest[:8] for path, digest in sorted(self._loaded_fingerprints.items())}
 
 
 # ── Module-level singleton ───────────────────────────────────────────────────
@@ -591,7 +580,7 @@ _SCANNER_REGISTRY = ScannerRegistry()
 # The freshness check fingerprints them so a long-lived server that loaded
 # pre-edit code can be detected (R12-2). Derived from __package__ so a package
 # rename keeps the check functional.
-_SCANNER_IMPL_PKG: str = f"{__package__.rsplit('.', 1)[0]}.analysis"
+_SCANNER_IMPL_PKG: str = f"{(__package__ or 'external_llm.agent').rsplit('.', 1)[0]}.analysis"
 
 
 def _auto_register() -> None:
@@ -607,8 +596,8 @@ def _auto_register() -> None:
                 "cluster_gap_tolerance": "Optional[int]",
                 "cross_file_referenced_names": "Optional[set]",
             },
-                file_filter=".py",
-                supported_languages=set(_PYTHON_ONLY),
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
             skip_in_all_mode=True,  # superseded by public_dead_code_scanner (superset)
         ),
         scan_dead_blocks,
@@ -623,8 +612,8 @@ def _auto_register() -> None:
             name="duplicate_definition_scanner",
             description="Find top-level duplicate definitions (same name, same kind)",
             input_schema={"max_per_file": "int"},
-                file_filter="",
-                supported_languages=set(_TS_LANGUAGES),
+            file_filter="",
+            supported_languages=set(_TS_LANGUAGES),
         ),
         scan_duplicate_definitions,
     )
@@ -636,8 +625,8 @@ def _auto_register() -> None:
             name="unused_import_scanner",
             description="Find unused import statements via AST reference analysis",
             input_schema={"max_per_file": "int"},
-                file_filter=".py",
-                supported_languages=set(_PYTHON_ONLY),
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
         ),
         scan_unused_imports,
     )
@@ -653,8 +642,8 @@ def _auto_register() -> None:
                 "cluster_gap_tolerance": "Optional[int]",
                 "cross_file_referenced_names": "Optional[set]",
             },
-                file_filter=".py",
-                supported_languages=set(_PYTHON_ONLY),
+            file_filter=".py",
+            supported_languages=set(_PYTHON_ONLY),
         ),
         scan_public_dead_blocks,
     )
@@ -763,7 +752,7 @@ _auto_register()
 # build_delete_ops_from_structural_worksets (_is_pipeline_break).
 
 
-def get_registry() -> "ScannerRegistry":
+def get_registry() -> ScannerRegistry:
     """Return the module-level ScannerRegistry singleton.
 
     All agent tool handlers should call this function instead of constructing

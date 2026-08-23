@@ -6,6 +6,7 @@ prefixing. A sibling directory that merely starts with the same characters
 ``path_security._repo_within_allowlist`` and ``resolve_under_repo_subdir``
 already document for their own callers.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -62,7 +63,7 @@ class TestApplyPatchRepoRootStrip:
         if path == repo_root_str:
             path = ""
         elif path.startswith(repo_root_str + "/"):
-            path = path[len(repo_root_str):].lstrip("/")
+            path = path[len(repo_root_str) :].lstrip("/")
         if path.startswith("/"):
             path = path.lstrip("/")
         return path
@@ -73,10 +74,13 @@ class TestApplyPatchRepoRootStrip:
     def test_nested_path_inside_repo(self):
         assert self._strip("/home/dev/repo", "/home/dev/repo/pkg/mod/a.py") == "pkg/mod/a.py"
 
-    @pytest.mark.parametrize("path", [
-        "/home/dev/repository/a.py",
-        "/home/dev/repo-backup/x.py",
-    ])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/home/dev/repository/a.py",
+            "/home/dev/repo-backup/x.py",
+        ],
+    )
     def test_sibling_prefix_is_left_alone(self, path: str):
         """Previously produced 'sitory/a.py' / '-backup/x.py'."""
         assert self._strip("/home/dev/repo", path) == path.lstrip("/")

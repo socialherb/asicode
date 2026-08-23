@@ -60,11 +60,7 @@ def _seed_repo(root: Path, n: int = _N_DOCS) -> None:
 
 
 def _write_doc(root: Path, k: int, payload: int) -> None:
-    (root / f"doc{k}.py").write_text(
-        f"# unique_token_doc{k}\n"
-        f"def function_{k}(x, y):\n"
-        f"    return x + y + {payload}\n"
-    )
+    (root / f"doc{k}.py").write_text(f"# unique_token_doc{k}\ndef function_{k}(x, y):\n    return x + y + {payload}\n")
 
 
 def _build_searcher(root: Path) -> RAGSearcher:
@@ -192,20 +188,16 @@ def test_index_arrays_consistent_under_concurrent_invalidate(tmp_path: Path) -> 
         assert len(searcher._doc_texts) == n, "doc_texts length drift"
         # Running-total invariant (replaces per-file sum(); must stay exact).
         assert searcher._total_doc_len == sum(searcher._doc_lengths), (
-            f"total_doc_len={searcher._total_doc_len} != "
-            f"sum={sum(searcher._doc_lengths)}"
+            f"total_doc_len={searcher._total_doc_len} != sum={sum(searcher._doc_lengths)}"
         )
         expected_avgdl = searcher._total_doc_len / max(n, 1)
-        assert abs(searcher._avgdl - expected_avgdl) < 1e-9, (
-            f"avgdl={searcher._avgdl} != expected {expected_avgdl}"
-        )
+        assert abs(searcher._avgdl - expected_avgdl) < 1e-9, f"avgdl={searcher._avgdl} != expected {expected_avgdl}"
         # path↔text alignment: docN.py's text must contain unique_token_docN.
         for idx, path in enumerate(searcher._rel_paths):
             assert path.endswith(".py"), f"unexpected path: {path}"
             marker = "unique_token_" + path[: -len(".py")]
             assert marker in searcher._doc_texts[idx], (
-                f"path↔doc misalignment at idx {idx}: path={path!r} "
-                f"text lacks {marker!r}"
+                f"path↔doc misalignment at idx {idx}: path={path!r} text lacks {marker!r}"
             )
 
 
@@ -225,9 +217,7 @@ def test_remove_doc_at_requires_caller_lock(tmp_path: Path) -> None:
 
     assert searcher._n_docs == before - 1
     assert searcher._total_doc_len == total_before - removed_len
-    assert abs(
-        searcher._avgdl - (searcher._total_doc_len / max(searcher._n_docs, 1))
-    ) < 1e-9
+    assert abs(searcher._avgdl - (searcher._total_doc_len / max(searcher._n_docs, 1))) < 1e-9
 
 
 def test_stale_result_not_recached_after_invalidate_race(tmp_path: Path) -> None:
@@ -259,7 +249,7 @@ def test_stale_result_not_recached_after_invalidate_race(tmp_path: Path) -> None
 
     def _pausing_bm25(q, top_k, file_glob=None):
         res = real_bm25(q, top_k, file_glob)  # reads the (old) index under lock
-        search_read_done.set()                 # searcher has read the old index
+        search_read_done.set()  # searcher has read the old index
         allow_search_finish.wait(timeout=5.0)  # block until invalidation lands
         return res
 
@@ -283,8 +273,7 @@ def test_stale_result_not_recached_after_invalidate_race(tmp_path: Path) -> None
 
     with searcher._search_cache_lock:
         assert cache_key not in searcher._search_cache, (
-            "stale pre-mutation result was re-cached after the clear "
-            "(generation guard missing)"
+            "stale pre-mutation result was re-cached after the clear (generation guard missing)"
         )
 
 
@@ -333,7 +322,7 @@ def test_generation_compare_holds_cache_lock(tmp_path: Path) -> None:
 
     query = "alpha_token_xyz"
     cache_key = searcher._make_cache_key(query, 5, None)
-    with searcher._search_cache_lock:        # drain -> the 1st acquire (read) is a miss
+    with searcher._search_cache_lock:  # drain -> the 1st acquire (read) is a miss
         searcher._search_cache.clear()
 
     real_lock = searcher._search_cache_lock
@@ -382,9 +371,7 @@ def test_path_to_index_map_stays_consistent(tmp_path: Path) -> None:
     searcher = _build_searcher(tmp_path)
 
     def _check():
-        assert searcher._rel_path_to_idx == {
-            p: i for i, p in enumerate(searcher._rel_paths)
-        }
+        assert searcher._rel_path_to_idx == {p: i for i, p in enumerate(searcher._rel_paths)}
 
     _check()
     # Remove doc2.
@@ -409,6 +396,7 @@ def test_path_to_index_map_stays_consistent(tmp_path: Path) -> None:
 # lazy first-call cost of every ``find_relevant_files``) must bail out promptly
 # on ESC / Ctrl-C. ``_build_index`` returns False and ``_ensure_index`` keeps
 # ``_built`` False, so the uncommitted per-doc arrays never become visible.
+
 
 def test_build_index_pre_set_cancel_returns_false(tmp_path: Path) -> None:
     """A pre-set cancel_event makes _build_index() return False at the first
@@ -464,9 +452,11 @@ def test_build_index_without_cancel_event_unchanged(tmp_path: Path) -> None:
 # would leave ESC inert on every ``find_relevant_files`` first-call build. The
 # searcher must read ``config.cancel_event`` FRESH at ``_build_index()`` time.
 
+
 def test_ensure_index_honors_per_turn_config_mutation(tmp_path: Path) -> None:
     """ESC pressed via a config.cancel_event set AFTER construction is honored."""
     import types
+
     _seed_repo(tmp_path, n=10)
     cfg = types.SimpleNamespace(cancel_event=None)
     rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False, config=cfg)
@@ -475,12 +465,12 @@ def test_ensure_index_honors_per_turn_config_mutation(tmp_path: Path) -> None:
 
     ev = threading.Event()
     cfg.cancel_event = ev
-    ev.set()                                           # ESC pressed
-    assert rs._cancel_event is None                    # STILL frozen None ...
-    assert rs._get_cancel_event() is ev                # ... but fresh read sees live event
+    ev.set()  # ESC pressed
+    assert rs._cancel_event is None  # STILL frozen None ...
+    assert rs._get_cancel_event() is ev  # ... but fresh read sees live event
     rs._ensure_index()
-    assert rs._built is False                          # fresh read → cancel honored
-    assert rs._n_docs == 0                             # local arrays never committed
+    assert rs._built is False  # fresh read → cancel honored
+    assert rs._n_docs == 0  # local arrays never committed
 
     ev.clear()
     rs._ensure_index()
@@ -491,6 +481,7 @@ def test_ensure_index_honors_per_turn_config_mutation(tmp_path: Path) -> None:
 def test_build_index_with_config_no_event_unchanged(tmp_path: Path) -> None:
     """config passed but cancel_event None → _build_index returns True as before."""
     import types
+
     _seed_repo(tmp_path, n=10)
     cfg = types.SimpleNamespace(cancel_event=None)
     rs = RAGSearcher(str(tmp_path), vector_cache_enabled=False, config=cfg)

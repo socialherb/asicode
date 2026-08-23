@@ -11,6 +11,7 @@ of pytest output cost +229 MB through ``run_tests``.
 Lives here rather than beside any one caller so the next stream-reading tool
 inherits the bound instead of rediscovering it.
 """
+
 from __future__ import annotations
 
 from collections import deque as _deque
@@ -65,7 +66,7 @@ class _BoundedCapture:
             # happens to chunk is a bound in name only.
             self._tail.clear()
             self._tail_len = 0
-            text = text[-self._cap:]
+            text = text[-self._cap :]
         self._tail.append(text)
         self._tail_len += len(text)
         # Drop whole chunks from the front while the rest still covers the cap,

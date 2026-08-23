@@ -45,6 +45,7 @@ def _aggressive_thread_switching():
 
 # ── Per-thread model context (Bug 1: set_model_context race) ───────────────────
 
+
 def test_model_context_is_thread_local_not_shared():
     """Concurrent sessions must not overwrite each other's model context.
 
@@ -82,9 +83,7 @@ def test_model_context_is_thread_local_not_shared():
     t_b.join(timeout=10)
 
     assert not errors, f"threads raised: {errors}"
-    assert observations.get("A") == "gpt-4o", (
-        f"session A saw the wrong model (cross-contamination): {observations!r}"
-    )
+    assert observations.get("A") == "gpt-4o", f"session A saw the wrong model (cross-contamination): {observations!r}"
     assert observations.get("B") == "claude-sonnet", (
         f"session B saw the wrong model (cross-contamination): {observations!r}"
     )
@@ -129,9 +128,7 @@ def test_model_context_defaults_empty_on_uninitialized_thread():
     t.start()
     t.join(timeout=5)
 
-    assert seen_on_new_thread["v"] == "", (
-        f"new thread inherited another session's model: {seen_on_new_thread!r}"
-    )
+    assert seen_on_new_thread["v"] == "", f"new thread inherited another session's model: {seen_on_new_thread!r}"
 
 
 # ── Adaptive hub: cache key must track the persistence namespace ─────────────
@@ -144,17 +141,14 @@ def test_model_context_defaults_empty_on_uninitialized_thread():
 # therefore write-only, and every sub-agent flush copied the parent's whole blob
 # into it, after which the two copies drifted.
 
+
 def _trace_namespaces(monkeypatch):
     """Record (op, namespace) for every hub load/save; returns the list."""
     from external_llm.editor.learning import strategy_state
 
     seen: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        strategy_state, "read_namespace", lambda ns, *a, **k: seen.append(("read", ns)) or {}
-    )
-    monkeypatch.setattr(
-        strategy_state, "write_namespace", lambda ns, v, *a, **k: seen.append(("write", ns)) or True
-    )
+    monkeypatch.setattr(strategy_state, "read_namespace", lambda ns, *a, **k: seen.append(("read", ns)) or {})
+    monkeypatch.setattr(strategy_state, "write_namespace", lambda ns, v, *a, **k: seen.append(("write", ns)) or True)
     return seen
 
 
@@ -181,9 +175,7 @@ def test_hub_cache_is_keyed_by_namespace_not_shared(monkeypatch):
     )
     assert set(store._adaptive_hubs) == {"adaptive_hub", "adaptive_hub/m-1"}
     hub_reads = [ns for op, ns in seen if op == "read" and ns.startswith("adaptive_hub")]
-    assert "adaptive_hub/m-1" in hub_reads, (
-        "per-model namespace was never READ — it was write-only before this fix"
-    )
+    assert "adaptive_hub/m-1" in hub_reads, "per-model namespace was never READ — it was write-only before this fix"
 
 
 def test_sub_agent_save_does_not_carry_the_parent_blob(monkeypatch):
@@ -200,7 +192,8 @@ def test_sub_agent_save_does_not_carry_the_parent_blob(monkeypatch):
     writes: list[tuple[str, object]] = []
     monkeypatch.setattr(strategy_state, "read_namespace", lambda ns, *a, **k: {})
     monkeypatch.setattr(
-        strategy_state, "write_namespace",
+        strategy_state,
+        "write_namespace",
         lambda ns, v, *a, **k: writes.append((ns, v)) or True,
     )
     store = InMemoryRunStore()
@@ -219,9 +212,7 @@ def test_sub_agent_save_does_not_carry_the_parent_blob(monkeypatch):
     assert [ns for ns, _ in writes] == ["adaptive_hub/m-2"], writes
     payload = repr(writes[0][1])
     assert "sub_only_tool" in payload, "sub-agent's own signal missing from its namespace"
-    assert "parent_only_tool" not in payload, (
-        "parent's accumulated signals were duplicated into adaptive_hub/m-2"
-    )
+    assert "parent_only_tool" not in payload, "parent's accumulated signals were duplicated into adaptive_hub/m-2"
 
 
 def test_concurrent_hub_init_builds_exactly_one(monkeypatch):

@@ -3,6 +3,7 @@
 run_lint의 언어 디스패치(ruff/eslint/go/generic/none), gofmt -d diff 파싱,
 golangci-lint 이슈 수집, _resolve_path/_normalize_file_path 예외 경로를 고정.
 """
+
 from __future__ import annotations
 
 import json
@@ -26,8 +27,9 @@ class TestRunRuffErrors:
     def test_ruff_nonzero_rc_surfaces_stderr(self, tmp_path, monkeypatch):
         f = tmp_path / "a.py"
         f.write_text("x = 1")
-        monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run",
-                            lambda *a, **k: _proc(returncode=2, stderr="syntax error"))
+        monkeypatch.setattr(
+            "external_llm.agent.lint_runner.subprocess.run", lambda *a, **k: _proc(returncode=2, stderr="syntax error")
+        )
         out = LintRunner(str(tmp_path)).run_ruff(str(f))
         assert out.ok is False
         assert "exit code 2" in out.summary
@@ -38,12 +40,20 @@ class TestRunRuffErrors:
         f = tmp_path / "a.py"
         f.write_text("x = 1")
         issues = [
-            {"filename": "a.py", "location": {"row": i, "column": 1},
-             "code": "F401", "message": f"unused {i}", "severity": "warning", "fix": None}
+            {
+                "filename": "a.py",
+                "location": {"row": i, "column": 1},
+                "code": "F401",
+                "message": f"unused {i}",
+                "severity": "warning",
+                "fix": None,
+            }
             for i in range(1, 3)
         ]
-        monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run",
-                            lambda *a, **k: _proc(returncode=1, stdout=json.dumps(issues)))
+        monkeypatch.setattr(
+            "external_llm.agent.lint_runner.subprocess.run",
+            lambda *a, **k: _proc(returncode=1, stdout=json.dumps(issues)),
+        )
         out = LintRunner(str(tmp_path)).run_ruff(str(f), max_issues=2)
         assert out.ok is False
         assert "(truncated to 2)" in out.summary
@@ -52,12 +62,19 @@ class TestRunRuffErrors:
         f = tmp_path / "a.py"
         f.write_text("x = 1")
         issues = [
-            {"filename": "a.py", "location": {"row": 1, "column": 1},
-             "code": "F401", "message": "unused", "severity": "warning",
-             "fix": {"message": "remove"}},
+            {
+                "filename": "a.py",
+                "location": {"row": 1, "column": 1},
+                "code": "F401",
+                "message": "unused",
+                "severity": "warning",
+                "fix": {"message": "remove"},
+            },
         ]
-        monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run",
-                            lambda *a, **k: _proc(returncode=1, stdout=json.dumps(issues)))
+        monkeypatch.setattr(
+            "external_llm.agent.lint_runner.subprocess.run",
+            lambda *a, **k: _proc(returncode=1, stdout=json.dumps(issues)),
+        )
         out = LintRunner(str(tmp_path)).run_ruff(str(f))
         assert "(1 auto-fixable)" in out.summary
 
@@ -108,16 +125,17 @@ class TestGenericLint:
 
     def test_rc_zero_ok(self, tmp_path, monkeypatch):
         (tmp_path / "a.rb").write_text("x = 1")
-        monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run",
-                            lambda *a, **k: _proc(returncode=0))
+        monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run", lambda *a, **k: _proc(returncode=0))
         out = LintRunner(str(tmp_path))._run_generic_lint(["tool"], "a.rb")
         assert out.ok is True
         assert "no lint issues" in out.summary
 
     def test_blank_lines_skipped_and_max_issues_break(self, tmp_path, monkeypatch):
         (tmp_path / "a.rb").write_text("x = 1")
-        monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run",
-                            lambda *a, **k: _proc(returncode=1, stdout="w1\n\nw2\nw3\n"))
+        monkeypatch.setattr(
+            "external_llm.agent.lint_runner.subprocess.run",
+            lambda *a, **k: _proc(returncode=1, stdout="w1\n\nw2\nw3\n"),
+        )
         out = LintRunner(str(tmp_path))._run_generic_lint(["tool"], "a.rb", max_issues=2)
         assert [i.message for i in out.issues] == ["w1", "w2"]  # 빈 줄 스킵 + cap
         assert out.ok is False
@@ -135,8 +153,7 @@ class TestGoLint:
         (tmp_path / "a.go").write_text("package main\n")
         r = LintRunner(str(tmp_path))
         err = LintResult(ok=False, summary="gofmt broke", error="gofmt broke")
-        monkeypatch.setattr(r, "_run_lint_command",
-                            lambda cmd, tool, timeout=30: (None, err))
+        monkeypatch.setattr(r, "_run_lint_command", lambda cmd, tool, timeout=30: (None, err))
         with caplog.at_level(logging.WARNING):
             out = r._run_go_lint(str(tmp_path / "a.go"))
         assert out.ok is True  # 소프트 실패 — 이슈 없이 통과

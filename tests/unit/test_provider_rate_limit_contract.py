@@ -10,6 +10,7 @@ backoff, so the hint was silently dropped on exactly the provider that needs
 it most (local/slow Ollama endpoints). The AST contract below pins the
 kwarg on every raise site, including ones added in the future.
 """
+
 from __future__ import annotations
 
 import ast
@@ -26,9 +27,7 @@ def _rate_limit_raise_sites():
             if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
                 continue
             func = node.exc.func
-            name = func.id if isinstance(func, ast.Name) else (
-                func.attr if isinstance(func, ast.Attribute) else None
-            )
+            name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else None)
             if name != "LLMRateLimitError":
                 continue
             yield file.relative_to(_REPO_ROOT).as_posix(), node.lineno, node.exc
@@ -44,8 +43,7 @@ def test_every_rate_limit_raise_passes_retry_after_hint():
     ]
     assert not missing, (
         "LLMRateLimitError raise sites must pass retry_after= (parsed server "
-        "hint, or None) so retry layers can honor it instead of fixed backoff:\n"
-        + "\n".join(missing)
+        "hint, or None) so retry layers can honor it instead of fixed backoff:\n" + "\n".join(missing)
     )
 
 
@@ -62,12 +60,8 @@ def test_retry_after_hint_is_derived_from_the_response_header():
                 continue  # explicit "no hint available" is allowed
             if isinstance(value, ast.Name):
                 continue  # local alias (e.g. `retry_after = parse_retry_after(...)`)
-            if not (
-                isinstance(value, ast.Call)
-                and getattr(value.func, "id", None) == "parse_retry_after"
-            ):
+            if not (isinstance(value, ast.Call) and getattr(value.func, "id", None) == "parse_retry_after"):
                 hardcoded.append(f"{rel}:{lineno}")
     assert not hardcoded, (
-        "retry_after= must be parse_retry_after(response.headers) or None, "
-        f"got non-derived values at: {hardcoded}"
+        f"retry_after= must be parse_retry_after(response.headers) or None, got non-derived values at: {hardcoded}"
     )

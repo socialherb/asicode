@@ -1,6 +1,7 @@
 """
 Integration tests for performance benchmarking.
 """
+
 import json
 import time
 from unittest.mock import Mock, patch
@@ -27,7 +28,7 @@ class TestPerformanceBenchmark:
             collector.record_tool_call(
                 tool_name=f"tool_{i % 10}",
                 execution_time=(i % 100) / 1000.0,  # convert ms to seconds
-                cache_hit=False
+                cache_hit=False,
             )
 
         end_time = time.perf_counter()
@@ -52,10 +53,7 @@ class TestPerformanceBenchmark:
 
         for i in range(iterations):
             collector.record_llm_call(
-                prompt_tokens=100 + i,
-                completion_tokens=50 + i,
-                execution_time_ms=2000 + i * 10,
-                failed=False
+                prompt_tokens=100 + i, completion_tokens=50 + i, execution_time_ms=2000 + i * 10, failed=False
             )
             # Note: cached parameter ignored for benchmark
 
@@ -91,7 +89,7 @@ class TestPerformanceBenchmark:
                     collector.record_tool_call(
                         tool_name=f"tool_{tool_id % 20}",
                         execution_time=(tool_id % 200) / 1000.0,  # ms to seconds
-                        cache_hit=False
+                        cache_hit=False,
                     )
                 results_queue.put(True)
             except Exception as e:
@@ -149,7 +147,7 @@ class TestPerformanceBenchmark:
             collector.record_tool_call(
                 tool_name=f"benchmark_tool_{i % 50}",
                 execution_time=(i % 300) / 1000.0,  # ms to seconds
-                cache_hit=False
+                cache_hit=False,
             )
 
         # Force garbage collection
@@ -170,7 +168,7 @@ class TestPerformanceBenchmark:
             collector.record_tool_call(
                 tool_name=f"agg_tool_{i}",
                 execution_time=(i * 10) / 1000.0,  # ms to seconds
-                cache_hit=False
+                cache_hit=False,
             )
 
         # Time aggregation operations — process_time (CPU work), NOT wall time:
@@ -203,11 +201,7 @@ class TestPerformanceBenchmark:
         from external_llm.agent.agent_loop import AgentLoop
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
-        config = AgentConfig(
-            max_turns=3,
-            rag_enabled=False,
-            self_review_enabled=False
-        )
+        config = AgentConfig(max_turns=3, rag_enabled=False, self_review_enabled=False)
 
         mock_llm = Mock()
         mock_llm.get_provider_name.return_value = "openai"
@@ -217,19 +211,15 @@ class TestPerformanceBenchmark:
         mock_llm.chat_with_tools.return_value = mock_response
 
         registry = ToolRegistry(temp_repo_root, config)
-        agent = AgentLoop(
-            llm_client=mock_llm,
-            registry=registry,
-            config=config,
-            model="test-model"
-        )
+        agent = AgentLoop(llm_client=mock_llm, registry=registry, config=config, model="test-model")
 
         # Time agent execution
         start_time = time.perf_counter()
 
         # Mock the run method to return quickly
         from external_llm.agent.agent_loop import AgentResult
-        with patch.object(agent, 'run') as mock_run:
+
+        with patch.object(agent, "run") as mock_run:
             mock_run.return_value = AgentResult(status="success", turns=[], final_message="Benchmark completed")
             result = agent.run("Benchmark query")
 
@@ -327,9 +317,7 @@ class TestPerformanceBenchmark:
         # Simulate high-frequency monitoring
         while time.perf_counter() - start_time < duration_seconds:
             collector.record_tool_call(
-                tool_name="monitored_tool",
-                execution_time=(operations % 200) / 1000.0,
-                cache_hit=False
+                tool_name="monitored_tool", execution_time=(operations % 200) / 1000.0, cache_hit=False
             )
             operations += 1
 
@@ -378,12 +366,11 @@ class TestPerformanceBenchmark:
 
         # Print benchmark results (for debugging/information)
         print(f"\nfind_symbol benchmark ({iterations} iterations):")
-        print(f"  Average: {avg_duration*1000:.2f}ms")
-        print(f"  Min: {min_duration*1000:.2f}ms")
-        print(f"  Max: {max_duration*1000:.2f}ms")
+        print(f"  Average: {avg_duration * 1000:.2f}ms")
+        print(f"  Min: {min_duration * 1000:.2f}ms")
+        print(f"  Max: {max_duration * 1000:.2f}ms")
 
     def test_comparative_benchmark(self):
         """Benchmark performance with different configurations."""
         # Test with and without caching
         # Implementation-specific
-

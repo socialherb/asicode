@@ -3,6 +3,7 @@ provider (merged --glob / -e) instead of one per (glob, pattern) pair —
 94 spawns (~1.1s) collapsed to ~13 (~0.13s) — with caps scaled to the merged
 pattern count so no single pattern is starved of its per-pattern budget.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -23,10 +24,7 @@ def captured(tmp_path, monkeypatch):
         out = ""
         if "--glob" in cmd and "*.sh" in cmd:
             # Only the bash provider's merged call yields matches.
-            out = (
-                "run.sh:10:myfunc() {\n"
-                "run.sh:20:function helper {\n"
-            )
+            out = "run.sh:10:myfunc() {\nrun.sh:20:function helper {\n"
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(ss.subprocess, "run", _fake_run)

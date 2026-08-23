@@ -31,9 +31,17 @@ class TestCommentSyntaxClassification:
     def test_c_style_family(self):
         # JS/TS/Go/Java/Kotlin/Rust/C/C++/C#/Swift/Scala: '//' line + '/* */' block.
         c_style = {
-            LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT, LanguageId.GO,
-            LanguageId.JAVA, LanguageId.KOTLIN, LanguageId.RUST, LanguageId.C,
-            LanguageId.CPP, LanguageId.CSHARP, LanguageId.SWIFT, LanguageId.SCALA,
+            LanguageId.TYPESCRIPT,
+            LanguageId.JAVASCRIPT,
+            LanguageId.GO,
+            LanguageId.JAVA,
+            LanguageId.KOTLIN,
+            LanguageId.RUST,
+            LanguageId.C,
+            LanguageId.CPP,
+            LanguageId.CSHARP,
+            LanguageId.SWIFT,
+            LanguageId.SCALA,
         }
         for lid in c_style:
             cs = comment_syntax_for(lid)

@@ -58,7 +58,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from ..common.atomic_io import atomic_write_json
 from ..languages import LanguageId
@@ -201,7 +201,7 @@ def _strip_access_verb(name: str) -> str:
     return ""
 
 
-def _dotted_target(node: ast.AST) -> Optional[str]:
+def _dotted_target(node: ast.AST | None) -> str | None:
     """Rebuild ``self._cache`` / ``self._cache["k"]`` target string.
 
     Returns a stable string capturing the *location* being touched
@@ -378,7 +378,7 @@ def _literal_str(node: ast.AST) -> str:
     return ""
 
 
-def _literal_path(node: ast.AST) -> Optional[str]:
+def _literal_path(node: ast.AST) -> str | None:
     """Return a stable key for an ``open()`` path argument.
 
     Literal strings are used verbatim; ``self._path`` style attribute chains
@@ -587,15 +587,18 @@ def _collect_members(tree: ast.Module) -> dict[str, list[dict[str, Any]]]:
 
 
 def _scan_module(
-    tree: ast.Module,
+    tree: ast.Module | None,
     rel_path: str,
     graph: Any,
     max_per_file: int,
     grouped: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[BrokenContractCandidate]:
     """Group top-level & method defs by core name, validate pairs."""
+    if tree is None and grouped is None:
+        return []  # unreadable/broken file contract: no candidates
     # Collect every function/method def with a non-trivial core name.
     if grouped is None:
+        assert tree is not None  # guarded above: grouped is None implies tree present
         grouped = _collect_members(tree)
 
     candidates: list[BrokenContractCandidate] = []
@@ -619,7 +622,7 @@ def _evaluate_pair(
     core: str,
     rel_path: str,
     graph: Any,
-) -> Optional[BrokenContractCandidate]:
+) -> BrokenContractCandidate | None:
     """Validate one candidate pair; return a BrokenContractCandidate or None."""
     a_writes, a_reads = a["writes"], a["reads"]
     b_writes, b_reads = b["writes"], b["reads"]

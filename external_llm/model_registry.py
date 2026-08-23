@@ -26,8 +26,6 @@ Matching rules:
 
 from __future__ import annotations
 
-from typing import Optional
-
 from external_llm.model_catalog import MODEL_ALIASES
 from external_llm.ollama_api import query_ollama_capabilities
 
@@ -39,13 +37,20 @@ from external_llm.ollama_api import query_ollama_capabilities
 # carries no "-vl"/"_vl" separator — plain "vl" covers it, as do pixtral /
 # internvl, which are vision-only model families).
 OLLAMA_VISION_KEYWORDS: tuple[str, ...] = (
-    "llava", "bakllava", "moondream", "minicpm-v", "vision", "-vl", "_vl",
-    "vl", "pixtral", "internvl",
+    "llava",
+    "bakllava",
+    "moondream",
+    "minicpm-v",
+    "vision",
+    "-vl",
+    "_vl",
+    "vl",
+    "pixtral",
+    "internvl",
 )
 
 
-def _check_model_capability_cached(model_name: str, capability: str,
-                                   base_url_hint: Optional[str] = None) -> bool:
+def _check_model_capability_cached(model_name: str, capability: str, base_url_hint: str | None = None) -> bool:
     """Query model capability with in-memory caching.
 
     Returns False if the capability is unknown or the Ollama API is
@@ -92,20 +97,20 @@ OLLAMA_NUM_CTX_OVERRIDES: dict[str, int] = {}
 # misrouted to the native DeepSeek client.
 CLOUD_PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("openrouter/", "openrouter"),
-    ("claude",    "anthropic"),
-    ("gpt-",      "openai"),
+    ("claude", "anthropic"),
+    ("gpt-", "openai"),
     # No trailing hyphen: OpenAI ships the bare reasoning-model ids alongside
     # their sized variants, and ``KNOWN_MODELS["openai"]`` offers ``o3``. With
     # ``"o3-"`` here that id matched nothing, and the one live caller
     # (webapp/routes/agent_stream.py) reads a None as "not a cloud model" and
     # falls back to ``"deepseek"`` — so asking for o3 dispatched to DeepSeek.
     # ``o3-mini``/``o4-mini`` still match, being prefixed by the bare id.
-    ("o1",        "openai"),
-    ("o3",        "openai"),
-    ("o4",        "openai"),
-    ("gemini",    "google"),
-    ("deepseek",  "deepseek"),
-    ("glm-",      "zai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("o4", "openai"),
+    ("gemini", "google"),
+    ("deepseek", "deepseek"),
+    ("glm-", "zai"),
 )
 
 # ── Cloud models: text-only (reject image input) ──────────────────────────────
@@ -136,6 +141,7 @@ TEXT_ONLY_MODEL_PREFIXES: tuple[str, ...] = (
 # Query API — import these functions instead of duplicating detection logic
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def _norm(model: str) -> str:
     """Lowercase and strip provider prefix (e.g. 'ollama:gemma4:e2b' → 'gemma4:e2b').
 
@@ -159,7 +165,7 @@ def _norm(model: str) -> str:
     return name
 
 
-def ollama_vision(model: str, base_url_hint: Optional[str] = None) -> bool:
+def ollama_vision(model: str, base_url_hint: str | None = None) -> bool:
     """Return True if this Ollama model supports image/vision input.
 
     Detection strategy (two-tier):
@@ -176,7 +182,7 @@ def ollama_vision(model: str, base_url_hint: Optional[str] = None) -> bool:
     return _check_model_capability_cached(m, "vision", base_url_hint)
 
 
-def ollama_supports_tools(model: str, base_url_hint: Optional[str] = None) -> Optional[bool]:
+def ollama_supports_tools(model: str, base_url_hint: str | None = None) -> bool | None:
     """Return whether this Ollama model supports native tool calling.
 
     True/False when the server reported the ``tools`` capability (via the
@@ -191,7 +197,7 @@ def ollama_supports_tools(model: str, base_url_hint: Optional[str] = None) -> Op
     return "tools" in caps
 
 
-def get_ollama_num_ctx(model: str) -> Optional[int]:
+def get_ollama_num_ctx(model: str) -> int | None:
     """Return explicit num_ctx for a model, or None to use the size-based fallback.
 
     Only covers models whose tag doesn't encode a parseable size.
@@ -203,7 +209,7 @@ def get_ollama_num_ctx(model: str) -> Optional[int]:
 # NOTE: get_answer_max_tokens() removed — see comment above for the new approach.
 
 
-def detect_cloud_provider(model: str) -> Optional[str]:
+def detect_cloud_provider(model: str) -> str | None:
     """Detect API provider from model name prefix. Returns None if unknown/Ollama."""
     m = _norm(model)
     for prefix, provider in CLOUD_PROVIDER_PREFIXES:

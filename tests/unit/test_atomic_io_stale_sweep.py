@@ -12,6 +12,7 @@ another process holds its own live temp file in the same directory, and
 deleting that would corrupt its ``os.replace``. These tests pin both halves —
 stale leftovers go, live ones stay.
 """
+
 from __future__ import annotations
 
 import json
@@ -144,7 +145,10 @@ def test_finalize_failure_removes_temp_and_keeps_target(tmp_path):
 
     with pytest.raises(OSError, match="chmod exploded"):
         atomic_io._atomic_replace(
-            target, ".tmp", lambda fh: fh.write("new"), finalize=_finalize,
+            target,
+            ".tmp",
+            lambda fh: fh.write("new"),
+            finalize=_finalize,
         )
     assert target.read_text() == "old"
     leftovers = [p for p in os.listdir(tmp_path) if p.startswith(".atomic_")]

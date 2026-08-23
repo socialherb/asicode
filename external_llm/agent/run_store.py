@@ -87,7 +87,7 @@ class InMemoryRunStore:
         """Normalize model name for filesystem use."""
         if not name:
             return ""
-        return ''.join(c if c.isalnum() or c in '._-' else '_' for c in name.strip())[:50]
+        return "".join(c if c.isalnum() or c in "._-" else "_" for c in name.strip())[:50]
 
     def _model_dir(self) -> str:
         """Return model-specific subdirectory under runs/."""
@@ -202,6 +202,7 @@ class InMemoryRunStore:
             # weight_learning imports only stdlib — the import cannot fail,
             # so the old except ImportError fallback was dead code.
             from .weight_learning import AdaptiveLearnerHub
+
             hub = AdaptiveLearnerHub()
             self._load_adaptive_hub_state(hub, ns)
             self._adaptive_hubs[ns] = hub
@@ -220,6 +221,7 @@ class InMemoryRunStore:
     def _load_adaptive_hub_state(self, hub: Any, ns: str) -> None:
         try:
             from external_llm.editor.learning.strategy_state import read_namespace
+
             state = read_namespace(ns)
             if isinstance(state, dict):
                 hub.load_state(state)
@@ -233,6 +235,7 @@ class InMemoryRunStore:
             return
         try:
             from external_llm.editor.learning.strategy_state import write_namespace
+
             write_namespace(ns, hub.get_summary())
         except Exception as exc:
             logger.debug("run_store: _save_adaptive_hub_state failed: %s", exc)
@@ -287,16 +290,14 @@ class InMemoryRunStore:
             return
         pending = getattr(tls, "pending", 0) + 1
         now = time.monotonic()
-        if (pending >= _HUB_FLUSH_MAX_PENDING
-                or now - getattr(tls, "last_flush", now) >= _HUB_FLUSH_INTERVAL_S):
+        if pending >= _HUB_FLUSH_MAX_PENDING or now - getattr(tls, "last_flush", now) >= _HUB_FLUSH_INTERVAL_S:
             tls.pending = 0
             tls.last_flush = now
             self._save_adaptive_hub_state()
         else:
             tls.pending = pending
 
-    def record_tool_usage(self, phase: str, tool_name: str, success: bool,
-                          context_bucket: str = "") -> None:
+    def record_tool_usage(self, phase: str, tool_name: str, success: bool, context_bucket: str = "") -> None:
         """Record a tool-usage signal into the adaptive hub (batched persist)."""
         hub = self._get_adaptive_hub()
         if hub:

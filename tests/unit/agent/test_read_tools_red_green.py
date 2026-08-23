@@ -5,6 +5,7 @@ grep fallback/retry/timeout paths, find_symbol detail rendering,
 find_references, get_file_outline, find_relevant_files, and read_image —
 most of which had no behavioral test at all.
 """
+
 from __future__ import annotations
 
 import os
@@ -22,6 +23,7 @@ from external_llm.agent.tool_handlers.read_tools import (
 
 # ── module-level helpers ────────────────────────────────────────────────────
 
+
 def test_glob_to_regex_bare_double_star():
     """A bare `**` (not `**/`) matches any characters including separators."""
     rx = _glob_to_regex("**")
@@ -31,11 +33,13 @@ def test_glob_to_regex_bare_double_star():
 
 # ── glob tool edges ─────────────────────────────────────────────────────────
 
+
 def test_glob_scope_value_error_reported_outside(tool_registry, monkeypatch, tmp_path):
     """The defensive relative_to ValueError (scope resolved outside the root
     between the two checks) degrades to the same outside-repo error."""
     monkeypatch.setattr(
-        tool_registry, "_secure_path",
+        tool_registry,
+        "_secure_path",
         lambda *a, **kw: tmp_path / "outside",
     )
     res = tool_registry.dispatch("glob", {"pattern": "*.py", "path": "sub"})
@@ -78,7 +82,8 @@ def test_read_file_open_failure_reported(tool_registry, tmp_path):
 def test_over_cap_guidance_outline_failure_falls_back(tool_registry, monkeypatch):
     """A failing outline degrades to the plain count + range hint."""
     monkeypatch.setattr(
-        tool_registry._symbol_searcher, "get_file_outline",
+        tool_registry._symbol_searcher,
+        "get_file_outline",
         lambda path: (_ for _ in ()).throw(RuntimeError("no grammar")),
     )
     out = tool_registry._over_cap_guidance("big.py", 5000)
@@ -87,6 +92,7 @@ def test_over_cap_guidance_outline_failure_falls_back(tool_registry, monkeypatch
 
 
 # ── _run_search_bounded failure branches ────────────────────────────────────
+
 
 def test_run_search_bounded_popen_oserror(tool_registry, monkeypatch):
     def _boom(*a, **kw):
@@ -171,6 +177,7 @@ def test_run_search_bounded_timeout_killpg_missing(tool_registry, monkeypatch):
 
 # ── grep tool edges ─────────────────────────────────────────────────────────
 
+
 def test_grep_empty_pattern_error(tool_registry):
     res = tool_registry.dispatch("grep", {})
     assert not res.ok
@@ -237,6 +244,7 @@ def test_grep_char_budget_cut(tool_registry, monkeypatch):
 
 # ── read_symbol / find_symbol ───────────────────────────────────────────────
 
+
 def test_read_symbol_not_found(tool_registry):
     res = tool_registry.dispatch("read_symbol", {"name": "zzz_absent"})
     assert res.ok
@@ -278,12 +286,19 @@ def test_find_symbol_detail_fields_and_inheritance(tool_registry, monkeypatch):
     # The real indexer omits bases/decorators for same-file classes, so a rich
     # fake def drives the rendering branches (docstring/bases/methods/decorators).
     rich = types.SimpleNamespace(
-        kind="class", name="C", file="detail.py", line=8, signature="",
-        docstring="Docstring.", bases=["Base"],
-        methods=[f"m{i}" for i in range(12)], decorators=["deco"],
+        kind="class",
+        name="C",
+        file="detail.py",
+        line=8,
+        signature="",
+        docstring="Docstring.",
+        bases=["Base"],
+        methods=[f"m{i}" for i in range(12)],
+        decorators=["deco"],
     )
     monkeypatch.setattr(
-        tool_registry._symbol_searcher, "find_symbol",
+        tool_registry._symbol_searcher,
+        "find_symbol",
         lambda name, kind="any", search_path=None: [rich],
     )
     res = tool_registry.dispatch("find_symbol", {"name": "C"})
@@ -312,10 +327,9 @@ def test_find_symbol_detail_fields_and_inheritance(tool_registry, monkeypatch):
 
 # ── find_references ─────────────────────────────────────────────────────────
 
+
 def test_find_references_all_paths(tool_registry):
-    (Path(tool_registry.repo_root) / "refs.py").write_text(
-        "def f():\n    return 1\n\nx = f()\n"
-    )
+    (Path(tool_registry.repo_root) / "refs.py").write_text("def f():\n    return 1\n\nx = f()\n")
     res = tool_registry.dispatch("find_references", {"name": "f"})
     assert res.ok, res.error
     assert "reference(s)" in res.content
@@ -331,10 +345,16 @@ def test_find_references_all_paths(tool_registry):
 
 # ── get_file_outline ────────────────────────────────────────────────────────
 
+
 def _sym(kind, name, line, end=None, signature="", bases=None, methods=None):
     return types.SimpleNamespace(
-        kind=kind, name=name, line=line, end_line=end,
-        signature=signature, bases=bases or [], methods=methods or [],
+        kind=kind,
+        name=name,
+        line=line,
+        end_line=end,
+        signature=signature,
+        bases=bases or [],
+        methods=methods or [],
     )
 
 
@@ -364,10 +384,10 @@ def test_get_file_outline_kind_rendering(tool_registry, monkeypatch):
     monkeypatch.setattr(tool_registry._symbol_searcher, "get_file_outline", lambda path: mixed)
     res = tool_registry.dispatch("get_file_outline", {"path": "shapes.py"})
     assert res.ok, res.error
-    assert "lines 1–20" in res.content      # noqa: RUF001 — get_file_outline emits an EN DASH in ranges
+    assert "lines 1–20" in res.content  # noqa: RUF001 — get_file_outline emits an EN DASH in ranges
     assert "bases: B" in res.content
     assert "methods: m1, m2" in res.content
-    assert "(line 25)" in res.content       # single-line extent
+    assert "(line 25)" in res.content  # single-line extent
     assert "f((x)) (line 25)" in res.content  # function signature in parens
     assert "v (line 30) — = 1" in res.content
     assert "[macro] M (line 35)" in res.content
@@ -375,6 +395,7 @@ def test_get_file_outline_kind_rendering(tool_registry, monkeypatch):
 
 
 # ── find_relevant_files / read_image ────────────────────────────────────────
+
 
 def test_find_relevant_files_empty_query_error(tool_registry):
     res = tool_registry.dispatch("find_relevant_files", {})

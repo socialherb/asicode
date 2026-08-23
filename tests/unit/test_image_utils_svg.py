@@ -5,6 +5,7 @@ base64-encoded as ``image/svg+xml`` (vision APIs reject it and PIL cannot decode
 it → a useless "[Image Attached]" placeholder). Instead it is inlined as UTF-8
 text, while raster images, data-URLs, and the quoted-path pass keep working.
 """
+
 from __future__ import annotations
 
 import base64
@@ -20,6 +21,7 @@ from external_llm.image_utils import (
 
 # ── regression guards on the extension sets ──────────────────────────────────
 
+
 def test_svg_not_in_raster_set():
     """SVG must stay out of the raster set and in the text-inline set."""
     assert ".svg" not in _IMAGE_EXTENSIONS
@@ -29,6 +31,7 @@ def test_svg_not_in_raster_set():
 
 
 # ── _read_text_inline unit tests ──────────────────────────────────────────────
+
 
 def test_read_text_inline_missing_returns_none(tmp_path):
     assert _read_text_inline(tmp_path / "nope.svg") is None
@@ -80,6 +83,7 @@ def test_read_text_inline_small_returns_labelled_block(tmp_path):
 
 # ── _classify_attachment unit tests ───────────────────────────────────────────
 
+
 def test_classify_unknown_extension_is_none(tmp_path):
     p = tmp_path / "code.py"
     p.write_text("x = 1", encoding="utf-8")
@@ -102,6 +106,7 @@ def test_classify_raster_returns_image_kind(tmp_path):
 
 
 # ── _extract_images_from_input behaviour (the real boundary) ─────────────────
+
 
 def test_svg_not_in_images_but_inlined(tmp_path):
     """The core fix: an SVG path is NOT returned as an image; its text is inlined."""
@@ -179,9 +184,11 @@ def test_mixed_png_and_svg_in_one_prompt(tmp_path):
 
 # ── P21-2: raster attachment size cap ────────────────────────────────────────
 
+
 def test_raster_over_cap_kept_as_path(tmp_path):
     """An image larger than _IMAGE_MAX_BYTES must not be base64-embedded."""
     from external_llm.image_utils import _IMAGE_MAX_BYTES
+
     p = tmp_path / "big.png"
     with open(p, "wb") as f:
         f.truncate(_IMAGE_MAX_BYTES + 1)  # sparse — stat-based guard
@@ -191,6 +198,7 @@ def test_raster_over_cap_kept_as_path(tmp_path):
 def test_raster_at_cap_embedded(tmp_path):
     """Exactly _IMAGE_MAX_BYTES is still embedded (<= policy)."""
     from external_llm.image_utils import _IMAGE_MAX_BYTES
+
     p = tmp_path / "cap.png"
     with open(p, "wb") as f:
         f.truncate(_IMAGE_MAX_BYTES)

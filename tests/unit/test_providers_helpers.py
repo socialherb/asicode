@@ -1,4 +1,5 @@
 """Tests for helper functions in external_llm/providers.py."""
+
 from __future__ import annotations
 
 import ast
@@ -139,9 +140,7 @@ def test_except_clauses_reference_real_requests_attributes() -> None:
     for node in ast.walk(tree):
         if not isinstance(node, ast.ExceptHandler) or node.type is None:
             continue
-        type_nodes = (
-            node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
-        )
+        type_nodes = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
         for type_node in type_nodes:
             chain = _attribute_chain(type_node)
             if chain is None or chain[0] != "requests":
@@ -185,7 +184,10 @@ def test_count_delimiters_ignores_delimiters_inside_double_quoted_strings():
     # delimiters inside a string literal must NOT count
     text = '{"msg": "has } and { and [ ] inside"}'
     assert _count_delimiters(text) == {
-        "open_curly": 1, "close_curly": 1, "open_square": 0, "close_square": 0,
+        "open_curly": 1,
+        "close_curly": 1,
+        "open_square": 0,
+        "close_square": 0,
     }
 
 
@@ -205,7 +207,7 @@ def test_count_delimiters_escaped_quote_does_not_terminate_string():
 
 def test_count_delimiters_truncation_proxy_balanced_vs_truncated():
     # The helper's consumers detect truncation via open_count > close_count.
-    assert _count_delimiters('{"partial":')['open_curly'] > 0
+    assert _count_delimiters('{"partial":')["open_curly"] > 0
     assert _count_delimiters("[1,2,3")["open_square"] > 0
     bal = _count_delimiters('{"ok": true}')
     assert bal["open_curly"] == bal["close_curly"]
@@ -230,7 +232,10 @@ def test_count_delimiters_ssot_no_inline_copy_remains():
 def test_count_delimiters_contract_shape():
     """Pin: returns exactly the 4 documented keys (callers index by name)."""
     assert set(_count_delimiters("{}[]{}").keys()) == {
-        "open_curly", "close_curly", "open_square", "close_square",
+        "open_curly",
+        "close_curly",
+        "open_square",
+        "close_square",
     }
 
 

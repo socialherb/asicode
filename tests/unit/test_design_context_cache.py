@@ -8,6 +8,7 @@ The current request is identified by a trailing STATIC system marker, not a
 "[REQUEST]" content prefix — the prefix mutated the previous user message on
 every new turn ([REQUEST] X → (turn N) X), breaking the cache prefix there.
 """
+
 import inspect
 
 from external_llm.agent.context_manager import SessionCompressionContext
@@ -16,10 +17,7 @@ from external_llm.agent.context_manager import SessionCompressionContext
 class _FakeSession:
     def __init__(self, n_turns: int, compressed_up_to: int = 0, summary: str = ""):
         roles = ["user", "assistant"]
-        self.turns = [
-            {"role": roles[i % 2], "content": f"content-{i}", "model": ""}
-            for i in range(n_turns)
-        ]
+        self.turns = [{"role": roles[i % 2], "content": f"content-{i}", "model": ""} for i in range(n_turns)]
         self.compressed_up_to = compressed_up_to
         self.compressed_summary = summary
         self.session_id = "test"
@@ -27,10 +25,7 @@ class _FakeSession:
 
 def _labeled_history(msgs):
     return [
-        m["content"]
-        for m in msgs
-        if m["role"] in ("user", "assistant", "tool")
-        and m["content"].startswith("(turn ")
+        m["content"] for m in msgs if m["role"] in ("user", "assistant", "tool") and m["content"].startswith("(turn ")
     ]
 
 
@@ -105,10 +100,8 @@ class TestCurrentRequestMarker:
     def test_marker_is_trailing_static_system_message(self):
         # Marker must be byte-identical across turns (no turn number) — on
         # Anthropic it is hoisted into the system block, which must stay stable.
-        m3 = [m["content"] for m in _build(_FakeSession(3))
-              if "CURRENT REQUEST" in m["content"]]
-        m5 = [m["content"] for m in _build(_FakeSession(5))
-              if "CURRENT REQUEST" in m["content"]]
+        m3 = [m["content"] for m in _build(_FakeSession(3)) if "CURRENT REQUEST" in m["content"]]
+        m5 = [m["content"] for m in _build(_FakeSession(5)) if "CURRENT REQUEST" in m["content"]]
         assert len(m3) == 1
         assert m3 == m5
         assert not any(ch.isdigit() for ch in m3[0])
@@ -170,15 +163,15 @@ class TestTopBlockOrdering:
         (d / "design_insights.md").write_text("insight body", encoding="utf-8")
         ctx = SessionCompressionContext(str(tmp_path))
         msgs = ctx.build_context_messages(
-            _FakeSession(3), skip_core_prompt=True, mode="code",
+            _FakeSession(3),
+            skip_core_prompt=True,
+            mode="code",
         )
         contents = [m["content"] for m in msgs]
         i_proj = next(i for i, c in enumerate(contents) if "Project Context" in c)
         i_repo = next(i for i, c in enumerate(contents) if "CURRENT REPOSITORY" in c)
         i_ins = next(i for i, c in enumerate(contents) if "DESIGN INSIGHTS" in c)
-        i_summary_or_turn = next(
-            i for i, c in enumerate(contents) if c.startswith("(turn ")
-        )
+        i_summary_or_turn = next(i for i, c in enumerate(contents) if c.startswith("(turn "))
         assert i_repo < i_proj < i_ins < i_summary_or_turn
 
     def test_repo_root_present_in_general_mode(self, tmp_path):
@@ -187,7 +180,9 @@ class TestTopBlockOrdering:
         # commit request in General mode).
         ctx = SessionCompressionContext(str(tmp_path))
         msgs = ctx.build_context_messages(
-            _FakeSession(3), skip_core_prompt=True, mode="general",
+            _FakeSession(3),
+            skip_core_prompt=True,
+            mode="general",
         )
         contents = [m["content"] for m in msgs]
         assert any("CURRENT REPOSITORY" in c for c in contents)
@@ -204,10 +199,8 @@ class TestInsightsLayer3CachePosition:
     insights block, which invalidated the prompt cache (summary + all turns) on
     every turn whenever the promoted set shifted with the recent user turns.
     """
-    _BODY = (
-        "FileLockManager uses WeakValueDictionary for lock identity "
-        "cross-request UNIQUE-TAIL-MARKER-ZZZ"
-    )
+
+    _BODY = "FileLockManager uses WeakValueDictionary for lock identity cross-request UNIQUE-TAIL-MARKER-ZZZ"
 
     def _repo_with_archive(self, tmp_path):
         d = tmp_path / ".asicode"
@@ -230,7 +223,8 @@ class TestInsightsLayer3CachePosition:
         ctx = SessionCompressionContext(repo)
         return ctx.build_context_messages(
             self._session_with_user(user_text),
-            skip_core_prompt=True, mode="code",
+            skip_core_prompt=True,
+            mode="code",
         )
 
     def test_promoted_block_not_in_early_insights_block(self, tmp_path):
@@ -277,8 +271,7 @@ class TestInsightsLayer3CachePosition:
         s_n = _FakeSession(3)
         s_n.turns[0]["content"] = match
         s_n.turns[2]["content"] = match
-        msgs_n = SessionCompressionContext(repo).build_context_messages(
-            s_n, skip_core_prompt=True, mode="code")
+        msgs_n = SessionCompressionContext(repo).build_context_messages(s_n, skip_core_prompt=True, mode="code")
 
         # Turn N+1: same first 3 turns, then 8 more USER turns of filler push
         # the matching turns OUT of the last-8 user window → task_query no
@@ -289,8 +282,7 @@ class TestInsightsLayer3CachePosition:
         s_n1.turns[2]["content"] = match
         for _i in range(4, 19, 2):
             s_n1.turns[_i]["content"] = filler
-        msgs_n1 = SessionCompressionContext(repo).build_context_messages(
-            s_n1, skip_core_prompt=True, mode="code")
+        msgs_n1 = SessionCompressionContext(repo).build_context_messages(s_n1, skip_core_prompt=True, mode="code")
 
         # Promotion flipped: turn N promotes, turn N+1 does not.
         assert any("PROMOTED FROM ARCHIVE" in m["content"] for m in msgs_n)
@@ -307,6 +299,7 @@ class TestInsightsLayer3CachePosition:
 class TestProcessTemperature:
     def test_temperature_fixed_per_process(self):
         import external_llm.agent.design_chat_loop as dcl
+
         assert 0.0 <= dcl._PROCESS_TEMPERATURE <= 0.3
         # No call site may re-randomize per call.
         src = inspect.getsource(dcl)

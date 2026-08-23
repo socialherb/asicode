@@ -1,4 +1,5 @@
 """Global ThreadPoolExecutor — eliminates pool create/destroy overhead (5-15ms/call)."""
+
 import atexit
 import os
 from concurrent.futures import ThreadPoolExecutor

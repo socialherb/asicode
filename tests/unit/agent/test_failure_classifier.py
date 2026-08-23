@@ -14,14 +14,17 @@ from external_llm.agent.failure_classifier import (
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
+
 class FakeResult:
     """Minimal stand-in for a ToolResult with an optional error attribute."""
+
     def __init__(self, error=None):
         self.error = error
 
 
 class FakeErrorWithAttrs:
     """Error-like object with arbitrary attributes (code, error_code, errno)."""
+
     def __init__(self, code=None, error_code=None, errno_val=None, msg=""):
         self.code = code
         self.error_code = error_code
@@ -35,6 +38,7 @@ class FakeErrorWithAttrs:
 # ======================================================================
 # _has_code_keyword
 # ======================================================================
+
 
 class TestHasCodeKeyword:
     def test_exact_match(self):
@@ -78,6 +82,7 @@ class TestHasCodeKeyword:
 # _has_text_phrase
 # ======================================================================
 
+
 class TestHasTextPhrase:
     def test_exact_phrase(self):
         assert _has_text_phrase("already applied", ("already applied",))
@@ -114,6 +119,7 @@ class TestHasTextPhrase:
 # _classify_by_type
 # ======================================================================
 
+
 class TestClassifyByType:
     def test_file_not_found(self):
         result = _classify_by_type(FileNotFoundError())
@@ -127,8 +133,7 @@ class TestClassifyByType:
         assert result.action == RecoveryAction.SWITCH_TOOL
 
     def test_transient_types(self):
-        for exc_cls in (TimeoutError, ConnectionError, ConnectionResetError,
-                        ConnectionAbortedError, BrokenPipeError):
+        for exc_cls in (TimeoutError, ConnectionError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             result = _classify_by_type(exc_cls())
             assert result is not None
             assert result.action == RecoveryAction.RETRY_SAME
@@ -151,6 +156,7 @@ class TestClassifyByType:
 # ======================================================================
 # _classify_by_code
 # ======================================================================
+
 
 class TestClassifyByCode:
     def test_numeric_enoent(self):
@@ -219,6 +225,7 @@ class TestClassifyByCode:
 # _classify_by_text
 # ======================================================================
 
+
 class TestClassifyByText:
     def test_already_applied(self):
         result = _classify_by_text("already applied")
@@ -272,6 +279,7 @@ class TestClassifyByText:
 # ======================================================================
 # FailureClassifier.classify — integration path
 # ======================================================================
+
 
 class TestFailureClassifierClassify:
     def make_classifier(self):
@@ -355,10 +363,12 @@ class TestFailureClassifierClassify:
     def test_type_match_priority_over_code(self):
         """Type-based classification is checked first and should win."""
         clf = self.make_classifier()
+
         class MyFileNotFoundError(FileNotFoundError):
             def __init__(self):
                 super().__init__()
                 self.code = "timeout_error"  # would trigger transient if type was checked second
+
         result = FakeResult(error=MyFileNotFoundError())
         classification = clf.classify("read_file", result)
         assert classification.action == RecoveryAction.SWITCH_TOOL  # type wins
@@ -394,6 +404,7 @@ class ResultWithMetadata:
     Pass *failure_class* for the normal shape, or *metadata* to inject a
     malformed value directly.
     """
+
     def __init__(self, error=None, failure_class=None, metadata=_UNSET):
         self.error = error
         if metadata is not _UNSET:
@@ -466,6 +477,7 @@ class TestFailureClassMetadata:
             FailureClass,
             normalize_failure_class,
         )
+
         assert FailureClass.NO_EFFECTIVE_CHANGE.value == "no_effective_change"
         assert normalize_failure_class("no_effective_change") is FailureClass.NO_EFFECTIVE_CHANGE
 
@@ -483,6 +495,7 @@ class TestFailureClassMetadata:
 # F1 — _ACTION_BY_FAILURE_CLASS ↔ FailureClass parity
 # ======================================================================
 
+
 class TestActionMapParity:
     def test_action_map_keys_are_canonical_failure_classes(self):
         """Every key in _ACTION_BY_FAILURE_CLASS must be a real FailureClass value.
@@ -495,6 +508,7 @@ class TestActionMapParity:
         """
         from external_llm.agent.failure_classifier import _ACTION_BY_FAILURE_CLASS
         from external_llm.agent.operation_models import FailureClass
+
         canonical = {fc.value for fc in FailureClass}
         assert set(_ACTION_BY_FAILURE_CLASS) <= canonical
 
@@ -502,6 +516,7 @@ class TestActionMapParity:
 # ======================================================================
 # Text tier — "not found" is only ambiguous for text-matching edit tools
 # ======================================================================
+
 
 class TestNotFoundIsToolAware:
     def make_classifier(self):

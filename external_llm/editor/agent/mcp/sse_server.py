@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from external_llm.agent.tool_registry import ToolRegistry
@@ -51,6 +51,7 @@ from external_llm.editor.agent.mcp._session_queue import (
     _SESSION_IDLE_TTL_SECONDS,
     _SESSION_SWEEP_INTERVAL_SECONDS,
     JsonRpcHandler,
+    QuietHttpHandler,
     _SessionQueueMixin,
 )
 
@@ -75,7 +76,7 @@ class SSEMcpServer(_SessionQueueMixin):
         host: str = "127.0.0.1",
         port: int = 8765,
         *,
-        handle: Optional[JsonRpcHandler] = None,
+        handle: JsonRpcHandler | None = None,
         session_idle_ttl: float = _SESSION_IDLE_TTL_SECONDS,
         sweep_interval: float = _SESSION_SWEEP_INTERVAL_SECONDS,
     ) -> None:
@@ -96,18 +97,17 @@ class SSEMcpServer(_SessionQueueMixin):
         )
 
 
-
 def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
     """Build the request-handler class bound to ``server`` (closure, no globals)."""
 
-    class _SseHandler(BaseHTTPRequestHandler):
+    class _SseHandler(QuietHttpHandler):
         server_version = "asicode-mcp-sse/1.0"
         protocol_version = "HTTP/1.1"
 
         # SSE streams stay open for the connection's lifetime; a log line per
         # event would spam stderr — route to the module logger (debug level).
-        def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("MCP SSE %s %s", self.address_string(), fmt % args)
+        def log_message(self, format: str, *args: Any) -> None:
+            logger.debug("MCP SSE %s %s", self.address_string(), format % args)
 
         # -- helpers ---------------------------------------------------------
 
@@ -127,25 +127,29 @@ def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            # Error responses end the exchange: never reuse this connection
+            # for a keep-alive read of a client that may already be gone.
+            self.send_header("Connection", "close")
             self._cors_headers()
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
 
         # -- HTTP verbs --------------------------------------------------------
 
-        def do_OPTIONS(self) -> None:
+        def do_OPTIONS(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             self.send_response(204)
             self._cors_headers()
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def do_GET(self) -> None:
+        def do_GET(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             if urlparse(self.path).path != "/sse":
                 self._json_error(404, "Not found — use GET /sse")
                 return
             self._open_stream()
 
-        def do_POST(self) -> None:
+        def do_POST(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             parsed = urlparse(self.path)
             if parsed.path != "/message":
                 self._json_error(404, "Not found — POST to the URL from the 'endpoint' event")
@@ -172,11 +176,13 @@ def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 request = None
             if not isinstance(request, dict):
-                payload = json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "Parse error"},
-                })
+                payload = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    }
+                )
             else:
                 # None for notifications (no id) — the 202 ack is their only reply.
                 payload = server._handle_request(request)
@@ -202,7 +208,7 @@ def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def do_DELETE(self) -> None:
+        def do_DELETE(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             if urlparse(self.path).path != "/message":
                 self._json_error(404, "Not found")
                 return

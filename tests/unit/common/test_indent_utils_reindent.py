@@ -5,6 +5,7 @@ the LLM emitted flush-left stayed at column 0 while its re-indented siblings
 moved to the match site's indent — producing invalid, "unexpected indent" code.
 ``reindent_to_match`` is live via plan_compiler's edit_blocks fuzzy-match path.
 """
+
 import ast
 import itertools
 
@@ -31,25 +32,15 @@ def test_flush_left_after_reindents_new_lines_to_match_site():
     A brand-new multi-line call (not present in 'before') must shift up with the
     rest instead of being left at column 0.
     """
-    actual_before = (
-        "        if not args:\n"
-        "            return None\n"
-        "        x = compute()"
-    )
-    after = (
-        "if not args:\n"
-        "    return None\n"
-        "y = transform(a,\n"
-        "              b)\n"
-        "x = compute()"
-    )
+    actual_before = "        if not args:\n            return None\n        x = compute()"
+    after = "if not args:\n    return None\ny = transform(a,\n              b)\nx = compute()"
     fixed = reindent_to_match(after, actual_before)
     lines = fixed.split("\n")
 
     # All top-level logical lines land at the match site's indent (8), not 0.
-    assert _indent(lines[0]) == 8, lines           # if not args:
-    assert _indent(lines[2]) == 8, lines           # y = transform(a,  (NEW line)
-    assert _indent(lines[4]) == 8, lines           # x = compute()
+    assert _indent(lines[0]) == 8, lines  # if not args:
+    assert _indent(lines[2]) == 8, lines  # y = transform(a,  (NEW line)
+    assert _indent(lines[4]) == 8, lines  # x = compute()
 
     # The whole block parses as valid Python inside a real method.
     full = "class C:\n    def m(self, args, a, b):\n" + fixed
@@ -66,9 +57,9 @@ def test_unit_conversion_preserved():
     after = "    function foo() {\n        return 2;\n    }"
     before = "  function foo() {\n    return 1;\n}"
     fixed = reindent_to_match(after, before).split("\n")
-    assert _indent(fixed[0]) == 2   # function -> 2sp (matched line)
-    assert _indent(fixed[1]) == 4   # return 2 -> 4sp (new line, ratio 0.5 of 8)
-    assert _indent(fixed[2]) == 0   # closing brace -> 0 (matched)
+    assert _indent(fixed[0]) == 2  # function -> 2sp (matched line)
+    assert _indent(fixed[1]) == 4  # return 2 -> 4sp (new line, ratio 0.5 of 8)
+    assert _indent(fixed[2]) == 0  # closing brace -> 0 (matched)
 
 
 def test_bracket_continuation_does_not_pollute_indent_unit():
@@ -95,17 +86,12 @@ def test_no_indent_explosion_on_continuation_in_scaled_path():
     bracket-continuation line) re-indented into a 4-space file ratio-scaled the
     continuation column to ~80 chars and over-indented real code lines.
     """
-    after = (
-        "  if cond:\n"
-        "    result = compute(a,\n"
-        "                     b)\n"
-        "    return result\n"
-    )
+    after = "  if cond:\n    result = compute(a,\n                     b)\n    return result\n"
     before = "    if cond:\n        old = 1\n"
     lines = reindent_to_match(after, before).split("\n")
-    assert _indent(lines[0]) == 4              # if cond: (matched)
-    assert _indent(lines[1]) == 8              # result = compute(  (one level deeper)
-    assert _indent(lines[3]) == 8              # return result
+    assert _indent(lines[0]) == 4  # if cond: (matched)
+    assert _indent(lines[1]) == 8  # result = compute(  (one level deeper)
+    assert _indent(lines[3]) == 8  # return result
     # Continuation 'b)' tracks the open paren, not a ratio-scaled column.
     assert _indent(lines[2]) == lines[1].index("(") + 1
 
@@ -126,7 +112,7 @@ def test_normalize_indent_char_preserves_continuation_alignment():
     old = "def f():\n\tx = 1\n\treturn x\n"
     new = "def f():\n    y = compute(a,\n               b)\n    return y\n"
     out = normalize_indent_char_to_file(new, old).split("\n")
-    assert out[1] == "\ty = compute(a,"   # real nesting line → 1 tab
+    assert out[1] == "\ty = compute(a,"  # real nesting line → 1 tab
     assert out[2] == "               b)"  # continuation alignment → untouched
     assert out[3] == "\treturn y"
 
@@ -136,8 +122,8 @@ def test_normalize_indent_char_converts_plain_nesting():
     old = "def f():\n\tx = 1\n"
     new = "def f():\n    y = 2\n        z = 3\n"
     out = normalize_indent_char_to_file(new, old).split("\n")
-    assert out[1] == "\ty = 2"      # depth 1 → 1 tab
-    assert out[2] == "\t\tz = 3"    # depth 2 → 2 tabs
+    assert out[1] == "\ty = 2"  # depth 1 → 1 tab
+    assert out[2] == "\t\tz = 3"  # depth 2 → 2 tabs
 
 
 def test_first_logical_indent_skips_bracket_continuation():
@@ -163,24 +149,24 @@ def test_ambiguous_content_does_not_flatten_control_flow():
     """
     actual_before = (
         "    if x:\n"
-        "        return None\n"      # depth 8 — inside the if
-        "    return None"            # depth 4 — block base
+        "        return None\n"  # depth 8 — inside the if
+        "    return None"  # depth 4 — block base
     )
     after = (
         "if x:\n"
         "    do_something()\n"
-        "    return None\n"          # intended: depth 8 (inside the if)
-        "return None"                # intended: depth 4 (block base)
+        "    return None\n"  # intended: depth 8 (inside the if)
+        "return None"  # intended: depth 4 (block base)
     )
     fixed = reindent_to_match(after, actual_before)
     lines = fixed.split("\n")
 
     # The in-block `return None` stays INSIDE the if (depth 8), and the base
     # `return None` sits at the block base (depth 4) — not both collapsed to 4.
-    assert _indent(lines[0]) == 4, lines            # if x:        -> base (4)
-    assert _indent(lines[1]) == 8, lines            # do_something -> one level in (8)
-    assert _indent(lines[2]) == 8, lines            # return None  -> STILL in the if (8)
-    assert _indent(lines[3]) == 4, lines            # return None  -> block base (4)
+    assert _indent(lines[0]) == 4, lines  # if x:        -> base (4)
+    assert _indent(lines[1]) == 8, lines  # do_something -> one level in (8)
+    assert _indent(lines[2]) == 8, lines  # return None  -> STILL in the if (8)
+    assert _indent(lines[3]) == 4, lines  # return None  -> block base (4)
 
     # And the result is valid Python whose meaning matches the intent.
     tree = ast.parse("def f():\n" + fixed)
@@ -226,6 +212,7 @@ def test_cross_unit_continuation_no_explosion():
 
     # Must parse as valid Python.
     import ast
+
     ast.parse("def f():\n" + fixed)
 
 
@@ -239,11 +226,11 @@ def test_flush_left_into_tab_file_no_explosion():
     case now routes through the unit-scaled path so a 4-space level maps to one
     tab level regardless of char width.
     """
-    after = "def f():\n    if x:\n        return 1"   # 4-space levels, col-0 base
-    before = "\tif q:\n\t\told = 1"                    # tab-indented, base = 1 tab
+    after = "def f():\n    if x:\n        return 1"  # 4-space levels, col-0 base
+    before = "\tif q:\n\t\told = 1"  # tab-indented, base = 1 tab
     fixed = reindent_to_match(after, before).split("\n")
-    assert fixed[0] == "\tdef f():"      # base level → 1 tab (not exploded)
-    assert fixed[1] == "\t\tif x:"       # +1 level → 2 tabs (was 5)
+    assert fixed[0] == "\tdef f():"  # base level → 1 tab (not exploded)
+    assert fixed[1] == "\t\tif x:"  # +1 level → 2 tabs (was 5)
     assert fixed[2] == "\t\t\treturn 1"  # +2 levels → 3 tabs (was 9)
     ast.parse("class C:\n" + "\n".join(fixed))
 
@@ -255,6 +242,7 @@ def test_flush_left_into_tab_file_no_explosion():
 # These invariants kill the *class* of regressions across a generated matrix of
 # (indent char x unit width x nesting depth x match-site base) rather than one
 # example at a time.  Generated with stdlib only — no hypothesis dependency.
+
 
 def _max_indent_levels(text: str) -> float:
     """Deepest non-continuation indent, normalised to nesting *levels*.
@@ -287,24 +275,20 @@ def _render(levels, char, width):
 
 
 _AFTER_SHAPES = [
-    [(0, "def f():"), (1, "if x:"), (2, "return 1")],   # col-0 base, 2 levels deep
-    [(0, "def f():"), (1, "x = 1"), (1, "return x")],    # col-0 base, flat body
-    [(1, "if x:"), (2, "return 1")],                     # already-indented base
-    [(0, "a = foo(b,"), (0, "c)"), (0, "d = 2")],        # bracket continuation
+    [(0, "def f():"), (1, "if x:"), (2, "return 1")],  # col-0 base, 2 levels deep
+    [(0, "def f():"), (1, "x = 1"), (1, "return x")],  # col-0 base, flat body
+    [(1, "if x:"), (2, "return 1")],  # already-indented base
+    [(0, "a = foo(b,"), (0, "c)"), (0, "d = 2")],  # bracket continuation
 ]
-_AFTERS = [
-    _render(shape, char, width)
-    for shape in _AFTER_SHAPES
-    for char, width in [(" ", 2), (" ", 4), ("\t", 1)]
-]
+_AFTERS = [_render(shape, char, width) for shape in _AFTER_SHAPES for char, width in [(" ", 2), (" ", 4), ("\t", 1)]]
 # Match sites whose per-level unit is *detectable* (>1 logical indent depth), so
 # the level-based no-explosion measurement below is reliable.
 _BEFORES_NESTED = [
-    "\tif q:\n\t\told = 1",                 # tab, base 1
-    "        if q:\n            old = 1",   # 4-space, base 8
-    "    if q:\n      old = 1",             # 2-space, base 4
-    "if q:\n    old = 1",                   # col-0 match site
-    "\t\t\tif q:\n\t\t\t\told = 1",         # tab, base 3
+    "\tif q:\n\t\told = 1",  # tab, base 1
+    "        if q:\n            old = 1",  # 4-space, base 8
+    "    if q:\n      old = 1",  # 2-space, base 4
+    "if q:\n    old = 1",  # col-0 match site
+    "\t\t\tif q:\n\t\t\t\told = 1",  # tab, base 3
 ]
 # A *flat* site (one logical level at 8sp) whose only extra raw "depth" is a
 # bracket continuation.  Its gcd "unit" is a bogus 8, so the level-based
@@ -350,10 +334,7 @@ def test_property_idempotence():
     for after, before in _PAIRS_ALL:
         once = reindent_to_match(after, before)
         twice = reindent_to_match(once, before)
-        assert once == twice, (
-            f"not idempotent\nafter={after!r}\nbefore={before!r}\n"
-            f"once={once!r}\ntwice={twice!r}"
-        )
+        assert once == twice, f"not idempotent\nafter={after!r}\nbefore={before!r}\nonce={once!r}\ntwice={twice!r}"
 
 
 def test_flush_left_flat_continuation_site_no_explosion():
@@ -366,11 +347,11 @@ def test_flush_left_flat_continuation_site_no_explosion():
     rows (agreeing with ``indent_unit``), so the body lands one real level in.
     """
     before = "        result = foo(a,\n                     b)\n        return result"
-    after = "def f():\n    y = transform()\n    return y"   # 4-space, col-0 base
+    after = "def f():\n    y = transform()\n    return y"  # 4-space, col-0 base
     fixed = reindent_to_match(after, before).split("\n")
-    assert fixed[0] == "        def f():"          # base → 8 spaces
+    assert fixed[0] == "        def f():"  # base → 8 spaces
     assert fixed[1] == "            y = transform()"  # +1 level → 12 (not 16)
-    assert fixed[2] == "            return y"          # +1 level → 12
+    assert fixed[2] == "            return y"  # +1 level → 12
     # The 8-space base is a method body — parse it in that context.
     ast.parse("class C:\n    def m(self):\n" + "\n".join(fixed))
 
@@ -407,6 +388,7 @@ def test_cross_unit_continuation_content_changed():
 
     # Must parse as valid Python.
     import ast
+
     ast.parse("def f():\n" + fixed)
 
 
@@ -478,6 +460,7 @@ def test_dest_unit_threaded_from_file_detection():
 # F1 invariant: reindent_block & reindent_to_anchor share ONE level→char core
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _leading_and_stripped(text_or_lines):
     """[(leading_whitespace, stripped_content)] for every non-empty line."""
     out = []
@@ -485,7 +468,7 @@ def _leading_and_stripped(text_or_lines):
     for ln in lines:
         body = ln.rstrip("\n")
         if body.strip():
-            lead = body[:len(body) - len(body.lstrip())]
+            lead = body[: len(body) - len(body.lstrip())]
             out.append((lead, body.lstrip()))
     return out
 
@@ -500,20 +483,20 @@ def test_reindent_block_anchor_level_char_invariant():
     output line's (leading-whitespace, stripped-content) must match.
     """
     sources = {
-        "tab":    ["\tfoo()\n", "\t\tbar()\n", "\t\t\tbaz()\n"],
+        "tab": ["\tfoo()\n", "\t\tbar()\n", "\t\t\tbaz()\n"],
         "2space": ["  foo()\n", "    bar()\n", "      baz()\n"],
         "4space": ["    foo()\n", "        bar()\n", "            baz()\n"],
     }
     dests = [
-        ("        if x:\n", 2),    # 8-space space anchor, dest_unit=2
-        ("        if x:\n", 4),    # 8-space space anchor, dest_unit=4
-        ("        if x:\n", None), # legacy default
-        ("\tif x:\n", 2),          # tab anchor (dest_unit irrelevant for tab emit)
+        ("        if x:\n", 2),  # 8-space space anchor, dest_unit=2
+        ("        if x:\n", 4),  # 8-space space anchor, dest_unit=4
+        ("        if x:\n", None),  # legacy default
+        ("\tif x:\n", 2),  # tab anchor (dest_unit irrelevant for tab emit)
         ("\tif x:\n", None),
     ]
     for sname, slines in sources.items():
         for anchor_line, dest_unit in dests:
-            base_indent = anchor_line[:len(anchor_line) - len(anchor_line.lstrip())]
+            base_indent = anchor_line[: len(anchor_line) - len(anchor_line.lstrip())]
             block_out = reindent_block("".join(slines), base_indent, dest_unit=dest_unit)
             anchor_out = reindent_to_anchor(list(slines), anchor_line, dest_unit=dest_unit)
             b = _leading_and_stripped(block_out)
@@ -527,6 +510,7 @@ def test_reindent_block_anchor_level_char_invariant():
 def test_block_levels_and_resolve_space_unit_core():
     """The shared core returns the expected (min, unit, block_char) and unit."""
     from external_llm.common.indent_utils import _block_levels, _resolve_space_unit
+
     # 4-space source: min 4, unit 4, space.
     assert _block_levels(["    a", "        b"]) == (4, 4, " ")
     # tab source: min 1, unit 1, tab.
@@ -546,6 +530,7 @@ def test_block_levels_and_resolve_space_unit_core():
 # ══════════════════════════════════════════════════════════════════════════════
 # F2: file-wide unit hint for flat (single-level) match sites
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def test_file_unit_hint_fixes_flat_2space_overindent():
     """A flat single-level 2-space site can't reveal the file's unit; without a
@@ -582,6 +567,7 @@ def test_file_unit_hint_4space_file_unaffected():
 # F3: content-map last_delta domain must match the continuation consumer
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_same_char_diff_unit_content_match_continuation_alignment():
     """Same indent char (space) but different unit (2sp snippet -> 4sp file).
 
@@ -597,7 +583,7 @@ def test_same_char_diff_unit_content_match_continuation_alignment():
     consumer; the continuation lands at col 11 (the file's own continuation
     column).
     """
-    after  = "  if c:\n    foo(a,\n       b)\n"          # 2sp: owner col4, cont col7
+    after = "  if c:\n    foo(a,\n       b)\n"  # 2sp: owner col4, cont col7
     before = "    if c:\n        foo(a,\n           OLD)\n"  # 4sp: owner col8, cont col11
     fixed = reindent_to_match(after, before)
     lines = fixed.split("\n")
@@ -606,15 +592,15 @@ def test_same_char_diff_unit_content_match_continuation_alignment():
         return len(lines[i]) - len(lines[i].lstrip(" "))
 
     assert lines[0] == "    if c:", lines
-    assert lines[1] == "        foo(a,", lines          # owner content-matched to file col 8
+    assert lines[1] == "        foo(a,", lines  # owner content-matched to file col 8
     cont_col = col(2)
     opener_col = col(1)
     assert cont_col == 11, (
-        f"continuation misaligned: col {cont_col} (owner opener col {opener_col}, "
-        f"file expects 11)\n{fixed}"
+        f"continuation misaligned: col {cont_col} (owner opener col {opener_col}, file expects 11)\n{fixed}"
     )
-    assert cont_col >= opener_col, (          # never shallower than its opener
+    assert cont_col >= opener_col, (  # never shallower than its opener
         f"continuation col {cont_col} < opener col {opener_col}\n{fixed}"
     )
     import ast
-    ast.parse("def f():\n" + fixed)            # must stay syntactically valid
+
+    ast.parse("def f():\n" + fixed)  # must stay syntactically valid

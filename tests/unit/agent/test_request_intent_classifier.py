@@ -1,4 +1,5 @@
 """Unit tests for request_intent_classifier.py — 100% branch coverage."""
+
 import pytest
 
 from external_llm.agent.request_intent_classifier import (
@@ -9,6 +10,7 @@ from external_llm.agent.request_intent_classifier import (
 )
 
 # ── normalize_routing_label ──────────────────────────────────────────────────
+
 
 class TestNormalizeRoutingLabel:
     """Cover all branches of normalize_routing_label."""
@@ -70,6 +72,7 @@ class TestNormalizeRoutingLabel:
     def test_question_label_is_recognized_no_drift(self, caplog):
         """'question' is a valid intent_type; must NOT trigger LABEL_DRIFT."""
         import logging
+
         caplog.set_level(logging.WARNING)
         result = normalize_routing_label("question")
         assert result == "question"
@@ -81,6 +84,7 @@ class TestNormalizeRoutingLabel:
         an internal first-class sentinel, NOT LLM-output drift, and must NOT trigger
         LABEL_DRIFT. Maps to explore_and_edit (fail-open: never block a legit edit)."""
         import logging
+
         caplog.set_level(logging.WARNING)
         result = normalize_routing_label("unknown")
         assert result == "explore_and_edit"
@@ -89,6 +93,7 @@ class TestNormalizeRoutingLabel:
     def test_unrecognized_label_passthrough(self, caplog):
         """Unrecognized label is logged as drift warning and returned as-is."""
         import logging
+
         caplog.set_level(logging.WARNING)
         result = normalize_routing_label("unknown_label")
         assert result == "unknown_label"
@@ -97,6 +102,7 @@ class TestNormalizeRoutingLabel:
     def test_unrecognized_still_lowercased_but_returned(self, caplog):
         """Lowercased version not in dict either → passed through."""
         import logging
+
         caplog.set_level(logging.WARNING)
         result = normalize_routing_label("Some_Unknown")
         assert result == "Some_Unknown"  # returned as-is (original case preserved)
@@ -104,6 +110,7 @@ class TestNormalizeRoutingLabel:
 
 
 # ── is_non_edit_intent ───────────────────────────────────────────────────────
+
 
 class TestIsNonEditIntent:
     def test_read_only_is_non_edit(self):
@@ -117,6 +124,7 @@ class TestIsNonEditIntent:
 
 
 # ── routing_intent_from_intent_result ────────────────────────────────────────
+
 
 class FakeIntentResult:
     def __init__(self, lane_hint="", intent_type=""):
@@ -167,6 +175,7 @@ class TestRoutingIntentFromIntentResult:
         explore_and_edit (fail-open: never block a legitimate edit) and must NOT
         emit LABEL_DRIFT, since 'unknown' is a first-class internal sentinel."""
         import logging
+
         caplog.set_level(logging.WARNING)
         result = FakeIntentResult(lane_hint="planner", intent_type="unknown")
         assert routing_intent_from_intent_result(result) == "explore_and_edit"
@@ -174,6 +183,7 @@ class TestRoutingIntentFromIntentResult:
 
 
 # ── intent_is_undetermined ───────────────────────────────────────────────────
+
 
 class TestIntentIsUndetermined:
     """The permission default (explore_and_edit) must stay separable from the
@@ -183,11 +193,14 @@ class TestIntentIsUndetermined:
         """No IntentResult attached at all — nothing was classified."""
         assert intent_is_undetermined(None) is True
 
-    @pytest.mark.parametrize("source", [
-        "minimal_fallback",   # LLM call raised / no client
-        "llm_parse_failed",   # response was not parseable JSON
-        "empty_request",      # nothing to classify
-    ])
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "minimal_fallback",  # LLM call raised / no client
+            "llm_parse_failed",  # response was not parseable JSON
+            "empty_request",  # nothing to classify
+        ],
+    )
     def test_resolver_failure_sources_are_undetermined(self, source):
         result = FakeIntentResult(lane_hint="planner", intent_type="unknown")
         result.metadata = {"source": source}

@@ -10,6 +10,7 @@ in-process edges, _run_tool_loop session inheritance + status mapping,
 drain/shutdown, _check_bg_subagent / background jobs, git-backed revert &
 synthetic-diff helpers, and the _OrchestratorBackedRegistry facade.
 """
+
 import os
 import subprocess as real_subprocess
 import sys
@@ -34,24 +35,35 @@ def _mk_orch(tmp_path, callback=None, **cfg):
     registry = Mock()
     registry.repo_root = str(tmp_path)
     return OrchestratorAgent(
-        Mock(), registry, OrchestratorConfig(**cfg), callback=callback,
+        Mock(),
+        registry,
+        OrchestratorConfig(**cfg),
+        callback=callback,
     )
 
 
 def _sub(task_id="dev_1", files=None, desc="do the thing"):
     return SubTaskSpec(
-        task_id=task_id, title="T", description=desc,
-        assigned_files=list(files or []), dependencies=[],
+        task_id=task_id,
+        title="T",
+        description=desc,
+        assigned_files=list(files or []),
+        dependencies=[],
     )
 
 
 def _git_repo(tmp_path, *extra_files):
     """Init a real git repo; commit tracked.py plus any extra files."""
+
     def git(*args):
         real_subprocess.run(
-            ["git", *args], cwd=str(tmp_path), check=True,
-            capture_output=True, timeout=30,
+            ["git", *args],
+            cwd=str(tmp_path),
+            check=True,
+            capture_output=True,
+            timeout=30,
         )
+
     git("init", "-q")
     git("config", "user.email", "t@example.com")
     git("config", "user.name", "T")
@@ -79,6 +91,7 @@ class TestContinueSubagent:
 
     def test_wraps_prior_context_and_maps_result(self, tmp_path):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path)
         seen = {}
 
@@ -86,9 +99,12 @@ class TestContinueSubagent:
             seen["desc"] = subtask.description
             seen["extra"] = extra_turns
             return AgentResult(
-                status="success", final_message="done",
-                turns=[SimpleNamespace()], applied_patches=[],
+                status="success",
+                final_message="done",
+                turns=[SimpleNamespace()],
+                applied_patches=[],
             )
+
         orch._run_subagent = fake_run
         res = orch.continue_subagent("dev_2", "fix more", prior_context="EARLIER\nstuff")
         assert "[CONTINUE FROM PREVIOUS SESSION]" in seen["desc"]
@@ -101,6 +117,7 @@ class TestContinueSubagent:
 
     def test_bare_request_without_prior_context(self, tmp_path):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path)
         seen = {}
         orch._run_subagent = lambda st, extra_turns=0, task_text=None, original_request="": (
@@ -120,18 +137,23 @@ class TestContinueSubagent:
 
 def _ipc_orch(tmp_path, callback=None, **cfg):
     return _mk_orch(
-        tmp_path, callback=callback, subagent_mode="ipc",
-        subagent_models={"1": ("prov", "model-x", "key")}, **cfg,
+        tmp_path,
+        callback=callback,
+        subagent_mode="ipc",
+        subagent_models={"1": ("prov", "model-x", "key")},
+        **cfg,
     )
 
 
 def _fake_ipc_result(status="success", turns=1):
     from external_llm.agent.subagent_ipc import SubagentResult
+
     return SubagentResult(task_id="dev_1", status=status, final_message="ok", turns=turns)
 
 
 def _patch_ipc_mocks(monkeypatch, wait_result=None):
     import external_llm.agent.subagent_ipc as ipc
+
     monkeypatch.setattr(ipc, "clear_result", lambda *a, **k: None)
     monkeypatch.setattr(ipc, "write_task", lambda *a, **k: None)
     monkeypatch.setattr(ipc, "wait_for_result", wait_result or (lambda *a, **k: _fake_ipc_result()))
@@ -145,6 +167,7 @@ def _patch_ipc_fs(monkeypatch):
 class TestRunSubagentIpc:
     def test_heartbeat_on_poll_emits_turn_and_tool(self, tmp_path, monkeypatch):
         import external_llm.agent.subagent_ipc as ipc
+
         events = []
         orch = _ipc_orch(tmp_path, callback=lambda e, d: events.append((e, d)))
 
@@ -152,11 +175,13 @@ class TestRunSubagentIpc:
             on_poll = k.get("on_poll")
             if on_poll:
                 monkeypatch.setattr(
-                    ipc, "read_heartbeat_state",
+                    ipc,
+                    "read_heartbeat_state",
                     lambda rr, aid: {"turn": 3, "last_tool": "read_file"},
                 )
                 on_poll(1.5, "dev_1")
             return _fake_ipc_result()
+
         _patch_ipc_mocks(monkeypatch, wait_result=fake_wait)
         _patch_ipc_fs(monkeypatch)
 
@@ -167,17 +192,21 @@ class TestRunSubagentIpc:
 
     def test_heartbeat_read_failure_still_emits(self, tmp_path, monkeypatch):
         import external_llm.agent.subagent_ipc as ipc
+
         events = []
         orch = _ipc_orch(tmp_path, callback=lambda e, d: events.append((e, d)))
 
         def fake_wait(*a, **k):
             on_poll = k.get("on_poll")
             if on_poll:
+
                 def bad(rr, aid):
                     raise ValueError("bad json")
+
                 monkeypatch.setattr(ipc, "read_heartbeat_state", bad)
                 on_poll(2.0, "dev_1")
             return _fake_ipc_result()
+
         _patch_ipc_mocks(monkeypatch, wait_result=fake_wait)
         _patch_ipc_fs(monkeypatch)
         res = orch._run_subagent_ipc(_sub())
@@ -189,8 +218,7 @@ class TestRunSubagentIpc:
         _patch_ipc_mocks(monkeypatch, wait_result=lambda *a, **k: None)
         _patch_ipc_fs(monkeypatch)
         abandoned = {}
-        orch._abandon_ipc_worker = (
-            lambda rr, wid, snaps, task_id=None, grace_s=None:
+        orch._abandon_ipc_worker = lambda rr, wid, snaps, task_id=None, grace_s=None: (
             abandoned.setdefault("wid", wid) or False
         )
         res = orch._run_subagent_ipc(_sub())
@@ -222,9 +250,11 @@ class TestRunSubagentIpc:
         orch = _ipc_orch(tmp_path)
         writes = []
         import external_llm.agent.subagent_ipc as ipc
+
         monkeypatch.setattr(ipc, "clear_result", lambda *a, **k: None)
         monkeypatch.setattr(
-            ipc, "write_task",
+            ipc,
+            "write_task",
             lambda rr, task, worker_id=None: writes.append(worker_id),
         )
         monkeypatch.setattr(ipc, "wait_for_result", lambda *a, **k: _fake_ipc_result())
@@ -238,8 +268,10 @@ class TestRunSubagentIpc:
     def test_review_retry_reverts_strays_under_revert_policy(self, tmp_path, monkeypatch):
         events = []
         orch = _ipc_orch(
-            tmp_path, callback=lambda e, d: events.append(e),
-            review_enabled=True, review_max_retries=1,
+            tmp_path,
+            callback=lambda e, d: events.append(e),
+            review_enabled=True,
+            review_max_retries=1,
             scope_violation_policy="revert",
         )
         (tmp_path / "a.py").write_text("PRE\n")
@@ -252,6 +284,7 @@ class TestRunSubagentIpc:
                 r.unassigned_changes = [{"file": "stray.py"}]
                 return r
             return None  # retry wait times out
+
         _patch_ipc_mocks(monkeypatch, wait_result=wait)
         monkeypatch.setattr(orch_mod, "asr_subagent_argv", lambda rr: ["asi", "--subagent"])
         orch._review_subagent_result = lambda **k: (False, "fix it")
@@ -266,6 +299,7 @@ class TestRunSubagentIpc:
 
     def test_cancelled_result_exit_confirmed_not_reused(self, tmp_path, monkeypatch):
         import external_llm.agent.subagent_ipc as ipc
+
         orch = _ipc_orch(tmp_path)
         _patch_ipc_mocks(monkeypatch, wait_result=lambda *a, **k: _fake_ipc_result(status="cancelled"))
         _patch_ipc_fs(monkeypatch)
@@ -276,12 +310,14 @@ class TestRunSubagentIpc:
 
     def test_cancelled_result_idle_read_failure_breaks_grace(self, tmp_path, monkeypatch):
         import external_llm.agent.subagent_ipc as ipc
+
         orch = _ipc_orch(tmp_path)
         _patch_ipc_mocks(monkeypatch, wait_result=lambda *a, **k: _fake_ipc_result(status="cancelled"))
         _patch_ipc_fs(monkeypatch)
 
         def bad(rr, wid):
             raise OSError("gone")
+
         monkeypatch.setattr(ipc, "read_worker_idle_heartbeat_state", bad)
         res = orch._run_subagent_ipc(_sub())
         assert res.status == "cancelled"
@@ -313,6 +349,7 @@ class TestWorkerLaunchers:
 
         def bad_popen(*a, **k):
             raise OSError("no osascript")
+
         monkeypatch.setattr(orch_mod.subprocess, "Popen", bad_popen)
         assert orch._launch_ipc_worker_terminal_macos("dev_1", "dev_1") is False
 
@@ -321,7 +358,8 @@ class TestWorkerLaunchers:
         orch._subagent_ipc_commands["dev_1"] = 'cd "/a b" && echo "hi\\n"'
         opened = {}
         monkeypatch.setattr(
-            orch_mod.subprocess, "Popen",
+            orch_mod.subprocess,
+            "Popen",
             lambda argv, **k: opened.setdefault("argv", argv),
         )
         assert orch._launch_ipc_worker_terminal_macos("dev_1", "dev_1") is True
@@ -336,6 +374,7 @@ class TestWorkerLaunchers:
         def fake_popen(argv, **k):
             argv_seen["argv"] = list(argv)
             return proc
+
         monkeypatch.setattr(orch_mod.subprocess, "Popen", fake_popen)
         assert orch._spawn_ipc_worker_background(str(tmp_path), "w1", "p", "m") is True
         assert orch._ipc_worker_procs["w1"] is proc
@@ -347,6 +386,7 @@ class TestWorkerLaunchers:
 
         def bad_popen(argv, **k):
             raise FileNotFoundError("no asi")
+
         monkeypatch.setattr(orch_mod.subprocess, "Popen", bad_popen)
         assert orch._spawn_ipc_worker_background(str(tmp_path), "w1", "", "") is False
 
@@ -357,7 +397,9 @@ class TestWorkerLaunchers:
         (d / "worker.log").write_bytes(b"x" * 32)
         monkeypatch.setattr(orch_mod, "_WORKER_LOG_ROTATE_BYTES", 10)
         monkeypatch.setattr(
-            orch_mod.subprocess, "Popen", lambda argv, **k: MagicMock(pid=1),
+            orch_mod.subprocess,
+            "Popen",
+            lambda argv, **k: MagicMock(pid=1),
         )
         assert orch._spawn_ipc_worker_background(str(tmp_path), "w1", "", "") is True
         assert (d / "worker.log.old").exists()
@@ -379,17 +421,22 @@ class TestRunSubagentInProcess:
 
             def run(self, task_text):
                 captured.append(task_text)
-                return (results.pop(0) if results
-                        else AgentResult(status="success", final_message="ok",
-                                         turns=[], applied_patches=[]))
+                return (
+                    results.pop(0)
+                    if results
+                    else AgentResult(status="success", final_message="ok", turns=[], applied_patches=[])
+                )
+
         monkeypatch.setattr(al, "AgentLoop", FakeLoop)
 
     def test_dedicated_client_created_and_goal_wrapped(self, tmp_path, monkeypatch):
         import external_llm.client as client_mod
+
         orch = _mk_orch(tmp_path, subagent_models={"1": ("ollama", "qwen", "k")})
         made = {}
         monkeypatch.setattr(
-            client_mod, "create_llm_client",
+            client_mod,
+            "create_llm_client",
             lambda **kw: made.setdefault("kw", kw) or Mock(),
         )
         captured = []
@@ -403,10 +450,12 @@ class TestRunSubagentInProcess:
 
     def test_dedicated_client_failure_falls_back(self, tmp_path, monkeypatch):
         import external_llm.client as client_mod
+
         orch = _mk_orch(tmp_path, subagent_models={"1": ("prov", "m", "k")})
 
         def bad_client(**kw):
             raise RuntimeError("bad key")
+
         monkeypatch.setattr(client_mod, "create_llm_client", bad_client)
         captured = []
         self._patch_loop(monkeypatch, [], captured)
@@ -416,6 +465,7 @@ class TestRunSubagentInProcess:
 
     def test_review_approved_breaks_loop(self, tmp_path, monkeypatch):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path, review_enabled=True, review_max_retries=3)
         captured = []
         self._patch_loop(
@@ -431,15 +481,20 @@ class TestRunSubagentInProcess:
 
     def test_review_rejected_retries_with_scope_revert(self, tmp_path, monkeypatch):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(
-            tmp_path, review_enabled=True, review_max_retries=1,
+            tmp_path,
+            review_enabled=True,
+            review_max_retries=1,
             scope_violation_policy="revert",
         )
         captured = []
         self._patch_loop(
             monkeypatch,
-            [AgentResult(status="success", final_message="v1", turns=[], applied_patches=[]),
-             AgentResult(status="success", final_message="v2", turns=[], applied_patches=[])],
+            [
+                AgentResult(status="success", final_message="v1", turns=[], applied_patches=[]),
+                AgentResult(status="success", final_message="v2", turns=[], applied_patches=[]),
+            ],
             captured,
         )
         orch._review_subagent_result = lambda **k: (False, "worse")
@@ -454,6 +509,7 @@ class TestRunSubagentInProcess:
     def test_model_context_scope_entered_with_run_store(self, tmp_path, monkeypatch):
         orch = _mk_orch(tmp_path, subagent_models={"1": ("p", "m", "k")})
         import external_llm.client as client_mod
+
         monkeypatch.setattr(client_mod, "create_llm_client", lambda **kw: Mock())
         rs = Mock()
         ctx = MagicMock()
@@ -474,6 +530,7 @@ class TestRunSubagentInProcess:
 class TestRunToolLoop:
     def _patch_dcl(self, monkeypatch, respond):
         import external_llm.agent.design_chat_loop as dcl
+
         instances = []
 
         class FakeLoop:
@@ -484,6 +541,7 @@ class TestRunToolLoop:
             def respond(self, msgs, **k):
                 self.msgs = list(msgs)
                 return respond
+
         monkeypatch.setattr(dcl, "DesignChatLoop", FakeLoop)
         return instances
 
@@ -511,7 +569,7 @@ class TestRunToolLoop:
         sm = Mock()
         sm.get_or_create.return_value = object()
         sm.build_context_messages.return_value = [
-            {"role": "system", "content": "──"},       # empty divider → filtered
+            {"role": "system", "content": "──"},  # empty divider → filtered
             {"role": "user", "content": "PRIOR TURN"},
         ]
         orch.orch_config = OrchestratorConfig(session_mgr=sm)
@@ -544,6 +602,7 @@ class TestRunToolLoop:
 
             def respond(self, msgs, **k):
                 raise AgentCancelled()
+
         monkeypatch.setattr(dcl, "DesignChatLoop", CancellingLoop)
         orch = _mk_orch(tmp_path)
         res = orch._run_tool_loop("TASK")
@@ -552,6 +611,7 @@ class TestRunToolLoop:
 
     def test_partial_when_subagents_all_failed(self, tmp_path, monkeypatch):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path)
         self._patch_dcl(monkeypatch, None)  # dc_result None
         # _run_tool_loop resets _bg_results at entry; results arrive via the
@@ -593,6 +653,7 @@ class TestDrainAndShutdown:
         def check(aid, timeout_s=0.0):
             calls.append(aid)
             return ("success", object())
+
         orch._check_bg_subagent = check
         orch._bg_subagents["a"] = {"future": Mock(), "result": None, "status": "running"}
         orch._bg_subagents["b"] = {"future": Mock(), "result": None, "status": "running"}
@@ -628,6 +689,7 @@ class TestCheckBgSubagent:
 
     def test_timeout_returns_running(self, tmp_path):
         from concurrent.futures import ThreadPoolExecutor
+
         orch = _mk_orch(tmp_path)
         pool = ThreadPoolExecutor(max_workers=1)
         try:
@@ -640,11 +702,14 @@ class TestCheckBgSubagent:
 
     def test_future_exception_wraps_error(self, tmp_path):
         from concurrent.futures import ThreadPoolExecutor
+
         orch = _mk_orch(tmp_path)
         pool = ThreadPoolExecutor(max_workers=1)
         try:
+
             def boom():
                 raise RuntimeError("kaboom")
+
             fut = pool.submit(boom)
             orch._bg_subagents["bad"] = {"future": fut, "result": None, "status": "running"}
             st, res = orch._check_bg_subagent("bad", timeout_s=2.0)
@@ -658,6 +723,7 @@ class TestCheckBgSubagent:
 class TestRunSubagentBackground:
     def test_success_registers_and_resolves(self, tmp_path):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path)
         ok = AgentResult(status="success", final_message="fine", turns=[], applied_patches=[])
         orch._run_subagent = Mock(return_value=ok)
@@ -688,9 +754,13 @@ class TestRevertUnassignedChanges:
         (tmp_path / "tracked.py").write_text("EDITED\n")
         (tmp_path / "other.py").write_text("EDITED2\n")
         orch = _mk_orch(tmp_path)
-        out = orch._revert_unassigned_changes(str(tmp_path), [
-            {"file": "tracked.py"}, {"file": "other.py"},
-        ])
+        out = orch._revert_unassigned_changes(
+            str(tmp_path),
+            [
+                {"file": "tracked.py"},
+                {"file": "other.py"},
+            ],
+        )
         assert sorted(out) == ["other.py", "tracked.py"]
         assert (tmp_path / "tracked.py").read_text() == "ORIGINAL\n"
         assert (tmp_path / "other.py").read_text() == "BASE\n"
@@ -706,9 +776,17 @@ class TestRevertUnassignedChanges:
     def test_infra_and_empty_entries_skipped(self, tmp_path):
         _git_repo(tmp_path)
         orch = _mk_orch(tmp_path)
-        assert orch._revert_unassigned_changes(str(tmp_path), [
-            {"file": ".asicode/subagents/x/task.json"}, {"file": ""}, None,
-        ]) == []
+        assert (
+            orch._revert_unassigned_changes(
+                str(tmp_path),
+                [
+                    {"file": ".asicode/subagents/x/task.json"},
+                    {"file": ""},
+                    None,
+                ],
+            )
+            == []
+        )
 
     def test_directory_entry_rmtree(self, tmp_path):
         _git_repo(tmp_path)
@@ -740,11 +818,16 @@ class TestRevertUnassignedChanges:
             if cmd[:4] == ["git", "checkout", "HEAD", "--"] and len(cmd) > 5:
                 return SimpleNamespace(returncode=1, stdout=b"", stderr=b"batch fail")
             return real_run(cmd, *a, **k)
+
         monkeypatch.setattr(real_subprocess, "run", failing_run)
         orch = _mk_orch(tmp_path)
-        out = orch._revert_unassigned_changes(str(tmp_path), [
-            {"file": "tracked.py"}, {"file": "second.py"},
-        ])
+        out = orch._revert_unassigned_changes(
+            str(tmp_path),
+            [
+                {"file": "tracked.py"},
+                {"file": "second.py"},
+            ],
+        )
         assert sorted(out) == ["second.py", "tracked.py"]
         assert (tmp_path / "tracked.py").read_text() == "ORIGINAL\n"
 
@@ -757,6 +840,7 @@ class TestRevertUnassignedChanges:
             if "ls-files" in cmd and "-z" in cmd:
                 raise real_subprocess.TimeoutExpired(cmd, 1)
             return real_run(cmd, *a, **k)
+
         monkeypatch.setattr(real_subprocess, "run", raising_run)
         orch = _mk_orch(tmp_path)
         out = orch._revert_unassigned_changes(str(tmp_path), [{"file": "u.txt"}])
@@ -779,21 +863,31 @@ class TestSynthesizeUntrackedDiff:
         (tmp_path / "n1.py").write_text("x = 1\n" * 40)
         (tmp_path / "n2.py").write_text("y = 2\n")
         out = OrchestratorAgent._synthesize_untracked_diff(
-            str(tmp_path), ["n1.py", "n2.py"], char_limit=20,
+            str(tmp_path),
+            ["n1.py", "n2.py"],
+            char_limit=20,
         )
         assert "further untracked files omitted" in out
         assert "+++ b/n2.py" not in out
 
     def test_tracked_only_returns_empty(self, tmp_path):
         _git_repo(tmp_path)
-        assert OrchestratorAgent._synthesize_untracked_diff(
-            str(tmp_path), ["tracked.py"],
-        ) == ""
+        assert (
+            OrchestratorAgent._synthesize_untracked_diff(
+                str(tmp_path),
+                ["tracked.py"],
+            )
+            == ""
+        )
 
     def test_git_failure_returns_empty(self, tmp_path):
-        assert OrchestratorAgent._synthesize_untracked_diff(
-            str(tmp_path / "nope"), ["a.py"],
-        ) == ""
+        assert (
+            OrchestratorAgent._synthesize_untracked_diff(
+                str(tmp_path / "nope"),
+                ["a.py"],
+            )
+            == ""
+        )
 
     def test_directory_assignment_prefix_match(self, tmp_path):
         _git_repo(tmp_path)
@@ -824,6 +918,7 @@ class TestGitHelpers:
 
     def test_snapshot_dirty_path_set(self, tmp_path):
         from external_llm.agent.orchestrator import _snapshot_dirty_path_set
+
         assert _snapshot_dirty_path_set(str(tmp_path)) == set()
         _git_repo(tmp_path)
         (tmp_path / "dirty.py").write_text("d\n")
@@ -840,7 +935,8 @@ class TestOrchestratorBackedRegistry:
         orch = _mk_orch(tmp_path)
         base = Mock()
         base.get_tool_schemas.return_value = [
-            {"name": "read_file"}, {"name": "spawn_subagent"},
+            {"name": "read_file"},
+            {"name": "spawn_subagent"},
         ]
         obr = _OrchestratorBackedRegistry(base, orch)
         return obr, base, orch
@@ -873,12 +969,14 @@ class TestOrchestratorBackedRegistry:
 
         def boom(name, args):
             raise orch_mod._NativeToolError("bad id")
+
         orch._dispatch_native_tool = boom
         tr = obr.dispatch("poll_subagent", {})
         assert tr.ok is False and tr.error == "bad id"
 
         def crash(name, args):
             raise RuntimeError("unexpected")
+
         orch._dispatch_native_tool = crash
         tr = obr.dispatch("list_subagents", {})
         assert tr.ok is False and "unexpected" in tr.error
@@ -909,6 +1007,7 @@ class TestMiscAgentHelpers:
             if str(p).endswith("flaky"):
                 raise OSError("no mtime")
             return real_getmtime(p)
+
         monkeypatch.setattr(os.path, "getmtime", flaky_mtime)
         (base / "flaky").mkdir()
         OrchestratorAgent._gc_subagent_artifacts(str(tmp_path))
@@ -924,10 +1023,16 @@ class TestMiscAgentHelpers:
         assert orch._tool_list_subagents() == "No sub-agents spawned yet."
         st = _sub(task_id="dev_3")
         orch._bg_subagents["dev_3"] = {
-            "subtask": st, "status": "running", "future": None, "result": None,
+            "subtask": st,
+            "status": "running",
+            "future": None,
+            "result": None,
         }
         orch._bg_subagents["dev_4"] = {
-            "subtask": None, "status": "done", "future": None, "result": None,
+            "subtask": None,
+            "status": "done",
+            "future": None,
+            "result": None,
         }
         out = orch._tool_list_subagents()
         assert "- dev_3 [running]: T" in out
@@ -935,11 +1040,14 @@ class TestMiscAgentHelpers:
 
     def test_extract_subagent_summary_patch_shapes(self, tmp_path):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path)
         st = _sub(task_id="dev_1")
         res = AgentResult(
-            status="success", final_message="did stuff",
-            turns=[], applied_patches=[
+            status="success",
+            final_message="did stuff",
+            turns=[],
+            applied_patches=[
                 {"file": "a.py"},
                 {"file_path": "b.py"},
                 SimpleNamespace(file_path="c.py"),
@@ -1001,10 +1109,13 @@ class TestDependencyAware:
         # Force the "cycle detected" branch, then make breaking fail, so the
         # fallback-to-original-order + no-ready/deadlock/force path all run.
         monkeypatch.setattr(
-            orch, "_detect_cycles_kahn", lambda tm: ([], [["dev_1", "dev_2"]]),
+            orch,
+            "_detect_cycles_kahn",
+            lambda tm: ([], [["dev_1", "dev_2"]]),
         )
         monkeypatch.setattr(orch, "_break_cycles", lambda subs, cyc: None)
         from external_llm.agent.agent_loop_types import AgentResult
+
         ok = AgentResult(status="success", final_message="ok", turns=[], applied_patches=[])
         orch._run_subagent = Mock(return_value=ok)
         subs = [
@@ -1036,6 +1147,7 @@ class TestParallelBatchCancelDrain:
         def slow_boom(st, *a, **k):
             time.sleep(0.3)
             raise RuntimeError("worker boom")
+
         orch._run_subagent = slow_boom
         batch = [_sub(task_id="dev_1"), _sub(task_id="dev_2")]
         results = orch._run_parallel_batch(batch, {}, {s.task_id: s for s in batch})
@@ -1047,11 +1159,13 @@ class TestParallelBatchCancelDrain:
 
     def test_cancel_drain_still_pending_gets_cancelled(self, tmp_path):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = self._mk_with_cancel(tmp_path)
 
         def slow(st, *a, **k):
             time.sleep(3.0)
             return AgentResult(status="success", final_message="late", turns=[], applied_patches=[])
+
         orch._run_subagent = slow
         batch = [_sub(task_id="dev_1"), _sub(task_id="dev_2")]
         results = orch._run_parallel_batch(batch, {}, {s.task_id: s for s in batch})
@@ -1067,6 +1181,7 @@ class TestParallelBatchCancelDrain:
 
         def raiser(st, *a, **k):
             raise cf.CancelledError()
+
         orch._run_subagent = raiser
         batch = [_sub(task_id="dev_1"), _sub(task_id="dev_2")]
         results = orch._run_parallel_batch(batch, {}, {s.task_id: s for s in batch})
@@ -1077,11 +1192,15 @@ class TestParallelBatchCancelDrain:
 class TestSynthesizeFromSubtasks:
     def test_all_result_shapes_rendered(self, tmp_path):
         from external_llm.agent.agent_loop_types import AgentResult
+
         orch = _mk_orch(tmp_path)
         pairs = [
             (_sub(task_id="dev_1"), None),
             (_sub(task_id="dev_2"), AgentResult(status="success", final_message="done", turns=[], applied_patches=[])),
-            (_sub(task_id="dev_3"), AgentResult(status="max_turns", final_message="partial", turns=[], applied_patches=[])),
+            (
+                _sub(task_id="dev_3"),
+                AgentResult(status="max_turns", final_message="partial", turns=[], applied_patches=[]),
+            ),
             (_sub(task_id="dev_4"), AgentResult(status="error", final_message="bad", turns=[], applied_patches=[])),
         ]
         out = orch._synthesize_from_subtasks(pairs)
@@ -1100,8 +1219,7 @@ class TestToolSpawnSubagent:
         orch = _mk_orch(tmp_path)
         orch._run_subagent_background = Mock()
         out = orch._tool_spawn_subagent(
-            {"task_description": "fix the parser bug properly",
-             "assigned_files": "src/a.py", "priority": "high"},
+            {"task_description": "fix the parser bug properly", "assigned_files": "src/a.py", "priority": "high"},
             "original request",
         )
         assert "src/a.py" in out
@@ -1117,19 +1235,22 @@ class TestToolSpawnSubagent:
         # A still-RUNNING agent holding src/shared.py …
         orch._bg_subagents["dev_1"] = {
             "subtask": _sub(task_id="dev_1", files=["src/shared.py"]),
-            "future": None, "result": None, "status": "running",
+            "future": None,
+            "result": None,
+            "status": "running",
         }
         # … and a FINISHED one (result set) that must be skipped.
         orch._bg_subagents["dev_2"] = {
             "subtask": _sub(task_id="dev_2", files=["src/shared.py"]),
-            "future": None, "result": object(), "status": "success",
+            "future": None,
+            "result": object(),
+            "status": "success",
         }
         out = orch._tool_spawn_subagent(
             {"task_description": "touch shared", "assigned_files": ["src/shared.py"]},
             "req",
         )
-        warns = [d for e, d in events if e == "orchestrator_warning"
-                 and d.get("type") == "tool_loop_file_conflict"]
+        warns = [d for e, d in events if e == "orchestrator_warning" and d.get("type") == "tool_loop_file_conflict"]
         assert warns and warns[0]["conflicting_agents"] == ["dev_1"]
         assert "File overlap with running sub-agent(s) dev_1" in out
 
@@ -1143,13 +1264,15 @@ class TestToolSpawnSubagent:
 
 class TestFormatPollPatches:
     def test_mixed_shapes_extract_names(self):
-        out = OrchestratorAgent._format_poll_patches([
-            {"file": "a.py"},
-            {"file_path": "b.py"},
-            SimpleNamespace(file_path="c.py"),
-            "raw diff text",
-            {"file": "a.py"},
-        ])
+        out = OrchestratorAgent._format_poll_patches(
+            [
+                {"file": "a.py"},
+                {"file_path": "b.py"},
+                SimpleNamespace(file_path="c.py"),
+                "raw diff text",
+                {"file": "a.py"},
+            ]
+        )
         assert "Applied patches (3): a.py, b.py, c.py" in out
 
     def test_unextractable_falls_back_to_count(self):
@@ -1182,7 +1305,9 @@ class TestCycleHelpers:
     def test_break_cycles_unbreakable_returns_none(self, tmp_path, monkeypatch):
         orch = _mk_orch(tmp_path)
         monkeypatch.setattr(
-            orch, "_detect_cycles_kahn", lambda tm: ([], [["dev_1", "dev_2"]]),
+            orch,
+            "_detect_cycles_kahn",
+            lambda tm: ([], [["dev_1", "dev_2"]]),
         )
         subs = [_sub(task_id="dev_1"), _sub(task_id="dev_2")]
         subs[0].dependencies = ["dev_2"]
@@ -1200,6 +1325,7 @@ class TestCycleHelpers:
     def test_cb_swallows_handler_exception(self, tmp_path):
         def evil(event, data):
             raise RuntimeError("handler bug")
+
         orch = _mk_orch(tmp_path, callback=evil)
         orch._cb("any_event", {"x": 1})  # must not raise
 
@@ -1215,11 +1341,13 @@ class TestClaimAndCleanup:
 
     def test_claim_heartbeat_read_failure_still_claims(self, tmp_path, monkeypatch):
         import external_llm.agent.subagent_ipc as ipc
+
         orch = _mk_orch(tmp_path)
         orch._reusable_worker_ids.add("w1")
 
         def bad_state(rr, wid):
             raise OSError("heartbeat unreadable")
+
         monkeypatch.setattr(ipc, "read_worker_idle_heartbeat_state", bad_state)
         assert orch._claim_reusable_worker(str(tmp_path)) == "w1"
 
@@ -1227,10 +1355,12 @@ class TestClaimAndCleanup:
 class TestAbandonEdges:
     def test_cancel_sentinel_failure_warns_and_fails(self, tmp_path, monkeypatch):
         import external_llm.agent.subagent_ipc as ipc
+
         orch = _mk_orch(tmp_path, cancel_event=threading.Event())  # soft timeout
 
         def bad_sentinel(rr, wid):
             raise OSError("cannot write")
+
         monkeypatch.setattr(ipc, "write_cancel_sentinel", bad_sentinel)
         reusable = orch._abandon_ipc_worker(str(tmp_path), "w1", grace_s=0.3)
         assert reusable is False
@@ -1256,6 +1386,7 @@ class TestSpawnBackgroundPlatforms:
         def fake_popen(argv, **k):
             seen["k"] = k
             return MagicMock(pid=1)
+
         monkeypatch.setattr(orch_mod.subprocess, "Popen", fake_popen)
         assert orch._spawn_ipc_worker_background(str(tmp_path), "w1", "", "") is True
         assert "creationflags" in seen["k"]
@@ -1264,15 +1395,19 @@ class TestSpawnBackgroundPlatforms:
     def test_log_handle_close_failure_logged(self, tmp_path, monkeypatch):
         orch = _mk_orch(tmp_path)
         import builtins
+
         real_open = builtins.open
 
         class FragileFile:
             def __init__(self, *a, **k):
                 pass
+
             def close(self):
                 raise OSError("close failed")
+
             def __enter__(self):
                 return self
+
             def __exit__(self, *a):
                 return False
 
@@ -1280,9 +1415,12 @@ class TestSpawnBackgroundPlatforms:
             if str(p).endswith("worker.log") and "b" in mode:
                 return FragileFile()
             return real_open(p, mode, *a, **k)
+
         monkeypatch.setattr(builtins, "open", fragile_open)
         monkeypatch.setattr(
-            orch_mod.subprocess, "Popen", lambda argv, **k: MagicMock(pid=1),
+            orch_mod.subprocess,
+            "Popen",
+            lambda argv, **k: MagicMock(pid=1),
         )
         assert orch._spawn_ipc_worker_background(str(tmp_path), "w1", "", "") is True
 
@@ -1290,8 +1428,7 @@ class TestSpawnBackgroundPlatforms:
 class _RigidResult:
     """An AgentResult stand-in that rejects attribute attachment."""
 
-    def __init__(self, status="success", final_message="m", turns=None,
-                 applied_patches=None, error=None):
+    def __init__(self, status="success", final_message="m", turns=None, applied_patches=None, error=None):
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "final_message", final_message)
         object.__setattr__(self, "turns", turns or [])
@@ -1306,13 +1443,16 @@ class TestAttachFailures:
         orch = _mk_orch(tmp_path)  # parallel=True → attribution possible
         result = _RigidResult(applied_patches=[{"file": "a.py"}])
         verdict = orch._compute_diff_verdict(
-            agent_id="dev_1", result=result,
-            repo_root=str(tmp_path), diff_cache={},
+            agent_id="dev_1",
+            result=result,
+            repo_root=str(tmp_path),
+            diff_cache={},
         )
         assert isinstance(verdict, str) and verdict
 
     def test_ipc_unassigned_attach_failure_logged(self, tmp_path, monkeypatch):
         import external_llm.agent.agent_loop as al
+
         orch = _ipc_orch(tmp_path)
         monkeypatch.setattr(al, "AgentResult", _RigidResult)
         _patch_ipc_mocks(monkeypatch)
@@ -1330,9 +1470,7 @@ class TestAttachFailures:
         _patch_ipc_mocks(monkeypatch)
         _patch_ipc_fs(monkeypatch)
         launched = []
-        orch._launch_ipc_worker_terminal_macos = (
-            lambda aid, wid: launched.append(wid) or True
-        )
+        orch._launch_ipc_worker_terminal_macos = lambda aid, wid: launched.append(wid) or True
         res = orch._run_subagent_ipc(_sub())
         assert res.status == "success" and launched == ["dev_1"]
 

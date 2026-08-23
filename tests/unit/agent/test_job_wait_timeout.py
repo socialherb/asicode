@@ -45,8 +45,7 @@ class _StubBgManager:
         self.wait_calls = []
         self.get_calls = 0
 
-    def wait_for_completion(self, job_id, timeout=120.0, poll_interval=1.0,
-                            cancel_event=None):
+    def wait_for_completion(self, job_id, timeout=120.0, poll_interval=1.0, cancel_event=None):
         self.wait_calls.append((timeout, cancel_event))
         return self.info
 
@@ -148,6 +147,7 @@ class TestJobOutputBounded:
     @staticmethod
     def _cap() -> int:
         from external_llm.agent.config.thresholds import config as _thresholds
+
         return _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
 
     def test_live_job_output_capped_at_bash_budget(self):
@@ -159,8 +159,7 @@ class TestJobOutputBounded:
         res = h._tool_job({"action": "output", "job_id": "j1"})
         assert res.ok
         assert len(res.content) <= self._cap() + 500, (  # +500 = truncation notice
-            f"job output rendered {len(res.content):,} chars against a "
-            f"{self._cap():,}-char cap"
+            f"job output rendered {len(res.content):,} chars against a {self._cap():,}-char cap"
         )
         assert "... [truncated" in res.content, "elision not announced"
         assert res.content.endswith("x" * 100), "the tail (latest output) was dropped"
@@ -179,12 +178,8 @@ class TestJobOutputBounded:
         # The notice names the TRUE total (what the process printed), unformatted
         # — e.g. "107940003", not the ~300K that survived the capture.
         expected = info.stdout_total + info.stderr_total - cap
-        assert f"{expected}" in res.content, (
-            "notice reported the surviving length instead of the true total"
-        )
-        assert f"{cap * 5}" not in res.content, (
-            "the surviving (capped) size leaked into the notice"
-        )
+        assert f"{expected}" in res.content, "notice reported the surviving length instead of the true total"
+        assert f"{cap * 5}" not in res.content, "the surviving (capped) size leaked into the notice"
 
     def test_small_job_output_untouched(self):
         info = _FakeJobInfo(status="completed")
@@ -235,9 +230,7 @@ class TestWaitForCompletionIntegration:
             timer = threading.Timer(0.1, ev.set)
             timer.start()
             try:
-                info = mgr.wait_for_completion(
-                    jid, timeout=30.0, poll_interval=0.05, cancel_event=ev
-                )
+                info = mgr.wait_for_completion(jid, timeout=30.0, poll_interval=0.05, cancel_event=ev)
             finally:
                 timer.cancel()
             elapsed = time.monotonic() - t0
@@ -257,9 +250,7 @@ class TestWaitForCompletionIntegration:
             done_proc.poll = lambda: 0
             mgr._jobs[jid].proc = done_proc
             t0 = time.monotonic()
-            info = mgr.wait_for_completion(
-                jid, timeout=10.0, poll_interval=0.02, cancel_event=threading.Event()
-            )
+            info = mgr.wait_for_completion(jid, timeout=10.0, poll_interval=0.02, cancel_event=threading.Event())
             assert info is not None and info.status == "completed"
             assert time.monotonic() - t0 < 5.0
         finally:

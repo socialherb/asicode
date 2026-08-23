@@ -27,12 +27,7 @@ _spec.loader.exec_module(g)  # type: ignore[union-attr]
 def _src(body_except: str) -> str:
     """A function whose one subprocess.run is wrapped by a try with *body_except*."""
     return (
-        "import subprocess\n"
-        "def f():\n"
-        "    try:\n"
-        "        subprocess.run(['rg', 'x'])\n"
-        f"    {body_except}\n"
-        "        pass\n"
+        f"import subprocess\ndef f():\n    try:\n        subprocess.run(['rg', 'x'])\n    {body_except}\n        pass\n"
     )
 
 
@@ -42,14 +37,13 @@ def _src(body_except: str) -> str:
 @pytest.mark.parametrize(
     "body_except",
     [
-        "except subprocess.SubprocessError:",            # P0 site #2 verbatim
-        "except (AttributeError, TypeError):",           # P0 site #1 verbatim
+        "except subprocess.SubprocessError:",  # P0 site #2 verbatim
+        "except (AttributeError, TypeError):",  # P0 site #1 verbatim
         "except (AttributeError, TypeError, subprocess.SubprocessError):",  # site #3
-        "except subprocess.CalledProcessError:",         # exit-code-only
-        "except subprocess.TimeoutExpired:",             # timeout-only
+        "except subprocess.CalledProcessError:",  # exit-code-only
+        "except subprocess.TimeoutExpired:",  # timeout-only
     ],
-    ids=["SubprocessError", "AttrError-TypeError", "tuple-missing-OSError",
-         "CalledProcessError", "TimeoutExpired"],
+    ids=["SubprocessError", "AttrError-TypeError", "tuple-missing-OSError", "CalledProcessError", "TimeoutExpired"],
 )
 def test_scan_flags_p0_defect_shapes(body_except):
     keys = g._scan_source(_src(body_except), "m.py")
@@ -57,7 +51,7 @@ def test_scan_flags_p0_defect_shapes(body_except):
 
 
 def test_scan_flags_no_try_at_all():
-    src = "import subprocess\n" "def f():\n    subprocess.run(['rg'])\n"
+    src = "import subprocess\ndef f():\n    subprocess.run(['rg'])\n"
     assert g._scan_source(src, "m.py") == ["m.py::<module>::f::0"]
 
 
@@ -83,15 +77,23 @@ def test_scan_flags_call_in_finally_region():
     [
         "except OSError:",
         "except FileNotFoundError:",
-        "except (subprocess.SubprocessError, OSError):",   # the FIX shape
+        "except (subprocess.SubprocessError, OSError):",  # the FIX shape
         "except (OSError, AttributeError):",
         "except Exception:",
         "except BaseException:",
-        "except:",                                          # bare
-        "except IOError:",                                  # OSError alias
+        "except:",  # bare
+        "except IOError:",  # OSError alias
     ],
-    ids=["OSError", "FileNotFoundError", "tuple-with-OSError", "tuple-leading-OSError",
-         "Exception", "BaseException", "bare", "IOError-alias"],
+    ids=[
+        "OSError",
+        "FileNotFoundError",
+        "tuple-with-OSError",
+        "tuple-leading-OSError",
+        "Exception",
+        "BaseException",
+        "bare",
+        "IOError-alias",
+    ],
 )
 def test_scan_passes_oserror_guarded(body_except):
     assert g._scan_source(_src(body_except), "m.py") == []
@@ -124,8 +126,8 @@ def test_scan_passes_nested_outer_try_catches_oserror():
     "suppress_args",
     [
         "OSError",
-        "OSError, subprocess.SubprocessError",   # the FIX shape as suppress
-        "Exception",                             # OSError supertype
+        "OSError, subprocess.SubprocessError",  # the FIX shape as suppress
+        "Exception",  # OSError supertype
         "BaseException",
     ],
     ids=["OSError", "tuple-with-OSError", "Exception", "BaseException"],
@@ -144,8 +146,8 @@ def test_scan_passes_suppress_guarded(suppress_args):
 @pytest.mark.parametrize(
     "suppress_args",
     [
-        "ValueError",                             # misses OSError entirely
-        "subprocess.SubprocessError",             # timeout-only, not OSError
+        "ValueError",  # misses OSError entirely
+        "subprocess.SubprocessError",  # timeout-only, not OSError
     ],
     ids=["ValueError", "SubprocessError"],
 )
@@ -164,12 +166,7 @@ def test_scan_flags_suppress_missing_oserror(suppress_args):
 
 def test_scan_flags_bare_with_is_not_a_guard():
     # A plain `with open(...)` is NOT an exception guard — only suppress counts.
-    src = (
-        "import subprocess\n"
-        "def f():\n"
-        "    with open('x', 'w') as fh:\n"
-        "        subprocess.run(['rg'], stdout=fh)\n"
-    )
+    src = "import subprocess\ndef f():\n    with open('x', 'w') as fh:\n        subprocess.run(['rg'], stdout=fh)\n"
     assert g._scan_source(src, "m.py") == ["m.py::<module>::f::0"], src
 
 
@@ -249,9 +246,7 @@ def test_main_returns_nonzero_on_net_new(tmp_path, monkeypatch):
     prod = tmp_path / "ext"
     prod.mkdir()
     (prod / "mod.py").write_text(
-        "import subprocess\n"
-        "def a():\n    subprocess.run(['rg'])\n\n"
-        "def b():\n    subprocess.run(['rg'])\n"
+        "import subprocess\ndef a():\n    subprocess.run(['rg'])\n\ndef b():\n    subprocess.run(['rg'])\n"
     )
     monkeypatch.setattr(g, "REPO", tmp_path)
     monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
@@ -265,10 +260,7 @@ def test_main_returns_nonzero_on_net_new(tmp_path, monkeypatch):
 def test_main_returns_zero_when_in_sync(tmp_path, monkeypatch):
     prod = tmp_path / "ext"
     prod.mkdir()
-    (prod / "mod.py").write_text(
-        "import subprocess\n"
-        "def a():\n    subprocess.run(['rg'])\n"
-    )
+    (prod / "mod.py").write_text("import subprocess\ndef a():\n    subprocess.run(['rg'])\n")
     monkeypatch.setattr(g, "REPO", tmp_path)
     monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
     monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
@@ -329,10 +321,7 @@ def test_no_new_unguarded_subprocess_beyond_baseline():
     current = g._get_current_keys()
     baseline = g._load_baseline()
     new = current - baseline
-    assert not new, (
-        f"{len(new)} new unguarded subprocess call(s) beyond baseline:\n"
-        + "\n".join(sorted(new))
-    )
+    assert not new, f"{len(new)} new unguarded subprocess call(s) beyond baseline:\n" + "\n".join(sorted(new))
 
 
 # --- per-file mode: explicit paths scope the scan (parallel-write race fix) ---
@@ -348,13 +337,15 @@ def test_iter_repo_py_filters_paths_to_scan_scope(tmp_path, monkeypatch):
     (tmp_path / "scripts" / "s.py").write_text("x = 1\n")
     monkeypatch.setattr(g, "REPO", tmp_path)
     monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
-    paths = g._resolve_scan_paths([
-        str(prod / "mod.py"),
-        str(tmp_path / "asi.py"),
-        str(tmp_path / "rootmod.py"),
-        str(tmp_path / "tests" / "t.py"),
-        str(tmp_path / "scripts" / "s.py"),
-    ])
+    paths = g._resolve_scan_paths(
+        [
+            str(prod / "mod.py"),
+            str(tmp_path / "asi.py"),
+            str(tmp_path / "rootmod.py"),
+            str(tmp_path / "tests" / "t.py"),
+            str(tmp_path / "scripts" / "s.py"),
+        ]
+    )
     scanned = g._iter_repo_py(paths)
     assert scanned == [
         prod / "mod.py",
@@ -387,9 +378,7 @@ def test_main_with_explicit_paths_scopes_scan(tmp_path, monkeypatch):
 def test_cache_persists_and_reuses_unchanged_files(tmp_path, monkeypatch):
     ext = tmp_path / "ext"
     (ext / "sub").mkdir(parents=True)
-    (ext / "sub" / "mod.py").write_text(
-        "import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8"
-    )
+    (ext / "sub" / "mod.py").write_text("import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8")
     monkeypatch.setattr(g, "REPO", tmp_path)
     monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
     monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")
@@ -426,9 +415,7 @@ def test_cache_reanalyzes_changed_file_only(tmp_path, monkeypatch):
 def test_cache_fail_open_on_corruption(tmp_path, monkeypatch):
     ext = tmp_path / "ext"
     (ext / "sub").mkdir(parents=True)
-    (ext / "sub" / "mod.py").write_text(
-        "import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8"
-    )
+    (ext / "sub" / "mod.py").write_text("import subprocess\nsubprocess.run(['a'])\n", encoding="utf-8")
     monkeypatch.setattr(g, "REPO", tmp_path)
     monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
     monkeypatch.setattr(g, "BASELINE", tmp_path / "b.txt")

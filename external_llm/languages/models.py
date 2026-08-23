@@ -3,6 +3,7 @@ Language models for multi-language support.
 
 Defines language identification, capabilities, and validation result types.
 """
+
 from __future__ import annotations
 
 import os
@@ -95,19 +96,19 @@ _EXT_MAP = {
 #   * cross-language resolution guard (see _get_language_group)
 _LANGUAGE_FAMILIES: tuple[frozenset[str], ...] = (
     frozenset({"TYPESCRIPT", "JAVASCRIPT"}),  # JS/TS family
-    frozenset({"PYTHON"}),                    # Python (+type stubs)
-    frozenset({"GO"}),                        # Go
-    frozenset({"JAVA"}),                      # Java
-    frozenset({"KOTLIN"}),                    # Kotlin
-    frozenset({"RUST"}),                      # Rust
-    frozenset({"RUBY"}),                      # Ruby
-    frozenset({"C", "CPP"}),                  # C/C++ family
-    frozenset({"PHP"}),                       # PHP
-    frozenset({"CSHARP"}),                    # C#
-    frozenset({"SWIFT"}),                     # Swift
-    frozenset({"SCALA"}),                     # Scala
-    frozenset({"LUA"}),                       # Lua
-    frozenset({"BASH"}),                      # Bash
+    frozenset({"PYTHON"}),  # Python (+type stubs)
+    frozenset({"GO"}),  # Go
+    frozenset({"JAVA"}),  # Java
+    frozenset({"KOTLIN"}),  # Kotlin
+    frozenset({"RUST"}),  # Rust
+    frozenset({"RUBY"}),  # Ruby
+    frozenset({"C", "CPP"}),  # C/C++ family
+    frozenset({"PHP"}),  # PHP
+    frozenset({"CSHARP"}),  # C#
+    frozenset({"SWIFT"}),  # Swift
+    frozenset({"SCALA"}),  # Scala
+    frozenset({"LUA"}),  # Lua
+    frozenset({"BASH"}),  # Bash
 )
 
 
@@ -196,7 +197,7 @@ class LanguageId(Enum):
 
     @staticmethod
     @lru_cache(maxsize=128)
-    def from_path(file_path: str) -> "LanguageId":
+    def from_path(file_path: str) -> LanguageId:
         """Map file extension to LanguageId."""
         _, ext = os.path.splitext(file_path)
         name = _EXT_MAP.get(ext.lower())
@@ -213,6 +214,7 @@ class SyntaxError_:  # noqa: N801 — trailing underscore avoids builtin shadow
     (pyright/tsc type errors, undefined names, missing imports). Both default
     so that existing call sites that only report syntax errors stay compatible.
     """
+
     file: str
     line: int
     col: int
@@ -237,6 +239,7 @@ class SyntaxValidationResult:
     language's own parser, always present — so the default is True and only the
     semantic paths construct the False case, via :meth:`unchecked`.
     """
+
     ok: bool
     errors: list[SyntaxError_] = field(default_factory=list)
     language: LanguageId = LanguageId.UNKNOWN
@@ -244,7 +247,7 @@ class SyntaxValidationResult:
     skip_reason: str = ""
 
     @classmethod
-    def unchecked(cls, language: LanguageId, reason: str) -> "SyntaxValidationResult":
+    def unchecked(cls, language: LanguageId, reason: str) -> SyntaxValidationResult:
         """A result meaning "nothing examined this file", with the why.
 
         *reason* reaches the model verbatim, so it names the missing tool
@@ -269,6 +272,7 @@ class SymbolPattern:
     id / custom-property names like ``btn-primary`` or ``--primary-color`` are
     not truncated at the first hyphen.
     """
+
     kind: str
     regex: str
     description: str = ""
@@ -278,6 +282,7 @@ class SymbolPattern:
 @dataclass
 class LanguageCapabilities:
     """Boolean flags describing what a language provider supports."""
+
     has_ast_parser: bool = False
     has_syntax_validator: bool = False
     has_semantic_validator: bool = False

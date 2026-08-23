@@ -7,28 +7,26 @@ analysis (former Step 2) moved out of this module in later steps.
 
 Circular-import safety: imports only stdlib (ast, dataclasses, re).
 """
+
 from __future__ import annotations
 
 import ast
 import contextlib
 import dataclasses
 import re
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Shared builtin-name sets
 # ---------------------------------------------------------------------------
 
 # Python keyword tokens excluded from IR operand lists.
-_PY_KW: frozenset[str] = frozenset(
-    {"not", "in", "is", "and", "or", "True", "False", "None"}
-)
-
+_PY_KW: frozenset[str] = frozenset({"not", "in", "is", "and", "or", "True", "False", "None"})
 
 
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclasses.dataclass
 class GuardCondition:
@@ -56,16 +54,15 @@ class GuardIR:
     compact: str
     """Single-line collapsed form suitable for LLM prompts / op.metadata."""
 
-    condition: Optional[GuardCondition]
+    condition: GuardCondition | None
     control: str
     """"continue" | "break" | "return" | "raise" | ""."""
-
 
     # ------------------------------------------------------------------
     # Compatibility helpers
     # ------------------------------------------------------------------
 
-    def to_legacy_tuple(self) -> tuple[Optional[dict], Optional[str]]:
+    def to_legacy_tuple(self) -> tuple[dict | None, str | None]:
         """(condition_dict, control) compatible with _extract_guard_ir output."""
         if self.condition is None:
             return None, None
@@ -79,6 +76,7 @@ class GuardIR:
 # ---------------------------------------------------------------------------
 # Internal: condition extraction helpers (Step 1)
 # ---------------------------------------------------------------------------
+
 
 def _compute_op_class(expr: ast.expr) -> str:
     if isinstance(expr, ast.UnaryOp):
@@ -110,7 +108,7 @@ def _extract_condition(stmt: ast.If) -> GuardCondition:
     attribute_pairs: list = []
     seen_pairs: set = set()
     for _n in ast.walk(stmt.test):
-        tok: Optional[str] = None
+        tok: str | None = None
         if isinstance(_n, ast.Name) and _n.id not in _PY_KW:
             tok = _n.id
         elif isinstance(_n, ast.Attribute) and _n.attr not in _PY_KW:
@@ -123,8 +121,7 @@ def _extract_condition(stmt: ast.If) -> GuardCondition:
         if tok and tok not in seen:
             operands.append(tok)
             seen.add(tok)
-    return GuardCondition(op_class=op_class, operands=operands,
-                          attribute_pairs=attribute_pairs)
+    return GuardCondition(op_class=op_class, operands=operands, attribute_pairs=attribute_pairs)
 
 
 def _make_compact(canonical: str) -> str:
@@ -140,7 +137,8 @@ def _make_compact(canonical: str) -> str:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _expand_condensed_guard_src(src: str, *, _return_tree: bool = False):
+
+def _expand_condensed_guard_src(src: str, *, _return_tree: bool = False) -> str | tuple[str, ast.Module] | None:
     """Expand a condensed single-line guard to valid multi-line Python.
 
     Handles "if cond: stmt1 stmt2" (two statements on one line without
@@ -154,21 +152,21 @@ def _expand_condensed_guard_src(src: str, *, _return_tree: bool = False):
     candidate so the caller can reuse the already-parsed AST instead of
     re-parsing the same string (see parse_guard).
     """
-    m = re.match(r'^(if\s+.+?):\s*(.+)$', src, re.DOTALL)
+    m = re.match(r"^(if\s+.+?):\s*(.+)$", src, re.DOTALL)
     if not m:
         return None
     head = m.group(1)
     body = m.group(2).strip()
     # Split body on exit keywords used as statement boundaries (no semicolons).
     parts = re.split(
-        r'\s+(?=\b(?:continue|break|return(?:\s+\S+)?|raise\s+\w+)\b)',
+        r"\s+(?=\b(?:continue|break|return(?:\s+\S+)?|raise\s+\w+)\b)",
         body,
     )
     if len(parts) < 2:
         return None
     indented = "\n    ".join(p.strip() for p in parts if p.strip())
     candidate = f"{head}:\n    {indented}"
-    _tree: Optional[ast.AST] = None
+    _tree: ast.AST | None = None
     with contextlib.suppress(SyntaxError):
         _tree = ast.parse(candidate, mode="exec")
     if _tree is None:
@@ -182,7 +180,8 @@ def _expand_condensed_guard_src(src: str, *, _return_tree: bool = False):
 # Public factories
 # ---------------------------------------------------------------------------
 
-def parse_guard(raw: str) -> Optional[GuardIR]:
+
+def parse_guard(raw: str) -> GuardIR | None:
     """Parse *raw* into a GuardIR (Step 1: condition + control only).
 
     Returns None only when *raw* is empty.  Returns a GuardIR with
@@ -192,7 +191,7 @@ def parse_guard(raw: str) -> Optional[GuardIR]:
         return None
 
     src = raw.strip()
-    _tree: Optional[ast.Module] = None
+    _tree: ast.Module | None = None
     try:
         _tree = ast.parse(src, mode="exec")
     except SyntaxError:
@@ -207,7 +206,7 @@ def parse_guard(raw: str) -> Optional[GuardIR]:
         # The expander already parsed the candidate for its own syntax check —
         # reuse that tree instead of parsing the same string a second time.
         _expanded = _expand_condensed_guard_src(src, _return_tree=True)
-        if _expanded:
+        if isinstance(_expanded, tuple):
             _tree = _expanded[1]
     if _tree is None or not _tree.body or not isinstance(_tree.body[0], ast.If):
         return GuardIR(raw=raw, canonical="", compact="", condition=None, control="")
@@ -221,10 +220,7 @@ def parse_guard(raw: str) -> Optional[GuardIR]:
 
     control = _extract_control(stmt)
     if not control:
-        return GuardIR(raw=raw, canonical=canonical, compact=compact,
-                       condition=None, control="")
+        return GuardIR(raw=raw, canonical=canonical, compact=compact, condition=None, control="")
 
     condition = _extract_condition(stmt)
-    return GuardIR(raw=raw, canonical=canonical, compact=compact,
-                   condition=condition, control=control)
-
+    return GuardIR(raw=raw, canonical=canonical, compact=compact, condition=condition, control=control)

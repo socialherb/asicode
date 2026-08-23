@@ -29,7 +29,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.config.thresholds import config as _cfg
 
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # registry must be capped — an unbounded one leaks threads (not just memory)
 # in long-lived multi-repo webapp processes. On overflow the LRU entry is
 # evicted and stop()'d (thread + timers torn down). See get_or_create_runner.
-_runners: "OrderedDict[str, ProactiveRunner]" = OrderedDict()
+_runners: OrderedDict[str, ProactiveRunner] = OrderedDict()
 _runners_lock = threading.Lock()
 
 
@@ -49,8 +49,8 @@ def get_or_create_runner(
     repo_root: str,
     model_tier: str = "small",
     push_manager=None,
-    llm_invoke_fn: Optional[Callable] = None,
-) -> "ProactiveRunner":
+    llm_invoke_fn: Callable | None = None,
+) -> ProactiveRunner:
     """
     Get the ProactiveRunner for repo_root, creating and starting one if absent.
 
@@ -65,10 +65,11 @@ def get_or_create_runner(
         push_manager:   PushManager instance (uses global singleton if None)
         llm_invoke_fn:  Optional callable to run LLM tasks. Injected by main.py.
     """
-    evicted: Optional["ProactiveRunner"] = None
+    evicted: ProactiveRunner | None = None
     with _runners_lock:
         if repo_root not in _runners:
             from external_llm.editor.agent.autonomous.push_manager import get_push_manager
+
             pm = push_manager or get_push_manager()
             runner = ProactiveRunner(
                 repo_root=repo_root,
@@ -78,9 +79,7 @@ def get_or_create_runner(
             )
             runner.start()
             _runners[repo_root] = runner
-            logger.info(
-                "ProactiveRunner created for repo=%s (model_tier=%s)", repo_root, model_tier
-            )
+            logger.info("ProactiveRunner created for repo=%s (model_tier=%s)", repo_root, model_tier)
             # LRU eviction: bound the per-repo registry. Each entry owns a drain
             # daemon thread + TriggerEngine schedule timers, so an unbounded
             # registry leaks threads (not just memory) in long-lived multi-repo
@@ -91,7 +90,8 @@ def get_or_create_runner(
                 logger.warning(
                     "ProactiveRunner registry cap (%d) exceeded; evicting LRU runner "
                     "for repo=%s (drain thread + engine timers will be torn down)",
-                    max_runners, evicted_repo,
+                    max_runners,
+                    evicted_repo,
                 )
         else:
             # Update llm_invoke_fn if provided (called again after model selection)
@@ -137,6 +137,7 @@ def update_runner_features(repo_root: str, features_csv: str) -> None:
     if not runner:
         return
     from external_llm.editor.agent.autonomous.trigger_policy import TriggerPolicy
+
     if not features_csv or features_csv.strip() == "all":
         runner.policy.enabled_features = set(TriggerPolicy._ALL_FEATURES)
     else:
@@ -144,13 +145,14 @@ def update_runner_features(repo_root: str, features_csv: str) -> None:
         runner.policy.enabled_features = requested & TriggerPolicy._ALL_FEATURES
     logger.info(
         "ProactiveRunner features updated: %s → %s",
-        repo_root, runner.policy.enabled_features,
+        repo_root,
+        runner.policy.enabled_features,
     )
 
 
 def make_stream_callback_interceptor(
     repo_root: str,
-    original_cb: Optional[Callable],
+    original_cb: Callable | None,
 ) -> Callable:
     """
     Wrap the AgentLoop stream_callback to intercept agent state events.
@@ -189,6 +191,7 @@ def make_stream_callback_interceptor(
 
 # ── ProactiveRunner ───────────────────────────────────────────────────────────
 
+
 class ProactiveRunner:
     """
     Main autonomous agent coordinator.
@@ -205,7 +208,7 @@ class ProactiveRunner:
         repo_root: str,
         model_tier: str = "small",
         push_manager=None,
-        llm_invoke_fn: Optional[Callable] = None,
+        llm_invoke_fn: Callable | None = None,
     ):
         self.repo_root = repo_root
         self.llm_invoke_fn = llm_invoke_fn
@@ -221,7 +224,7 @@ class ProactiveRunner:
         self._queue = AutonomousTaskQueue()
 
         self._running = False
-        self._drain_thread: Optional[threading.Thread] = None
+        self._drain_thread: threading.Thread | None = None
         # Guards _running flag + _drain_thread lifecycle (start/stop). Mirrors
         # TriggerEngine's pattern; prevents concurrent start() from spawning two
         # drain threads and stop()/start() races that orphan a joinable thread.
@@ -245,8 +248,7 @@ class ProactiveRunner:
                 name=f"proactive-drain-{self.repo_root[-24:]}",
             )
             self._drain_thread.start()
-            logger.info("ProactiveRunner started (repo=%s, model_tier=%s)",
-                        self.repo_root, self.policy.model_tier)
+            logger.info("ProactiveRunner started (repo=%s, model_tier=%s)", self.repo_root, self.policy.model_tier)
 
     def stop(self) -> None:
         with self._lifecycle_lock:
@@ -279,14 +281,17 @@ class ProactiveRunner:
 
         # ESCALATE: push immediately without queuing (user needs to see it now)
         if decision.kind == ActionKind.ESCALATE:
-            self.push.broadcast("proactive_escalation", {
-                "message": decision.message,
-                "event_kind": event.kind.value,
-                "source_file": event.source_file,
-                "metadata": event.metadata,
-                "timestamp": event.timestamp,
-                "priority": decision.priority,
-            })
+            self.push.broadcast(
+                "proactive_escalation",
+                {
+                    "message": decision.message,
+                    "event_kind": event.kind.value,
+                    "source_file": event.source_file,
+                    "metadata": event.metadata,
+                    "timestamp": event.timestamp,
+                    "priority": decision.priority,
+                },
+            )
             return
 
         self._queue.enqueue(event, decision)
@@ -326,44 +331,56 @@ class ProactiveRunner:
             event = task.event
 
             if action.kind == ActionKind.NOTIFY:
-                self.push.broadcast("proactive_notification", {
-                    "message": action.message,
-                    "event_kind": event.kind.value,
-                    "source_file": event.source_file,
-                    "timestamp": event.timestamp,
-                    "priority": action.priority,
-                })
+                self.push.broadcast(
+                    "proactive_notification",
+                    {
+                        "message": action.message,
+                        "event_kind": event.kind.value,
+                        "source_file": event.source_file,
+                        "timestamp": event.timestamp,
+                        "priority": action.priority,
+                    },
+                )
 
             elif action.kind in (ActionKind.SUGGEST, ActionKind.AUTO_FIX):
                 # Signal UI that work is starting
-                self.push.broadcast("proactive_fix_started", {
-                    "task_id": task.task_id,
-                    "event_kind": event.kind.value,
-                    "source_file": event.source_file,
-                    "message": action.message,
-                    "action": action.kind.value,
-                    "timestamp": time.time(),
-                })
+                self.push.broadcast(
+                    "proactive_fix_started",
+                    {
+                        "task_id": task.task_id,
+                        "event_kind": event.kind.value,
+                        "source_file": event.source_file,
+                        "message": action.message,
+                        "action": action.kind.value,
+                        "timestamp": time.time(),
+                    },
+                )
 
                 result = self._run_llm_task(event, action)
 
-                self.push.broadcast("proactive_fix_done", {
-                    "task_id": task.task_id,
-                    "event_kind": event.kind.value,
-                    "source_file": event.source_file,
-                    "result": result,
-                    "action": action.kind.value,
-                    "message": action.message,
-                    "timestamp": time.time(),
-                })
+                self.push.broadcast(
+                    "proactive_fix_done",
+                    {
+                        "task_id": task.task_id,
+                        "event_kind": event.kind.value,
+                        "source_file": event.source_file,
+                        "result": result,
+                        "action": action.kind.value,
+                        "message": action.message,
+                        "timestamp": time.time(),
+                    },
+                )
 
         except Exception as exc:
             logger.warning("ProactiveRunner task %s error: %s", task.task_id, exc, exc_info=True)
-            self.push.broadcast("proactive_error", {
-                "task_id": task.task_id,
-                "error": str(exc),
-                "event_kind": task.event.kind.value,
-            })
+            self.push.broadcast(
+                "proactive_error",
+                {
+                    "task_id": task.task_id,
+                    "error": str(exc),
+                    "event_kind": task.event.kind.value,
+                },
+            )
         finally:
             self._queue.task_done(task.task_id)
 
@@ -377,8 +394,7 @@ class ProactiveRunner:
         if not self.llm_invoke_fn:
             return {
                 "status": "no_model",
-                "message": "No LLM invoke function connected. "
-                           "Inject llm_invoke_fn via main.py.",
+                "message": "No LLM invoke function connected. Inject llm_invoke_fn via main.py.",
                 "prompt_preview": action.prompt[:200] if action.prompt else "",
             }
 

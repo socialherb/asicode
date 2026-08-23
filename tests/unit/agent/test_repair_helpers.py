@@ -6,6 +6,7 @@ reference preservation, and the broken-strip guard) and
 _strip_redundant_dataclass_decorator (Name/Call decorator detection in both
 file and new body, and the RH-B1 dotted-decorator crash fix).
 """
+
 from __future__ import annotations
 
 from external_llm.agent.repair_helpers import (
@@ -14,6 +15,7 @@ from external_llm.agent.repair_helpers import (
 )
 
 # ── _strip_redundant_inline_imports ─────────────────────────────────────────
+
 
 class TestStripRedundantInlineImports:
     def test_bad_file_source_returns_unchanged(self):
@@ -47,8 +49,7 @@ class TestStripRedundantInlineImports:
 
     def test_from_import_module_match_removed(self):
         file_src = "from os import path\n"
-        assert _strip_redundant_inline_imports(
-            "from os import path\nprint(path)\n", file_src) == "print(path)\n"
+        assert _strip_redundant_inline_imports("from os import path\nprint(path)\n", file_src) == "print(path)\n"
 
     def test_from_import_asname_used_keeps_whole_stmt(self):
         file_src = "from os import path\n"
@@ -58,8 +59,7 @@ class TestStripRedundantInlineImports:
     def test_from_other_module_name_match_removed(self):
         # Module differs but the imported NAME is module-level → redundant.
         file_src = "from time import sleep\n"
-        assert _strip_redundant_inline_imports(
-            "from other import sleep\nprint(sleep)\n", file_src) == "print(sleep)\n"
+        assert _strip_redundant_inline_imports("from other import sleep\nprint(sleep)\n", file_src) == "print(sleep)\n"
 
     def test_from_other_module_asname_used_kept(self):
         file_src = "from time import sleep\n"
@@ -85,6 +85,7 @@ class TestStripRedundantInlineImports:
 
 
 # ── _strip_redundant_dataclass_decorator ────────────────────────────────────
+
 
 class TestStripRedundantDataclassDecorator:
     FILE = "@dataclass\nclass A:\n    x: int\n"

@@ -10,6 +10,7 @@ Reproduces the reported symptom: reasoning shown (💭 thought), tools ran, but
 the REPL returns to prompt with NO final answer because the closing message
 landed in reasoning_content and was discarded at the normal termination path.
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -62,11 +63,17 @@ def test_normal_termination_falls_back_to_reasoning_content():
     result = DesignChatResult()
     msgs = [LLMMessage(role="user", content="let's improve this")]
 
-    with mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs), \
-         mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs):
+    with (
+        mock.patch("external_llm.agent.design_chat_loop._evict_for_loop", return_value=msgs),
+        mock.patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", return_value=msgs),
+    ):
         loop._respond_impl(
-            msgs, stream_callback=None, reasoning_callback=None,
-            max_tool_iterations=5, token_callback=None, result=result,
+            msgs,
+            stream_callback=None,
+            reasoning_callback=None,
+            max_tool_iterations=5,
+            token_callback=None,
+            result=result,
         )
 
     # The closing summary must come from reasoning_content, not be empty.

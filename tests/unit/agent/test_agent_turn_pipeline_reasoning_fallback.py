@@ -10,6 +10,7 @@ the REPL returned to the prompt with no final message.
 This pins ``TurnPipelineMixin._effective_final_content`` — the single helper
 now used by all five termination/early-finish paths.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -19,9 +20,15 @@ from external_llm.agent.agent_turn_pipeline import TurnPipelineMixin
 
 def _resp_dict(*, content="", reasoning="", has_raw=True):
     """Build the dict shape returned by AgentLoop._llm_call_with_tools / n()."""
-    raw = SimpleNamespace(raw_response={
-        "choices": [{"message": {"reasoning_content": reasoning}}] if reasoning or content is not None else [],
-    }) if has_raw else None
+    raw = (
+        SimpleNamespace(
+            raw_response={
+                "choices": [{"message": {"reasoning_content": reasoning}}] if reasoning or content is not None else [],
+            }
+        )
+        if has_raw
+        else None
+    )
     return {"content": content, "raw": raw}
 
 
@@ -50,9 +57,11 @@ def test_empty_content_no_reasoning_returns_empty():
 
 def test_object_response_uses_getattr_path():
     """When response is an object (not dict), read .content / .raw via getattr."""
-    raw = SimpleNamespace(raw_response={
-        "choices": [{"message": {"reasoning_content": "from-object"}}],
-    })
+    raw = SimpleNamespace(
+        raw_response={
+            "choices": [{"message": {"reasoning_content": "from-object"}}],
+        }
+    )
     resp = SimpleNamespace(content="", raw=raw)
     assert TurnPipelineMixin._effective_final_content(resp) == "from-object"
 
@@ -79,9 +88,11 @@ def test_none_response_is_safe():
 def test_reasoning_not_string_is_safe():
     r = {
         "content": "",
-        "raw": SimpleNamespace(raw_response={
-            "choices": [{"message": {"reasoning_content": None}}],
-        }),
+        "raw": SimpleNamespace(
+            raw_response={
+                "choices": [{"message": {"reasoning_content": None}}],
+            }
+        ),
     }
     assert TurnPipelineMixin._effective_final_content(r) == ""
 

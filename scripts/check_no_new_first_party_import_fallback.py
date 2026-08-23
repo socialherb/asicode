@@ -49,10 +49,22 @@ REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "scripts" / "first_party_import_fallback_baseline.txt"
 
 _SCAN_ROOTS = ("external_llm", "services", "webapp")
-_SKIP_DIRS = frozenset({
-    "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules",
-    ".venv", "venv", "env", ".tox", "dist", "build", ".eggs", ".git",
-})
+_SKIP_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        ".git",
+    }
+)
 
 
 def _should_skip(path: Path) -> bool:
@@ -86,10 +98,7 @@ def _catches_importerror(handler: ast.ExceptHandler) -> bool:
     """True if this except clause catches ImportError (alone or in a tuple)."""
     if handler.type is None:
         return False  # bare except — a different gate's concern
-    return any(
-        isinstance(n, ast.Name) and n.id == "ImportError"
-        for n in ast.walk(handler.type)
-    )
+    return any(isinstance(n, ast.Name) and n.id == "ImportError" for n in ast.walk(handler.type))
 
 
 def _is_first_party_import(node: ast.AST) -> bool:
@@ -165,7 +174,10 @@ def _read_sources(rel_paths: list[str], index_only: bool) -> dict[str, str]:
             if index_only:
                 out = subprocess.run(
                     ["git", "show", f":{rel}"],
-                    cwd=REPO, capture_output=True, text=True, timeout=30,
+                    cwd=REPO,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                     check=False,
                 )
                 if out.returncode == 0:
@@ -179,8 +191,12 @@ def _read_sources(rel_paths: list[str], index_only: bool) -> dict[str, str]:
 
 def _git_list_scope_py() -> list[str] | None:
     out = subprocess.run(
-        ["git", "ls-files"], cwd=REPO, capture_output=True, text=True,
-        timeout=60, check=False,
+        ["git", "ls-files"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
     if out.returncode != 0:
         return None

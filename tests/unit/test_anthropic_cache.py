@@ -11,7 +11,6 @@ Covers two complementary cache contracts:
    leaking it risks future strict-validation 400s.
 """
 
-
 from typing import ClassVar
 
 from external_llm.anthropic_client import AnthropicClient
@@ -27,15 +26,15 @@ class TestMarkLastMessageForCaching:
     def test_string_content_promoted_to_text_block(self):
         msgs = [{"role": "user", "content": "hello"}]
         self.mark(msgs)
-        assert msgs[-1]["content"] == [
-            {"type": "text", "text": "hello", "cache_control": EPHEMERAL}
-        ]
+        assert msgs[-1]["content"] == [{"type": "text", "text": "hello", "cache_control": EPHEMERAL}]
 
     def test_list_content_marks_last_block(self):
-        msgs = [{
-            "role": "user",
-            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}],
-        }]
+        msgs = [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}],
+            }
+        ]
         self.mark(msgs)
         assert msgs[-1]["content"][-1]["cache_control"] == EPHEMERAL
 
@@ -77,8 +76,12 @@ class _FakeResponse:
         return {
             "content": [{"type": "text", "text": "ok"}],
             "stop_reason": "end_turn",
-            "usage": {"input_tokens": 10, "output_tokens": 2,
-                      "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            },
         }
 
 
@@ -103,14 +106,19 @@ def _make_client():
 class TestChatWithToolsCaching:
     def test_payload_has_system_and_last_message_breakpoints(self):
         client = _make_client()
-        system_text = "## Identity\n" + ("You are a careful assistant. " * 40) + \
-                      "\n## Rules\n" + ("Follow the rules closely. " * 40)
+        system_text = (
+            "## Identity\n"
+            + ("You are a careful assistant. " * 40)
+            + "\n## Rules\n"
+            + ("Follow the rules closely. " * 40)
+        )
         messages = [
             {"role": "system", "content": system_text},
             {"role": "user", "content": "first request"},
         ]
-        tools = [{"name": "read_file", "description": "Read a file",
-                  "parameters": {"type": "object", "properties": {}}}]
+        tools = [
+            {"name": "read_file", "description": "Read a file", "parameters": {"type": "object", "properties": {}}}
+        ]
 
         client.chat_with_tools(messages, tools, model="claude-sonnet-4-20250514")
         payload = client._session.captured
@@ -127,99 +135,111 @@ class TestChatWithToolsCaching:
         # Breakpoint count stays within Anthropic's limit of 4.
         n = sum(1 for b in sys_blocks if b.get("cache_control"))
         n += sum(
-            1 for m in payload["messages"]
+            1
+            for m in payload["messages"]
             if isinstance(m["content"], list)
-            for blk in m["content"] if isinstance(blk, dict) and blk.get("cache_control")
+            for blk in m["content"]
+            if isinstance(blk, dict) and blk.get("cache_control")
         )
         assert n <= 4
 
 
 class _FakeOpenAIResponse:
-  """Minimal response shape for OpenAIClient.chat/chat_with_tools parsing."""
-  status_code = 200
-  text = "{}"
-  headers: ClassVar[dict] = {}
+    """Minimal response shape for OpenAIClient.chat/chat_with_tools parsing."""
 
-  def json(self):
-      return {
-          "choices": [{"message": {"content": "ok", "tool_calls": None}}],
-          "usage": {"prompt_tokens": 10, "completion_tokens": 1},
-      }
+    status_code = 200
+    text = "{}"
+    headers: ClassVar[dict] = {}
+
+    def json(self):
+        return {
+            "choices": [{"message": {"content": "ok", "tool_calls": None}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+        }
 
 
 class _FakeOpenAISession:
-  """Captures the json payload sent via session.post()."""
+    """Captures the json payload sent via session.post()."""
 
-  def __init__(self):
-      self.captured = None
+    def __init__(self):
+        self.captured = None
 
-  def post(self, url, headers=None, json=None, timeout=None, **kw):
-      self.captured = json
-      resp = _FakeOpenAIResponse()
-      # streaming path reads iter_lines / iter_bytes (P28-1 SSE parser)
-      resp.iter_lines = lambda: iter([])
-      resp.iter_bytes = lambda: iter([])
-      resp.iter_content = lambda *a, **k: iter([])
-      resp.close = lambda: None
-      return resp
+    def post(self, url, headers=None, json=None, timeout=None, **kw):
+        self.captured = json
+        resp = _FakeOpenAIResponse()
+        # streaming path reads iter_lines / iter_bytes (P28-1 SSE parser)
+        resp.iter_lines = lambda: iter([])
+        resp.iter_bytes = lambda: iter([])
+        resp.iter_content = lambda *a, **k: iter([])
+        resp.close = lambda: None
+        return resp
 
 
 def _make_openai_client(cls):
-  c = cls.__new__(cls)
-  c.api_key = "test"
-  c.base_url = "https://api.openai.com/v1"
-  c.timeout = 30
-  c._session = _FakeOpenAISession()
-  return c
+    c = cls.__new__(cls)
+    c.api_key = "test"
+    c.base_url = "https://api.openai.com/v1"
+    c.timeout = 30
+    c._session = _FakeOpenAISession()
+    return c
 
 
 class TestOpenAIPayloadDoesNotLeakCacheBreakpoint:
-  """``cache_breakpoint_offset`` is Anthropic-only. OpenAI-compatible providers
-  must never see it in the request payload (they use automatic prefix caching
-  and the field risks future strict-validation 400s). Regression guard for the
-  pop() added to OpenAIClient.chat / chat_with_tools."""
+    """``cache_breakpoint_offset`` is Anthropic-only. OpenAI-compatible providers
+    must never see it in the request payload (they use automatic prefix caching
+    and the field risks future strict-validation 400s). Regression guard for the
+    pop() added to OpenAIClient.chat / chat_with_tools."""
 
-  def _msgs(self):
-      return [LLMMessage(role="user", content="hi")]
+    def _msgs(self):
+        return [LLMMessage(role="user", content="hi")]
 
-  def test_openai_client_chat_strips_breakpoint_offset(self):
-      c = _make_openai_client(OpenAIClient)
-      c.chat(self._msgs(), model="gpt-4o", cache_breakpoint_offset=42)
-      assert "cache_breakpoint_offset" not in c._session.captured
+    def test_openai_client_chat_strips_breakpoint_offset(self):
+        c = _make_openai_client(OpenAIClient)
+        c.chat(self._msgs(), model="gpt-4o", cache_breakpoint_offset=42)
+        assert "cache_breakpoint_offset" not in c._session.captured
 
-  def test_openai_client_chat_with_tools_strips_breakpoint_offset(self):
-      c = _make_openai_client(OpenAIClient)
-      c.chat_with_tools(
-          self._msgs(), [], model="gpt-4o",
-          cache_breakpoint_offset=42, token_callback=lambda _: None,
-      )
-      assert "cache_breakpoint_offset" not in c._session.captured
+    def test_openai_client_chat_with_tools_strips_breakpoint_offset(self):
+        c = _make_openai_client(OpenAIClient)
+        c.chat_with_tools(
+            self._msgs(),
+            [],
+            model="gpt-4o",
+            cache_breakpoint_offset=42,
+            token_callback=lambda _: None,
+        )
+        assert "cache_breakpoint_offset" not in c._session.captured
 
-  def test_zai_client_chat_strips_breakpoint_offset(self):
-      # ZAIClient overrides chat() but delegates to super(); the pop must
-      # still fire on the parent path so ZAI's payload stays clean.
-      c = _make_openai_client(ZAIClient)
-      c.chat(self._msgs(), model="glm-4.6", cache_breakpoint_offset=42)
-      assert "cache_breakpoint_offset" not in c._session.captured
+    def test_zai_client_chat_strips_breakpoint_offset(self):
+        # ZAIClient overrides chat() but delegates to super(); the pop must
+        # still fire on the parent path so ZAI's payload stays clean.
+        c = _make_openai_client(ZAIClient)
+        c.chat(self._msgs(), model="glm-4.6", cache_breakpoint_offset=42)
+        assert "cache_breakpoint_offset" not in c._session.captured
 
-  def test_zai_client_chat_with_tools_strips_breakpoint_offset(self):
-      c = _make_openai_client(ZAIClient)
-      c.chat_with_tools(
-          self._msgs(), [], model="glm-4.6",
-          cache_breakpoint_offset=42, thinking_mode=True,
-          token_callback=lambda _: None,
-      )
-      assert "cache_breakpoint_offset" not in c._session.captured
+    def test_zai_client_chat_with_tools_strips_breakpoint_offset(self):
+        c = _make_openai_client(ZAIClient)
+        c.chat_with_tools(
+            self._msgs(),
+            [],
+            model="glm-4.6",
+            cache_breakpoint_offset=42,
+            thinking_mode=True,
+            token_callback=lambda _: None,
+        )
+        assert "cache_breakpoint_offset" not in c._session.captured
 
-  def test_zai_client_thinking_field_preserved(self):
-      # Ensure stripping the Anthropic-only kwarg does not also drop ZAI's
-      # own thinking/reasoning params.
-      c = _make_openai_client(ZAIClient)
-      c.chat_with_tools(
-          self._msgs(), [], model="glm-4.6",
-          thinking_mode=True, cache_breakpoint_offset=42,
-          token_callback=lambda _: None,
-      )
-      payload = c._session.captured
-      assert payload.get("thinking") == {"type": "enabled"}
-      assert "cache_breakpoint_offset" not in payload
+    def test_zai_client_thinking_field_preserved(self):
+        # Ensure stripping the Anthropic-only kwarg does not also drop ZAI's
+        # own thinking/reasoning params.
+        c = _make_openai_client(ZAIClient)
+        c.chat_with_tools(
+            self._msgs(),
+            [],
+            model="glm-4.6",
+            thinking_mode=True,
+            cache_breakpoint_offset=42,
+            token_callback=lambda _: None,
+        )
+        payload = c._session.captured
+        assert payload.get("thinking") == {"type": "enabled"}
+        assert "cache_breakpoint_offset" not in payload

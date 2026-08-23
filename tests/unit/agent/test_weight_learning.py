@@ -59,6 +59,7 @@ def _learn_sig(**overrides) -> LearningSignal:
 # Constants
 # ============================================================================
 
+
 class TestConstants:
     def test_axes_defined(self):
         assert len(_AXES) == 5
@@ -83,6 +84,7 @@ class TestConstants:
 # ============================================================================
 # resolve_bucket
 # ============================================================================
+
 
 class TestResolveBucket:
     def test_default(self):
@@ -114,6 +116,7 @@ class TestResolveBucket:
 # _normalize_weights
 # ============================================================================
 
+
 class TestNormalizeWeights:
     def test_normalize_sum_to_one(self):
         w = {"a": 1.0, "b": 2.0, "c": 3.0, "d": 4.0, "e": 5.0}
@@ -138,7 +141,7 @@ class TestNormalizeWeights:
         w = {"success": 0.3, "repair": 0.2, "contract": 0.3, "complexity": 0.1, "cost": 0.1}
         result = _normalize_weights(w)
         for v in result.values():
-            assert len(str(v).split('.')[1]) <= 6
+            assert len(str(v).split(".")[1]) <= 6
 
     def test_normalize_preserves_only_axes(self):
         w = {"success": 1.0, "repair": 1.0, "contract": 1.0, "complexity": 1.0, "cost": 1.0, "extra": 999}
@@ -152,6 +155,7 @@ class TestNormalizeWeights:
 # ============================================================================
 # _clamp_weights
 # ============================================================================
+
 
 class TestClampWeights:
     def test_clamp_low_values(self):
@@ -179,28 +183,29 @@ class TestClampWeights:
 # _blend_weights
 # ============================================================================
 
+
 class TestBlendWeights:
     def test_blend_half_half(self):
         learned = {"success": 0.4, "repair": 0.3, "contract": 0.1, "complexity": 0.1, "cost": 0.1}
-        static  = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
+        static = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
         result = _blend_weights(learned, static, 0.5, 0.5)
         assert abs(sum(result.values()) - 1.0) < 1e-6
 
     def test_blend_pure_learned(self):
         learned = {"success": 0.5, "repair": 0.2, "contract": 0.1, "complexity": 0.1, "cost": 0.1}
-        static  = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
+        static = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
         result = _blend_weights(learned, static, 1.0, 0.0)
         assert abs(sum(result.values()) - 1.0) < 1e-6
 
     def test_blend_pure_static(self):
         learned = {"success": 0.5, "repair": 0.2, "contract": 0.1, "complexity": 0.1, "cost": 0.1}
-        static  = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
+        static = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
         result = _blend_weights(learned, static, 0.0, 1.0)
         assert result == _normalize_weights(static)
 
     def test_blend_normalized(self):
         learned = {"success": 10.0, "repair": 0.0, "contract": 0.0, "complexity": 0.0, "cost": 0.0}
-        static  = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
+        static = {"success": 0.2, "repair": 0.2, "contract": 0.3, "complexity": 0.2, "cost": 0.1}
         result = _blend_weights(learned, static, 1.0, 1.0)
         assert abs(sum(result.values()) - 1.0) < 1e-6
 
@@ -208,6 +213,7 @@ class TestBlendWeights:
 # ============================================================================
 # _compute_weight_delta
 # ============================================================================
+
 
 class TestComputeWeightDelta:
     """Test all 4 rule groups (A, B, C, D) in _compute_weight_delta."""
@@ -238,9 +244,7 @@ class TestComputeWeightDelta:
     def test_rule_a_free_text_semantic_failure_does_not_fire(self):
         """Free-text 'contract' in semantic_failures must NOT fire rule A —
         the structured contract_violation flag is the SSOT (no keyword sniffing)."""
-        signal = self.make_signal(
-            semantic_failures=["Contract Breach"], contract_violation=False, success=False
-        )
+        signal = self.make_signal(semantic_failures=["Contract Breach"], contract_violation=False, success=False)
         delta = _compute_weight_delta(signal, self.make_weights())
         assert delta["contract"] == 0
         assert delta["repair"] == 0
@@ -350,6 +354,7 @@ class TestComputeWeightDelta:
 # _apply_weight_delta
 # ============================================================================
 
+
 class TestApplyWeightDelta:
     def test_apply_simple_delta(self):
         weights = {"success": 0.35, "repair": 0.30, "contract": 0.20, "complexity": 0.10, "cost": 0.05}
@@ -386,8 +391,11 @@ class TestApplyWeightDelta:
         """
         weights = dict.fromkeys(_AXES, 0.2)
         delta = {
-            "success": 0.4, "repair": 0.4, "contract": 0.4,
-            "complexity": -0.4, "cost": -0.4,
+            "success": 0.4,
+            "repair": 0.4,
+            "contract": 0.4,
+            "complexity": -0.4,
+            "cost": -0.4,
         }
         result = _apply_weight_delta(weights, delta)
         assert abs(sum(result.values()) - 1.0) < 1e-6
@@ -428,14 +436,17 @@ class TestWeightBucketState:
     def test_to_dict(self):
         state = WeightBucketState(
             weights={"success": 0.3, "repair": 0.2, "contract": 0.3, "complexity": 0.1, "cost": 0.1},
-            signal_count=5, last_updated=123.0,
+            signal_count=5,
+            last_updated=123.0,
         )
         d = state.to_dict()
         assert d["signal_count"] == 5
         assert d["weights"]["success"] == 0.3
 
     def test_default_initialization(self):
-        state = WeightBucketState(weights={"success": 0.35, "repair": 0.30, "contract": 0.20, "complexity": 0.10, "cost": 0.05})
+        state = WeightBucketState(
+            weights={"success": 0.35, "repair": 0.30, "contract": 0.20, "complexity": 0.10, "cost": 0.05}
+        )
         assert state.signal_count == 0
         assert state.last_updated == 0.0
 
@@ -443,6 +454,7 @@ class TestWeightBucketState:
 # ============================================================================
 # WeightLearner
 # ============================================================================
+
 
 class TestWeightLearner:
     def test_initial_state(self):
@@ -499,7 +511,9 @@ class TestWeightLearner:
     def test_update_increases_signal_count(self):
         learner = WeightLearner()
         sig = _learn_sig(
-            success=True, repair_attempts=1, repair_burden="medium",
+            success=True,
+            repair_attempts=1,
+            repair_burden="medium",
         )
         learner.update(sig)
         state = learner.get_bucket_state(BUCKET_DEFAULT)
@@ -508,7 +522,8 @@ class TestWeightLearner:
     def test_update_unknown_bucket_skipped(self):
         learner = WeightLearner()
         sig = _learn_sig(
-            bucket="nonexistent", success=True,
+            bucket="nonexistent",
+            success=True,
         )
         # Should not raise error
         learner.update(sig)
@@ -521,7 +536,8 @@ class TestWeightLearner:
         learner = WeightLearner()
         # A signal that fires no rules
         sig = _learn_sig(
-            success=False, repair_burden="none",
+            success=False,
+            repair_burden="none",
         )
         learner.update(sig)
         state = learner.get_bucket_state(BUCKET_DEFAULT)
@@ -531,7 +547,9 @@ class TestWeightLearner:
     def test_multiple_updates(self):
         learner = WeightLearner()
         sig = _learn_sig(
-            success=True, repair_attempts=1, repair_burden="medium",
+            success=True,
+            repair_attempts=1,
+            repair_burden="medium",
         )
         for _ in range(3):
             learner.update(sig)
@@ -579,6 +597,7 @@ class TestWeightLearner:
 # ============================================================================
 # WeightLearner advanced tests
 # ============================================================================
+
 
 class TestWeightLearnerAdvanced:
     def test_update_changes_weights(self):
@@ -637,6 +656,7 @@ class TestWeightLearnerAdvanced:
 # ExecutionLearner/StrategyPolicyLearner subsystem was removed)
 # ============================================================================
 
+
 class TestWeightLearnerThreadSafety:
     """WeightLearner.update must be safe under concurrent access."""
 
@@ -677,6 +697,7 @@ class TestWeightLearnerThreadSafety:
 # ============================================================================
 # update_weights_from_monitor_result (monitor → learner bridge)
 # ============================================================================
+
 
 class TestUpdateFromMonitorResult:
     """Rule A contract signals must flow from the monitor's STRUCTURED

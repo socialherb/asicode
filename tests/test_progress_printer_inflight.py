@@ -8,6 +8,7 @@ stamped with the number of the "most recently started tool", leaving earlier
 numbering). This test pins down that call_id-based matching + completion-order
 numbering + single live-line model prevents that class of bug.
 """
+
 import io
 import sys
 
@@ -37,11 +38,11 @@ def _drive(events):
     i = 0
     while i < len(raw):
         ch = raw[i]
-        if ch == "\x1b" and raw[i + 1:i + 2] == "[":
+        if ch == "\x1b" and raw[i + 1 : i + 2] == "[":
             j = i + 2
             while j < len(raw) and not raw[j].isalpha():
                 j += 1
-            seq = raw[i:j + 1]
+            seq = raw[i : j + 1]
             if seq.endswith("K"):  # \x1b[2K → clear current row
                 row = []
             # anything else (color/dim) is a display attribute — irrelevant to assertions, discard
@@ -74,14 +75,16 @@ def _err(cid, tool):
 
 def test_interleaved_parallel_tools_number_in_completion_order():
     # 3 tools start concurrently → completions arrive in a different order than starts (b, a, c).
-    committed, _raw, printer = _drive([
-        _run("a", "read_file"),
-        _run("b", "grep"),
-        _run("c", "read_symbol"),
-        _done("b", "grep"),
-        _done("a", "read_file"),
-        _done("c", "read_symbol"),
-    ])
+    committed, _raw, printer = _drive(
+        [
+            _run("a", "read_file"),
+            _run("b", "grep"),
+            _run("c", "read_symbol"),
+            _done("b", "grep"),
+            _done("a", "read_file"),
+            _done("c", "read_symbol"),
+        ]
+    )
     # exactly 3 committed ✓ lines, 0 orphaned ○
     check_rows = [r for r in committed if r.strip()]
     assert len(check_rows) == 3, check_rows
@@ -111,12 +114,14 @@ def test_missing_call_id_concurrent_does_not_drop_completion():
     # concurrent execution where the provider doesn't supply a tool-call id: both completions
     # should render as ✓ and in-flight should end up empty (guards against dropped completions /
     # ghost live lines, #1 regression).
-    committed, _raw, printer = _drive([
-        _run(None, "read_file"),
-        _run(None, "grep"),
-        _done(None, "read_file"),
-        _done(None, "grep"),
-    ])
+    committed, _raw, printer = _drive(
+        [
+            _run(None, "read_file"),
+            _run(None, "grep"),
+            _done(None, "read_file"),
+            _done(None, "grep"),
+        ]
+    )
     check_rows = [r for r in committed if r.strip()]
     assert len(check_rows) == 2, check_rows
     assert sum(r.count("✓") for r in check_rows) == 2, check_rows
@@ -126,12 +131,14 @@ def test_missing_call_id_concurrent_does_not_drop_completion():
 
 
 def test_error_completion_renders_cross_and_drains_inflight():
-    committed, _raw, printer = _drive([
-        _run("a", "read_file"),
-        _run("b", "grep"),
-        _err("a", "read_file"),
-        _done("b", "grep"),
-    ])
+    committed, _raw, printer = _drive(
+        [
+            _run("a", "read_file"),
+            _run("b", "grep"),
+            _err("a", "read_file"),
+            _done("b", "grep"),
+        ]
+    )
     check_rows = [r for r in committed if r.strip()]
     # ✗ line + error detail + ✓ line are interleaved, so verify at the glyph level
     assert sum(r.count("✗") for r in check_rows) == 1, check_rows

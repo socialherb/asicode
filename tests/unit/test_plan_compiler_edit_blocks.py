@@ -8,6 +8,7 @@ best match" hint was silently omitted from the retry error, defeating the
 LLM-retry loop for multi-line edit blocks. With autojunk disabled the ratio
 is ~0.99.
 """
+
 from __future__ import annotations
 
 import os
@@ -36,9 +37,7 @@ def test_fuzzy_match_context_ratio_survives_autojunk():
             path="m.py",
         )
     details = ei.value.details
-    assert details.get("best_match_ratio", 0) > 0.35, (
-        f"ratio collapsed (autojunk): {details.get('best_match_ratio')}"
-    )
+    assert details.get("best_match_ratio", 0) > 0.35, f"ratio collapsed (autojunk): {details.get('best_match_ratio')}"
     assert details.get("file_context_near_match") is not None
 
 

@@ -9,6 +9,7 @@ P3 adds _remove_files(set) (one pass per list, set membership) and reparse_files
 deleted sets and hands each to the batched path. These tests pin the contract
 that batched invalidation produces the SAME graph state as the per-path loop.
 """
+
 import shutil
 import tempfile
 import textwrap
@@ -32,12 +33,14 @@ def _symbol_names(g):
 
 def test_remove_files_equivalent_to_remove_file_per_path():
     """_remove_files(set) must leave the same state as remove_file x N."""
-    repo = _make_repo({
-        "a.py": "def a():\n    b()\n",
-        "b.py": "def b():\n    pass\n",
-        "c.py": "def c():\n    a()\n",
-        "d.py": "def d():\n    c()\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def a():\n    b()\n",
+            "b.py": "def b():\n    pass\n",
+            "c.py": "def c():\n    a()\n",
+            "d.py": "def d():\n    c()\n",
+        }
+    )
     try:
         # Reference: remove a and c via the single-file API
         g_ref = RepositoryGraph(repo)
@@ -62,11 +65,13 @@ def test_remove_files_equivalent_to_remove_file_per_path():
 
 def test_reparse_files_equivalent_to_reparse_file_per_path(monkeypatch):
     """reparse_files(list) must leave the same state as reparse_file x N."""
-    repo = _make_repo({
-        "a.py": "def a():\n    pass\n",
-        "b.py": "def b():\n    pass\n",
-        "c.py": "def c():\n    pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def a():\n    pass\n",
+            "b.py": "def b():\n    pass\n",
+            "c.py": "def c():\n    pass\n",
+        }
+    )
     try:
         # Reference: reparse a and c with edits
         g_ref = RepositoryGraph(repo)
@@ -86,9 +91,7 @@ def test_reparse_files_equivalent_to_reparse_file_per_path(monkeypatch):
         (Path(repo) / "c.py").write_text("def c_new():\n    pass\n")
         g.reparse_files([str(Path(repo) / "a.py"), str(Path(repo) / "c.py")])
 
-        assert _symbol_names(g) == ref_names, (
-            f"batch reparse diverged from per-path: {_symbol_names(g)} != {ref_names}"
-        )
+        assert _symbol_names(g) == ref_names, f"batch reparse diverged from per-path: {_symbol_names(g)} != {ref_names}"
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
@@ -112,10 +115,12 @@ def test_reparse_files_dedups_when_same_path_passed_twice():
         g = RepositoryGraph(repo)
         g.build()
         (Path(repo) / "a.py").write_text("def a():\n    b()\n\ndef b():\n    pass\n")
-        g.reparse_files([
-            str(Path(repo) / "a.py"),
-            str(Path(repo) / "a.py"),  # duplicate
-        ])
+        g.reparse_files(
+            [
+                str(Path(repo) / "a.py"),
+                str(Path(repo) / "a.py"),  # duplicate
+            ]
+        )
         # a appears exactly once (no double-injection of edges)
         a_edges = [e for e in g.call_edges if e.caller == "a"]
         assert len(a_edges) == 1, f"duplicate reparse injected {len(a_edges)} caller=a edges"

@@ -3,6 +3,7 @@
 query_ollama_capabilities must return None when the shared /api/show query
 returns None (server unreachable / model not found / non-native tag).
 """
+
 from __future__ import annotations
 
 from external_llm import ollama_api
@@ -20,7 +21,8 @@ def test_capabilities_empty_list_returns_none(monkeypatch):
 
 def test_capabilities_tuple_extraction(monkeypatch):
     monkeypatch.setattr(
-        ollama_api, "_query_ollama_show",
+        ollama_api,
+        "_query_ollama_show",
         lambda *a, **k: {"capabilities": ["completion", "tools", "vision"]},
     )
     assert ollama_api.query_ollama_capabilities("llama3:latest") == ("completion", "tools", "vision")

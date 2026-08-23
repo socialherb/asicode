@@ -4,6 +4,7 @@ ClaudeSession — ClaudeSDKClient wrapper with streaming, hooks, and interrupts.
 Provides a robust async context manager for Claude Code Agent communication.
 Handles streaming events, permission hooks, and session lifecycle.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +13,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from .verdict import CollaborationVerdict
 
@@ -28,6 +29,7 @@ _MAX_RETAINED_EVENTS = 200
 @dataclass
 class SessionEvent:
     """A single event from a Claude Code Agent session."""
+
     type: str = "unknown"  # "text", "tool_call", "tool_result", "error", "verdict", "status"
     content: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -37,6 +39,7 @@ class SessionEvent:
 @dataclass
 class SessionResult:
     """Complete result of a Claude Code Agent session."""
+
     verdict: CollaborationVerdict
     # Ring-capped at _MAX_RETAINED_EVENTS (most recent events only).
     events: list[SessionEvent] = field(default_factory=list)
@@ -44,7 +47,7 @@ class SessionResult:
     total_tokens: int = 0
     total_cost_usd: float = 0.0
     duration_seconds: float = 0.0
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class ClaudeSession:
@@ -62,9 +65,9 @@ class ClaudeSession:
     def __init__(
         self,
         options: Any = None,  # ClaudeAgentOptions
-        event_callback: Optional[Callable[[SessionEvent], None]] = None,
+        event_callback: Callable[[SessionEvent], None] | None = None,
         include_partial: bool = True,
-        query_timeout: Optional[float] = None,
+        query_timeout: float | None = None,
     ):
         self._options = options
         self._event_callback = event_callback
@@ -77,9 +80,9 @@ class ClaudeSession:
         self._tool_names_by_id: dict[str, str] = {}
         self._last_cost_usd: float = 0.0
         self._last_total_tokens: int = 0
-        self._structured_candidate: Optional[dict[str, Any]] = None
+        self._structured_candidate: dict[str, Any] | None = None
 
-    async def __aenter__(self) -> "ClaudeSession":
+    async def __aenter__(self) -> ClaudeSession:
         """Enter context: create and connect the SDK client."""
         from claude_agent_sdk import ClaudeSDKClient
 
@@ -158,9 +161,7 @@ class ClaudeSession:
                 # push_manager's SSE keepalive park).
                 query_task = asyncio.create_task(self._run_query(prompt))
                 try:
-                    verdict = await asyncio.wait_for(
-                        query_task, timeout=self._query_timeout
-                    )
+                    verdict = await asyncio.wait_for(query_task, timeout=self._query_timeout)
                 except (asyncio.CancelledError, GeneratorExit):
                     query_task.cancel()
                     if query_task.done() and not query_task.cancelled():
@@ -186,9 +187,7 @@ class ClaudeSession:
 
         except asyncio.TimeoutError:
             duration = time.monotonic() - start
-            logger.warning(
-                "ClaudeSession.query timed out after %ss", self._query_timeout
-            )
+            logger.warning("ClaudeSession.query timed out after %ss", self._query_timeout)
             # Best-effort stop the agent subprocess — without this the SDK
             # keeps running the agent in the background (burning tokens/CPU)
             # while the caller has already moved on.
@@ -197,10 +196,7 @@ class ClaudeSession:
                 verdict=CollaborationVerdict(
                     status="failure",
                     summary="Query timed out",
-                    details=(
-                        "Claude Code Agent did not complete within "
-                        f"{self._query_timeout} seconds"
-                    ),
+                    details=(f"Claude Code Agent did not complete within {self._query_timeout} seconds"),
                     confidence=0.0,
                 ),
                 events=self._events,
@@ -263,7 +259,7 @@ class ClaudeSession:
             UserMessage,
         )
 
-        final_verdict: Optional[CollaborationVerdict] = None
+        final_verdict: CollaborationVerdict | None = None
         accumulated_text: list[str] = []
         has_error = False
 
@@ -290,12 +286,15 @@ class ClaudeSession:
                 api_error = getattr(message, "api_error_status", None)
                 if (msg_errors or api_error) and not has_error:
                     has_error = True
-                    self._emit_event(SessionEvent(
-                        type="error",
-                        content=f"Result error: {msg_errors or api_error}",
-                    ))
+                    self._emit_event(
+                        SessionEvent(
+                            type="error",
+                            content=f"Result error: {msg_errors or api_error}",
+                        )
+                    )
                 final_verdict = self._handle_result_message(
-                    message, accumulated_text,
+                    message,
+                    accumulated_text,
                 )
 
             elif isinstance(message, SystemMessage):
@@ -332,19 +331,23 @@ class ClaudeSession:
             if delta_type == "text_delta":
                 text = delta.get("text", "")
                 if text:
-                    self._emit_event(SessionEvent(
-                        type="text",
-                        content=text,
-                        metadata={"partial": True},
-                    ))
+                    self._emit_event(
+                        SessionEvent(
+                            type="text",
+                            content=text,
+                            metadata={"partial": True},
+                        )
+                    )
             elif delta_type == "input_json_delta":
                 partial_json = delta.get("partial_json", "")
                 if partial_json:
-                    self._emit_event(SessionEvent(
-                        type="tool_call",
-                        content=partial_json,
-                        metadata={"partial": True, "delta_type": "input_json"},
-                    ))
+                    self._emit_event(
+                        SessionEvent(
+                            type="tool_call",
+                            content=partial_json,
+                            metadata={"partial": True, "delta_type": "input_json"},
+                        )
+                    )
 
         elif event_type == "content_block_start":
             block = ev.get("content_block", {})
@@ -354,22 +357,22 @@ class ClaudeSession:
                 tool_name = block.get("name", "?")
                 if tool_id:
                     self._tool_names_by_id[tool_id] = tool_name
-                self._emit_event(SessionEvent(
-                    type="tool_call",
-                    content=f"Starting tool: {tool_name}",
-                    metadata={
-                        "tool_name": tool_name,
-                        "tool_id": tool_id,
-                        "event": "start",
-                    },
-                ))
+                self._emit_event(
+                    SessionEvent(
+                        type="tool_call",
+                        content=f"Starting tool: {tool_name}",
+                        metadata={
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "event": "start",
+                        },
+                    )
+                )
 
         elif event_type == "content_block_stop":
             pass  # block completed
 
-    def _handle_assistant_message(
-        self, message: Any, accumulated_text: list[str]
-    ) -> None:
+    def _handle_assistant_message(self, message: Any, accumulated_text: list[str]) -> None:
         """Process an AssistantMessage containing content blocks."""
         from claude_agent_sdk import TextBlock, ToolResultBlock, ToolUseBlock
 
@@ -378,10 +381,12 @@ class ClaudeSession:
                 text = getattr(block, "text", str(block))
                 if text:
                     accumulated_text.append(text)
-                    self._emit_event(SessionEvent(
-                        type="text",
-                        content=text,
-                    ))
+                    self._emit_event(
+                        SessionEvent(
+                            type="text",
+                            content=text,
+                        )
+                    )
 
             elif isinstance(block, ToolUseBlock):
                 tool_name = getattr(block, "name", "?")
@@ -399,16 +404,18 @@ class ClaudeSession:
                 if tool_id:
                     self._tool_names_by_id[tool_id] = tool_name
                 self._tool_calls_count += 1
-                self._emit_event(SessionEvent(
-                    type="tool_call",
-                    content=f"Tool: {tool_name}",
-                    metadata={
-                        "tool_name": tool_name,
-                        "tool_id": tool_id,
-                        "input": tool_input,
-                        "event": "complete",
-                    },
-                ))
+                self._emit_event(
+                    SessionEvent(
+                        type="tool_call",
+                        content=f"Tool: {tool_name}",
+                        metadata={
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "input": tool_input,
+                            "event": "complete",
+                        },
+                    )
+                )
 
             elif isinstance(block, ToolResultBlock):
                 self._emit_tool_result(block)
@@ -431,22 +438,23 @@ class ClaudeSession:
         is_error = bool(getattr(block, "is_error", False))
         # content can be str | list[{"type": "text", "text": ...}] | None
         if isinstance(content, list):
-            content = "\n".join(
-                str(part.get("text", "")) for part in content
-                if isinstance(part, dict)
+            content = "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        self._emit_event(
+            SessionEvent(
+                type="tool_result",
+                content=str(content or "")[:500],
+                metadata={
+                    "tool_use_id": tool_use_id,
+                    "tool_name": self._tool_names_by_id.get(tool_use_id, "?"),
+                    "is_error": is_error,
+                },
             )
-        self._emit_event(SessionEvent(
-            type="tool_result",
-            content=str(content or "")[:500],
-            metadata={
-                "tool_use_id": tool_use_id,
-                "tool_name": self._tool_names_by_id.get(tool_use_id, "?"),
-                "is_error": is_error,
-            },
-        ))
+        )
 
     def _handle_result_message(
-        self, message: Any, accumulated_text: Optional[list[str]] = None,
+        self,
+        message: Any,
+        accumulated_text: list[str] | None = None,
     ) -> CollaborationVerdict:
         """Extract a CollaborationVerdict from a ResultMessage.
 
@@ -475,11 +483,13 @@ class ClaudeSession:
         error_note = "; ".join(str(e) for e in errors)
 
         def _emit(verdict: CollaborationVerdict) -> CollaborationVerdict:
-            self._emit_event(SessionEvent(
-                type="verdict",
-                content=f"Status: {verdict.status} | {verdict.summary}",
-                metadata={"verdict": verdict.to_dict()},
-            ))
+            self._emit_event(
+                SessionEvent(
+                    type="verdict",
+                    content=f"Status: {verdict.status} | {verdict.summary}",
+                    metadata={"verdict": verdict.to_dict()},
+                )
+            )
             return verdict
 
         # 1. Structured output from output_format option
@@ -509,30 +519,35 @@ class ClaudeSession:
         result_text = str(getattr(message, "result", "") or "")
         first_line = result_text.split("\n", maxsplit=1)[0][:80] if result_text else ""
         if result_text:
-            return _emit(CollaborationVerdict(
-                status="needs_review" if not getattr(message, 'is_error', False) else "failure",
-                summary=first_line or "Unstructured result",
-                details=result_text,
-                confidence=0.5,
-            ))
+            return _emit(
+                CollaborationVerdict(
+                    status="needs_review" if not getattr(message, "is_error", False) else "failure",
+                    summary=first_line or "Unstructured result",
+                    details=result_text,
+                    confidence=0.5,
+                )
+            )
 
         # 4. No result, but the assistant already streamed its analysis —
         #    return it for review instead of discarding the whole session.
         full_text = "\n".join(accumulated_text or []).strip()
         if full_text:
-            return _emit(CollaborationVerdict(
-                status="needs_review",
-                summary=(
-                    f"Session ended with error after analysis: {error_note}"
-                    if error_note else "Analysis text without structured verdict"
-                ),
-                details=full_text,
-                confidence=0.5,
-                metadata={"result_error": error_note} if error_note else {},
-            ))
+            return _emit(
+                CollaborationVerdict(
+                    status="needs_review",
+                    summary=(
+                        f"Session ended with error after analysis: {error_note}"
+                        if error_note
+                        else "Analysis text without structured verdict"
+                    ),
+                    details=full_text,
+                    confidence=0.5,
+                    metadata={"result_error": error_note} if error_note else {},
+                )
+            )
 
         # 5. Truly empty — report the error
-        is_error = getattr(message, 'is_error', False)
+        is_error = getattr(message, "is_error", False)
         if is_error:
             verdict = CollaborationVerdict(
                 status="failure",

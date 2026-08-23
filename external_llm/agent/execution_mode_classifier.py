@@ -18,7 +18,6 @@ import logging
 import re
 import threading
 import weakref
-from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
 
@@ -28,6 +27,7 @@ class ExecuteMode(str, enum.Enum):
 
     Replaces scattered string literals with a typed enum.
     """
+
     NORMAL = "normal"
     STRICT_JSON = "strict_json"
     PLAN_JSON = "plan_json"
@@ -35,11 +35,12 @@ class ExecuteMode(str, enum.Enum):
     LEGACY = "legacy"
 
     @classmethod
-    def _missing_(cls, value: object) -> Optional["ExecuteMode"]:
+    def _missing_(cls, value: object) -> ExecuteMode | None:
         """Fuzzy match: allow any case variation and hyphen/underscore variants."""
         if not isinstance(value, str):
             return None
         from external_llm.languages._normalize import normalize_key
+
         _normalized = normalize_key(value)
         for member in cls:
             if member.value == _normalized:
@@ -83,7 +84,7 @@ _client_timeout_locks_lock = threading.Lock()
 # strict_json is a *number* (a line position), so semantic routing only fires
 # when a digit is present — this just lifts the reliance on a hardcoded
 # position-keyword list ("line"/"라인"/"줄"), letting other phrasings/languages
-#("line/row 5", "row 10", "position 20") route correctly. No-op when embeddings are
+# ("line/row 5", "row 10", "position 20") route correctly. No-op when embeddings are
 # unavailable (see external_llm/agent/semantic_intent.py).
 _MODE_INTENT_EXAMPLES = {
     "line_edit": [
@@ -131,6 +132,7 @@ def _get_mode_matcher():
     with _mode_matcher_lock:
         if _mode_matcher is None:
             from external_llm.agent.semantic_intent import SemanticIntentMatcher
+
             _mode_matcher = SemanticIntentMatcher(
                 _MODE_INTENT_EXAMPLES,
                 threshold=_cfg.scores.SEMANTIC_INTENT_MIN,
@@ -162,7 +164,7 @@ def _has_number_after_keyword(text: str, keywords: tuple[str, ...]) -> bool:
             if idx < 0:
                 break
             # Scan the remainder after the keyword — first non-space char must be a digit.
-            rest = text[idx + len(kw):].lstrip()
+            rest = text[idx + len(kw) :].lstrip()
             if rest and rest[0].isdigit():
                 return True
             # The keyword may be embedded in a longer word; skip past this
@@ -171,7 +173,7 @@ def _has_number_after_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     return False
 
 
-def analyze_request_for_optimal_mode(prompt: str, target_file: Optional[str]) -> str:
+def analyze_request_for_optimal_mode(prompt: str, target_file: str | None) -> str:
     """
     Analyze prompt to recommend optimal execution mode.
     Returns: ExecuteMode value string ("normal", "strict_json", "intelligent", "plan_json", "legacy").
@@ -216,7 +218,7 @@ def _analyze_intent_with_keywords(prompt: str) -> str:
     return "normal"
 
 
-def _analyze_intent_with_llm_if_available(prompt: str, target_file: Optional[str]) -> Optional[ExecuteMode]:
+def _analyze_intent_with_llm_if_available(prompt: str, target_file: str | None) -> ExecuteMode | None:
     """
     Use LLM to analyze intent and determine optimal mode.
     Returns ``None`` if LLM is not available or fails.
@@ -229,7 +231,7 @@ def _analyze_intent_with_llm_if_available(prompt: str, target_file: Optional[str
         from external_llm.intelligent_service import create_intelligent_service_from_env
 
         # Use a short timeout so intent analysis never blocks the request for long
-        _INTENT_TIMEOUT_SEC = 5
+        _intent_timeout_sec = 5
 
         # Try to create a minimal service for intent analysis
         service = create_intelligent_service_from_env(None, None)
@@ -279,7 +281,7 @@ Output only the mode name — no explanation."""
         with client_lock:
             orig_timeout = getattr(client, "timeout", 120)
             try:
-                client.timeout = _INTENT_TIMEOUT_SEC
+                client.timeout = _intent_timeout_sec
                 response = client.chat(
                     messages=[
                         LLMMessage(role="system", content=system_prompt),

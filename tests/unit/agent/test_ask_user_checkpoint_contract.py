@@ -12,6 +12,7 @@ to interpret it correctly:
 Regression guard: returning an empty-string ``answer`` key on timeout/cancel
 would shadow the tool's own ``default`` (config note: "on timeout, proceed autonomously with default").
 """
+
 import pytest
 
 
@@ -47,9 +48,7 @@ def test_ask_user_callback_return_shapes(
     assert result.metadata["answer"] == expected_answer, result.metadata
 
 
-def test_ask_user_empty_answer_key_shadows_default_regression(
-    tool_registry, agent_config
-):
+def test_ask_user_empty_answer_key_shadows_default_regression(tool_registry, agent_config):
     """Explicit regression: an empty-string answer key (the old buggy shape)
     WOULD shadow the tool default. This documents WHY the callback must omit the
     key on timeout/cancel rather than return ``{"answer": ""}``."""
@@ -75,7 +74,9 @@ def test_ask_user_callback_note_surfaces_in_content(tool_registry, agent_config)
     """
     agent_config.user_checkpoint_enabled = True
     agent_config.user_checkpoint_callback = lambda _qd: {
-        "status": "answered", "answer": "yes", "note": "only if tests pass",
+        "status": "answered",
+        "answer": "yes",
+        "note": "only if tests pass",
     }
     agent_config._user_checkpoint_count = 0
 
@@ -84,6 +85,4 @@ def test_ask_user_callback_note_surfaces_in_content(tool_registry, agent_config)
     assert result.ok
     assert result.metadata["status"] == "answered"
     assert result.metadata["answer"] == "yes"
-    assert "only if tests pass" in result.content, (
-        "note must surface in tool content so the LLM sees user context"
-    )
+    assert "only if tests pass" in result.content, "note must surface in tool content so the LLM sees user context"

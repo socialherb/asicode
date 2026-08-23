@@ -1,6 +1,7 @@
 """RED→GREEN: helpers in external_llm/providers.py not covered by the legacy
 test_providers_* suite — _safe_callback failure isolation, multi-system message
 merging, _try_ocr_base64 body, and the _images_to_text OCR path."""
+
 from __future__ import annotations
 
 import base64
@@ -184,11 +185,13 @@ def test_try_ocr_base64_builds_position_labels(monkeypatch) -> None:
         monkeypatch,
         {
             # top-left line: y=5 (top), x=10 (left); plus a low-conf word dropped
-            "eng": _ocr_data([
-                ("hello", 80, 10, 5, 20, 10),
-                ("noise", 5, 40, 5, 20, 10),   # conf < 20 → filtered
-                ("world", 70, 80, 40, 20, 10),  # y=40 (bottom), x=80 (right)
-            ]),
+            "eng": _ocr_data(
+                [
+                    ("hello", 80, 10, 5, 20, 10),
+                    ("noise", 5, 40, 5, 20, 10),  # conf < 20 → filtered
+                    ("world", 70, 80, 40, 20, 10),  # y=40 (bottom), x=80 (right)
+                ]
+            ),
         },
     )
     out = _try_ocr_base64(_B64)

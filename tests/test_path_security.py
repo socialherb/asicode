@@ -1,6 +1,7 @@
 """
 Tests for path_security.py — path normalization and validation.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -75,6 +76,18 @@ class TestNormalizeRelPath:
 
     def test_git_prefix_and_dot_slash(self):
         assert normalize_rel_path("a/./foo.py") == "foo.py"
+
+    def test_preserve_git_prefix_real_dir(self):
+        # A real repo path may live under an a/ or b/ directory;
+        # preserve_git_prefix keeps the a/ component.
+        assert normalize_rel_path("a/b.py", preserve_git_prefix=True) == "a/b.py"
+        assert normalize_rel_path("b/foo/bar.py", preserve_git_prefix=True) == "b/foo/bar.py"
+
+    def test_preserve_git_prefix_still_rejects_traversal(self):
+        # Security contract is unchanged when preserving the prefix.
+        assert normalize_rel_path("../x", preserve_git_prefix=True) == ""
+        assert normalize_rel_path("a/../b", preserve_git_prefix=True) == ""
+        assert normalize_rel_path("C:\\x.txt", preserve_git_prefix=True) == ""
 
     def test_mixed_backslash_and_forward(self):
         assert normalize_rel_path("foo\\bar/baz.py") == "foo/bar/baz.py"
@@ -216,9 +229,7 @@ class TestResolveUnderRepoSubdir:
         cont.mkdir(parents=True)
         (cont / "sess.json").write_text("{}")
         # relative candidate is anchored at repo_root, not process CWD
-        result = resolve_under_repo_subdir(
-            str(tmp_path), self.SUBDIR, f"{self.SUBDIR}/sess.json"
-        )
+        result = resolve_under_repo_subdir(str(tmp_path), self.SUBDIR, f"{self.SUBDIR}/sess.json")
         assert result == (cont / "sess.json").resolve()
 
     def test_reject_absolute_path_outside_repo(self, tmp_path):
@@ -234,17 +245,13 @@ class TestResolveUnderRepoSubdir:
         evil.mkdir(parents=True)
         (evil / "x.json").write_text("{}")
         with pytest.raises(ValueError, match="path_outside_allowed"):
-            resolve_under_repo_subdir(
-                str(tmp_path), self.SUBDIR, str(evil / "x.json")
-            )
+            resolve_under_repo_subdir(str(tmp_path), self.SUBDIR, str(evil / "x.json"))
 
     def test_reject_relative_traversal(self, tmp_path):
         # relative candidate that escapes via .. — anchored at repo_root, then
         # resolves outside the allowed dir
         with pytest.raises(ValueError, match="path_outside_allowed"):
-            resolve_under_repo_subdir(
-                str(tmp_path), self.SUBDIR, "../../etc/passwd"
-            )
+            resolve_under_repo_subdir(str(tmp_path), self.SUBDIR, "../../etc/passwd")
 
     def test_reject_path_under_repo_but_not_subdir(self, tmp_path):
         """A path inside repo_root but outside the continuation subdir must be
@@ -252,6 +259,4 @@ class TestResolveUnderRepoSubdir:
         """
         (tmp_path / "package.json").write_text("{}")
         with pytest.raises(ValueError, match="path_outside_allowed"):
-            resolve_under_repo_subdir(
-                str(tmp_path), self.SUBDIR, str(tmp_path / "package.json")
-            )
+            resolve_under_repo_subdir(str(tmp_path), self.SUBDIR, str(tmp_path / "package.json"))

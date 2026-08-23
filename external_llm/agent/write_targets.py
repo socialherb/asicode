@@ -34,12 +34,13 @@ files because they run the same code. :func:`write_target_paths` is the entry
 point; it never raises, because three of its four callers sit on the write path
 where failing to answer must not fail the user's edit.
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,8 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
 
 # ── unified diff ────────────────────────────────────────────────────────────
 
-def _clean_header_path(raw: str) -> Optional[str]:
+
+def _clean_header_path(raw: str) -> str | None:
     """Normalise the path half of a ``---`` / ``+++`` header line.
 
     Strips the ``a/`` / ``b/`` prefix, and — this is the part every copy but
@@ -158,7 +160,8 @@ def parse_patch_targets(patch: str) -> list[str]:
 
 # ── truncated / raw tool arguments ──────────────────────────────────────────
 
-def try_repair_truncated_json(raw: str) -> Optional[dict[str, Any]]:
+
+def try_repair_truncated_json(raw: str) -> dict[str, Any] | None:
     """Attempt to repair and parse a truncated JSON object string.
 
     Streaming truncation can cut off the end of a JSON object, e.g.::
@@ -193,9 +196,7 @@ def try_repair_truncated_json(raw: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def recover_args_from_raw(
-    args: dict[str, Any], required_keys: tuple[str, ...]
-) -> dict[str, Any]:
+def recover_args_from_raw(args: dict[str, Any], required_keys: tuple[str, ...]) -> dict[str, Any]:
     """Recover tool arguments from ``__raw_arguments`` when *required_keys* are absent.
 
     Several provider paths preserve the raw tool-call arguments as
@@ -230,9 +231,7 @@ def recover_args_from_raw(
             if _key not in _result or not _result.get(_key):
                 # Escape-aware value pattern: ([^"\\]|\\.)* steps over \" and \\
                 # instead of truncating at the first escaped quote.
-                _m = re.search(
-                    r'"' + re.escape(_key) + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', raw
-                )
+                _m = re.search(r'"' + re.escape(_key) + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
                 if _m is not None:
                     # JSON-unescape the captured value — the raw text contains
                     # literal \n / \" / \\ sequences, and writing them through
@@ -242,9 +241,7 @@ def recover_args_from_raw(
                     except (ValueError, json.JSONDecodeError):
                         # Leave the key missing → the tool returns a clean error
                         # rather than acting on a half-decoded value.
-                        logger.debug(
-                            "could not JSON-unescape recovered %r", _key, exc_info=True
-                        )
+                        logger.debug("could not JSON-unescape recovered %r", _key, exc_info=True)
                         continue
         if all(_result.get(k) for k in required_keys):
             logger.debug(
@@ -261,15 +258,14 @@ def recover_args_from_raw(
         _result = dict(args)
         _result.update(_repaired)
         _result.pop("__raw_arguments", None)
-        logger.debug(
-            "recovered args from __raw_arguments (JSON repair) for %s", required_keys
-        )
+        logger.debug("recovered args from __raw_arguments (JSON repair) for %s", required_keys)
         return _result
 
     return args
 
 
 # ── write_plan ──────────────────────────────────────────────────────────────
+
 
 def repair_plan_json(text: str) -> str:
     """Thin re-export of the handler's LLM-JSON repair, imported lazily.
@@ -360,7 +356,8 @@ def plan_target_paths(plan: Any) -> list[str]:
 
 # ── entry point ─────────────────────────────────────────────────────────────
 
-def _infer_tool_name(args: dict[str, Any]) -> Optional[str]:
+
+def _infer_tool_name(args: dict[str, Any]) -> str | None:
     """Guess the payload tool from the argument keys.
 
     ``FileLockManager.acquire_relevant`` is also called from the webapp with a
@@ -374,9 +371,7 @@ def _infer_tool_name(args: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def write_target_paths(
-    tool_name: Optional[str], args: Optional[dict[str, Any]]
-) -> list[str]:
+def write_target_paths(tool_name: str | None, args: dict[str, Any] | None) -> list[str]:
     """Repo-relative (or absolute, as given) target paths for a write-tool call.
 
     Returns ``[]`` when the targets cannot be determined — callers distinguish
@@ -417,7 +412,8 @@ def write_target_paths(
     except Exception:
         logger.debug(
             "write target extraction failed for %s — treating scope as unknown",
-            tool_name, exc_info=True,
+            tool_name,
+            exc_info=True,
         )
         return []
     else:

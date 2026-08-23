@@ -14,6 +14,7 @@ Determinism matters: the digest is rendered into the context verbatim every
 turn, so it must be byte-identical across rebuilds to keep the prompt-cache
 prefix stable.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -22,16 +23,30 @@ from typing import Any
 # and are reported by name only — new tools degrade gracefully, never crash.
 _READ_TOOLS = {"read_file", "read_symbol", "get_file_outline", "read_image"}
 _WRITE_TOOLS = {
-    "create_file", "apply_patch", "write_plan", "edit_ast", "edit_file",
-    "edit_text", "modify_symbol", "anchor_edit",
+    "create_file",
+    "apply_patch",
+    "write_plan",
+    "edit_ast",
+    "edit_file",
+    "edit_text",
+    "modify_symbol",
+    "anchor_edit",
 }
 _COMMAND_TOOLS = {"bash", "run_tests", "run_lint"}
 _SEARCH_TOOLS = {
-    "grep", "glob", "find_symbol", "find_references", "find_relevant_files",
-    "query_dependency_graph", "analyze_change_impact",
-    "estimate_change_scope", "run_structural_scan",
+    "grep",
+    "glob",
+    "find_symbol",
+    "find_references",
+    "find_relevant_files",
+    "query_dependency_graph",
+    "analyze_change_impact",
+    "estimate_change_scope",
+    "run_structural_scan",
     "find_tests_for_symbol",
-    "search_web", "web_fetch", "search_design_history",
+    "search_web",
+    "web_fetch",
+    "search_design_history",
 }
 # Tools with no cross-turn state worth carrying (pure UI / meta)
 _IGNORED_TOOLS = {"ask_user", "save_insight"}
@@ -102,6 +117,8 @@ def build_work_state_digest(tool_results: list[dict[str, Any]]) -> str:
             continue
         tool = entry.get("tool") or ""
         args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
+        if not isinstance(args, dict):
+            args = {}
         ok = bool(entry.get("ok", True))
 
         if tool in _IGNORED_TOOLS or not tool:
@@ -110,9 +127,7 @@ def build_work_state_digest(tool_results: list[dict[str, Any]]) -> str:
         if not ok:
             target = _arg_path(args) or _arg_query(args)
             err = _first_line(entry.get("content") or "", _ERR_EXCERPT_CHARS)
-            failures.append(
-                f"{tool} {target}".strip() + (f" — {err}" if err else "")
-            )
+            failures.append(f"{tool} {target}".strip() + (f" — {err}" if err else ""))
 
         if tool in _READ_TOOLS:
             path = _arg_path(args)

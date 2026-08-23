@@ -1,4 +1,5 @@
 """Tests for the standalone modify_symbol tool."""
+
 import ast
 import os
 import tempfile
@@ -33,6 +34,7 @@ def _ts_grammar_available(lang: str) -> bool:
     """True when the tree-sitter binding for ``lang`` is installed."""
     try:
         from external_llm.languages.tree_sitter_utils import get_available_languages
+
         return lang in get_available_languages()
     except Exception:
         return False
@@ -67,6 +69,7 @@ def _write_temp_file(content: str, suffix: str = ".py") -> str:
 
 # ── Tests for _looks_like_full_symbol_block ─────────────────────────────────
 
+
 class TestLooksLikeFullSymbolBlock:
     def test_full_function_def(self):
         assert _looks_like_full_symbol_block("def foo():\n    pass\n")
@@ -88,6 +91,7 @@ class TestLooksLikeFullSymbolBlock:
 
 
 # ── Tests for _realign_dedented_leading_lines ───────────────────────────────
+
 
 class TestRealignDedentedLeadingLines:
     def test_dedented_decorator_realigned_to_def(self):
@@ -116,6 +120,7 @@ class TestRealignDedentedLeadingLines:
 
 # ── Tests for _find_symbol_ast_node ─────────────────────────────────────────
 
+
 class TestFindSymbolAstNode:
     def test_find_top_level_function(self):
         source = "def foo(): pass\ndef bar(): pass\n"
@@ -139,6 +144,7 @@ class TestFindSymbolAstNode:
 
 
 # ── Tests for _apply_ast_precise ────────────────────────────────────────────
+
 
 class TestApplyAstPrecise:
     def test_full_block_replacement(self):
@@ -175,14 +181,15 @@ class TestApplyAstPrecise:
 
 # ── Tests for modify_symbol (end-to-end) ────────────────────────────────────
 
+
 class TestModifySymbol:
     def test_full_block(self):
         path = _write_temp_file(SAMPLE_SOURCE)
         try:
-            new_greet = '''    def greet(self) -> str:
+            new_greet = """    def greet(self) -> str:
         \"\"\"Modified greeting.\"\"\"
         return f"Hi, {self.name}!"
-'''
+"""
             success, diff, new_content = modify_symbol(path, "Greeter.greet", new_greet)
             assert success, f"Failed: {diff}"
             assert "Hi, " in new_content
@@ -194,9 +201,9 @@ class TestModifySymbol:
     def test_body_only(self):
         path = _write_temp_file(SAMPLE_SOURCE)
         try:
-            new_greet_body = '''        \"\"\"Modified greeting.\"\"\"
+            new_greet_body = """        \"\"\"Modified greeting.\"\"\"
         return f"Hey, {self.name}!"
-'''
+"""
             success, diff, new_content = modify_symbol(path, "Greeter.greet", new_greet_body)
             assert success, f"Failed: {diff}"
             assert "Hey, " in new_content
@@ -226,11 +233,11 @@ class TestModifySymbol:
         try:
             # First line at col 0, remaining lines at original class-method depth.
             new_code = (
-                '@staticmethod\n'
-                '    def mark(messages):\n'
+                "@staticmethod\n"
+                "    def mark(messages):\n"
                 '        """New docstring."""\n'
-                '        if not messages:\n'
-                '            return None\n'
+                "        if not messages:\n"
+                "            return None\n"
                 '        messages[-1]["cached"] = "ephemeral"\n'
             )
             success, diff, new_content = modify_symbol(path, "Client.mark", new_code)
@@ -252,9 +259,9 @@ class TestModifySymbol:
         """
         path = _write_temp_file(SAMPLE_SOURCE)
         try:
-            new_greet = '''    def greet(self) -> str:
+            new_greet = """    def greet(self) -> str:
         return f"Hi, {self.name}!"
-'''
+"""
             success, diff, new_content = modify_symbol(path, "Greeter.greet", new_greet)
             assert success, f"Failed: {diff}"
             # Result must still parse — no spurious indentation drift.
@@ -266,7 +273,7 @@ class TestModifySymbol:
             assert "    def __init__(self, name: str):\n" in new_content
             assert "        self.name = name\n" in new_content
             assert "    def farewell(self) -> str:\n" in new_content
-            assert "        return f\"Goodbye, {self.name}!\"\n" in new_content
+            assert '        return f"Goodbye, {self.name}!"\n' in new_content
             # And the file on disk matches what was returned.
             assert Path(path).read_text() == new_content
         finally:
@@ -338,13 +345,7 @@ class TestModifySymbol:
         path = _write_temp_file(source)
         try:
             # Full block emitted with a 2-space indent unit.
-            new_code = (
-                "def foo(self, n=0):\n"
-                "  a = 100\n"
-                "  if n:\n"
-                "    b = 2\n"
-                "  c = 3\n"
-            )
+            new_code = "def foo(self, n=0):\n  a = 100\n  if n:\n    b = 2\n  c = 3\n"
             success, diff, new_content = modify_symbol(path, "X.foo", new_code)
             assert success, f"Failed: {diff}"
             lines = {ln.strip(): ln for ln in new_content.splitlines() if ln.strip()}
@@ -397,29 +398,30 @@ class TestModifySymbol:
         try:
             new_code = (
                 '"""Doc."""\n'
-                'result = self._make_result(ok=False,\n'
+                "result = self._make_result(ok=False,\n"
                 '                           content="",\n'
                 '                           error="pattern required")\n'
-                'if not args:\n'
-                '    return result\n'
-                'for x in args:\n'
-                '    if x > 0:\n'
-                '        total += x\n'
-                'return total\n'
+                "if not args:\n"
+                "    return result\n"
+                "for x in args:\n"
+                "    if x > 0:\n"
+                "        total += x\n"
+                "return total\n"
             )
             success, diff, new_content = modify_symbol(path, "Foo.bar", new_code)
             assert success, f"Failed: {diff}"
             import ast as _ast
+
             _ast.parse(new_content)  # must be valid Python
             lines = {ln.strip(): ln for ln in new_content.splitlines() if ln.strip()}
             # Logical body lines normalized to the method body indent (8) / nesting.
-            assert lines['if not args:'].startswith("        if"), repr(lines['if not args:'])
-            assert lines['return result'].startswith("            return"), repr(lines['return result'])
-            assert lines['total += x'].startswith("                total"), repr(lines['total += x'])
+            assert lines["if not args:"].startswith("        if"), repr(lines["if not args:"])
+            assert lines["return result"].startswith("            return"), repr(lines["return result"])
+            assert lines["total += x"].startswith("                total"), repr(lines["total += x"])
             # Aligned continuation tracks the open paren of its owner line (col 35),
             # never blown up to a 100+ space indent.
             content_line = lines['content="",']
-            assert content_line.startswith(" " * 35 + 'content'), repr(content_line)
+            assert content_line.startswith(" " * 35 + "content"), repr(content_line)
             assert (len(content_line) - len(content_line.lstrip())) < 40, repr(content_line)
         finally:
             os.unlink(path)
@@ -487,9 +489,7 @@ class TestModifySymbol:
             rel_path = os.path.basename(path)
             repo_root = os.path.dirname(path)
             success, diff, _new_content = modify_symbol(
-                rel_path, "Greeter.greet",
-                "    def greet(self):\n        return \"ok\"\n",
-                repo_root=repo_root
+                rel_path, "Greeter.greet", '    def greet(self):\n        return "ok"\n', repo_root=repo_root
             )
             assert success, f"Failed: {diff}"
         finally:
@@ -506,8 +506,9 @@ class TestModifySymbol:
         """)
         path = _write_temp_file(source, suffix=".js")
         try:
-            success, diff, new_content = modify_symbol(path, "greet",
-                "function greet(name) {\n    return \"Hi, \" + name + \"!\";\n}\n")
+            success, diff, new_content = modify_symbol(
+                path, "greet", 'function greet(name) {\n    return "Hi, " + name + "!";\n}\n'
+            )
             assert success, f"Failed: {diff}"
             assert "Hi, " in new_content
         finally:
@@ -535,6 +536,7 @@ class TestModifySymbol:
 
 
 # ── Tests for _find_symbol_line_range ──────────────────────────────────────
+
 
 class TestFindSymbolLineRange:
     def test_python_function(self):
@@ -585,11 +587,11 @@ class TestFindSymbolLineRange:
         r = _find_symbol_line_range(source, "compute", "m.c")
         assert r is not None
         start, end = r
-        assert start == 1                         # def line index
-        assert end == 6                            # exclusive: through closing '}'
+        assert start == 1  # def line index
+        assert end == 6  # exclusive: through closing '}'
         lines = source.splitlines()
         assert lines[start].strip() == "int compute(int x)"
-        assert lines[end - 1].strip() == "}"       # closing brace included
+        assert lines[end - 1].strip() == "}"  # closing brace included
 
     def test_no_brace_indent_branch_not_empty(self, monkeypatch):
         """The indentation fallback must never return an empty (i, i) range.
@@ -601,20 +603,13 @@ class TestFindSymbolLineRange:
             "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
             lambda *a, **k: None,
         )
-        source = (
-            "def !!!bad===\n"
-            "def foo():\n"
-            "    a = 1\n"
-            "    b = 2\n"
-            "def bar():\n"
-            "    pass\n"
-        )
+        source = "def !!!bad===\ndef foo():\n    a = 1\n    b = 2\ndef bar():\n    pass\n"
         r = _find_symbol_line_range(source, "foo", "t.py")
         assert r is not None
         start, end = r
         assert start == 1
-        assert end > start                          # NOT the empty (1, 1) range
-        assert end == 4                             # def + two body lines
+        assert end > start  # NOT the empty (1, 1) range
+        assert end == 4  # def + two body lines
 
 
 # ── Python fallback must never use the C-family brace/indent heuristic ──────
@@ -633,35 +628,36 @@ class TestFindSymbolLineRange:
 #        the decorator and deleting two section comments. Valid Python, so the
 #        post-edit syntax gate passed it — silent corruption.
 
+
 class TestPythonSymbolRangeFallback:
     # Mirrors the go_provider.py shape that produced both bugs.
     SRC: ClassVar[str] = (
-        "import re\n"                                            # 0
-        "\n"                                                     # 1
-        "\n"                                                     # 2
-        "class GoSyntaxProvider:\n"                              # 3
-        "    _KINDS = frozenset({'variable'})\n"                 # 4
-        "\n"                                                     # 5
-        "    @staticmethod\n"                                    # 6
-        "    def _find_block_end(content: str, offset: int) -> int:\n"   # 7
-        '        """Doc."""\n'                                   # 8
-        "        return 0\n"                                     # 9
-        "\n"                                                     # 10
-        "    # ── Definition keywords ──\n"                      # 11
-        "\n"                                                     # 12
-        "    # ── Regex fallback ──\n"                           # 13
-        "\n"                                                     # 14
-        "    def _find_defs(\n"                                  # 15
-        "        self, content: str,\n"                          # 16
-        "    ) -> list[tuple[str, int]]:\n"                      # 17
-        '        """Regex fallback."""\n'                        # 18
-        "        results = []\n"                                 # 19
-        "        return results\n"                               # 20
-        "\n"                                                     # 21
-        "\n"                                                     # 22
-        "class OtherProvider:\n"                                 # 23
-        "    def _find_block_end(self) -> int:\n"                # 24
-        "        return 1\n"                                     # 25
+        "import re\n"  # 0
+        "\n"  # 1
+        "\n"  # 2
+        "class GoSyntaxProvider:\n"  # 3
+        "    _KINDS = frozenset({'variable'})\n"  # 4
+        "\n"  # 5
+        "    @staticmethod\n"  # 6
+        "    def _find_block_end(content: str, offset: int) -> int:\n"  # 7
+        '        """Doc."""\n'  # 8
+        "        return 0\n"  # 9
+        "\n"  # 10
+        "    # ── Definition keywords ──\n"  # 11
+        "\n"  # 12
+        "    # ── Regex fallback ──\n"  # 13
+        "\n"  # 14
+        "    def _find_defs(\n"  # 15
+        "        self, content: str,\n"  # 16
+        "    ) -> list[tuple[str, int]]:\n"  # 17
+        '        """Regex fallback."""\n'  # 18
+        "        results = []\n"  # 19
+        "        return results\n"  # 20
+        "\n"  # 21
+        "\n"  # 22
+        "class OtherProvider:\n"  # 23
+        "    def _find_block_end(self) -> int:\n"  # 24
+        "        return 1\n"  # 25
     )
 
     @staticmethod
@@ -684,14 +680,13 @@ class TestPythonSymbolRangeFallback:
         assert lines[r[0]].strip() == "@staticmethod"
         assert lines[r[1] - 1].strip() == "return 0"
         # The two "# ── ... ──" separators belong to the NEXT symbol.
-        assert "── Definition keywords ──" not in "\n".join(lines[r[0]:r[1]])
+        assert "── Definition keywords ──" not in "\n".join(lines[r[0] : r[1]])
 
     def test_fallback_matches_the_ast_answer_exactly(self):
         """On an unparseable file the fallback must agree with ast on a clean one."""
         broken = self._unparseable(self.SRC)
         for sym in ("GoSyntaxProvider._find_block_end", "GoSyntaxProvider._find_defs"):
-            assert _find_symbol_line_range(self.SRC, sym, "p.py") == \
-                   _find_symbol_line_range(broken, sym, "p.py"), sym
+            assert _find_symbol_line_range(self.SRC, sym, "p.py") == _find_symbol_line_range(broken, sym, "p.py"), sym
 
     @pytest.mark.parametrize("src_kind", ["clean", "unparseable"])
     def test_wrong_class_qualifier_returns_none(self, src_kind):
@@ -732,23 +727,24 @@ class TestPythonSymbolRangeFallback:
         f.write_text(self.SRC, encoding="utf-8")
         before = f.read_text(encoding="utf-8")
         ok, err, _ = modify_symbol(
-            "p.py", "GoProvider._find_block_end",
-            "    @staticmethod\n"
-            "    def _find_block_end(content: str, offset: int) -> int:\n"
-            "        return 99\n",
+            "p.py",
+            "GoProvider._find_block_end",
+            "    @staticmethod\n    def _find_block_end(content: str, offset: int) -> int:\n        return 99\n",
             repo_root=str(tmp_path),
         )
         assert ok is False
         assert "no class named 'GoProvider'" in err
-        assert "GoSyntaxProvider" in err                 # the suggestion
-        assert f.read_text(encoding="utf-8") == before   # file untouched
+        assert "GoSyntaxProvider" in err  # the suggestion
+        assert f.read_text(encoding="utf-8") == before  # file untouched
 
     def test_unparseable_file_miss_explains_itself(self, tmp_path):
         """A locate miss on a broken file must say so, not blame the splice."""
         f = tmp_path / "p.py"
         f.write_text(self._unparseable(self.SRC), encoding="utf-8")
         ok, err, _ = modify_symbol(
-            "p.py", "GoSyntaxProvider.no_such_method", "    def no_such_method(self): ...\n",
+            "p.py",
+            "GoSyntaxProvider.no_such_method",
+            "    def no_such_method(self): ...\n",
             repo_root=str(tmp_path),
         )
         assert ok is False
@@ -762,8 +758,9 @@ class TestPythonSymbolRangeFallback:
         text-editing tool" — no exit.
         """
         import inspect
+
         src = inspect.getsource(smt.modify_symbol)
-        for msg in ("Use apply_patch instead.", "Use apply_patch instead\""):
+        for msg in ("Use apply_patch instead.", 'Use apply_patch instead"'):
             assert msg not in src
         assert "edit_text" in src
 
@@ -776,40 +773,54 @@ class TestPythonSymbolRangeFallback:
 # the common case in Kotlin/Java/Go/Rust/etc. The fix routes non-Python
 # lookup through the per-language provider patterns (typed policy) instead.
 
+
 class TestFindSymbolProviderModifiers:
     """Symbol location must find declarations with leading modifiers."""
 
     # (source, symbol, file, expected_start_line_index, desc)
     CASES: ClassVar[list] = [
         # Kotlin — every common modifier form
-        ("    private fun allocateUniqueNames(): List<String> {\n        x()\n    }\n",
-         "allocateUniqueNames", "Engine.kt", 0, "private fun"),
-        ("    override fun isRecordingNow(): Boolean {\n        return true\n    }\n",
-         "isRecordingNow", "Engine.kt", 0, "override fun"),
-        ("    suspend fun fetchAsync(): String {\n        return \"\"\n    }\n",
-         "fetchAsync", "Engine.kt", 0, "suspend fun"),
-        ("    internal fun helper(): Int {\n        return 1\n    }\n",
-         "helper", "Engine.kt", 0, "internal fun"),
+        (
+            "    private fun allocateUniqueNames(): List<String> {\n        x()\n    }\n",
+            "allocateUniqueNames",
+            "Engine.kt",
+            0,
+            "private fun",
+        ),
+        (
+            "    override fun isRecordingNow(): Boolean {\n        return true\n    }\n",
+            "isRecordingNow",
+            "Engine.kt",
+            0,
+            "override fun",
+        ),
+        (
+            '    suspend fun fetchAsync(): String {\n        return ""\n    }\n',
+            "fetchAsync",
+            "Engine.kt",
+            0,
+            "suspend fun",
+        ),
+        ("    internal fun helper(): Int {\n        return 1\n    }\n", "helper", "Engine.kt", 0, "internal fun"),
         # Bare fun must still work (no regression)
-        ("    fun startRecording() {\n        doWork()\n    }\n",
-         "startRecording", "Engine.kt", 0, "bare fun"),
+        ("    fun startRecording() {\n        doWork()\n    }\n", "startRecording", "Engine.kt", 0, "bare fun"),
         # Java — visibility + override modifiers
-        ("    private void doWork() {\n        run();\n    }\n",
-         "doWork", "Foo.java", 0, "private void"),
-        ("    public final String getName() {\n        return name;\n    }\n",
-         "getName", "Foo.java", 0, "public final method"),
+        ("    private void doWork() {\n        run();\n    }\n", "doWork", "Foo.java", 0, "private void"),
+        (
+            "    public final String getName() {\n        return name;\n    }\n",
+            "getName",
+            "Foo.java",
+            0,
+            "public final method",
+        ),
         # Go — method on receiver type
-        ("func (s *Server) Start() {\n    s.listen()\n}\n",
-         "Start", "server.go", 0, "Go receiver method"),
+        ("func (s *Server) Start() {\n    s.listen()\n}\n", "Start", "server.go", 0, "Go receiver method"),
         # Rust — pub/visibility modifiers
-        ("pub fn compute(x: i32) -> i32 {\n    x + 1\n}\n",
-         "compute", "lib.rs", 0, "pub fn"),
-        ("    pub(crate) fn helper() {\n        todo!()\n    }\n",
-         "helper", "lib.rs", 0, "pub(crate) fn"),
+        ("pub fn compute(x: i32) -> i32 {\n    x + 1\n}\n", "compute", "lib.rs", 0, "pub fn"),
+        ("    pub(crate) fn helper() {\n        todo!()\n    }\n", "helper", "lib.rs", 0, "pub(crate) fn"),
     ]
 
-    @pytest.mark.parametrize("source,symbol,fname,expect_start,desc", CASES,
-                             ids=[c[4] for c in CASES])
+    @pytest.mark.parametrize("source,symbol,fname,expect_start,desc", CASES, ids=[c[4] for c in CASES])
     def test_modifier_declarations_found(self, source, symbol, fname, expect_start, desc):
         r = _find_symbol_line_range(source, symbol, fname)
         assert r is not None, f"FAILED to locate '{symbol}' ({desc}) — modifier-form regression"
@@ -942,9 +953,7 @@ class TestKotlinBraceCorruptionFix:
         r = _find_symbol_line_range(self.REPRO, "generatePdfReport", "Report.kt")
         assert r is not None
         # closing brace of generatePdfReport is 1-based line 14 = 0-idx 13
-        assert r[0] <= 13 < r[1], (
-            f"closing brace (0-idx 13) not in range {r} -> orphan-}} risk"
-        )
+        assert r[0] <= 13 < r[1], f"closing brace (0-idx 13) not in range {r} -> orphan-}} risk"
 
     def test_b_naive_fallback_includes_closing_brace(self, monkeypatch):
         # Fix B: even with tree-sitter unavailable, the literal-aware SSOT brace
@@ -955,42 +964,40 @@ class TestKotlinBraceCorruptionFix:
         )
         r = _find_symbol_line_range(self.REPRO, "generatePdfReport", "Report.kt")
         assert r is not None
-        assert r[0] <= 13 < r[1], (
-            f"fallback range {r} dropped closing brace -> orphan-}} risk"
-        )
+        assert r[0] <= 13 < r[1], f"fallback range {r} dropped closing brace -> orphan-}} risk"
 
     def test_bc_fallback_brace_offset_edge_cases(self, monkeypatch):
-            # Regression guard for three fallback-path (tree-sitter unavailable)
-            # brace-offset bugs in _find_symbol_line_range:
-            #  (3) a default-arg literal like fmt = "{}" made find('{') land
-            #      mid-string → block-end scan balanced from the wrong point →
-            #      truncated range that orphans the body on edit.
-            #  (4) Allman detection skipped '//'/'#' but not /* */ block comments
-            #      (javadoc) sitting between signature and '{' → body-less range.
-            #  (2) CRLF/CR files: splitlines() strips the terminator, so the
-            #      `len(line)+1` offset drifts one char per CRLF line and can land
-            #      the scan point inside an earlier symbol's body.
-            monkeypatch.setattr(
-                "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
-                lambda *a, **k: None,
-            )
-            # (3) literal '{' / '}' in a Kotlin default-arg string
-            kt = 'fun greet(fmt: String = "{}") {\n    println(fmt)\n}\n'
-            assert _find_symbol_line_range(kt, "greet", "x.kt") == (0, 3)
-            kt2 = 'fun f(s: String = "}") {\n    x()\n}\nfun next() { y() }\n'
-            assert _find_symbol_line_range(kt2, "f", "x.kt") == (0, 3)
-            # (4) Allman + multi-line /* */ (javadoc) and single-line /* */
-            c = "void compute()\n/**\n * doc\n */\n{\n    do_work();\n}\n"
-            assert _find_symbol_line_range(c, "compute", "x.c") == (0, 7)
-            c2 = "void compute()\n/* one */\n{\n    do_work();\n}\n"
-            assert _find_symbol_line_range(c2, "compute", "x.c") == (0, 5)
-            # (2) CRLF vs LF parity — symbol on a non-zero line so offset
-            #     accumulation matters; both must yield the same correct range.
-            body = "fun first() { val x = 1 }\nfun target() {\n    println()\n}\n"
-            assert _find_symbol_line_range(body, "target", "x.kt") == (1, 4)
-            assert _find_symbol_line_range(body.replace("\n", "\r\n"), "target", "x.kt") == (1, 4)
-            deep = "val a = 1\nval b = 2\nval c = 3\nval d = 4\nval e = 5\nfun target() {\n    x()\n}\n"
-            assert _find_symbol_line_range(deep.replace("\n", "\r\n"), "target", "x.kt") == (5, 8)
+        # Regression guard for three fallback-path (tree-sitter unavailable)
+        # brace-offset bugs in _find_symbol_line_range:
+        #  (3) a default-arg literal like fmt = "{}" made find('{') land
+        #      mid-string → block-end scan balanced from the wrong point →
+        #      truncated range that orphans the body on edit.
+        #  (4) Allman detection skipped '//'/'#' but not /* */ block comments
+        #      (javadoc) sitting between signature and '{' → body-less range.
+        #  (2) CRLF/CR files: splitlines() strips the terminator, so the
+        #      `len(line)+1` offset drifts one char per CRLF line and can land
+        #      the scan point inside an earlier symbol's body.
+        monkeypatch.setattr(
+            "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
+            lambda *a, **k: None,
+        )
+        # (3) literal '{' / '}' in a Kotlin default-arg string
+        kt = 'fun greet(fmt: String = "{}") {\n    println(fmt)\n}\n'
+        assert _find_symbol_line_range(kt, "greet", "x.kt") == (0, 3)
+        kt2 = 'fun f(s: String = "}") {\n    x()\n}\nfun next() { y() }\n'
+        assert _find_symbol_line_range(kt2, "f", "x.kt") == (0, 3)
+        # (4) Allman + multi-line /* */ (javadoc) and single-line /* */
+        c = "void compute()\n/**\n * doc\n */\n{\n    do_work();\n}\n"
+        assert _find_symbol_line_range(c, "compute", "x.c") == (0, 7)
+        c2 = "void compute()\n/* one */\n{\n    do_work();\n}\n"
+        assert _find_symbol_line_range(c2, "compute", "x.c") == (0, 5)
+        # (2) CRLF vs LF parity — symbol on a non-zero line so offset
+        #     accumulation matters; both must yield the same correct range.
+        body = "fun first() { val x = 1 }\nfun target() {\n    println()\n}\n"
+        assert _find_symbol_line_range(body, "target", "x.kt") == (1, 4)
+        assert _find_symbol_line_range(body.replace("\n", "\r\n"), "target", "x.kt") == (1, 4)
+        deep = "val a = 1\nval b = 2\nval c = 3\nval d = 4\nval e = 5\nfun target() {\n    x()\n}\n"
+        assert _find_symbol_line_range(deep.replace("\n", "\r\n"), "target", "x.kt") == (5, 8)
 
     def test_fallback_range_excludes_next_sibling_doc_comment(self, monkeypatch):
         # Regression: the brace-branch trailing-skip absorbed the NEXT symbol's
@@ -1001,18 +1008,13 @@ class TestKotlinBraceCorruptionFix:
             "external_llm.agent.symbol_modify_tool._find_symbol_range_via_treesitter",
             lambda *a, **k: None,
         )
-        src = (
-            "void foo(void) { return; }\n"
-            "\n"
-            "// doc for bar\n"
-            "void bar(void) { return; }\n"
-        )
+        src = "void foo(void) { return; }\n\n// doc for bar\nvoid bar(void) { return; }\n"
         r = _find_symbol_line_range(src, "foo", "x.c")
         assert r is not None
         # foo's range must NOT reach the ``// doc for bar`` line (0-idx 2).
         assert r[1] <= 2, f"range {r} absorbed next sibling's doc comment"
         sl = src.splitlines(keepends=True)
-        foo_text = "".join(sl[r[0]:r[1]])
+        foo_text = "".join(sl[r[0] : r[1]])
         assert "// doc for bar" not in foo_text
 
     def test_first_significant_line_skips_block_comments(self):
@@ -1032,40 +1034,38 @@ class TestKotlinBraceCorruptionFix:
         assert _first_significant_line("// c\n@dec\ndef foo():") == "def foo():"
         # all comments -> empty
         assert _first_significant_line("/** c */") == ""
+
     def test_c_orphan_brace_rejected_pre_write(self):
         # Fix C: the pre-write gate rejects brace-imbalanced content for
         # compiler-less brace languages (Kotlin/Java/Rust/C/C++/...).
         from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
-        balanced = 'class C {\n    fun f() {\n        println(1)\n    }\n}\n'
-        orphan = 'class C {\n    fun f() {\n        return 1\n    }\n    }\n}\n'
-        brace_in_string = (
-            'class C {\n    fun f() {\n        val s = "close }"\n    }\n}\n'
-        )
+
+        balanced = "class C {\n    fun f() {\n        println(1)\n    }\n}\n"
+        orphan = "class C {\n    fun f() {\n        return 1\n    }\n    }\n}\n"
+        brace_in_string = 'class C {\n    fun f() {\n        val s = "close }"\n    }\n}\n'
         assert _post_edit_syntax_ok(balanced, "x.kt") is True
         assert _post_edit_syntax_ok(orphan, "x.kt") is False
         # literal-aware: a brace inside a string must NOT trip the gate
         assert _post_edit_syntax_ok(brace_in_string, "x.kt") is True
         # Java orphan also rejected (same gate applies across brace languages)
-        assert _post_edit_syntax_ok(
-            'class C {\n    void f() { return; }\n    }\n}\n', "x.java"
-        ) is False
+        assert _post_edit_syntax_ok("class C {\n    void f() { return; }\n    }\n}\n", "x.java") is False
+
     def test_c_rust_lifetime_not_fail_closed(self):
-            # Fix C extension: a Rust lifetime tick ('a) was mistaken for a char-
-            # literal start, so net_brace_count() saw struct Parser<'a> { as -1 and
-            # the pre-write gate rejected EVERY Rust edit on any file containing a
-            # lifetime-before-brace. A valid balanced Rust struct with lifetimes
-            # must pass the gate (return True), while a genuine orphan still fails.
-            from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
-            balanced_rust = "struct Parser<'a> {\n    input: &'a str,\n}\n"
-            two_lifetimes = "impl<'a, 'b> Foo<'a> {\n    x: &'b str,\n}\n"
-            orphan_rust = "struct Parser<'a> {\n    input: &'a str,\n    }\n}\n"
-            assert _post_edit_syntax_ok(balanced_rust, "p.rs") is True, (
-                "Rust lifetime swallowed the opening brace -> valid edit fail-closed"
-            )
-            assert _post_edit_syntax_ok(two_lifetimes, "p.rs") is True
-            assert _post_edit_syntax_ok(orphan_rust, "p.rs") is False, (
-                "genuine orphan brace must still be rejected"
-            )
+        # Fix C extension: a Rust lifetime tick ('a) was mistaken for a char-
+        # literal start, so net_brace_count() saw struct Parser<'a> { as -1 and
+        # the pre-write gate rejected EVERY Rust edit on any file containing a
+        # lifetime-before-brace. A valid balanced Rust struct with lifetimes
+        # must pass the gate (return True), while a genuine orphan still fails.
+        from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
+
+        balanced_rust = "struct Parser<'a> {\n    input: &'a str,\n}\n"
+        two_lifetimes = "impl<'a, 'b> Foo<'a> {\n    x: &'b str,\n}\n"
+        orphan_rust = "struct Parser<'a> {\n    input: &'a str,\n    }\n}\n"
+        assert _post_edit_syntax_ok(balanced_rust, "p.rs") is True, (
+            "Rust lifetime swallowed the opening brace -> valid edit fail-closed"
+        )
+        assert _post_edit_syntax_ok(two_lifetimes, "p.rs") is True
+        assert _post_edit_syntax_ok(orphan_rust, "p.rs") is False, "genuine orphan brace must still be rejected"
 
     def test_c_brace_gate_relative_delta(self):
         # The brace-balance gate uses a RELATIVE delta when the pre-edit source
@@ -1073,10 +1073,11 @@ class TestKotlinBraceCorruptionFix:
         # imbalance (scanner limitation / mid-fix broken code) is no longer
         # false-rejected — while an edit that introduces an orphan brace still is.
         from external_llm.agent.symbol_modify_tool import _post_edit_syntax_ok
+
         # Source has a pre-existing imbalance (trailing junk) — net != 0.
-        src = "fun foo() {\n    val s = \"x\"\n}\n}}}}\n"
+        src = 'fun foo() {\n    val s = "x"\n}\n}}}}\n'
         # Brace-neutral edit: same braces, only a literal changed.
-        neutral = "fun foo() {\n    val s = \"y\"\n}\n}}}}\n"
+        neutral = 'fun foo() {\n    val s = "y"\n}\n}}}}\n'
         # Absolute gate (no source) false-rejects a valid brace-neutral edit.
         assert _post_edit_syntax_ok(neutral, "x.kt") is False
         # Relative gate (with source) accepts the brace-neutral edit.
@@ -1103,7 +1104,10 @@ class TestKotlinBraceCorruptionFix:
             }
         """)
         ok, msg, new_content = modify_symbol(
-            p, "generatePdfReport", new_body, repo_root=d,
+            p,
+            "generatePdfReport",
+            new_body,
+            repo_root=d,
         )
         assert ok, f"modify_symbol failed: {msg}"
         assert net_brace_count(new_content) == 0, "orphan `}` introduced"
@@ -1260,7 +1264,7 @@ class TestModifySymbolNonPythonEndToEnd:
                 return x * 2;
             }
             """)
-        new = textwrap.dedent('''\
+        new = textwrap.dedent("""\
             /**
              * Compute something.
              * @param x input value
@@ -1269,7 +1273,7 @@ class TestModifySymbolNonPythonEndToEnd:
             {
                 return x * 9;
             }
-            ''')
+            """)
         d = tempfile.mkdtemp()
         p = os.path.join(d, "m.c")
         with open(p, "w", encoding="utf-8") as f:
@@ -1287,6 +1291,7 @@ class TestModifySymbolNonPythonEndToEnd:
 
 
 # ── Defense-1: body-only indent-drift correction ────────────────────────────
+
 
 class TestMinIndent:
     def test_uniform_indent(self):
@@ -1351,15 +1356,15 @@ class TestCorrectIndentDrift:
         # diagnostic must fire and correct the drifted majority while leaving
         # the shallow outlier untouched (not push it into under-indent).
         drifted = [
-            '        """Read a symbol."""',           # 8-space (target) — shallow outlier
-            '            name = args.get("name")',    # 12-space (drift)
-            '            return self._make_result(name)',  # 12-space (drift)
+            '        """Read a symbol."""',  # 8-space (target) — shallow outlier
+            '            name = args.get("name")',  # 12-space (drift)
+            "            return self._make_result(name)",  # 12-space (drift)
         ]
         out = _correct_indent_drift(drifted, "        ", "Foo.bar")
         assert out == [
-            '        """Read a symbol."""',           # outlier untouched (still 8)
-            '        name = args.get("name")',        # corrected 12 -> 8
-            '        return self._make_result(name)',  # corrected 12 -> 8
+            '        """Read a symbol."""',  # outlier untouched (still 8)
+            '        name = args.get("name")',  # corrected 12 -> 8
+            "        return self._make_result(name)",  # corrected 12 -> 8
         ]
 
     def test_under_indent_outlier_not_overcorrected(self):
@@ -1368,8 +1373,8 @@ class TestCorrectIndentDrift:
         # inverse mistake: shifting an already-correct body because of a deep
         # outlier would under-indent the majority.
         lines = [
-            "    x = 1",         # 4 (target)
-            "    return x",      # 4 (target)
+            "    x = 1",  # 4 (target)
+            "    return x",  # 4 (target)
         ]
         out = _correct_indent_drift(lines, "    ", "foo")
         assert out == lines  # mode == target → noop
@@ -1381,11 +1386,11 @@ class TestCorrectIndentDrift:
         # the nested body into a parse error. min == target (the outer
         # statements) and the block parses cleanly, so no correction must fire.
         nested = [
-            "    def inner():",        # 4 (target) — outer logical stmt
-            "        a = 1",           # 8 — body of inner (majority)
-            "        b = 2",           # 8
-            "        return result",   # 8
-            "    return inner",        # 4 (target) — outer logical stmt
+            "    def inner():",  # 4 (target) — outer logical stmt
+            "        a = 1",  # 8 — body of inner (majority)
+            "        b = 2",  # 8
+            "        return result",  # 8
+            "    return inner",  # 4 (target) — outer logical stmt
         ]
         out = _correct_indent_drift(nested, "    ", "foo")
         assert out == nested, f"nested body flattened: {out}"
@@ -1395,10 +1400,10 @@ class TestCorrectIndentDrift:
         # of a nested def. The majority of lines sit inside the for/if block.
         nested = [
             "    for item in items:",  # 4 (target)
-            "        if item.ok:",     # 8
+            "        if item.ok:",  # 8
             "            process(item)",  # 12
-            "            log(item)",     # 12
-            "    return done",         # 4 (target)
+            "            log(item)",  # 12
+            "    return done",  # 4 (target)
         ]
         out = _correct_indent_drift(nested, "    ", "foo")
         assert out == nested, f"nested control-flow flattened: {out}"
@@ -1427,8 +1432,9 @@ class TestApplyAstPreciseDriftDefense:
         added = _added_lines(diff)
         # The spliced line must sit at 8 spaces (the method's body indent),
         # NOT 12 (the drifted depth the model sent).
-        assert any(_indent_of(ln) == 8 and "x = 999" in ln for ln in added), \
+        assert any(_indent_of(ln) == 8 and "x = 999" in ln for ln in added), (
             f"drift not corrected, added lines: {added}"
+        )
 
     def test_correct_body_only_lands_at_base_indent(self):
         source = "class Foo:\n    def bar(self):\n        x = 1\n        return x\n"
@@ -1445,14 +1451,14 @@ class TestApplyAstPreciseDriftDefense:
         diff, mode = _apply_ast_precise(source, "test.py", "foo", drifted_body)
         assert mode == "python_body_only"
         added = _added_lines(diff)
-        assert any(_indent_of(ln) == 4 and "x = 999" in ln for ln in added), \
-            f"normalization failed, added: {added}"
+        assert any(_indent_of(ln) == 4 and "x = 999" in ln for ln in added), f"normalization failed, added: {added}"
 
     def test_indent_drift_warning_is_observable(self, caplog):
         # The defense logs a WARNING whenever it applies a corrective shift.
         # _correct_indent_drift is exercised directly (the common path already
         # produces correct indent, so we drive the helper to assert the signal).
         from external_llm.agent.symbol_modify_tool import _correct_indent_drift
+
         drifted = ["            x = 1", "            return x"]
         with caplog.at_level("WARNING", logger="asicode.modify_symbol_tool"):
             _correct_indent_drift(drifted, "        ", "Foo.bar")
@@ -1473,10 +1479,10 @@ class TestApplyAstPreciseDriftDefense:
         assert diff is not None, "edit must succeed (previously failed via compile)"
         added = _added_lines(diff)
         # Both the docstring and the statements must land at 8-space indent.
-        assert any(_indent_of(ln) == 8 and "docstring" in ln for ln in added), \
-            f"docstring not at 8-space: {added}"
-        assert any(_indent_of(ln) == 8 and "x = 999" in ln for ln in added), \
+        assert any(_indent_of(ln) == 8 and "docstring" in ln for ln in added), f"docstring not at 8-space: {added}"
+        assert any(_indent_of(ln) == 8 and "x = 999" in ln for ln in added), (
             f"drifted statement not corrected to 8-space: {added}"
+        )
 
     def test_nested_function_body_not_flattened(self):
         # REGRESSION (2026-06-22): a body whose MAJORITY of lines sit inside a
@@ -1510,11 +1516,11 @@ class TestApplyAstPreciseDriftDefense:
         added = _added_lines(diff)
         # The nested body line must land at 12-space (preserved nesting),
         # NOT 8-space (which would be the flattened regression).
-        assert any(_indent_of(ln) == 12 and "v * 5" in ln for ln in added), \
-            f"nested body flattened to 8-space: {added}"
+        assert any(_indent_of(ln) == 12 and "v * 5" in ln for ln in added), f"nested body flattened to 8-space: {added}"
 
 
 # ── Defense-2: mode misclassification warning ───────────────────────────────
+
 
 class TestModeMisclassificationWarning:
     """When a def/class statement reaches the body-only path (because the
@@ -1546,10 +1552,12 @@ class TestModeMisclassificationWarning:
 # parses a uniformly-over-indented body as valid, so compile() let it through
 # and the caller saw success with a silent one-level body drift.
 
+
 class TestFullBlockBodyIndentDrift:
     def _body_indent(self, content: str, name: str) -> int:
         """col_offset of the first statement in `name`'s body."""
         tree = ast.parse(content)
+
         def walk(node):
             for ch in ast.iter_child_nodes(node):
                 if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)) and ch.name == name:
@@ -1558,6 +1566,7 @@ class TestFullBlockBodyIndentDrift:
                 if r is not None:
                     return r
             return None
+
         return walk(tree)
 
     def _run(self, source: str, symbol: str, new_code: str) -> str:
@@ -1596,12 +1605,7 @@ class TestFullBlockBodyIndentDrift:
         # (the if-body being one level deeper than the return) must survive the
         # corrective shift — only the whole-body offset is reduced by one unit.
         source = "class X:\n    def foo(self):\n        return 1\n"
-        new_code = (
-            "    def foo(self):\n"
-            "            if True:\n"
-            "                x = 10\n"
-            "            return x\n"
-        )
+        new_code = "    def foo(self):\n            if True:\n                x = 10\n            return x\n"
         new_content = self._run(source, "X.foo", new_code)
         lines = {ln.strip(): ln for ln in new_content.splitlines() if ln.strip()}
         # Top-level body statements land at 8 (one unit below the def's 4).
@@ -1620,12 +1624,7 @@ class TestFullBlockBodyIndentDrift:
     def test_multiline_signature_not_split(self):
         # The def statement owns its multi-line signature continuation rows;
         # the correction must split at the BODY, not inside the signature.
-        source = (
-            "class X:\n"
-            "    def foo(self,\n"
-            "             a):\n"
-            "        return 1\n"
-        )
+        source = "class X:\n    def foo(self,\n             a):\n        return 1\n"
         new_code = (
             "    def foo(self,\n"
             "             a):\n"
@@ -1676,7 +1675,7 @@ class TestFullBlockDataclassDecoratorPreserved:
         # The model re-declares @dataclass in a FULL block AND adds field z.
         # Before the fix, strip deleted the decorator (count 0). After the fix
         # it must survive exactly once.
-        source = textwrap.dedent('''\
+        source = textwrap.dedent("""\
             from dataclasses import dataclass
 
 
@@ -1684,14 +1683,14 @@ class TestFullBlockDataclassDecoratorPreserved:
             class Foo:
                 x: int
                 y: int
-        ''')
-        new_code = textwrap.dedent('''\
+        """)
+        new_code = textwrap.dedent("""\
             @dataclass
             class Foo:
                 x: int
                 y: int
                 z: int
-        ''')
+        """)
         new_content = self._run(source, "Foo", new_code)
         # The decorator MUST survive exactly once (the bug dropped it to 0).
         assert new_content.count("@dataclass") == 1
@@ -1705,7 +1704,7 @@ class TestFullBlockDataclassDecoratorPreserved:
         # though new_body carries no class line. The strip is a no-op here
         # (a bare body can't parse to a ClassDef), so the decorator survives
         # via the preserved header.
-        source = textwrap.dedent('''\
+        source = textwrap.dedent("""\
             from dataclasses import dataclass
 
 
@@ -1713,12 +1712,12 @@ class TestFullBlockDataclassDecoratorPreserved:
             class Foo:
                 x: int
                 y: int
-        ''')
-        new_body = textwrap.dedent('''\
+        """)
+        new_body = textwrap.dedent("""\
             x: int
             y: int
             z: int
-        ''')
+        """)
         new_content = self._run(source, "Foo", new_body)
         assert new_content.count("@dataclass") == 1
         assert "z: int" in new_content
@@ -1729,19 +1728,19 @@ class TestSurgicalEditMultilineSignatureBodyStart:
     parameter row. A body-only edit must preserve the signature verbatim."""
 
     def test_multiline_signature_params_preserved(self):
-        source = textwrap.dedent('''\
+        source = textwrap.dedent("""\
             def foo(
                 a: int,
                 b: str,
             ) -> None:
                 x = a + len(b)
                 return x
-        ''')
+        """)
         # body-only replacement (no def line) — new body
-        new_body = textwrap.dedent('''\
+        new_body = textwrap.dedent("""\
             y = a * 2
             return y
-        ''')
+        """)
         diff = _apply_surgical_edit(source, "m.py", new_body, 0, 6)
         assert diff is not None
         added = _added_lines(diff)
@@ -1761,15 +1760,15 @@ class TestSurgicalEditMultilineSignatureBodyStart:
         assert "return y" in added_text
 
     def test_singleline_signature_body_start(self):
-        source = textwrap.dedent('''\
+        source = textwrap.dedent("""\
             def foo(a: int) -> None:
                 x = a + 1
                 return x
-        ''')
-        new_body = textwrap.dedent('''\
+        """)
+        new_body = textwrap.dedent("""\
             y = a * 2
             return y
-        ''')
+        """)
         diff = _apply_surgical_edit(source, "m.py", new_body, 0, 3)
         assert diff is not None
         added = _added_lines(diff)
@@ -1781,16 +1780,16 @@ class TestSurgicalEditMultilineSignatureBodyStart:
         assert "y = a * 2" in added_text
 
     def test_decorator_plus_singleline_signature(self):
-        source = textwrap.dedent('''\
+        source = textwrap.dedent("""\
             @deco
             def foo(a: int) -> None:
                 x = a + 1
                 return x
-        ''')
-        new_body = textwrap.dedent('''\
+        """)
+        new_body = textwrap.dedent("""\
             y = a * 2
             return y
-        ''')
+        """)
         diff = _apply_surgical_edit(source, "m.py", new_body, 0, 4)
         assert diff is not None
         added = _added_lines(diff)
@@ -1822,6 +1821,7 @@ class TestFindSymbolAstNodeTreeReuse:
 
 
 # ── diff application helpers ─────────────────────────────────────────────────
+
 
 def _added_lines(diff: str) -> list:
     """Return the content (no leading '+') of every added line in a unified
@@ -1907,11 +1907,13 @@ class TestAtomicWriteText:
         crash/SIGKILL/disk-full at os.replace), the temp is unlinked and the
         original file is NOT truncated (open(path,'w') would have zeroed it)."""
         import external_llm.common.atomic_io as aio
+
         p = tmp_path / "f.txt"
         p.write_text("original")
 
         def boom(src, dst):
             raise OSError("simulated rename failure")
+
         monkeypatch.setattr(aio.os, "replace", boom)
 
         with pytest.raises(OSError, match="simulated rename failure"):
@@ -1975,49 +1977,23 @@ class TestAtomicWriteText:
 
 class TestTrailingForeignStmt:
     def test_detects_next_method_signature_opener(self):
-        code = (
-            "    def _gate(self, ok):\n"
-            "        return ok\n"
-            "\n"
-            "    def _process_tool_call(\n"
-        )
+        code = "    def _gate(self, ok):\n        return ok\n\n    def _process_tool_call(\n"
         assert _trailing_foreign_stmt(code) == "def _process_tool_call("
 
     def test_detects_same_indent_decorator(self):
-        code = (
-            "    def _gate(self, ok):\n"
-            "        return ok\n"
-            "\n"
-            "    @property\n"
-        )
+        code = "    def _gate(self, ok):\n        return ok\n\n    @property\n"
         assert _trailing_foreign_stmt(code) == "@property"
 
     def test_clean_block_returns_none(self):
-        code = (
-            "    def _gate(self, ok):\n"
-            "        return ok\n"
-            "\n"
-        )
+        code = "    def _gate(self, ok):\n        return ok\n\n"
         assert _trailing_foreign_stmt(code) is None
 
     def test_nested_def_is_legitimate(self):
-        code = (
-            "def outer():\n"
-            "    def inner():\n"
-            "        return 1\n"
-            "    return inner\n"
-        )
+        code = "def outer():\n    def inner():\n        return 1\n    return inner\n"
         assert _trailing_foreign_stmt(code) is None
 
     def test_class_block_with_methods_is_legitimate(self):
-        code = (
-            "class X:\n"
-            "    def a(self):\n"
-            "        return 1\n"
-            "\n"
-            "    def b(self):\n"
-            "        return 2\n"
-        )
+        code = "class X:\n    def a(self):\n        return 1\n\n    def b(self):\n        return 2\n"
         assert _trailing_foreign_stmt(code) is None
 
     def test_no_definition_returns_none(self):
@@ -2093,20 +2069,23 @@ class TestPreWriteGateWithoutToolchain:
     file. No test covered the toolchain-absent path before.
     """
 
-    GOOD_JS = 'function a() {\n  return 1;\n}\n'
-    BAD_JS = 'function a() {\n  return 1;\n}\n}\n'
-    GOOD_GO = 'package m\n\nfunc A() int {\n\treturn 1\n}\n'
-    BAD_GO = 'package m\n\nfunc A() int {\n\treturn 1\n}\n}\n'
+    GOOD_JS = "function a() {\n  return 1;\n}\n"
+    BAD_JS = "function a() {\n  return 1;\n}\n}\n"
+    GOOD_GO = "package m\n\nfunc A() int {\n\treturn 1\n}\n"
+    BAD_GO = "package m\n\nfunc A() int {\n\treturn 1\n}\n}\n"
 
     @staticmethod
     def _no_toolchain():
         return patch.object(smt.shutil, "which", return_value=None)
 
-    @pytest.mark.parametrize("path,good,bad", [
-        ("x.js", GOOD_JS, BAD_JS),
-        ("x.ts", GOOD_JS, BAD_JS),
-        ("x.go", GOOD_GO, BAD_GO),
-    ])
+    @pytest.mark.parametrize(
+        "path,good,bad",
+        [
+            ("x.js", GOOD_JS, BAD_JS),
+            ("x.ts", GOOD_JS, BAD_JS),
+            ("x.go", GOOD_GO, BAD_GO),
+        ],
+    )
     def test_orphan_brace_rejected_without_compiler(self, path, good, bad):
         with self._no_toolchain():
             assert smt._post_edit_syntax_ok(good, path, good) is True
@@ -2114,15 +2093,7 @@ class TestPreWriteGateWithoutToolchain:
 
     def test_regex_containing_backtick_does_not_void_the_tally(self):
         """`.replace(/```/g, "")` must not flip literal parity."""
-        src = (
-            'function f(s) {\n'
-            '  const q = s.replace(/```/g, "");\n'
-            '  return q;\n'
-            '}\n'
-            'function g() {\n'
-            '  return 2;\n'
-            '}\n'
-        )
+        src = 'function f(s) {\n  const q = s.replace(/```/g, "");\n  return q;\n}\nfunction g() {\n  return 2;\n}\n'
         # js_lexing understands the regex; the plain scanner does not.
         assert net_brace_count(src, js_lexing=True) == 0
         with self._no_toolchain():
@@ -2131,14 +2102,14 @@ class TestPreWriteGateWithoutToolchain:
 
     def test_regex_with_lone_brace_is_not_a_false_reject(self):
         """A regex like /[{]/ is balanced code, not a brace-count change."""
-        base = 'function f() {\n  return 1;\n}\n'
-        edited = 'function f() {\n  const re = /[{]/;\n  return re;\n}\n'
+        base = "function f() {\n  return 1;\n}\n"
+        edited = "function f() {\n  const re = /[{]/;\n  return re;\n}\n"
         with self._no_toolchain():
             assert smt._post_edit_syntax_ok(edited, "x.js", base) is True
 
     def test_division_is_not_treated_as_a_regex(self):
         """C-family `/` is division — js_lexing must stay opt-in."""
-        c_src = 'int f(void) { int a = b / c; int d = e / f; return a; }\n'
+        c_src = "int f(void) { int a = b / c; int d = e / f; return a; }\n"
         assert net_brace_count(c_src) == 0
         with self._no_toolchain():
             assert smt._post_edit_syntax_ok(c_src, "x.c", c_src) is True
@@ -2150,6 +2121,7 @@ if __name__ == "__main__":
 
 
 # ── _python_symbol_miss_reason — narrowed diagnosis fallback ─────────────────
+
 
 class TestPythonSymbolMissReason:
     """``_python_symbol_miss_reason`` swallows only compiler-real exceptions.
@@ -2282,7 +2254,10 @@ def test_ast_precise_body_only_invalid_range_skipped(monkeypatch):
 def test_ast_precise_empty_header_one_line_def_skipped():
     """A one-line ``def foo(): pass`` has no header rows (deco_start ==
     body_start) → documented skipped_empty_header."""
-    assert _apply_ast_precise("def foo(): pass\nx = 1\n", "f.py", "foo", "    return 1\n") == (None, "skipped_empty_header")
+    assert _apply_ast_precise("def foo(): pass\nx = 1\n", "f.py", "foo", "    return 1\n") == (
+        None,
+        "skipped_empty_header",
+    )
 
 
 def test_ast_precise_redundant_import_body_stripped_to_empty():
@@ -2407,17 +2382,14 @@ def test_symbol_line_range_indent_based_extent_without_braces(monkeypatch):
 def test_apply_diff_to_source_multiple_hunks():
     """A second @@ hunk applies the pending first hunk and continues."""
     source = "line1\nline2\nline3\nline4\n"
-    diff = (
-        "--- a\n+++ b\n"
-        "@@ -1,2 +1,2 @@\n line1\n-line2\n+X2\n"
-        "@@ -3,2 +3,2 @@\n line3\n-line4\n+X4\n"
-    )
+    diff = "--- a\n+++ b\n@@ -1,2 +1,2 @@\n line1\n-line2\n+X2\n@@ -3,2 +3,2 @@\n line3\n-line4\n+X4\n"
     assert _apply_diff_to_source(source, diff) == "line1\nX2\nline3\nX4\n"
 
 
 def test_post_edit_syntax_ok_node_infra_failure_falls_through(monkeypatch):
     """node --check raising (timeout/OSError) must NOT be more permissive
     than node being absent — it falls through to the toolchain-free tiers."""
+
     def _which(name):
         return "/usr/bin/node" if name == "node" else None
 
@@ -2433,7 +2405,8 @@ def test_post_edit_syntax_ok_node_rejects_both_modes(monkeypatch):
     """node available but both CJS/ESM checks fail → False."""
     monkeypatch.setattr(smt.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
     monkeypatch.setattr(
-        smt.subprocess, "run",
+        smt.subprocess,
+        "run",
         lambda *a, **k: SimpleNamespace(returncode=1, stderr=b""),
     )
     assert _post_edit_syntax_ok("const x = ;\n", "x.js", "const y = 2;\n") is False
@@ -2489,12 +2462,7 @@ def test_ts_syntax_valid_semantic_errors_are_not_syntax_errors():
     """A type/unresolved-reference error is invisible to tree-sitter — the
     syntax gate must not reject it. Compiler-grade validation is the agent
     validation stack's job (tool_registry / tool_safety / write mixins)."""
-    bad_types = (
-        "fun f(): Int {\n"
-        "    val x: String = undefined_thing()\n"
-        "    return x\n"
-        "}\n"
-    )
+    bad_types = "fun f(): Int {\n    val x: String = undefined_thing()\n    return x\n}\n"
     assert _ts_syntax_valid(bad_types, LanguageId.KOTLIN) is True
 
 

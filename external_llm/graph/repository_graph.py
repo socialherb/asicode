@@ -18,7 +18,6 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.languages.base import build_line_index, line_at_offset
@@ -108,7 +107,7 @@ _extract_cache = RootCache(_EXTRACT_CACHE_MAX_ENTRIES)
 # the same process must not re-load the multi-MB JSON just because its own
 # counter started at 0.  Keyed by cache path so different repos (e.g. test
 # tmpdirs) never share a memo.
-_disk_manifest_lens: dict[str, int] = {}
+_disk_manifest_lens: dict[Path, int] = {}
 # Process-wide imported-name memo (A5, 2026-08-12): keyed like
 # _extract_cache — (repo_root, abs path) tuples with the same
 # (mtime_ns, size) staleness contract, bounded by _EXTRACT_CACHE_MAX_ENTRIES.
@@ -199,7 +198,7 @@ def _dedupe_importers(entries: list[tuple[str, int]]) -> list[str]:
     return importers
 
 
-def path_to_module(file_path: str, repo_root: Optional[str] = None) -> str:
+def path_to_module(file_path: str, repo_root: str | None = None) -> str:
     """Convert a file path to a dotted Python module name — SINGLE SOURCE.
 
     The one place that turns a repo path into the module name used in import
@@ -265,7 +264,7 @@ class CallEdge:
     # carry the CGI-convention attribution (qualified self. callee_symbol,
     # dotted callee_display, call-form confidence).  Additive defaults keep
     # pre-P3 snapshots loadable: CallEdge(**d) without these keys still works.
-    callee_symbol: Optional[str] = None  # canonical callee (CGI convention)
+    callee_symbol: str | None = None  # canonical callee (CGI convention)
     callee_display: str = ""  # dotted call-site form, e.g. "self.foo"
     confidence: float = 1.0  # call-form heuristic (0.9 / 0.85 / 0.5; 0.2 = unsupported form)
     # P2 (2026-08-12): explicit marker for unsupported call forms (chained
@@ -279,12 +278,12 @@ class CallEdge:
     # otherwise — so RG's snapshot can serve CallGraphIndexer's forward edges
     # without re-deriving scope rules.  Additive default keeps pre-P3 snapshots
     # loadable.
-    caller_symbol: Optional[str] = None  # canonical caller (CGI convention)
+    caller_symbol: str | None = None  # canonical caller (CGI convention)
     # P3 Stage 2: definition line of the caller function — disambiguates
     # same-qualname redefinitions (e.g. two ``ui_root`` functions in if/else
     # branches both resolve to qualname ``mount_ui.ui_root``; CGI dedups per
     # function NODE, so the SSOT conversion needs the def line to split them).
-    caller_def_line: Optional[int] = None
+    caller_def_line: int | None = None
 
 
 class _SymbolRangeIndex:
@@ -336,7 +335,7 @@ class _SymbolRangeIndex:
 class RepositoryGraph:
     """Repository-wide symbol graph."""
 
-    def __init__(self, repo_root: str, cache_path: Optional[str | Path] = None):
+    def __init__(self, repo_root: str, cache_path: str | Path | None = None):
         self.repo_root = os.path.abspath(repo_root)
         self.symbols: dict[str, SymbolNode] = {}
         self.call_edges: list[CallEdge] = []
@@ -368,7 +367,7 @@ class RepositoryGraph:
         # *cache_path* overrides the default ``{repo_root}/.cache/...`` location
         # (the structural-scanner gate passes its patched test seam here).
         self._cache_path: Path = default_cache_path(self.repo_root) if cache_path is None else Path(cache_path)
-        self._disk_cache: Optional[dict] = None
+        self._disk_cache: dict | None = None
         self._disk_cache_mtime_ns: int = 0
         # Pipeline-integration state — meaningful only under
         # build(collect_imported_names=True) (the gate's mode); see build().
@@ -565,9 +564,7 @@ class RepositoryGraph:
                 self._save_cache_snapshot()
         self.cache_stats["total"] = len(self._py_stamps) + len(self._nonpy_stamps)
         self.cache_stats["changed"] = (
-            len(self._fresh_parsed)
-            + len(self._fresh_parsed_uncapped)
-            + len(self._fresh_parsed_nonpy)
+            len(self._fresh_parsed) + len(self._fresh_parsed_uncapped) + len(self._fresh_parsed_nonpy)
         )
         self.cache_stats["parsed_uncapped"] = len(self._fresh_parsed_uncapped)
         if self._fresh_parsed_uncapped:
@@ -659,7 +656,7 @@ class RepositoryGraph:
         if self._disk_cache is None:
             self._load_disk_cache_snapshot()
 
-    def _disk_file_data(self, rel: str, st: os.stat_result) -> Optional[dict]:
+    def _disk_file_data(self, rel: str, st: os.stat_result) -> dict | None:
         """One file's extraction from the gate's disk cache, or None.
 
         Serves only files whose manifest stamp (mtime_ns + size) matches the
@@ -684,9 +681,7 @@ class RepositoryGraph:
             _logger.debug("disk cache payload for %s unusable (%s); re-parsing", rel, exc)
             return None
 
-    def _process_file_cached(
-        self, file_path: str, track: bool = False, use_disk_tier: bool = True
-    ) -> None:
+    def _process_file_cached(self, file_path: str, track: bool = False, use_disk_tier: bool = True) -> None:
         """Process one Python file, serving unchanged files from the process cache.
 
         Unchanged (same ``mtime_ns`` + ``size``) files are injected from
@@ -738,11 +733,7 @@ class RepositoryGraph:
                 return
             _extract_cache.pop(key, None)
         # First-build disk tier (structural gate JSON, read-only).
-        data = (
-            self._disk_file_data(rel, st)
-            if (use_disk_tier or self._disk_cache is not None)
-            else None
-        )
+        data = self._disk_file_data(rel, st) if (use_disk_tier or self._disk_cache is not None) else None
         served_from_cache = data is not None
         if data is None:
             data = self.extract_file(file_path)
@@ -914,7 +905,7 @@ class RepositoryGraph:
         except Exception as exc:
             _logger.debug("structural cache save failed (%s): %s", self._cache_path, exc)
 
-    def extract_file(self, file_path: str) -> Optional[dict]:
+    def extract_file(self, file_path: str) -> dict | None:
         """Parse ONE Python file → ``{"symbols": [...], "calls": [...], "imports": [...]}``.
 
         Pure extraction with no graph mutation: the caller decides where the
@@ -1006,7 +997,7 @@ class RepositoryGraph:
         for imp in data["imports"]:
             self.import_edges.append(imp)
 
-    def _extract_non_python(self, file_path: str, content: str) -> Optional[dict]:
+    def _extract_non_python(self, file_path: str, content: str) -> dict | None:
         """Pure extraction of one non-Python file → ``{"symbols", "calls", "imports"}``.
 
         The lang-agnostic analogue of :meth:`extract_file`: parse-only, no graph
@@ -1287,9 +1278,9 @@ class RepositoryGraph:
     def get_symbol(
         self,
         name: str,
-        file_path: Optional[str] = None,
-        prefer_files: Optional[list[str]] = None,
-    ) -> Optional[SymbolNode]:
+        file_path: str | None = None,
+        prefer_files: list[str] | None = None,
+    ) -> SymbolNode | None:
         """Retrieve a symbol by name or qualname, optionally scoped to a file.
 
         A dotted ``name`` (e.g. ``MyClass.helper``) is matched against
@@ -1467,6 +1458,8 @@ class RepositoryGraph:
         Dedup by (caller, callee, file_path, line).
         """
         self._ensure_call_index()
+        assert self._call_index is not None
+        assert self._segment_index is not None
         exact = self._call_index[field].get(symbol_name)
         if exact:
             # Copy — callers must be able to mutate the returned list without
@@ -1537,6 +1530,7 @@ class RepositoryGraph:
         if not file_path:
             return []
         self._ensure_import_index()
+        assert self._import_index is not None
         if LanguageId.from_path(file_path) is not LanguageId.PYTHON:
             # Non-Python (TS/JS/...) import edges store module paths, not
             # dotted names: imported="../string_utils" from
@@ -1631,9 +1625,7 @@ class RepositoryGraph:
             for sid in self.file_symbols.pop(rel_path, []):
                 self.symbols.pop(sid, None)
         # Remove _symbol_locations entries whose file is in the set
-        self._symbol_locations = {
-            k: v for k, v in self._symbol_locations.items() if k[1] not in rel_paths
-        }
+        self._symbol_locations = {k: v for k, v in self._symbol_locations.items() if k[1] not in rel_paths}
         # Remove call edges from these files (one pass, set membership)
         self.call_edges = [e for e in self.call_edges if e.file_path not in rel_paths]
         # Remove import edges from these files (one pass, set membership)
@@ -1795,7 +1787,7 @@ class GraphVisitor(ast.NodeVisitor):
         self.symbols: list[SymbolNode] = []
         self.calls: list[CallEdge] = []
         self.imports: list[ImportEdge] = []
-        self.current_class: Optional[str] = None
+        self.current_class: str | None = None
         self._in_function: int = 0  # nesting depth — guards module-level constant detection
         self._parent_stack: list[ast.AST] = []
         # P3 Stage 2: real AST nesting depth of the node currently being
@@ -1872,7 +1864,7 @@ class GraphVisitor(ast.NodeVisitor):
         """
         return path_to_module(file_path, self.repo_root)
 
-    def _compute_signature_hash(self, node: ast.FunctionDef) -> Optional[str]:
+    def _compute_signature_hash(self, node: ast.FunctionDef) -> str | None:
         """Compute a hash of the function signature.
 
         Pure arg-name arithmetic over a parser-produced AST — cannot raise.
@@ -1905,7 +1897,7 @@ class GraphVisitor(ast.NodeVisitor):
         # Compute SHA1 hash (hex digest)
         return hashlib.sha1(signature.encode(), usedforsecurity=False).hexdigest()[:8]  # first 8 chars
 
-    def _extract_signature(self, node: ast.FunctionDef) -> Optional[str]:
+    def _extract_signature(self, node: ast.FunctionDef) -> str | None:
         """Extract full function signature text with type annotations.
 
         Operates only on parser-produced AST — ``ast.unparse`` cannot fail on
@@ -1959,8 +1951,9 @@ class GraphVisitor(ast.NodeVisitor):
             p = arg.arg
             if arg.annotation:
                 p += f": {ast.unparse(arg.annotation)}"
-            if i < len(args.kw_defaults) and args.kw_defaults[i] is not None:
-                p += f" = {ast.unparse(args.kw_defaults[i])}"
+            kd = args.kw_defaults[i] if i < len(args.kw_defaults) else None
+            if kd is not None:
+                p += f" = {ast.unparse(kd)}"
             params.append(p)
 
         # **kwargs
@@ -2015,7 +2008,7 @@ class GraphVisitor(ast.NodeVisitor):
             file_path=self.file_path,
             kind="function" if not self.current_class else "method",
             start_line=node.lineno,
-            end_line=node.end_lineno if hasattr(node, "end_lineno") else node.lineno,
+            end_line=node.end_lineno if node.end_lineno is not None else node.lineno,
             signature_hash=signature_hash,
             docstring=ast.get_docstring(node),
             signature=self._extract_signature(node),
@@ -2087,7 +2080,7 @@ class GraphVisitor(ast.NodeVisitor):
             file_path=self.file_path,
             kind="class",
             start_line=node.lineno,
-            end_line=node.end_lineno if hasattr(node, "end_lineno") else node.lineno,
+            end_line=node.end_lineno if node.end_lineno is not None else node.lineno,
             signature_hash=None,
             docstring=ast.get_docstring(node),
             bases=bases if bases else None,
@@ -2106,7 +2099,7 @@ class GraphVisitor(ast.NodeVisitor):
         self._scope_def_line.pop()
         self.current_class = previous_class
 
-    def _resolve_call_name(self, node: ast.AST) -> Optional[str]:
+    def _resolve_call_name(self, node: ast.AST) -> str | None:
         """Resolve a call expression to a normalised string name.
 
         Normalisation rule: strip ``self.`` and ``cls.`` prefixes so that
@@ -2134,7 +2127,7 @@ class GraphVisitor(ast.NodeVisitor):
             return self._resolve_call_name(node.func)
         return None
 
-    def _canonical_call_attrs(self, func: ast.expr, legacy_callee: str) -> tuple[str, str, float]:
+    def _canonical_call_attrs(self, func: ast.expr, legacy_callee: str) -> tuple[str, str, float, str]:
         """CGI-convention call attribution (P3 Stage 1).
 
         Mirrors ``CallGraphIndexer._parse_call`` so RG's per-file payload is
@@ -2199,11 +2192,7 @@ class GraphVisitor(ast.NodeVisitor):
         # Decorator call: attribute to the decorated function (CGI parity;
         # P3 Stage 2).  The line-based lookup would mis-attribute it to an
         # enclosing function whose range covers the decorator line.
-        caller = (
-            self._decorator_stack[-1]
-            if self._decorator_stack
-            else self._get_current_symbol(line=node.lineno)
-        )
+        caller = self._decorator_stack[-1] if self._decorator_stack else self._get_current_symbol(line=node.lineno)
         if caller:
             # Object identity: capture literal positional arg values.
             # get_user(1) → ["1"], fetch("admin") → ['"admin"'].
@@ -2314,7 +2303,7 @@ class GraphVisitor(ast.NodeVisitor):
             self.symbols.append(symbol)
         self.generic_visit(node)
 
-    def _get_current_symbol(self, line: Optional[int] = None) -> Optional[str]:
+    def _get_current_symbol(self, line: int | None = None) -> str | None:
         """Get the qualname of the function/method that contains *line*.
 
         When *line* is provided, uses line-range matching against all function
@@ -2332,7 +2321,7 @@ class GraphVisitor(ast.NodeVisitor):
         if line is not None:
             # Line-range matching: find the innermost function/method
             # whose scope contains the given line number.
-            best: Optional[tuple[str, int]] = None  # (qualname, span)
+            best: tuple[str, int] | None = None  # (qualname, span)
             for symbol in self.symbols:
                 if symbol.kind not in ("function", "method"):
                     continue

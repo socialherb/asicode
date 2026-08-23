@@ -13,6 +13,7 @@ Two layers are covered:
    ``raw_content`` must serialize those blocks verbatim (thinking block included)
    instead of synthesizing text+tool_use blocks and dropping thinking.
 """
+
 from __future__ import annotations
 
 from external_llm.anthropic_client import AnthropicClient
@@ -56,14 +57,12 @@ def test_design_chat_loop_preserves_anthropic_content_blocks_as_raw_content():
     tool_use_block = {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "x"}}
 
     raw = {"content": [thinking_block, tool_use_block]}
-    _assistant_raw_blocks = (
-        raw.get("content") if isinstance(raw.get("content"), list) else None
-    )
+    _assistant_raw_blocks = raw.get("content") if isinstance(raw.get("content"), list) else None
 
     msg = LLMMessage(
-        role="assistant", content="",
-        tool_calls=[{"id": "tu_1", "type": "function",
-                     "function": {"name": "read_file", "arguments": "{}"}}],
+        role="assistant",
+        content="",
+        tool_calls=[{"id": "tu_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
         raw_content=_assistant_raw_blocks,
     )
     # thinking block preserved with signature (required for echo).
@@ -76,9 +75,7 @@ def test_design_chat_loop_preserves_anthropic_content_blocks_as_raw_content():
 def test_design_chat_loop_omits_raw_content_for_openai_response():
     """OpenAI responses have no top-level `content` list → raw_content stays None."""
     raw = {"choices": [{"message": {"content": "ok"}}]}  # no top-level "content"
-    _assistant_raw_blocks = (
-        raw.get("content") if isinstance(raw.get("content"), list) else None
-    )
+    _assistant_raw_blocks = raw.get("content") if isinstance(raw.get("content"), list) else None
     assert _assistant_raw_blocks is None  # OpenAI path unaffected
 
 
@@ -91,9 +88,9 @@ def test_anthropic_chat_serializes_raw_content_with_thinking_block():
     messages = [
         LLMMessage(role="user", content="do it"),
         LLMMessage(
-            role="assistant", content="",
-            tool_calls=[{"id": "tu_9", "type": "function",
-                         "function": {"name": "apply_patch", "arguments": "{}"}}],
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "tu_9", "type": "function", "function": {"name": "apply_patch", "arguments": "{}"}}],
             raw_content=[thinking_block, tool_use_block],
         ),
         LLMMessage(role="user", content="ok"),
@@ -118,9 +115,9 @@ def test_anthropic_chat_falls_back_to_synthesis_when_no_raw_content():
     messages = [
         LLMMessage(role="user", content="do it"),
         LLMMessage(
-            role="assistant", content="patching",
-            tool_calls=[{"id": "tu_1", "type": "function",
-                         "function": {"name": "apply_patch", "arguments": "{}"}}],
+            role="assistant",
+            content="patching",
+            tool_calls=[{"id": "tu_1", "type": "function", "function": {"name": "apply_patch", "arguments": "{}"}}],
             # no raw_content
         ),
         LLMMessage(role="user", content="ok"),
@@ -141,4 +138,5 @@ if __name__ == "__main__":
     import sys
 
     import pytest
+
     sys.exit(pytest.main([__file__, "-v"]))

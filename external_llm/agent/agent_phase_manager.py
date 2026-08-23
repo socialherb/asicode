@@ -13,6 +13,7 @@ Moved here:
       _run_self_review()
       _auto_test_and_inject()
 """
+
 from __future__ import annotations
 
 import os
@@ -40,6 +41,22 @@ class PhaseManagerMixin:
       - self._llm_call_with_tools(messages)
       - self._append_native_tool_messages(...)
     """
+
+    # Host-class attributes (provided by AgentLoop, not set here). Pure typing
+    # scaffolding — AgentLoop.__init__ owns the runtime values.
+    config: Any
+    registry: Any
+    llm_client: Any
+    model: str
+    _cb: Any
+    _agent_phase: str
+    _phase_target_file: str | None
+    _phase_target_symbol: str | None
+    _tool_success_memory: dict[str, tuple[str, int]]
+    _tool_fail_memory: dict[str, tuple[str, int]]
+    _llm_call_with_tools: Any
+    _build_tool_result_message: Any
+    _append_native_tool_messages: Any
 
     # ------------------------------------------------------------------
     # Tool hint builder
@@ -128,8 +145,8 @@ class PhaseManagerMixin:
             self._phase_target_symbol = str((tool_args or {}).get("name") or "").strip()
         elif tool_name in {"apply_patch", "write_plan", "bash"}:
             # Filesystem operations: stay in EDIT to allow batch operations
-            route = getattr(self.config, 'route_decision', None)
-            is_fs_op = route and hasattr(route, 'reasoning') and 'Filesystem operation' in (route.reasoning or '')
+            route = getattr(self.config, "route_decision", None)
+            is_fs_op = route and hasattr(route, "reasoning") and "Filesystem operation" in (route.reasoning or "")
             if is_fs_op and tool_name == "bash":
                 self._agent_phase = "EDIT"  # stay in EDIT for next file
             elif tool_name == "bash":
@@ -169,7 +186,6 @@ class PhaseManagerMixin:
     # The phase machine is advisory only: it shapes the [AGENT STATE] hint and
     # nothing else.
 
-
     # ------------------------------------------------------------------
     # Self-review phase
     # ------------------------------------------------------------------
@@ -205,6 +221,7 @@ class PhaseManagerMixin:
         - When new_fail_count >= max_tdd_cycles: instructs LLM to summarise.
         """
         from ..client import LLMMessage
+
         self._cb("tdd_cycle_start", {"turn": turn_num, "attempt": tdd_fail_count + 1})
 
         # Build pytest args: user-specified paths + TDD-optimised flags
@@ -217,39 +234,44 @@ class PhaseManagerMixin:
         # repos that still have them).
         _repo_root = getattr(self.registry, "repo_root", None)
         _legacy_ignores = [
-            _p for _p in ("tests/test_intelligent_llm.py", "tests/test_indices_selection.py")
+            _p
+            for _p in ("tests/test_intelligent_llm.py", "tests/test_indices_selection.py")
             if _repo_root and os.path.exists(os.path.join(_repo_root, _p))
         ]
         tdd_args = [
-            *tdd_paths, "-x", "--tb=short", "-q",
+            *tdd_paths,
+            "-x",
+            "--tb=short",
+            "-q",
             *[f"--ignore={_p}" for _p in _legacy_ignores],
         ]
-        test_result = self.registry.dispatch(
-            "run_tests", {"args": tdd_args}
-        )
+        test_result = self.registry.dispatch("run_tests", {"args": tdd_args})
 
         if test_result.ok:
-            self._cb("tdd_cycle_pass", {
-                "turn": turn_num,
-                "content": test_result.content[:400],
-            })
+            self._cb(
+                "tdd_cycle_pass",
+                {
+                    "turn": turn_num,
+                    "content": test_result.content[:400],
+                },
+            )
             msg = LLMMessage(
                 role="user",
-                content=(
-                    "[TDD] \u2705 All tests passed after your change.\n\n"
-                    + test_result.content
-                ),
+                content=("[TDD] \u2705 All tests passed after your change.\n\n" + test_result.content),
             )
             return [*messages, msg], 0
 
         # Tests failed
         new_fail_count = tdd_fail_count + 1
-        self._cb("tdd_cycle_fail", {
-            "turn": turn_num,
-            "attempt": new_fail_count,
-            "max": self.config.max_tdd_cycles,
-            "content": test_result.content[:400],
-        })
+        self._cb(
+            "tdd_cycle_fail",
+            {
+                "turn": turn_num,
+                "attempt": new_fail_count,
+                "max": self.config.max_tdd_cycles,
+                "content": test_result.content[:400],
+            },
+        )
 
         if new_fail_count >= self.config.max_tdd_cycles:
             header = (

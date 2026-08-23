@@ -10,6 +10,7 @@ materialised in memory on every read_symbol call.
 The windowed read is exact: line numbers come from the AST symbol index, so
 only ``[start, start+count)`` is needed — O(window) memory for any file size.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,9 +19,7 @@ from external_llm.agent.symbol_search import SymbolDef
 
 
 def _boom(*args, **kwargs):
-    raise AssertionError(
-        "read_text must not be called — read_symbol must stream its window"
-    )
+    raise AssertionError("read_text must not be called — read_symbol must stream its window")
 
 
 class _StubSearcher:
@@ -40,8 +39,11 @@ def test_read_symbol_streams_window_not_whole_file(tool_registry, temp_repo_root
         fh.write("\ndef target_fn():\n    return 42\n")
     defs = [
         SymbolDef(
-            file="big_module.py", line=60_002, end_line=60_004,
-            kind="function", name="target_fn",
+            file="big_module.py",
+            line=60_002,
+            end_line=60_004,
+            kind="function",
+            name="target_fn",
         )
     ]
     monkeypatch.setattr(tool_registry, "_symbol_searcher", _StubSearcher(defs))
@@ -65,8 +67,7 @@ def test_read_symbol_fallback_window_without_end_line(tool_registry, temp_repo_r
             fh.write(f"line_{i:03d}\n")
         fh.write("def mid_fn():\n    pass\n")
     defs = [
-        SymbolDef(file="mid_module.py", line=202, end_line=None,
-                  kind="function", name="mid_fn"),
+        SymbolDef(file="mid_module.py", line=202, end_line=None, kind="function", name="mid_fn"),
     ]
     monkeypatch.setattr(tool_registry, "_symbol_searcher", _StubSearcher(defs))
     monkeypatch.setattr(Path, "read_text", _boom)

@@ -1,6 +1,7 @@
 """
 Unit tests for ToolRegistry cache consistency improvements.
 """
+
 import os
 import shutil
 import tempfile
@@ -83,9 +84,7 @@ def test_invalidate_after_write_normalizes_absolute_snapshot_paths():
         # the snapshot that drives invalidation is keyed by absolute path.
         with open(os.path.join(repo_root, "a.py"), "w") as f:
             f.write("def foo(): pass\ndef gamma(): pass\n")
-        registry._invalidate_cache_after_write(
-            [os.path.join(repo_root, "a.py")]
-        )
+        registry._invalidate_cache_after_write([os.path.join(repo_root, "a.py")])
         # Without entry normalization gamma would be invisible (stale index).
         assert "gamma" in cgi._nodes
 
@@ -98,9 +97,7 @@ def test_invalidate_after_write_normalizes_absolute_snapshot_paths():
         # RAGSearcher receives the RELATIVE form, never the absolute one.
         mock_rag = Mock()
         registry._rag_searcher = mock_rag
-        registry._invalidate_cache_after_write(
-            [os.path.join(repo_root, "a.py")]
-        )
+        registry._invalidate_cache_after_write([os.path.join(repo_root, "a.py")])
         mock_rag.invalidate_files.assert_called_once_with(["a.py"])
     finally:
         shutil.rmtree(repo_root, ignore_errors=True)
@@ -120,9 +117,11 @@ def test_detect_repo_language_cached_per_repo_root(tmp_path, monkeypatch):
 
     ToolRegistry._LANGUAGE_DETECTION_CACHE.pop(_os.path.normpath(str(tmp_path)), None)
     first = ToolRegistry._detect_repo_language(str(tmp_path))
+
     # Second call must be served from the cache — os.walk would blow up.
     def _no_walk(*a, **k):
         raise AssertionError("os.walk called on a cache hit")
+
     monkeypatch.setattr(_os, "walk", _no_walk)
     assert ToolRegistry._detect_repo_language(str(tmp_path)) == first
     # A Python repo caches None (all tools visible) — None must ALSO hit.
@@ -174,7 +173,8 @@ def test_cache_hit_metadata_not_aliased_to_cache_entry():
 
     # Seed the cache with a read-only entry carrying its own metadata.
     registry._tool_result_cache.set(
-        "read_file", {"path": "x.py"},
+        "read_file",
+        {"path": "x.py"},
         {"ok": True, "content": "DATA", "error": None, "metadata": {"original": True}},
     )
 
@@ -197,8 +197,7 @@ def test_cache_hit_metadata_not_aliased_to_cache_entry():
     assert r2.metadata.get("original") is True
     # The caller-side mutation must NOT have polluted the cache entry.
     assert "caller_added" not in r2.metadata, (
-        "cache entry metadata was aliased into the hit result and polluted "
-        "by a caller-side mutation"
+        "cache entry metadata was aliased into the hit result and polluted by a caller-side mutation"
     )
 
 
@@ -253,13 +252,15 @@ def test_network_reads_empty_scope_survive_file_writes(tmp_path):
     cache = ToolResultCache()
     cache.set("search_web", {"query": "asdf"}, {"ok": True}, paths=frozenset())
     cache.set(
-        "read_file", {"path": "a.py"}, {"ok": True},
+        "read_file",
+        {"path": "a.py"},
+        {"ok": True},
         paths=frozenset({"/r/a.py"}),
     )
     removed = cache.invalidate_paths(frozenset({"/r/a.py"}))
     assert removed == 1
     assert cache.get("search_web", {"query": "asdf"}) is not None  # survived
-    assert cache.get("read_file", {"path": "a.py"}) is None        # dropped
+    assert cache.get("read_file", {"path": "a.py"}) is None  # dropped
 
 
 def test_unknown_scope_reads_still_dropped_by_any_write(tmp_path):

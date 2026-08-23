@@ -4,6 +4,7 @@ Mixin은 AgentLoop에 상속된다. 여기서는 최소 표면(self.config, self
 self._cb, self._tool_*_memory, self._agent_phase)을 갖춘 호스트 스텁으로
 직접 호출해 각 브랜치를 고정한다.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -14,9 +15,18 @@ from external_llm.agent.agent_phase_manager import PhaseManagerMixin
 class _Host(PhaseManagerMixin):
     """PhaseManagerMixin이 요구하는 최소 표면을 갖춘 호스트 스텁."""
 
-    def __init__(self, *, success=None, fail=None, phase="DISCOVER",
-                 route_decision=None, test_paths=(), max_tdd_cycles=2,
-                 repo_root=None, dispatch_result=None):
+    def __init__(
+        self,
+        *,
+        success=None,
+        fail=None,
+        phase="DISCOVER",
+        route_decision=None,
+        test_paths=(),
+        max_tdd_cycles=2,
+        repo_root=None,
+        dispatch_result=None,
+    ):
         self._tool_success_memory = success or {}
         self._tool_fail_memory = fail or {}
         self._agent_phase = phase
@@ -142,6 +152,7 @@ class TestAutoTestAndInject:
     @staticmethod
     def _msgs():
         from external_llm.client import LLMMessage
+
         return [LLMMessage(role="user", content="orig")]
 
     def test_pass_resets_fail_count_and_injects_pass_message(self):

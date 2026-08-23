@@ -13,6 +13,7 @@ synchronous insights-compaction path.
 These are source-contract tests (inspect.getsource) — they verify the wiring
 exists without importing asi (which has heavy import-time side effects).
 """
+
 import logging
 
 import pytest
@@ -28,6 +29,7 @@ def _get_compact_insights_source() -> str:
     side effects) and locate it by its ``def`` line, balance-indenting the body.
     """
     import re
+
     src_path = "external_llm/repl/repl_impl.py"
     with open(src_path, encoding="utf-8") as f:
         lines = f.readlines()
@@ -38,7 +40,9 @@ def _get_compact_insights_source() -> str:
             start = i
             break
     if start is None:
-        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
+        pytest.fail(
+            "_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression"
+        )
     # Collect until the next top-level/statement at the same or lower indent
     # that isn't part of the body. The function is indented 4 spaces; its body
     # is indented 8+. We stop at the first line at indent <= 4 that follows a
@@ -70,8 +74,7 @@ class TestInsightsCompactSuppress:
         """
         src = _get_compact_insights_source()
         assert 'logging.getLogger("external_llm")' in src, (
-            "filter must attach to the 'external_llm' parent logger to intercept "
-            "providers.py's logger.error"
+            "filter must attach to the 'external_llm' parent logger to intercept providers.py's logger.error"
         )
         assert "addFilter" in src, "filter must be added before the LLM call"
         assert "removeFilter" in src, "filter must be removed in finally"
@@ -102,9 +105,7 @@ class TestInsightsCompactSuppress:
         provider error). The notice is keyed by failure class so auth/quota/rate
         each get one notice, then stay silent."""
         src = _get_compact_insights_source()
-        assert "_compress_failure_notice(" in src, (
-            "except block must call _compress_failure_notice to route the notice"
-        )
+        assert "_compress_failure_notice(" in src, "except block must call _compress_failure_notice to route the notice"
         # The original exception must be passed through (not re-wrapped), because
         # _compress_failure_notice branches on isinstance(exc, LLMAuthenticationError).
         assert "_cie" in src, "the caught exception must be passed to the notice helper"
@@ -115,7 +116,7 @@ class TestInsightsCompactSuppress:
         the actionable cause (bad helper key)."""
         src = _get_compact_insights_source()
         assert "_ci_notice" in src, "notice variable must be threaded to the output path"
-        assert 'if _ci_notice:' in src or 'if _ci_notice :' in src, (
+        assert "if _ci_notice:" in src or "if _ci_notice :" in src, (
             "notice must be checked before the generic fallback message"
         )
 
@@ -124,9 +125,7 @@ class TestInsightsCompactSuppress:
         specific notice was already shown (avoids double-messaging)."""
         src = _get_compact_insights_source()
         # The generic message must be guarded by `if not _ci_notice`
-        assert "if not _ci_notice" in src, (
-            "generic fallback message must be skipped when a specific notice was shown"
-        )
+        assert "if not _ci_notice" in src, "generic fallback message must be skipped when a specific notice was shown"
 
 
 class TestSuppressFilterBehavior:
@@ -137,23 +136,38 @@ class TestSuppressFilterBehavior:
         record type providers.py emits on 401."""
         f = cm._SuppressInfoFilter()
         record = logging.LogRecord(
-            name="external_llm", level=logging.ERROR, pathname="x", lineno=1,
-            msg="DeepSeek authentication failed (401)", args=(), exc_info=None,
+            name="external_llm",
+            level=logging.ERROR,
+            pathname="x",
+            lineno=1,
+            msg="DeepSeek authentication failed (401)",
+            args=(),
+            exc_info=None,
         )
         assert f.filter(record) is False, "ERROR records must be suppressed"
 
     def test_filter_suppresses_warning_level(self):
         f = cm._SuppressInfoFilter()
         record = logging.LogRecord(
-            name="external_llm", level=logging.WARNING, pathname="x", lineno=1,
-            msg="warn", args=(), exc_info=None,
+            name="external_llm",
+            level=logging.WARNING,
+            pathname="x",
+            lineno=1,
+            msg="warn",
+            args=(),
+            exc_info=None,
         )
         assert f.filter(record) is False
 
     def test_filter_suppresses_info_level(self):
         f = cm._SuppressInfoFilter()
         record = logging.LogRecord(
-            name="external_llm", level=logging.INFO, pathname="x", lineno=1,
-            msg="info", args=(), exc_info=None,
+            name="external_llm",
+            level=logging.INFO,
+            pathname="x",
+            lineno=1,
+            msg="info",
+            args=(),
+            exc_info=None,
         )
         assert f.filter(record) is False

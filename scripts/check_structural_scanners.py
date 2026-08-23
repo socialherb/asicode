@@ -401,11 +401,7 @@ def _unjudged_languages(file_paths: list[str]) -> list[tuple[str, list[str]]]:
         if lid is LanguageId.PYTHON or lid is LanguageId.UNKNOWN:
             continue
         present.setdefault(lid.value, []).append(rel)
-    return [
-        (lang, files)
-        for lang, files in sorted(present.items())
-        if not is_language_available(lang)
-    ]
+    return [(lang, files) for lang, files in sorted(present.items()) if not is_language_available(lang)]
 
 
 def _candidate_file(cand: dict) -> str:
@@ -485,9 +481,7 @@ def _missing_scanner_deps() -> list[str]:
     try:
         import vulture.core  # noqa: F401
     except ImportError:
-        missing.append(
-            "vulture_dead_code_scanner — install the optional extra: pip install 'asicode[vulture]'"
-        )
+        missing.append("vulture_dead_code_scanner — install the optional extra: pip install 'asicode[vulture]'")
     return missing
 
 
@@ -681,6 +675,14 @@ def main() -> int:
     full_scan = paths is None
     if full_scan:
         file_paths = _walk_scan_files(REPO)
+        # Full-scan mode excludes scratch probe files (*_probe.py) just like
+        # _untracked_scan_files does for per-file mode (and the zero-scan test
+        # does): a sibling worker's transient intentional-violation probe must
+        # not trip the zero-candidate floor (probes are written inside the repo
+        # by gate-mechanics tests and unlinked in finally; os.walk does NOT
+        # read .gitignore, so the exclusion must be explicit here, not left to
+        # ignore patterns — mirrors _untracked_scan_files' *_probe.py check).
+        file_paths = [f for f in file_paths if not f.endswith("_probe.py")]
     else:
         # P-2 (2026-08-16): pre-commit passes only STAGED paths, so a new
         # (untracked) file with a violation passed the per-file gate until its

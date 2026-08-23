@@ -9,6 +9,7 @@ branches of the insight helpers and _SessionSearcher.
 Also pins the _edit_insight new_category timestamp-preservation contract for
 hand-written headers (no "[category]" bracket).
 """
+
 from __future__ import annotations
 
 import os
@@ -67,9 +68,7 @@ def _make_loop(repo_root, session_mgr=None, run_store=None, write_tools=None):
     reg.repo_root = repo_root
     reg._WRITE_TOOLS = set(write_tools or [])
     reg.normalize_args_for_display = lambda args: args
-    reg.dispatch.return_value = SimpleNamespace(
-        content="generic output", error=None, ok=True, metadata={}
-    )
+    reg.dispatch.return_value = SimpleNamespace(content="generic output", error=None, ok=True, metadata={})
     loop = DesignChatLoop(llm_client=MagicMock(), registry=reg, model="test-model")
     loop._session_mgr = session_mgr
     loop._run_store = run_store
@@ -82,11 +81,27 @@ def _populated_session_mgr(repo_root):
     session = mgr.get_or_create("test-session-1")
     session.turns = [
         {"role": "user", "content": "I want to add logging to the handler module.", "timestamp": 1000000.0},
-        {"role": "assistant", "content": "Let me look at the handler.py file for existing logging patterns.", "timestamp": 1000010.0},
-        {"role": "user", "content": "Actually, can we add validation for empty inputs instead?", "timestamp": 1000020.0},
-        {"role": "assistant", "content": "Sure, let's add input validation using the existing validator pattern.", "timestamp": 1000030.0},
+        {
+            "role": "assistant",
+            "content": "Let me look at the handler.py file for existing logging patterns.",
+            "timestamp": 1000010.0,
+        },
+        {
+            "role": "user",
+            "content": "Actually, can we add validation for empty inputs instead?",
+            "timestamp": 1000020.0,
+        },
+        {
+            "role": "assistant",
+            "content": "Sure, let's add input validation using the existing validator pattern.",
+            "timestamp": 1000030.0,
+        },
         {"role": "user", "content": "Also need to handle the edge case for None values.", "timestamp": 1000040.0},
-        {"role": "assistant", "content": "The None handler is in utils.py. Let's add a guard clause there.", "timestamp": 1000050.0},
+        {
+            "role": "assistant",
+            "content": "The None handler is in utils.py. Let's add a guard clause there.",
+            "timestamp": 1000050.0,
+        },
     ]
     session.compressed_summary = (
         "The user requested adding logging to the handler module, "
@@ -107,7 +122,8 @@ class TestProcessToolCallSaveInsight:
         result = DesignChatResult()
         out = loop._process_tool_call(
             _tc("save_insight", {"insight": "Test insight", "category": "architecture"}),
-            None, result,
+            None,
+            result,
         )
         assert out.startswith("Insight saved")
         path = os.path.join(tmp_repo, ".asicode", "design_insights.md")
@@ -129,7 +145,8 @@ class TestProcessToolCallSaveInsight:
         result = DesignChatResult()
         loop._process_tool_call(
             _tc("save_insight", {"insight": "x" * 2500, "category": "pattern"}),
-            None, result,
+            None,
+            result,
         )
         content = Path(os.path.join(tmp_repo, ".asicode", "design_insights.md")).read_text(encoding="utf-8")
         # drop the "### [pattern] <timestamp>" header line, keep only the body
@@ -163,7 +180,9 @@ class TestProcessToolCallSaveInsight:
             events.append((event_type, payload["tool"], payload["status"]))
 
         loop._process_tool_call(
-            _tc("save_insight", {"insight": "x"}), cb, result,
+            _tc("save_insight", {"insight": "x"}),
+            cb,
+            result,
         )
         assert ("design_tool_call", "save_insight", "running") in events
         assert ("design_tool_call", "save_insight", "complete") in events
@@ -188,7 +207,9 @@ class TestProcessToolCallDeleteInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("delete_insight", {"entry_match": "pattern"}), None, result,
+            _tc("delete_insight", {"entry_match": "pattern"}),
+            None,
+            result,
         )
         assert out.startswith("✅ Deleted insight:")
         assert result.tool_results[0]["ok"] is True
@@ -207,7 +228,9 @@ class TestProcessToolCallDeleteInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("delete_insight", {"entry_match": "nothing matches"}), None, result,
+            _tc("delete_insight", {"entry_match": "nothing matches"}),
+            None,
+            result,
         )
         assert out.startswith("Error: No insight found")
         assert result.tool_results[0]["ok"] is False
@@ -217,7 +240,9 @@ class TestProcessToolCallDeleteInsight:
         loop = _make_loop(repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("delete_insight", {"entry_match": "x"}), None, result,
+            _tc("delete_insight", {"entry_match": "x"}),
+            None,
+            result,
         )
         assert out == "Error: No design insights file found."
         assert result.tool_results[0]["ok"] is False
@@ -229,7 +254,9 @@ class TestProcessToolCallDeleteInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("delete_insight", {"entry_match": "x"}), None, result,
+            _tc("delete_insight", {"entry_match": "x"}),
+            None,
+            result,
         )
         assert out == "Error: Design insights file is empty."
         assert result.tool_results[0]["ok"] is False
@@ -256,7 +283,8 @@ class TestProcessToolCallEditInsight:
         result = DesignChatResult()
         out = loop._process_tool_call(
             _tc("edit_insight", {"entry_match": "gotcha", "new_insight": "updated body"}),
-            None, result,
+            None,
+            result,
         )
         assert out.startswith("✅ Edited insight:")
         assert result.tool_results[0]["ok"] is True
@@ -267,7 +295,9 @@ class TestProcessToolCallEditInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("edit_insight", {"new_insight": "x"}), None, result,
+            _tc("edit_insight", {"new_insight": "x"}),
+            None,
+            result,
         )
         assert out == "Error: 'entry_match' is required."
 
@@ -275,7 +305,9 @@ class TestProcessToolCallEditInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("edit_insight", {"entry_match": "x"}), None, result,
+            _tc("edit_insight", {"entry_match": "x"}),
+            None,
+            result,
         )
         assert out == "Error: 'new_insight' is required and must not be empty."
 
@@ -284,12 +316,16 @@ class TestProcessToolCallEditInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         loop._process_tool_call(
-            _tc("edit_insight", {
-                "entry_match": "gotcha",
-                "new_insight": "updated body",
-                "new_category": "bug",
-            }),
-            None, result,
+            _tc(
+                "edit_insight",
+                {
+                    "entry_match": "gotcha",
+                    "new_insight": "updated body",
+                    "new_category": "bug",
+                },
+            ),
+            None,
+            result,
         )
         content = Path(os.path.join(tmp_repo, ".asicode", "design_insights.md")).read_text(encoding="utf-8")
         header = next(line for line in content.splitlines() if line.startswith("###"))
@@ -306,12 +342,16 @@ class TestProcessToolCallEditInsight:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         loop._process_tool_call(
-            _tc("edit_insight", {
-                "entry_match": "2026-08-14",
-                "new_insight": "updated note",
-                "new_category": "pattern",
-            }),
-            None, result,
+            _tc(
+                "edit_insight",
+                {
+                    "entry_match": "2026-08-14",
+                    "new_insight": "updated note",
+                    "new_category": "pattern",
+                },
+            ),
+            None,
+            result,
         )
         content = Path(path).read_text(encoding="utf-8")
         assert "### [pattern] 2026-08-14 18:47 +0900" in content, content
@@ -325,7 +365,9 @@ class TestProcessToolCallEditInsight:
             side_effect=RuntimeError("boom"),
         ):
             out = loop._process_tool_call(
-                _tc("edit_insight", {"entry_match": "x", "new_insight": "y"}), None, result,
+                _tc("edit_insight", {"entry_match": "x", "new_insight": "y"}),
+                None,
+                result,
             )
         assert out == "Error editing insight: boom"
         assert result.tool_results[0]["ok"] is False
@@ -339,7 +381,8 @@ class TestProcessToolCallSearchHistory:
         result = DesignChatResult()
         out = loop._process_tool_call(
             _tc("search_design_history", {"query": "logging", "max_results": 2}),
-            None, result,
+            None,
+            result,
         )
         assert "Found" in out and "logging" in out
         assert result.tool_results[0]["ok"] is True
@@ -358,7 +401,8 @@ class TestProcessToolCallSearchHistory:
         result = DesignChatResult()
         out = loop._process_tool_call(
             _tc("search_design_history", {"query": "logging", "max_results": "many"}),
-            None, result,
+            None,
+            result,
         )
         assert "Found" in out  # coerced to 3, not crashed
 
@@ -369,7 +413,8 @@ class TestProcessToolCallSearchHistory:
         result = DesignChatResult()
         out = loop._process_tool_call(
             _tc("search_design_history", {"query": "logging", "max_results": 9999}),
-            None, result,
+            None,
+            result,
         )
         assert "showing top 50" in out
 
@@ -380,7 +425,9 @@ class TestProcessToolCallSearchHistory:
         loop.session_id = "test-session-1"
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("search_design_history", {"query": "logging"}), None, result,
+            _tc("search_design_history", {"query": "logging"}),
+            None,
+            result,
         )
         assert out == "Error searching design history: session corrupt"
         assert result.tool_results[0]["ok"] is False
@@ -396,7 +443,9 @@ class TestProcessToolCallSearchHistory:
             events.append((event_type, payload["tool"], payload["status"]))
 
         loop._process_tool_call(
-            _tc("search_design_history", {"query": "logging"}), cb, result,
+            _tc("search_design_history", {"query": "logging"}),
+            cb,
+            result,
         )
         assert ("design_tool_call", "search_design_history", "running") in events
         assert ("design_tool_call", "search_design_history", "complete") in events
@@ -442,7 +491,9 @@ class TestProcessToolCallGeneric:
         result = DesignChatResult()
         result.recall_session_key = "k1"
         out = loop._process_tool_call(
-            _tc("apply_patch", {"patch": "..."}), None, result,
+            _tc("apply_patch", {"patch": "..."}),
+            None,
+            result,
         )
         assert "diff summary" in out
         assert loop.registry._snapshot_target_files.called
@@ -452,7 +503,9 @@ class TestProcessToolCallGeneric:
         loop.registry._snapshot_target_files = lambda name, args: {"f.py": "old"}
         loop.registry._safety_manager.summarize_change = lambda snaps: None
         loop.registry.dispatch.return_value = SimpleNamespace(
-            content="patched", error=None, ok=True,
+            content="patched",
+            error=None,
+            ok=True,
             metadata={"verify_warning": "syntax soft-fail"},
         )
         result = DesignChatResult()
@@ -467,7 +520,9 @@ class TestProcessToolCallGeneric:
         loop.registry._safety_manager.summarize_change = lambda snaps: None
         loop.registry._safety_manager.new_semantic_warnings = lambda snaps: "[F1] dead branch"
         loop.registry.dispatch.return_value = SimpleNamespace(
-            content="patched", error=None, ok=True,
+            content="patched",
+            error=None,
+            ok=True,
             metadata={"semantic_repaired": 2},
         )
         result = DesignChatResult()
@@ -482,7 +537,10 @@ class TestProcessToolCallGeneric:
         loop.registry._safety_manager.summarize_change = lambda snaps: "⚠️ NO CHANGE"
         loop.registry._safety_manager.all_files_unchanged = lambda snaps: True
         loop.registry.dispatch.return_value = SimpleNamespace(
-            content="patched", error=None, ok=True, metadata={},
+            content="patched",
+            error=None,
+            ok=True,
+            metadata={},
         )
         result = DesignChatResult()
         result.recall_session_key = "k1"
@@ -499,7 +557,10 @@ class TestProcessToolCallGeneric:
             events.append(payload)
 
         loop.registry.dispatch.return_value = SimpleNamespace(
-            content="x" * 1200 + "\n[POST-EDIT DIFF] tail info", error=None, ok=True, metadata={},
+            content="x" * 1200 + "\n[POST-EDIT DIFF] tail info",
+            error=None,
+            ok=True,
+            metadata={},
         )
         loop._process_tool_call(_tc("bash", {}), cb, result)
         payload = events[-1]
@@ -518,7 +579,9 @@ class TestProcessToolCallGeneric:
             events.append(payload)
 
         loop.registry.dispatch.return_value = SimpleNamespace(
-            content="plan updated", error=None, ok=True,
+            content="plan updated",
+            error=None,
+            ok=True,
             metadata={"plan": {"item": "x"}, "prev_statuses": {"a": "done"}},
         )
         loop._process_tool_call(_tc("update_plan", {}), cb, result)
@@ -581,8 +644,12 @@ class TestInsightHelperEdges:
     def test_find_entry_multiple_matches(self):
         from external_llm.agent.insights_manager import InsightEntry
 
-        e1 = InsightEntry(lines=["### [a] shared keyword\n", "body one\n\n"], header_line="### [a] shared keyword", category="a")
-        e2 = InsightEntry(lines=["### [b] shared keyword\n", "body two\n\n"], header_line="### [b] shared keyword", category="b")
+        e1 = InsightEntry(
+            lines=["### [a] shared keyword\n", "body one\n\n"], header_line="### [a] shared keyword", category="a"
+        )
+        e2 = InsightEntry(
+            lines=["### [b] shared keyword\n", "body two\n\n"], header_line="### [b] shared keyword", category="b"
+        )
         idx, err = _find_entry_by_match([e1, e2], "shared keyword")
         assert idx is None and "Multiple insights match" in err
         assert "[a]" in err and "[b]" in err
@@ -621,7 +688,8 @@ class TestInsightHelperEdges:
 
         entry = InsightEntry(
             lines=["### [pattern] 2026-08-14 18:47 +0900\n", "old invariant\n", "\n"],
-            header_line="### [pattern] 2026-08-14 18:47 +0900", category="pattern",
+            header_line="### [pattern] 2026-08-14 18:47 +0900",
+            category="pattern",
         )
         with patch(
             "external_llm.agent.design_chat_loop.select_promotable_entries",
@@ -741,8 +809,10 @@ class TestSearchDesignHistoryBranches:
     def test_archive_load_error_returns_empty(self, tmp_repo):
         session = SimpleNamespace(
             turns=[{"role": "user", "content": "recent only", "timestamp": 1.0}],
-            compressed_up_to=1, archived_count=0,
-            decisions=[], compressed_summary="",
+            compressed_up_to=1,
+            archived_count=0,
+            decisions=[],
+            compressed_summary="",
         )
         mgr = MagicMock()
         mgr.get_or_create.return_value = session
@@ -790,10 +860,14 @@ class TestPureHelpers:
     def test_strip_tool_messages(self):
         msgs = [
             LLMMessage(role="user", content="hi"),
-            LLMMessage(role="assistant", content="", tool_calls=[
-                {"function": {"name": "read_file"}},
-                {"function": {"name": "grep"}},
-            ]),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {"function": {"name": "read_file"}},
+                    {"function": {"name": "grep"}},
+                ],
+            ),
             LLMMessage(role="tool", content="result", tool_call_id="c1", name="read_file"),
         ]
         out = dcl._strip_tool_messages(msgs)
@@ -859,16 +933,22 @@ class TestPureHelpers:
         assert "authentication" in dcl._user_facing_llm_error(LLMAuthenticationError("x"))
         assert "quota" in dcl._user_facing_llm_error(LLMQuotaExceededError("x"))
         assert "provider-side" in dcl._user_facing_llm_error(
-            LLMAPIError('{"error":{"message":"Error from provider (Console Go): Upstream request failed"}}'))
+            LLMAPIError('{"error":{"message":"Error from provider (Console Go): Upstream request failed"}}')
+        )
         assert "context window" in dcl._user_facing_llm_error(ContextWindowCollapseError("small"))
         assert "An error occurred" in dcl._user_facing_llm_error(RuntimeError("weird"))
 
     def test_fallback_plain_chat_success(self):
         client = MagicMock()
         client.chat.return_value = LLMResponse(
-            content="plain answer", model="m", provider="stub",
-            tokens_used=7, prompt_tokens=5, completion_tokens=2,
-            finish_reason="stop", raw_response=None,
+            content="plain answer",
+            model="m",
+            provider="stub",
+            tokens_used=7,
+            prompt_tokens=5,
+            completion_tokens=2,
+            finish_reason="stop",
+            raw_response=None,
         )
         out = dcl._fallback_plain_chat([LLMMessage(role="user", content="q")], client, "m")
         assert out["content"] == "plain answer"
@@ -877,7 +957,10 @@ class TestPureHelpers:
     def test_fallback_plain_chat_reasoning_extract_failure(self):
         client = MagicMock()
         client.chat.return_value = LLMResponse(
-            content="answer", model="m", provider="stub", tokens_used=1,
+            content="answer",
+            model="m",
+            provider="stub",
+            tokens_used=1,
             finish_reason="stop",
             raw_response=None,
         )
@@ -906,7 +989,8 @@ class TestCallLlmWithRetry:
         from dataclasses import replace
 
         monkeypatch.setattr(
-            dcl, "_cfg",
+            dcl,
+            "_cfg",
             replace(dcl._cfg, counts=replace(dcl._cfg.counts, DESIGN_CHAT_LLM_MAX_RETRIES=1)),
         )
         loop = _make_loop("/tmp/x")
@@ -999,8 +1083,15 @@ class TestCallLlmWithRetry:
 class _ScriptedClient:
     """LLM stub with scripted chat_with_tools / chat outcomes."""
 
-    def __init__(self, tool_response=None, tool_responses=None, tool_error=None,
-                 chat_responses=None, chat_errors=None, on_tool_call=None):
+    def __init__(
+        self,
+        tool_response=None,
+        tool_responses=None,
+        tool_error=None,
+        chat_responses=None,
+        chat_errors=None,
+        on_tool_call=None,
+    ):
         self.tool_response = tool_response
         self.tool_responses = list(tool_responses or [])
         self.tool_error = tool_error
@@ -1032,15 +1123,24 @@ class _ScriptedClient:
         if self.chat_errors:
             raise self.chat_errors.pop(0)
         return LLMResponse(
-            content="default final", model=model, provider="stub",
-            tokens_used=1, finish_reason="stop", raw_response=None,
+            content="default final",
+            model=model,
+            provider="stub",
+            tokens_used=1,
+            finish_reason="stop",
+            raw_response=None,
         )
 
 
 def _stop_response(content=""):
     return ToolCallResponse(
-        content=content, model="m", provider="stub", tokens_used=1,
-        finish_reason="stop", raw_response=None, tool_calls=[],
+        content=content,
+        model="m",
+        provider="stub",
+        tokens_used=1,
+        finish_reason="stop",
+        raw_response=None,
+        tool_calls=[],
     )
 
 
@@ -1057,7 +1157,8 @@ def _zero_retries(monkeypatch):
     from dataclasses import replace
 
     monkeypatch.setattr(
-        dcl, "_cfg",
+        dcl,
+        "_cfg",
         replace(dcl._cfg, counts=replace(dcl._cfg.counts, DESIGN_CHAT_LLM_MAX_RETRIES=0)),
     )
 
@@ -1118,13 +1219,26 @@ class TestRespondScenarios:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
             chat_responses=[
-                LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None),
-                LLMResponse(content="final after retry", model="m", provider="stub", tokens_used=2, finish_reason="stop", raw_response=None),
+                LLMResponse(
+                    content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                ),
+                LLMResponse(
+                    content="final after retry",
+                    model="m",
+                    provider="stub",
+                    tokens_used=2,
+                    finish_reason="stop",
+                    raw_response=None,
+                ),
             ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
@@ -1137,13 +1251,20 @@ class TestRespondScenarios:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
             chat_responses=[
                 LLMResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
                     finish_reason="stop",
                     raw_response={"choices": [{"message": {"reasoning_content": "reasoned answer"}}]},
                 ),
@@ -1158,12 +1279,18 @@ class TestRespondScenarios:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
             chat_responses=[
-                LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None),
+                LLMResponse(
+                    content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                ),
             ],
             chat_errors=[RuntimeError("retry died")],
         )
@@ -1184,7 +1311,9 @@ class TestProcessToolCallStreamEdges:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("delete_insight", {"entry_match": "pattern"}), self._raise_cb, result,
+            _tc("delete_insight", {"entry_match": "pattern"}),
+            self._raise_cb,
+            result,
         )
         assert out.startswith("✅ Deleted insight:")
 
@@ -1193,7 +1322,9 @@ class TestProcessToolCallStreamEdges:
         loop = _make_loop(tmp_repo)
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("edit_insight", {"entry_match": "gotcha", "new_insight": "new"}), self._raise_cb, result,
+            _tc("edit_insight", {"entry_match": "gotcha", "new_insight": "new"}),
+            self._raise_cb,
+            result,
         )
         assert out.startswith("✅ Edited insight:")
 
@@ -1203,7 +1334,9 @@ class TestProcessToolCallStreamEdges:
         loop.session_id = "test-session-1"
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("search_design_history", {"query": "logging"}), self._raise_cb, result,
+            _tc("search_design_history", {"query": "logging"}),
+            self._raise_cb,
+            result,
         )
         assert "Found" in out
 
@@ -1214,7 +1347,9 @@ class TestProcessToolCallStreamEdges:
         loop.session_id = "s1"
         result = DesignChatResult()
         out = loop._process_tool_call(
-            _tc("search_design_history", {"query": "logging"}), self._raise_cb, result,
+            _tc("search_design_history", {"query": "logging"}),
+            self._raise_cb,
+            result,
         )
         assert out.startswith("Error searching design history:")
 
@@ -1253,7 +1388,10 @@ class TestProcessToolCallStreamEdges:
         loop.registry._snapshot_target_files = lambda n, a: {"f": "old"}
         loop.registry._safety_manager.summarize_change = lambda snaps: None
         loop.registry.dispatch.return_value = SimpleNamespace(
-            content="patched", error=None, ok=True, metadata=None,
+            content="patched",
+            error=None,
+            ok=True,
+            metadata=None,
         )
         result = DesignChatResult()
         result.recall_session_key = "k1"
@@ -1333,8 +1471,10 @@ class TestRetryWaitAndFlip:
             def __init__(self, api_key, base_url, timeout):
                 pass
 
-        with patch("external_llm.anthropic_client.ZAIAnthropicClient", _FakeZAI), \
-             patch("external_llm.openai_client.ZAIClient", _FakeOpenAICompat):
+        with (
+            patch("external_llm.anthropic_client.ZAIAnthropicClient", _FakeZAI),
+            patch("external_llm.openai_client.ZAIClient", _FakeOpenAICompat),
+        ):
             loop = _make_loop("/tmp/x")
             loop.llm_client = _FakeZAI()
             assert loop._flip_zai_endpoint() is True
@@ -1378,16 +1518,23 @@ class TestRespondMoreScenarios:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="working", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response={"bad": "shape"},
+                content="working",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response={"bad": "shape"},
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
-        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning",
-                   side_effect=TypeError("bad raw")):
+        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning", side_effect=TypeError("bad raw")):
             r = loop.respond([LLMMessage(role="user", content="do it")], max_tool_iterations=2)
         assert r.content == "fin"
 
@@ -1397,12 +1544,25 @@ class TestRespondMoreScenarios:
             tool_responses=[
                 ToolCallResponse(
                     content='{"name": "read_file", "arguments": {"file_path": "README.md"}}',
-                    model="m", provider="stub", tokens_used=1,
-                    finish_reason="stop", raw_response=None, tool_calls=[],
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="stop",
+                    raw_response=None,
+                    tool_calls=[],
                 ),
                 _stop_response("read done"),
             ],
-            chat_responses=[LLMResponse(content="read done", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="read done",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="stop",
+                    raw_response=None,
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1416,18 +1576,27 @@ class TestRespondMoreScenarios:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
-                    finish_reason="tool_calls", raw_response=None,
-                    tool_calls=[ToolCallRequest(
-                        call_id="c1", name="update_plan",
-                        args={"goal": "g", "items": [{"title": "open item", "status": "pending"}]},
-                    )],
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="tool_calls",
+                    raw_response=None,
+                    tool_calls=[
+                        ToolCallRequest(
+                            call_id="c1",
+                            name="update_plan",
+                            args={"goal": "g", "items": [{"title": "open item", "status": "pending"}]},
+                        )
+                    ],
                 ),
                 _stop_response("done once"),
                 _stop_response("done twice"),
             ],
             chat_responses=[
-                LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None),
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                ),
             ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
@@ -1446,8 +1615,12 @@ class TestRespondMoreScenarios:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
-                    finish_reason="tool_calls", raw_response=None,
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="tool_calls",
+                    raw_response=None,
                     tool_calls=[
                         ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"}),
                         ToolCallRequest(call_id="c2", name="read_file", args={"file_path": "README.md"}),
@@ -1455,7 +1628,11 @@ class TestRespondMoreScenarios:
                 ),
                 _stop_response("all done"),
             ],
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1472,8 +1649,12 @@ class TestRespondMoreScenarios:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="ask_user", args={"question": "continue?"})],
             ),
         )
@@ -1511,10 +1692,7 @@ class TestArchiveCache:
         p = mgr.archive_path("test-session-1")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text('{"role": "user", "content": "x"}\n')
-        turns = [
-            {"role": "user", "content": f"archived turn {i} unique words", "timestamp": 1.0}
-            for i in range(3)
-        ]
+        turns = [{"role": "user", "content": f"archived turn {i} unique words", "timestamp": 1.0} for i in range(3)]
         entries, sig, from_cache = dcl._archived_bm25_entries(mgr, "test-session-1", turns)
         assert len(entries) == 3
         assert sig is not None and from_cache is False
@@ -1557,7 +1735,8 @@ class TestParseTextToolCallsEdges:
 
     def test_openai_function_format(self):
         out = dcl._parse_text_tool_calls(
-            '{"type": "function", "function": {"name": "grep", "arguments": "{\\"pattern\\": \\"x\\"}"}}')
+            '{"type": "function", "function": {"name": "grep", "arguments": "{\\"pattern\\": \\"x\\"}"}}'
+        )
         assert out and out[0]["name"] == "grep" and out[0]["args"] == {"pattern": "x"}
 
     def test_list_with_non_dict_items(self):
@@ -1565,13 +1744,11 @@ class TestParseTextToolCallsEdges:
         assert out and out[0]["name"] == "read_file"
 
     def test_free_text_scan_with_escaped_quotes(self):
-        out = dcl._parse_text_tool_calls(
-            'prefix text {"name": "read_file", "arguments": {"path": "a\\"b"}} suffix')
+        out = dcl._parse_text_tool_calls('prefix text {"name": "read_file", "arguments": {"path": "a\\"b"}} suffix')
         assert out and out[0]["name"] == "read_file"
 
     def test_fenced_json_block(self):
-        out = dcl._parse_text_tool_calls(
-            '```json\n{"name": "read_file", "arguments": {"path": "x"}}\n```')
+        out = dcl._parse_text_tool_calls('```json\n{"name": "read_file", "arguments": {"path": "x"}}\n```')
         assert out and out[0]["name"] == "read_file"
 
 
@@ -1608,11 +1785,19 @@ class TestRespondEdgeCallbacks:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="working", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="working",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1627,11 +1812,19 @@ class TestRespondEdgeCallbacks:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="working", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="working",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1641,7 +1834,9 @@ class TestRespondEdgeCallbacks:
                 raise RuntimeError("cli died")
 
         r = loop.respond(
-            [LLMMessage(role="user", content="go")], stream_callback=cb, max_tool_iterations=2,
+            [LLMMessage(role="user", content="go")],
+            stream_callback=cb,
+            max_tool_iterations=2,
         )
         assert r.content == "fin"
 
@@ -1649,11 +1844,19 @@ class TestRespondEdgeCallbacks:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="working", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="working",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1663,7 +1866,9 @@ class TestRespondEdgeCallbacks:
                 raise RuntimeError("cli died")
 
         r = loop.respond(
-            [LLMMessage(role="user", content="go")], stream_callback=cb, max_tool_iterations=2,
+            [LLMMessage(role="user", content="go")],
+            stream_callback=cb,
+            max_tool_iterations=2,
         )
         assert r.content == "fin"
 
@@ -1672,17 +1877,28 @@ class TestRespondEdgeCallbacks:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
-                    finish_reason="tool_calls", raw_response=None,
-                    tool_calls=[ToolCallRequest(
-                        call_id="c1", name="update_plan",
-                        args={"goal": "g", "items": [{"title": "open item", "status": "pending"}]},
-                    )],
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="tool_calls",
+                    raw_response=None,
+                    tool_calls=[
+                        ToolCallRequest(
+                            call_id="c1",
+                            name="update_plan",
+                            args={"goal": "g", "items": [{"title": "open item", "status": "pending"}]},
+                        )
+                    ],
                 ),
                 _stop_response("done once"),
                 _stop_response("done twice"),
             ],
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1709,7 +1925,8 @@ class TestRespondEdgeCallbacks:
         from dataclasses import replace
 
         monkeypatch.setattr(
-            dcl, "_cfg",
+            dcl,
+            "_cfg",
             replace(dcl._cfg, counts=replace(dcl._cfg.counts, DESIGN_CHAT_LLM_MAX_RETRIES=1)),
         )
         client = _ScriptedClient(
@@ -1730,8 +1947,12 @@ class TestRespondEdgeCallbacks:
         ev = threading.Event()
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="ask_user", args={"question": "continue?"})],
             ),
         )
@@ -1747,8 +1968,12 @@ class TestRespondEdgeCallbacks:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
-                    finish_reason="tool_calls", raw_response=None,
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="tool_calls",
+                    raw_response=None,
                     tool_calls=[
                         ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"}),
                         ToolCallRequest(call_id="c2", name="read_file", args={"file_path": "README.md"}),
@@ -1756,7 +1981,11 @@ class TestRespondEdgeCallbacks:
                 ),
                 _stop_response("all done"),
             ],
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -1768,11 +1997,19 @@ class TestRespondEdgeCallbacks:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
-            chat_responses=[LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
             chat_errors=[LLMRateLimitError("rl on retry")],
         )
         reg = ToolRegistry(_repo, AgentConfig())
@@ -1785,8 +2022,12 @@ class TestRespondEdgeCallbacks:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
             chat_errors=[LLMAuthenticationError("bad key")],
@@ -1800,19 +2041,36 @@ class TestRespondEdgeCallbacks:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
             chat_responses=[
-                LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response={"choices": [{}]}),
-                LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response={"choices": [{}]}),
+                LLMResponse(
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="stop",
+                    raw_response={"choices": [{}]},
+                ),
+                LLMResponse(
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="stop",
+                    raw_response={"choices": [{}]},
+                ),
             ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
-        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning",
-                   side_effect=AttributeError("bad raw")):
+        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning", side_effect=AttributeError("bad raw")):
             r = loop.respond([LLMMessage(role="user", content="go")], max_tool_iterations=1)
         assert r.content.startswith("⚠️")  # both extraction fallbacks failed → empty funnel
 
@@ -1887,8 +2145,11 @@ class TestSearchHistoryLongText:
 
     def test_archive_less_session_mgr(self, tmp_repo):
         session = SimpleNamespace(
-            turns=[], compressed_up_to=0, archived_count=0,
-            decisions=[], compressed_summary="",
+            turns=[],
+            compressed_up_to=0,
+            archived_count=0,
+            decisions=[],
+            compressed_summary="",
         )
         mgr = SimpleNamespace(get_or_create=lambda sid: session)
         loop = _make_loop(tmp_repo, session_mgr=mgr)
@@ -1899,11 +2160,14 @@ class TestSearchHistoryLongText:
     def test_fallback_plain_chat_reasoning_extract_failure(self):
         client = MagicMock()
         client.chat.return_value = LLMResponse(
-            content="answer", model="m", provider="stub", tokens_used=1,
-            finish_reason="stop", raw_response={"x": 1},
+            content="answer",
+            model="m",
+            provider="stub",
+            tokens_used=1,
+            finish_reason="stop",
+            raw_response={"x": 1},
         )
-        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning",
-                   side_effect=TypeError("bad")):
+        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning", side_effect=TypeError("bad")):
             out = dcl._fallback_plain_chat([LLMMessage(role="user", content="q")], client, "m")
         assert out["content"] == "answer"
 
@@ -1912,21 +2176,18 @@ class TestFinalResidualBranches:
     """Last uncovered branches: repair-path escapes, reasoning fallbacks, provider."""
 
     def test_function_arguments_bad_json_str(self):
-        out = dcl._parse_text_tool_calls(
-            '{"type": "function", "function": {"name": "grep", "arguments": "{bad"}}')
+        out = dcl._parse_text_tool_calls('{"type": "function", "function": {"name": "grep", "arguments": "{bad"}}')
         assert out and out[0]["args"] == {}
 
     def test_bracket_repair_closes_list(self):
         # Missing closing "]" forces _try_json → bracket repair (closes "[").
-        out = dcl._parse_text_tool_calls(
-            '[{"name": "read_file", "arguments": {"path": "x"}}')
+        out = dcl._parse_text_tool_calls('[{"name": "read_file", "arguments": {"path": "x"}}')
         assert out and out[0]["name"] == "read_file"
 
     def test_bracket_repair_escape_handling(self):
         # Unclosed "[" + escaped quote + backslash inside a string → repair
         # must keep the escape machinery alive across the scan.
-        out = dcl._parse_text_tool_calls(
-            '[{"name": "read_file", "arguments": {"path": "a\\\\b\\"c"}}')
+        out = dcl._parse_text_tool_calls('[{"name": "read_file", "arguments": {"path": "a\\\\b\\"c"}}')
         assert out and out[0]["args"] == {"path": 'a\\b"c'}
 
     def test_respond_raw_reasoning_fallback_failure(self, _repo, monkeypatch):
@@ -1934,18 +2195,25 @@ class TestFinalResidualBranches:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
-                    finish_reason="tool_calls", raw_response={"choices": [{}]},
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="tool_calls",
+                    raw_response={"choices": [{}]},
                     tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
                 ),
                 _stop_response("fin"),
             ],
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
-        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning",
-                   side_effect=TypeError("bad raw")):
+        with patch("external_llm.agent.design_chat_loop.extract_llm_reasoning", side_effect=TypeError("bad raw")):
             r = loop.respond([LLMMessage(role="user", content="go")], max_tool_iterations=2)
         assert r.content == "fin"
 
@@ -1953,14 +2221,26 @@ class TestFinalResidualBranches:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
             chat_responses=[
-                LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None),
-                LLMResponse(content="", model="m", provider="stub", tokens_used=1, finish_reason="stop",
-                            raw_response={"choices": [{"message": {"reasoning_content": "retry reasoning answer"}}]}),
+                LLMResponse(
+                    content="", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                ),
+                LLMResponse(
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="stop",
+                    raw_response={"choices": [{"message": {"reasoning_content": "retry reasoning answer"}}]},
+                ),
             ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
@@ -1972,11 +2252,24 @@ class TestFinalResidualBranches:
         _zero_retries(monkeypatch)
         client = _ScriptedClient(
             tool_response=ToolCallResponse(
-                content="", model="m", provider="", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
+                content="",
+                model="m",
+                provider="",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
                 tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
             ),
-            chat_responses=[LLMResponse(content="fin", model="m", provider="final-provider", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin",
+                    model="m",
+                    provider="final-provider",
+                    tokens_used=1,
+                    finish_reason="stop",
+                    raw_response=None,
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -2001,14 +2294,21 @@ class TestFinalResidualBranches2:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
                     finish_reason="tool_calls",
                     raw_response={"choices": [{"message": {"reasoning_content": "raw reasoned"}}]},
                     tool_calls=[ToolCallRequest(call_id="c1", name="read_file", args={"file_path": "README.md"})],
                 ),
                 _stop_response("fin"),
             ],
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")
@@ -2053,13 +2353,21 @@ class TestFinalResidualBranches4:
         client = _ScriptedClient(
             tool_responses=[
                 ToolCallResponse(
-                    content="", model="m", provider="stub", tokens_used=1,
-                    finish_reason="tool_calls", raw_response=None,
+                    content="",
+                    model="m",
+                    provider="stub",
+                    tokens_used=1,
+                    finish_reason="tool_calls",
+                    raw_response=None,
                     tool_calls=[ToolCallRequest(call_id="c1", name="ask_user", args={"question": "continue?"})],
                 ),
                 _stop_response("fin"),
             ],
-            chat_responses=[LLMResponse(content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None)],
+            chat_responses=[
+                LLMResponse(
+                    content="fin", model="m", provider="stub", tokens_used=1, finish_reason="stop", raw_response=None
+                )
+            ],
         )
         reg = ToolRegistry(_repo, AgentConfig())
         loop = DesignChatLoop(client, reg, "stub-model")

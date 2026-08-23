@@ -56,13 +56,17 @@ def _get_current_errors(paths: list[str] | None = None) -> set[str]:
     # helper swallows timeouts into returncode=-9, a fail-open semantic).
     try:
         result = subprocess.run(
-            ["ruff", "check", "--select=F811", "--output-format=concise"]
-            + (paths or ["."]),
-            capture_output=True, text=True, cwd=REPO, timeout=180,
+            ["ruff", "check", "--select=F811", "--output-format=concise"] + (paths or ["."]),
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            timeout=180,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        print("❌ ruff F811 scan timed out after 180s — failing closed rather than risk a silent pass.", file=sys.stderr)
+        print(
+            "❌ ruff F811 scan timed out after 180s — failing closed rather than risk a silent pass.", file=sys.stderr
+        )
         sys.exit(1)
     errors: set[str] = set()
     for line in result.stdout.splitlines():
@@ -138,9 +142,7 @@ def main() -> int:
     # A regression is any <file>::<name> group that now has MORE occurrences
     # than were baselined (baseline defaults to 0 for unseen groups).
     regressions = {
-        k: (cur, baseline_counts.get(k, 0))
-        for k, cur in current_counts.items()
-        if cur > baseline_counts.get(k, 0)
+        k: (cur, baseline_counts.get(k, 0)) for k, cur in current_counts.items() if cur > baseline_counts.get(k, 0)
     }
 
     if not regressions:

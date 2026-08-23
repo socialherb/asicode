@@ -7,6 +7,7 @@ Covers two contracts:
    AgentConfig/AgentLoop, reuses a passed-in svc/route_decision, and only
    creates fresh ones (LLM service + TaskRouter) when they are absent.
 """
+
 import threading
 from types import SimpleNamespace
 
@@ -72,7 +73,8 @@ class TestBuildEngineWiring:
         monkeypatch.setattr(tool_registry_mod, "ToolRegistry", _capture_registry)
         monkeypatch.setattr(agent_loop_mod, "AgentLoop", _capture_loop)
         monkeypatch.setattr(
-            intelligent_service_mod, "create_intelligent_service_from_env",
+            intelligent_service_mod,
+            "create_intelligent_service_from_env",
             lambda *a, **kw: pytest.fail("svc must not be recreated when EngineConfig.svc is set"),
         )
 
@@ -84,9 +86,15 @@ class TestBuildEngineWiring:
         rd = SimpleNamespace(intent_result=object())
         evt = threading.Event()
         cb = lambda *a, **kw: None  # noqa: E731 — no-op stream callback stub
-        cfg = _config(svc=svc, route_decision=rd, cancel_event=evt,
-                      stream_cb=cb, thinking_mode=True, reasoning_effort="high",
-                      scoped_verification=False)
+        cfg = _config(
+            svc=svc,
+            route_decision=rd,
+            cancel_event=evt,
+            stream_cb=cb,
+            thinking_mode=True,
+            reasoning_effort="high",
+            scoped_verification=False,
+        )
 
         loop = repl_impl._build_engine(cfg)
 
@@ -109,13 +117,15 @@ class TestBuildEngineWiring:
 
     def test_creates_svc_and_routes_when_absent(self, monkeypatch):
         import external_llm.agent.task_router as task_router_mod
+
         captured = {}
         self._patch_engine_parts(monkeypatch, captured)
 
         svc = _fake_svc()
         created = {}
         monkeypatch.setattr(
-            task_router_mod, "TaskRouter",
+            task_router_mod,
+            "TaskRouter",
             lambda **kw: SimpleNamespace(route=lambda request_text, repo_root=None: rd),
         )
 
@@ -124,6 +134,7 @@ class TestBuildEngineWiring:
             return svc
 
         import external_llm.intelligent_service as intelligent_service_mod
+
         monkeypatch.setattr(intelligent_service_mod, "create_intelligent_service_from_env", _create)
         rd = SimpleNamespace(intent_result=object())
 
@@ -138,6 +149,7 @@ class TestBuildEngineWiring:
         import external_llm.agent.agent_loop as agent_loop_mod
         import external_llm.agent.tool_registry as tool_registry_mod
         import external_llm.intelligent_service as intelligent_service_mod
+
         monkeypatch.setattr(intelligent_service_mod, "create_intelligent_service_from_env", lambda *a, **kw: None)
         monkeypatch.setattr(tool_registry_mod, "ToolRegistry", lambda *a, **kw: None)
         monkeypatch.setattr(agent_loop_mod, "AgentLoop", lambda **kw: None)

@@ -14,6 +14,7 @@ from typing import Any
 @dataclass
 class RepairResult:
     """Result of argument repair attempt."""
+
     repaired: bool
     original_args: dict[str, Any]
     repaired_args: dict[str, Any]
@@ -71,15 +72,14 @@ def _schema_param_types() -> dict[str, dict[str, str]]:
     if _PARAM_TYPES is None:
         table: dict[str, dict[str, str]] = {}
         from .tool_schemas import AGENT_TOOL_SCHEMAS
+
         for schema in AGENT_TOOL_SCHEMAS:
             fn = schema.get("function", schema)
             name = fn.get("name")
             props = (fn.get("parameters") or {}).get("properties") or {}
             if not name or not props:
                 continue
-            table[name] = {
-                p: spec.get("type") for p, spec in props.items() if spec.get("type")
-            }
+            table[name] = {p: spec.get("type") for p, spec in props.items() if spec.get("type")}
         _PARAM_TYPES = table
     return _PARAM_TYPES
 
@@ -173,7 +173,9 @@ class ArgumentRepairer:
         )
 
     def coerce_types(
-        self, tool_name: str, args: dict[str, Any],
+        self,
+        tool_name: str,
+        args: dict[str, Any],
     ) -> tuple[dict[str, Any], list[str], list[str]]:
         """Bring *args* in line with the tool schema's declared types.
 
@@ -251,9 +253,7 @@ class ArgumentRepairer:
                         # see. Containers below still refuse: no scalar reading
                         # of them exists at all.
                         del out[name]
-                        repairs.append(
-                            f"{name}={value!r} dropped (not {declared}; handler default applies)"
-                        )
+                        repairs.append(f"{name}={value!r} dropped (not {declared}; handler default applies)")
                 else:
                     errors.append(_type_error(name, value, f"a{'n' if declared[0] == 'i' else ''} {declared}"))
 

@@ -6,6 +6,7 @@ non-Python rejection, source syntax errors, field-alias normalization,
 executor failure hinting, idempotent results, the post-apply compile gate,
 dry-run preview, write errors, and text-edit recording.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -36,6 +37,7 @@ class _Harness(WriteToolsMixin):
 
     def _secure_path(self, path, *, confine=False):
         from pathlib import Path as _Path
+
         repo = _Path(self.repo_root).resolve()
         p = _Path(path)
         resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -62,6 +64,7 @@ def _write(tmp_path, name: str, content: str):
 
 # ── Validation errors ───────────────────────────────────────────────────────
 
+
 class TestValidationErrors:
     def test_missing_file_path_no_raw(self, harness):
         r = harness._tool_edit_ast({"ops": [{"type": "replace_expr"}]})
@@ -75,10 +78,12 @@ class TestValidationErrors:
         assert "(raw args:" not in r.error
 
     def test_missing_file_path_long_raw_hint(self, harness):
-        r = harness._tool_edit_ast({
-            "ops": [],
-            "__raw_arguments": "x" * 40,
-        })
+        r = harness._tool_edit_ast(
+            {
+                "ops": [],
+                "__raw_arguments": "x" * 40,
+            }
+        )
         assert r.ok is False
         assert "(raw args:" in r.error
         assert "x" * 40 in r.error
@@ -108,6 +113,7 @@ class TestValidationErrors:
 
 # ── Read failures ───────────────────────────────────────────────────────────
 
+
 class TestReadFailures:
     def test_oserror_read(self, harness, tmp_path, monkeypatch):
         _write(tmp_path, "t.py", "x = 1\n")
@@ -115,6 +121,7 @@ class TestReadFailures:
 
         def _boom(_p):
             raise OSError("boom")
+
         monkeypatch.setattr(mod, "read_text_with_encoding_fallback", _boom)
         r = harness._tool_edit_ast({"file_path": "t.py", "ops": [{"type": "replace_expr"}]})
         assert r.ok is False
@@ -144,13 +151,16 @@ class TestReadFailures:
 
 # ── Happy path & op normalization ───────────────────────────────────────────
 
+
 class TestHappyPath:
     def test_simple_replace_applies_and_records(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 2"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 2"}],
+            }
+        )
         assert r.ok is True
         assert "AST edit applied" in r.content
         assert "x = 2" in (tmp_path / "t.py").read_text()
@@ -161,46 +171,56 @@ class TestHappyPath:
 
     def test_field_alias_normalization(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "target": "x = 1", "new_expr": "x = 42"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "target": "x = 1", "new_expr": "x = 42"}],
+            }
+        )
         assert r.ok is True
         assert "x = 42" in (tmp_path / "t.py").read_text()
 
     def test_add_import_alias(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "add_import", "import_name": "import os"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "add_import", "import_name": "import os"}],
+            }
+        )
         assert r.ok is True
         assert "import os" in (tmp_path / "t.py").read_text()
 
     def test_op_key_fallback_to_op(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"op": "replace_expr", "old": "x = 1", "new": "x = 3"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"op": "replace_expr", "old": "x = 1", "new": "x = 3"}],
+            }
+        )
         assert r.ok is True
         assert "x = 3" in (tmp_path / "t.py").read_text()
 
     def test_action_key_fallback(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"action": "replace_expr", "old": "x = 1", "new": "x = 4"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"action": "replace_expr", "old": "x = 1", "new": "x = 4"}],
+            }
+        )
         assert r.ok is True
         assert "x = 4" in (tmp_path / "t.py").read_text()
 
     def test_non_dict_op_skipped(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": ["not-a-dict", {"type": "replace_expr", "old": "x = 1", "new": "x = 5"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": ["not-a-dict", {"type": "replace_expr", "old": "x = 1", "new": "x = 5"}],
+            }
+        )
         assert r.ok is True
         assert "x = 5" in (tmp_path / "t.py").read_text()
 
@@ -208,40 +228,49 @@ class TestHappyPath:
         _write(tmp_path, "t.py", "class A:\n    def m(self):\n        return 1\n")
         seen = {}
         import external_llm.agent.tool_handlers.ast_op_executor as ex_mod
+
         orig_apply = ex_mod.ASTOpExecutor.apply
 
         def _spy(self, source, ops, symbol=""):
             seen["symbol"] = symbol
             return orig_apply(self, source, ops, symbol)
+
         monkeypatch.setattr(ex_mod.ASTOpExecutor, "apply", _spy)
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "symbol": "A.m",
-            "ops": [{"type": "replace_expr", "old": "return 1", "new": "return 2"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "symbol": "A.m",
+                "ops": [{"type": "replace_expr", "old": "return 1", "new": "return 2"}],
+            }
+        )
         assert r.ok is True
         assert seen["symbol"] == "A.m"
 
 
 # ── Failure / idempotent / dry-run branches ─────────────────────────────────
 
+
 class TestResultBranches:
     def test_executor_failure_with_hint(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "old": "zzz_not_there", "new": "q"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "old": "zzz_not_there", "new": "q"}],
+            }
+        )
         assert r.ok is False
         assert "AST edit failed" in r.error
         assert "no match found" in r.error
 
     def test_idempotent_no_change(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 1"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 1"}],
+            }
+        )
         assert r.ok is True
         assert "no changes needed" in r.content
         assert r.metadata["changed"] is False
@@ -256,12 +285,14 @@ class TestResultBranches:
             ops_applied = 1
             ops_failed = ()
             new_source = "def broken(:\n"
-        monkeypatch.setattr(ex_mod.ASTOpExecutor, "apply",
-                            lambda self, source, ops, symbol="": _FakeResult())
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr"}],
-        })
+
+        monkeypatch.setattr(ex_mod.ASTOpExecutor, "apply", lambda self, source, ops, symbol="": _FakeResult())
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr"}],
+            }
+        )
         assert r.ok is False
         assert "invalid syntax" in r.error
         # File must not have been written
@@ -269,11 +300,13 @@ class TestResultBranches:
 
     def test_dry_run_preview_no_write(self, harness, tmp_path):
         _write(tmp_path, "t.py", "x = 1\n")
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "dry_run": True,
-            "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 9"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "dry_run": True,
+                "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 9"}],
+            }
+        )
         assert r.ok is True
         assert "[DRY RUN]" in r.content
         assert r.metadata["dry_run"] is True
@@ -283,18 +316,23 @@ class TestResultBranches:
 
 # ── Write errors ────────────────────────────────────────────────────────────
 
+
 class TestWriteErrors:
     def test_encode_error_on_write(self, harness, tmp_path, monkeypatch):
         _write(tmp_path, "t.py", "x = 1\n")
         from external_llm.agent.tool_handlers import write_tools_ast_mixin as mod
+
         monkeypatch.setattr(
-            mod, "read_text_with_encoding_fallback",
+            mod,
+            "read_text_with_encoding_fallback",
             lambda _p: ("x = 'é'\n", "ascii"),
         )
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "old": "x = 'é'", "new": "x = 'ü'"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "old": "x = 'é'", "new": "x = 'ü'"}],
+            }
+        )
         assert r.ok is False
         assert "Failed to write" in r.error
 
@@ -304,11 +342,14 @@ class TestWriteErrors:
 
         def _raise_oserror(_path, _data, **kw):
             raise OSError("denied")
+
         monkeypatch.setattr(mod, "atomic_write_bytes", _raise_oserror)
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 7"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 7"}],
+            }
+        )
         assert r.ok is False
         assert "Failed to write" in r.error
         # Read path must still work — only the write failed
@@ -322,17 +363,21 @@ class TestAtomicWriteFunnel:
     def test_write_routes_through_atomic_write_bytes(self, harness, tmp_path, monkeypatch):
         _write(tmp_path, "t.py", "x = 1\n")
         from external_llm.agent.tool_handlers import write_tools_ast_mixin as mod
+
         calls = []
         real = mod.atomic_write_bytes
 
         def _spy(path, data, **kw):
             calls.append((str(path), data))
             return real(path, data, **kw)
+
         monkeypatch.setattr(mod, "atomic_write_bytes", _spy)
-        r = harness._tool_edit_ast({
-            "file_path": "t.py",
-            "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 7"}],
-        })
+        r = harness._tool_edit_ast(
+            {
+                "file_path": "t.py",
+                "ops": [{"type": "replace_expr", "old": "x = 1", "new": "x = 7"}],
+            }
+        )
         assert r.ok is True
         assert len(calls) == 1, f"expected exactly one atomic write, got {len(calls)}"
         path, data = calls[0]
@@ -348,9 +393,8 @@ class TestAtomicWriteFunnel:
         import textwrap
 
         from external_llm.agent.tool_handlers import write_tools_ast_mixin as mod
+
         tree = _ast.parse(textwrap.dedent(inspect.getsource(mod.WriteToolsAstMixin._tool_edit_ast)))
         for node in _ast.walk(tree):
             if isinstance(node, _ast.Call) and getattr(node.func, "id", "") == "open":
-                raise AssertionError(
-                    "_tool_edit_ast must write via atomic_write_bytes, not open(...)"
-                )
+                raise AssertionError("_tool_edit_ast must write via atomic_write_bytes, not open(...)")

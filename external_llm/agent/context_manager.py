@@ -1,6 +1,3 @@
-
-
-
 """Context management strategy pattern for AgentLoop and DesignChat.
 
 Both systems need to keep LLM context within a token budget, but use
@@ -12,6 +9,7 @@ different strategies:
 - ``SessionCompressionContext`` (DesignChat): disk-backed session with
   LLM-based background compression. Supports per-model dynamic window sizing.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -23,7 +21,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.agent_context_manager import _SYSTEM_PROMPT_TEMPLATE
 from external_llm.agent.interrupt_tool_results import render_interrupt_tool_results
@@ -85,9 +83,9 @@ class _SuppressInfoFilter(logging.Filter):
         return False
 
 
-def _compress_failure_notice(session_id: str, model: str, exc: Exception,
-                             *, use_latch: bool = True,
-                             context: str = "background") -> Optional[str]:
+def _compress_failure_notice(
+    session_id: str, model: str, exc: Exception, *, use_latch: bool = True, context: str = "background"
+) -> str | None:
     """Build a one-shot user-facing notice for a compress failure.
 
     Returns a human-readable message the *first* time a given failure class is
@@ -104,7 +102,7 @@ def _compress_failure_notice(session_id: str, model: str, exc: Exception,
       - ``"background"``: messages reference background compression + auto-retry.
       - ``"interactive"``: messages reference the explicit command the user ran.
     """
-    _is_bg = (context == "background")
+    _is_bg = context == "background"
     if isinstance(exc, LLMAuthenticationError):
         _cls = "auth"
         if _is_bg:
@@ -151,9 +149,7 @@ def _compress_failure_notice(session_id: str, model: str, exc: Exception,
         if use_latch:
             return None  # transient/generic errors stay silent (already at debug)
         _cls = "error"
-        _msg = (
-            f"⚠ Helper model '{model}' failed: {type(exc).__name__}: {exc}"
-        )
+        _msg = f"⚠ Helper model '{model}' failed: {type(exc).__name__}: {exc}"
 
     if use_latch:
         with _compress_fail_latch_lock:
@@ -180,7 +176,7 @@ class ContextManager(ABC):
     def prepare_before_call(
         self,
         messages: list,
-        budget: Optional[Any] = None,
+        budget: Any | None = None,
     ) -> list:
         """Trim / compress *messages* to fit within the context budget.
 
@@ -199,6 +195,7 @@ class ContextManager(ABC):
 @dataclass
 class SlidingWindowConfig:
     """Configuration for SlidingWindowContext."""
+
     context_window_size: int = 60
     # Hysteresis: when trimming, reduce to ``window * hysteresis_factor``
     # so the count must regrow past ``window`` before the next trim.
@@ -219,7 +216,7 @@ class SlidingWindowContext(ContextManager):
     def __init__(
         self,
         config: SlidingWindowConfig,
-        stream_callback: Optional[Callable] = None,
+        stream_callback: Callable | None = None,
     ):
         self._config = config
         self._cb = stream_callback or (lambda _evt, _data: None)
@@ -227,7 +224,7 @@ class SlidingWindowContext(ContextManager):
     def prepare_before_call(
         self,
         messages: list,
-        budget: Optional[Any] = None,
+        budget: Any | None = None,
     ) -> list:
         """Apply sliding window to keep token usage bounded.
 
@@ -253,10 +250,7 @@ class SlidingWindowContext(ContextManager):
         kept = other_msgs[-trim_target:]
 
         # (a) Orphaned tool results — start of kept has no preceding assistant.
-        while kept and (
-            getattr(kept[0], "role", "") == "tool"
-            or _is_anthropic_tool_result(kept[0])
-        ):
+        while kept and (getattr(kept[0], "role", "") == "tool" or _is_anthropic_tool_result(kept[0])):
             m = kept[0]
             # Anthropic-native: a *user* message may mix text blocks with
             # tool_result blocks.  Dropping the entire message loses the
@@ -270,10 +264,7 @@ class SlidingWindowContext(ContextManager):
             if _is_anthropic_tool_result(m):
                 rc = getattr(m, "raw_content", None)
                 if isinstance(rc, list):
-                    text_blocks = [
-                        b for b in rc
-                        if isinstance(b, dict) and b.get("type") != "tool_result"
-                    ]
+                    text_blocks = [b for b in rc if isinstance(b, dict) and b.get("type") != "tool_result"]
                     if text_blocks:
                         kept[0] = dataclasses.replace(m, raw_content=text_blocks)
                         break
@@ -283,28 +274,21 @@ class SlidingWindowContext(ContextManager):
             trimmed += 1
 
         # (b) Orphaned assistant whose tool responses were dropped.
-        while (
-            kept
-            and (
-                getattr(kept[0], "role", "") == "assistant"
-                and (
-                    getattr(kept[0], "tool_calls", None)
-                    or _is_anthropic_tool_call(kept[0])
-                )
-                and (len(kept) < 2 or (
-                    getattr(kept[1], "role", "") != "tool"
-                    and not _is_anthropic_tool_result(kept[1])
-                ))
-            )
+        while kept and (
+            getattr(kept[0], "role", "") == "assistant"
+            and (getattr(kept[0], "tool_calls", None) or _is_anthropic_tool_call(kept[0]))
+            and (len(kept) < 2 or (getattr(kept[1], "role", "") != "tool" and not _is_anthropic_tool_result(kept[1])))
         ):
             dropped.append(kept[0])
             kept = kept[1:]
             trimmed += 1
 
         logger.info(
-            "Sliding window: trimming %d older messages "
-            "(window=%d, hysteresis_target=%d, total=%d)",
-            trimmed, window, trim_target, len(other_msgs),
+            "Sliding window: trimming %d older messages (window=%d, hysteresis_target=%d, total=%d)",
+            trimmed,
+            window,
+            trim_target,
+            len(other_msgs),
         )
         self._cb("context_trimmed", {"trimmed": trimmed, "kept": len(kept)})
         self._cb("agent_working", {"reason": "context_compressed", "kept": len(kept)})
@@ -360,9 +344,9 @@ class SlidingWindowContext(ContextManager):
         # the next cycle (the new message appends its own). Strip it now, so
         # the carried-forward body is pure content and the byte-cap below
         # measures/trims real content rather than a stale structural marker.
-        _END_MARKER = "[END COMPRESSED CONTEXT]"
-        if _old_summary.endswith(_END_MARKER):
-            _old_summary = _old_summary[: -len(_END_MARKER)].rstrip()
+        _end_marker = "[END COMPRESSED CONTEXT]"
+        if _old_summary.endswith(_end_marker):
+            _old_summary = _old_summary[: -len(_end_marker)].rstrip()
 
         # ── Strip nested carry-forward to prevent infinite growth ─────────
         # Each compression cycle's body already contains its own
@@ -376,32 +360,30 @@ class SlidingWindowContext(ContextManager):
         # the previous cycle had no fresh categories; requiring a leading "\n"
         # would silently miss it (strip would be a no-op and the byte cap
         # below would freeze the oldest content instead of the fresh one).
-        _CF_MARKER = "Previous summary (carried forward):"
-        _cf_idx = _old_summary.find(_CF_MARKER)
+        _cf_marker = "Previous summary (carried forward):"
+        _cf_idx = _old_summary.find(_cf_marker)
         if _cf_idx != -1:
             _old_summary = _old_summary[:_cf_idx].rstrip()
         # Byte-length cap (preserve whole lines so the summary is readable)
-        _MAX_CF_BYTES = self._config.carry_forward_bytes
-        if len(_old_summary.encode("utf-8")) > _MAX_CF_BYTES:
+        _max_cf_bytes = self._config.carry_forward_bytes
+        if len(_old_summary.encode("utf-8")) > _max_cf_bytes:
             # Truncate to the last whole line that fits within the cap.
             # Walk backward from the cap position so we never split a line.
             _encoded = _old_summary.encode("utf-8")
-            _cut = _encoded.rfind(b"\n", 0, _MAX_CF_BYTES)
+            _cut = _encoded.rfind(b"\n", 0, _max_cf_bytes)
             if _cut > 0:
                 _old_summary = _encoded[:_cut].decode("utf-8")
             else:
                 # No line boundary found — just keep the raw cap
-                _old_summary = _encoded[:_MAX_CF_BYTES].decode(
-                    "utf-8", errors="replace"
-                )
+                _old_summary = _encoded[:_max_cf_bytes].decode("utf-8", errors="replace")
 
         categories: dict[str, list[str]] = {
-            "errors": [],        # ✗ tool failures
-            "files_read": [],    # file read results (via bash / read_symbol)
-            "changes": [],       # apply_patch / write_plan results
-            "search": [],        # find_symbol / grep results
-            "other_tools": [],   # remaining tools
-            "discussion": [],    # user / assistant text
+            "errors": [],  # ✗ tool failures
+            "files_read": [],  # file read results (via bash / read_symbol)
+            "changes": [],  # apply_patch / write_plan results
+            "search": [],  # find_symbol / grep results
+            "other_tools": [],  # remaining tools
+            "discussion": [],  # user / assistant text
         }
 
         # ── Build tool_use_id → tool-name map (Anthropic-native path) ──────
@@ -416,11 +398,7 @@ class SlidingWindowContext(ContextManager):
             _rc = getattr(m, "raw_content", None)
             if isinstance(_rc, list):
                 for _b in _rc:
-                    if (
-                        isinstance(_b, dict)
-                        and _b.get("type") == "tool_use"
-                        and _b.get("id")
-                    ):
+                    if isinstance(_b, dict) and _b.get("type") == "tool_use" and _b.get("id"):
                         _id_to_name[_b["id"]] = _b.get("name") or "?"
 
         for m in _remaining:
@@ -430,16 +408,11 @@ class SlidingWindowContext(ContextManager):
             _mrc = getattr(m, "raw_content", None)
             _tool_result_blocks: list = []
             if isinstance(_mrc, list):
-                _tool_result_blocks = [
-                    b for b in _mrc
-                    if isinstance(b, dict) and b.get("type") == "tool_result"
-                ]
+                _tool_result_blocks = [b for b in _mrc if isinstance(b, dict) and b.get("type") == "tool_result"]
             if _tool_result_blocks:
                 # Classify each tool_result block like a standard role="tool" msg.
                 for _tb in _tool_result_blocks:
-                    name = _tb.get("name") or _id_to_name.get(
-                        _tb.get("tool_use_id", ""), "?"
-                    )
+                    name = _tb.get("name") or _id_to_name.get(_tb.get("tool_use_id", ""), "?")
                     content = _tb.get("content", "")
                     # Default ok mirrors the role="tool" path (ok=False): a
                     # non-JSON result is treated as failure in BOTH paths. The
@@ -544,9 +517,7 @@ class SlidingWindowContext(ContextManager):
         # the byte-cap honest (it trims the oldest tail = carried-forward data,
         # not the fresh categories).
         if _old_summary:
-            sections.append(
-                f"\nPrevious summary (carried forward):\n{_old_summary}"
-            )
+            sections.append(f"\nPrevious summary (carried forward):\n{_old_summary}")
 
         sections.append("[END COMPRESSED CONTEXT]")
         return LLMMessage(role="user", content="\n".join(sections))
@@ -578,7 +549,7 @@ class SlidingWindowContext(ContextManager):
 # with GC under WeakValueDictionary). Sibling defense: _compress_fail_latch
 # (above) caps the per-session failure-notice latch to bound the same class of
 # per-session module-global growth.
-_MODULE_COMPRESS_LOCKS: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
+_MODULE_COMPRESS_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _MODULE_COMPRESS_LOCKS_MUTEX = threading.Lock()
 
 
@@ -603,7 +574,7 @@ class SessionCompressionContext(ContextManager):
         # different content are not mistaken for unchanged. st_mtime_ns gives
         # sub-second granularity where the filesystem supports it; st_size
         # discriminates same-mtime-same-second rewrites.
-        self._project_md_cache: Optional[tuple[tuple[int, int], str]] = None
+        self._project_md_cache: tuple[tuple[int, int], str] | None = None
         # Per-session compression threading state. Reference the module-level
         # dicts so all per-request instances share one Lock per session (see
         # _MODULE_COMPRESS_LOCKS rationale above); cross-instance dedup of
@@ -616,7 +587,7 @@ class SessionCompressionContext(ContextManager):
     def prepare_before_call(
         self,
         messages: list,
-        budget: Optional[Any] = None,
+        budget: Any | None = None,
     ) -> list:
         """DesignChat does not trim a pre-built message list."""
         return messages
@@ -653,8 +624,10 @@ class SessionCompressionContext(ContextManager):
             return result
 
     def needs_compression(
-        self, session, recent_keep: Optional[int] = None,
-        batch_min: Optional[int] = None,
+        self,
+        session,
+        recent_keep: int | None = None,
+        batch_min: int | None = None,
     ) -> bool:
         """True if enough turns have accumulated since last compression.
 
@@ -681,10 +654,13 @@ class SessionCompressionContext(ContextManager):
     # ── Tier 2: Compress (LLM summarize) ──────────────────────────────
 
     def compress_old_turns(
-        self, session, llm_client, llm_model: str,
-        recent_keep: Optional[int] = None,
-        cancel_event: Optional[threading.Event] = None,
-        notify: Optional[Callable[[str], None]] = None,
+        self,
+        session,
+        llm_client,
+        llm_model: str,
+        recent_keep: int | None = None,
+        cancel_event: threading.Event | None = None,
+        notify: Callable[[str], None] | None = None,
     ) -> None:
         """Compress old user+AI turns into summary.
 
@@ -714,17 +690,11 @@ class SessionCompressionContext(ContextManager):
         new_turns = session.turns[_local_cut:cutoff]
         # exclude_from_compression=True turns are ephemeral (e.g. tool call
         # output logs) — omit from both LLM summary and verbatim re-insertion.
-        compressible = [
-            t for t in new_turns
-            if not t.get("preserve") and not t.get("exclude_from_compression")
-        ]
+        compressible = [t for t in new_turns if not t.get("preserve") and not t.get("exclude_from_compression")]
         # preserve=True turns are excluded from the LLM summary; they stay
         # visible verbatim because build_context_messages re-inserts every
         # preserve turn before compressed_up_to into the context.
-        preserved = [
-            t for t in new_turns
-            if t.get("preserve") and not t.get("exclude_from_compression")
-        ]
+        preserved = [t for t in new_turns if t.get("preserve") and not t.get("exclude_from_compression")]
 
         if not compressible and not preserved:
             return  # nothing to do
@@ -739,7 +709,8 @@ class SessionCompressionContext(ContextManager):
             logger.debug(
                 "compress_old_turns: %d compressible turn(s) but no llm_client; "
                 "skipping to preserve turns for session %s",
-                len(compressible), session.session_id,
+                len(compressible),
+                session.session_id,
             )
             return
 
@@ -893,10 +864,13 @@ class SessionCompressionContext(ContextManager):
 
     # ── Unified entry points ─────────────────────────────────────────
     def schedule_background_compress(
-        self, session, model: str, llm_client,
+        self,
+        session,
+        model: str,
+        llm_client,
         force: bool = False,
-        notify: Optional[Callable[[str], None]] = None,
-        persist: Optional[Callable[[], None]] = None,
+        notify: Callable[[str], None] | None = None,
+        persist: Callable[[], None] | None = None,
     ) -> None:
         """Run compression in background thread if needed."""
         if force:
@@ -906,9 +880,7 @@ class SessionCompressionContext(ContextManager):
             # summarize call for a single turn (the compress-lock blocks concurrency,
             # not re-firing). Fewer than FORCE_COMPRESS_MIN_TURNS → skip; the
             # provider's context limit still bounds the window (400 → overflow override).
-            if not self.needs_compression(
-                session, batch_min=self._cfg.compression.FORCE_COMPRESS_MIN_TURNS
-            ):
+            if not self.needs_compression(session, batch_min=self._cfg.compression.FORCE_COMPRESS_MIN_TURNS):
                 return
         elif not self.needs_compression(session):
             return
@@ -919,7 +891,9 @@ class SessionCompressionContext(ContextManager):
         def _run():
             try:
                 self.compress_old_turns(
-                    session, llm_client, model,
+                    session,
+                    llm_client,
+                    model,
                     recent_keep=self._cfg.compression.MIN_RECENT_TURNS_KEEP,
                     cancel_event=self._make_compress_cancel_event(),
                     notify=notify,
@@ -930,7 +904,8 @@ class SessionCompressionContext(ContextManager):
                 # Daemon thread: an uncaught exception would be silently lost.
                 # Log so background compression failures are observable.
                 logger.exception(
-                    "Background compress failed for session %s", session.session_id,
+                    "Background compress failed for session %s",
+                    session.session_id,
                 )
             finally:
                 _lock.release()
@@ -939,10 +914,13 @@ class SessionCompressionContext(ContextManager):
         _t.start()
 
     def compact_now(
-        self, session, model: str, llm_client,
+        self,
+        session,
+        model: str,
+        llm_client,
         recent_keep: int = 0,
-        notify: Optional[Callable[[str], None]] = None,
-        persist: Optional[Callable[[], None]] = None,
+        notify: Callable[[str], None] | None = None,
+        persist: Callable[[], None] | None = None,
     ) -> bool:
         """Synchronously fold turns down to ``recent_keep`` verbatim turns.
 
@@ -962,7 +940,9 @@ class SessionCompressionContext(ContextManager):
         try:
             _before = session.compressed_up_to
             self.compress_old_turns(
-                session, llm_client, model,
+                session,
+                llm_client,
+                model,
                 recent_keep=recent_keep,
                 cancel_event=self._make_compress_cancel_event(),
                 notify=notify,
@@ -977,7 +957,9 @@ class SessionCompressionContext(ContextManager):
     # ── Context message builder ──────────────────────────────────────
 
     def build_context_messages(
-        self, session, current_model: str = "",
+        self,
+        session,
+        current_model: str = "",
         skip_core_prompt: bool = False,
         mode: str = "code",
         owner: str = "",
@@ -1001,7 +983,7 @@ class SessionCompressionContext(ContextManager):
         messages: list[dict[str, str]] = []
         _divider: dict[str, str] = {"role": "system", "content": "──"}
 
-        is_general = (mode == "general")
+        is_general = mode == "general"
 
         # 0. System prompt (identity + core rules) — identical to main agent lane
         # (Chunk 1 before "## Available Tools", without tool/session/context placeholders)
@@ -1019,23 +1001,24 @@ class SessionCompressionContext(ContextManager):
         #     Placed right after the static core prompt so the
         #     [core_prompt][repo root] prefix stays cached across
         #     /code ↔ /general mode switches.
-        messages.append({
-            "role": "system",
-            "content": f"═══ CURRENT REPOSITORY: {self._repo_root_str} ═══",
-        })
+        messages.append(
+            {
+                "role": "system",
+                "content": f"═══ CURRENT REPOSITORY: {self._repo_root_str} ═══",
+            }
+        )
         messages.append(_divider)
 
         # 0b. Project context (from .asicode/project.md — code mode only)
         if not is_general:
             project_context = self.load_project_context_md()
             if project_context:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "=== Project Context (Auto-RAG + Prior Session) ===\n"
-                        f"{project_context}"
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (f"=== Project Context (Auto-RAG + Prior Session) ===\n{project_context}"),
+                    }
+                )
                 messages.append(_divider)
 
             # 0c. Design insights (saved from previous sessions via save_insight
@@ -1046,6 +1029,7 @@ class SessionCompressionContext(ContextManager):
             #     cached across insight saves.
             try:
                 from external_llm.agent.design_chat_loop import load_design_insights
+
                 # NOTE: Layer 3 task_query promotion is deliberately NOT requested
                 # here. This 0c block must stay byte-stable (it changes only on
                 # save_insight / compact-demote / archive restore|drop) so it
@@ -1058,28 +1042,27 @@ class SessionCompressionContext(ContextManager):
                 insights_text = ""
 
             if insights_text:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "=== DESIGN INSIGHTS (saved from previous sessions) ===\n"
-                        "These are discoveries and insights you saved in earlier sessions. "
-                        "Use them as context.\n\n"
-                        + insights_text
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "=== DESIGN INSIGHTS (saved from previous sessions) ===\n"
+                            "These are discoveries and insights you saved in earlier sessions. "
+                            "Use them as context.\n\n" + insights_text
+                        ),
+                    }
+                )
                 messages.append(_divider)
 
         # 1. Compressed summary of older turns (if available)
         if session.compressed_summary:
-            _summary_label = (
-                f"(turns 1-{session.compressed_up_to})"
-                if session.compressed_up_to > 0
-                else "(compressed)"
+            _summary_label = f"(turns 1-{session.compressed_up_to})" if session.compressed_up_to > 0 else "(compressed)"
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"=== CONVERSATION SUMMARY {_summary_label} ===\n{session.compressed_summary}",
+                }
             )
-            messages.append({
-                "role": "system",
-                "content": f"=== CONVERSATION SUMMARY {_summary_label} ===\n{session.compressed_summary}",
-            })
             messages.append(_divider)
 
         # 1b. Preserved old turns: preserve=True turns that compression has
@@ -1102,10 +1085,12 @@ class SessionCompressionContext(ContextManager):
             _pdg = _pt.get("digest")
             if _pdg and _prole == "assistant":
                 _pcontent += f"\n\n[WORK STATE — tools used in this turn]\n{_pdg}"
-            messages.append({
-                "role": _prole,
-                "content": _pcontent,
-            })
+            messages.append(
+                {
+                    "role": _prole,
+                    "content": _pcontent,
+                }
+            )
         if _preserved_old:
             messages.append(_divider)
 
@@ -1127,10 +1112,12 @@ class SessionCompressionContext(ContextManager):
         if total > 1:
             # No turn count in the header: the count changes every turn and would
             # break the prompt-cache prefix for every verbatim message after it.
-            messages.append({
-                "role": "system",
-                "content": "=== RECENT CONVERSATION ===",
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "=== RECENT CONVERSATION ===",
+                }
+            )
             messages.append(_divider)
 
         # Pre-scan: find the last non-excluded assistant turn (= the most recent
@@ -1158,27 +1145,31 @@ class SessionCompressionContext(ContextManager):
                 and turn.get("owner") != owner
             ):
                 _ip_abs = actual_start + idx + 1
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"(turn {_ip_abs}) [IN-PROGRESS IN ANOTHER TERMINAL] "
-                        "The following user request is already being handled by a "
-                        "parallel session — do NOT act on it:\n" + turn["content"]
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"(turn {_ip_abs}) [IN-PROGRESS IN ANOTHER TERMINAL] "
+                            "The following user request is already being handled by a "
+                            "parallel session — do NOT act on it:\n" + turn["content"]
+                        ),
+                    }
+                )
                 continue
             role = turn["role"]
             turn_model = turn.get("model", "")
             content = turn["content"]
 
             if role == "assistant" and turn_model and prev_model and turn_model != prev_model:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"[Model switched: {prev_model} → {turn_model}] "
-                        f"The following response was generated by a different model."
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"[Model switched: {prev_model} → {turn_model}] "
+                            f"The following response was generated by a different model."
+                        ),
+                    }
+                )
             if role == "assistant" and turn_model:
                 prev_model = turn_model
 
@@ -1219,14 +1210,16 @@ class SessionCompressionContext(ContextManager):
             messages.append({"role": role, "content": prefixed})
 
         if current_model and prev_model and current_model != prev_model:
-            messages.append({
-                "role": "system",
-                "content": (
-                    f"[Model switched: {prev_model} → {current_model}] "
-                    f"You are now continuing this conversation. "
-                    f"Previous responses above were generated by {prev_model}."
-                ),
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"[Model switched: {prev_model} → {current_model}] "
+                        f"You are now continuing this conversation. "
+                        f"Previous responses above were generated by {prev_model}."
+                    ),
+                }
+            )
 
         # 2c. Layer 3 promoted insights (turn-volatile). This MUST sit AFTER the
         #     cached verbatim-turns prefix: the promoted set depends on the last
@@ -1241,9 +1234,7 @@ class SessionCompressionContext(ContextManager):
             _task_q = ""
             try:
                 _uturns = [
-                    _t.get("content", "")
-                    for _t in session.turns[-8:]
-                    if _t.get("role") == "user" and _t.get("content")
+                    _t.get("content", "") for _t in session.turns[-8:] if _t.get("role") == "user" and _t.get("content")
                 ]
                 _task_q = "\n".join(_uturns)[-2000:]
             except Exception:
@@ -1251,45 +1242,52 @@ class SessionCompressionContext(ContextManager):
             if _task_q:
                 try:
                     from external_llm.agent.design_chat_loop import load_promoted_insights
+
                     _promoted = load_promoted_insights(self._repo_root_str, _task_q)
                 except Exception as _exc:
                     logger.debug("promoted insights load failed: %s", _exc)
                 else:
                     if _promoted:
-                        messages.append({
-                            "role": "system",
-                            "content": _promoted.strip(),
-                        })
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": _promoted.strip(),
+                            }
+                        )
 
         # Static current-request marker (no turn number — the text must be
         # byte-identical every turn; on Anthropic it is hoisted into the system
         # block, which must stay stable for the system-prompt cache breakpoints).
         if verbatim_turns and verbatim_turns[-1]["role"] == "user":
-            messages.append({
-                "role": "system",
-                "content": (
-                    "[CURRENT REQUEST] The most recent user message above is the "
-                    "current request — respond to it. Earlier turns are context. "
-                    "Any earlier user message marked [IN-PROGRESS IN ANOTHER "
-                    "TERMINAL] or left without an assistant response is being "
-                    "handled in a parallel session — do NOT act on it and do NOT "
-                    "merge it into the current request. "
-                    "The \"(turn N)\" labels on history messages are an internal "
-                    "reading aid — do NOT prefix your own response with \"(turn N)\" "
-                    "or otherwise echo these labels."
-                ),
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[CURRENT REQUEST] The most recent user message above is the "
+                        "current request — respond to it. Earlier turns are context. "
+                        "Any earlier user message marked [IN-PROGRESS IN ANOTHER "
+                        "TERMINAL] or left without an assistant response is being "
+                        "handled in a parallel session — do NOT act on it and do NOT "
+                        "merge it into the current request. "
+                        'The "(turn N)" labels on history messages are an internal '
+                        'reading aid — do NOT prefix your own response with "(turn N)" '
+                        "or otherwise echo these labels."
+                    ),
+                }
+            )
 
         if is_general:
-            messages.append({
-                "role": "system",
-                "content": (
-                    "[MODE: General Chat] The user is in general chat mode. "
-                    "Code context is not loaded. "
-                    "You can answer general questions (news, weather, stocks, current events, opinions, etc.) via web search or conversation. "
-                    "Do NOT use code tools unless explicitly asked."
-                ),
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[MODE: General Chat] The user is in general chat mode. "
+                        "Code context is not loaded. "
+                        "You can answer general questions (news, weather, stocks, current events, opinions, etc.) via web search or conversation. "
+                        "Do NOT use code tools unless explicitly asked."
+                    ),
+                }
+            )
 
         # ── Empty-content turn guard ─────────────────────────────────────────
         # A turn can be persisted with empty content (a design-chat turn that
@@ -1325,32 +1323,46 @@ def _safe_content(msg) -> str:
     """Extract string content from an LLMMessage, handling list/None types."""
     raw = msg.content
     if isinstance(raw, list):
-        return " ".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in raw
-        )
+        return " ".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in raw)
     return (raw or "").strip()
 
 
 def _extract_topics(messages: list, max_keywords: int = 8) -> list[str]:
     """Extract frequent keywords from message content (no LLM)."""
-    _STOP = {
-        "a", "an", "the", "is", "it", "in", "on", "at", "to", "of",
-        "and", "or", "but", "for", "with", "this", "that", "was",
-        "are", "be", "has", "have", "had",
+    _stop_words = {
+        "a",
+        "an",
+        "the",
+        "is",
+        "it",
+        "in",
+        "on",
+        "at",
+        "to",
+        "of",
+        "and",
+        "or",
+        "but",
+        "for",
+        "with",
+        "this",
+        "that",
+        "was",
+        "are",
+        "be",
+        "has",
+        "have",
+        "had",
     }
     word_freq: dict[str, int] = {}
     for m in messages:
         raw = m.content
         if isinstance(raw, list):
-            raw = " ".join(
-                p.get("text", "") if isinstance(p, dict) else str(p)
-                for p in raw
-            )
+            raw = " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in raw)
         raw = raw or ""
         for word in raw.lower().split():
-            w = word.strip('.,;:!?\"\'()[]{}')
-            if len(w) >= 4 and w not in _STOP:
+            w = word.strip(".,;:!?\"'()[]{}")
+            if len(w) >= 4 and w not in _stop_words:
                 word_freq[w] = word_freq.get(w, 0) + 1
     top_words = sorted(word_freq.items(), key=lambda x: -x[1])[:max_keywords]
     return [w for w, _ in top_words]

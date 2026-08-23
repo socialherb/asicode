@@ -111,7 +111,8 @@ def _load_cache() -> dict[str, tuple[tuple[int, int], list[str]]]:
             and len(fp) == 2
             and all(isinstance(x, int) for x in fp)
             and isinstance(keys, list)
-            and all(isinstance(k, str) for k in keys)):
+            and all(isinstance(k, str) for k in keys)
+        ):
             out[rel] = (tuple(fp), keys)
     return out
 
@@ -132,23 +133,49 @@ def _save_cache(cache: dict[str, tuple[tuple[int, int], list[str]]]) -> None:
     except (OSError, ValueError, TypeError):
         pass
 
-_SUBPROCESS_FUNCS = frozenset({
-    "run", "Popen", "call", "check_call", "check_output",
-})
+
+_SUBPROCESS_FUNCS = frozenset(
+    {
+        "run",
+        "Popen",
+        "call",
+        "check_call",
+        "check_output",
+    }
+)
 
 # Exception type NAMES that catch FileNotFoundError (OSError or a supertype).
 # ``subprocess.SubprocessError`` / ``CalledProcessError`` / ``TimeoutExpired``
 # are deliberately NOT here — they cover exit/timeout, not a missing binary.
-_OSERROR_SUPERTYPES = frozenset({
-    "OSError", "IOError", "EnvironmentError", "WindowsError",
-    "FileNotFoundError", "Exception", "BaseException",
-})
+_OSERROR_SUPERTYPES = frozenset(
+    {
+        "OSError",
+        "IOError",
+        "EnvironmentError",
+        "WindowsError",
+        "FileNotFoundError",
+        "Exception",
+        "BaseException",
+    }
+)
 
 _SCAN_ROOTS = ("external_llm", "services", "webapp")
-_SKIP_DIRS = frozenset({
-    "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules",
-    ".venv", "venv", "env", ".tox", "dist", "build", ".eggs", ".git",
-})
+_SKIP_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        ".git",
+    }
+)
 
 
 def _subprocess_aliases(tree: ast.AST) -> set[str]:
@@ -237,8 +264,10 @@ def _is_oserror_guarded(call: ast.Call, parents: dict[int, ast.AST]) -> bool:
         if isinstance(parent, ast.With) and any(child is s for s in parent.body):
             for item in parent.items:
                 ctx = item.context_expr
-                if isinstance(ctx, ast.Call) and _is_suppress_call(ctx) and any(
-                    _type_expr_catches_oserror(a) for a in ctx.args
+                if (
+                    isinstance(ctx, ast.Call)
+                    and _is_suppress_call(ctx)
+                    and any(_type_expr_catches_oserror(a) for a in ctx.args)
                 ):
                     return True
         # listed types miss OSError -> propagates past this try; keep going
@@ -421,8 +450,7 @@ def main() -> int:
     new_keys = current - baseline
 
     if not new_keys:
-        print(f"✅ No new unguarded subprocess calls ({len(current)} total, "
-              f"{len(baseline)} baselined)")
+        print(f"✅ No new unguarded subprocess calls ({len(current)} total, {len(baseline)} baselined)")
         return 0
 
     print(f"❌ {len(new_keys)} NEW unguarded subprocess call(s) (not in baseline):\n")

@@ -9,13 +9,13 @@ POST instead of two (or three, when the agent tools path also runs).  This
 module is what keeps providers.py (num_ctx enforcement) and context_budget.py
 (context-limit resolution) in sync without duplicated heuristics.
 """
+
 from __future__ import annotations
 
 import logging
 import os
 import re
 import time
-from typing import Optional
 
 import requests
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 
 
-def _ollama_base_url(override: Optional[str] = None) -> str:
+def _ollama_base_url(override: str | None = None) -> str:
     """Resolve the Ollama server URL: explicit override > OLLAMA_BASE_URL env > default."""
     if override:
         return override
@@ -102,7 +102,7 @@ def _show_cache_key(model_name: str, base_url: str) -> tuple[str, str]:
     return (model_name.lower().strip(), base_url)
 
 
-def _query_ollama_show(model_name: str, base_url_hint: Optional[str] = None) -> Optional[dict]:
+def _query_ollama_show(model_name: str, base_url_hint: str | None = None) -> dict | None:
     """Query Ollama ``/api/show`` ONCE and cache the full response payload.
 
     Returns the parsed ``/api/show`` JSON dict on success; ``None`` for a
@@ -178,7 +178,7 @@ def _query_ollama_show(model_name: str, base_url_hint: Optional[str] = None) -> 
         return data
 
 
-def query_ollama_num_ctx(model_name: str, base_url_hint: Optional[str] = None) -> Optional[int]:
+def query_ollama_num_ctx(model_name: str, base_url_hint: str | None = None) -> int | None:
     """Query Ollama ``/api/show`` for the model's configured ``num_ctx``.
 
     Returns the configured ``num_ctx`` from the model's Modelfile, or ``None``
@@ -208,13 +208,13 @@ def query_ollama_num_ctx(model_name: str, base_url_hint: Optional[str] = None) -
             return int(num_ctx)
     # Priority 2: parse modelfile text for PARAMETER num_ctx
     modelfile: str = data.get("modelfile", "")
-    match = re.search(r'(?im)^PARAMETER\s+num_ctx\s+(\d+)\s*$', modelfile)
+    match = re.search(r"(?im)^PARAMETER\s+num_ctx\s+(\d+)\s*$", modelfile)
     if match:
         return int(match.group(1))
     return None
 
 
-def query_ollama_capabilities(model_name: str, base_url_hint: Optional[str] = None) -> Optional[tuple[str, ...]]:
+def query_ollama_capabilities(model_name: str, base_url_hint: str | None = None) -> tuple[str, ...] | None:
     """Query Ollama ``/api/show`` for the model's capability list (Ollama 0.6+).
 
     Returns a tuple of capability names (e.g. ``("completion", "tools",

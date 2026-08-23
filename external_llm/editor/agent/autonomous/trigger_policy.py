@@ -22,37 +22,37 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 from external_llm.editor.agent.autonomous.trigger_engine import TriggerEvent, TriggerKind
 
 # Module-level mapping: TriggerKind → feature name (used by TriggerPolicy._evaluate)
 _KIND_TO_FEATURE: dict = {
-    TriggerKind.FILE_MODIFIED:       "file_review",
-    TriggerKind.TEST_FAILED:         "test_analysis",
-    TriggerKind.TEST_RECOVERED:      "test_recovery",
-    TriggerKind.AGENT_STALL:         "agent_stall",
-    TriggerKind.AGENT_COMPLETED:     "agent_status",
-    TriggerKind.AGENT_FAILED:        "agent_status",
-    TriggerKind.IMPORT_ERROR:        "import_repair",
+    TriggerKind.FILE_MODIFIED: "file_review",
+    TriggerKind.TEST_FAILED: "test_analysis",
+    TriggerKind.TEST_RECOVERED: "test_recovery",
+    TriggerKind.AGENT_STALL: "agent_stall",
+    TriggerKind.AGENT_COMPLETED: "agent_status",
+    TriggerKind.AGENT_FAILED: "agent_status",
+    TriggerKind.IMPORT_ERROR: "import_repair",
     TriggerKind.INTEGRATION_MISSING: "integration_repair",
 }
 
 
 class ActionKind(Enum):
-    IGNORE   = "ignore"
-    NOTIFY   = "notify"      # Template message, no LLM
-    SUGGEST  = "suggest"     # 1-2 sentence analysis, small LLM sufficient
-    AUTO_FIX = "auto_fix"    # Full PLANNER lane — model quality determines result quality
-    ESCALATE = "escalate"    # Immediate user notification + optional approval
+    IGNORE = "ignore"
+    NOTIFY = "notify"  # Template message, no LLM
+    SUGGEST = "suggest"  # 1-2 sentence analysis, small LLM sufficient
+    AUTO_FIX = "auto_fix"  # Full PLANNER lane — model quality determines result quality
+    ESCALATE = "escalate"  # Immediate user notification + optional approval
 
 
 @dataclass
 class ActionDecision:
     kind: ActionKind
-    message: str = ""               # Human-readable message (NOTIFY / ESCALATE)
-    prompt: str = ""                # LLM request text (SUGGEST / AUTO_FIX)
-    priority: int = 2               # 0=critical  1=high  2=normal
+    message: str = ""  # Human-readable message (NOTIFY / ESCALATE)
+    prompt: str = ""  # LLM request text (SUGGEST / AUTO_FIX)
+    priority: int = 2  # 0=critical  1=high  2=normal
     requires_model_tier: str = "none"  # "none" | "small" | "strong"
 
 
@@ -63,22 +63,29 @@ class TriggerPolicy:
     _FILE_COOLDOWN = 30.0
 
     # All valid feature names (for validation / default)
-    _ALL_FEATURES: frozenset = frozenset({
-        "file_review", "test_analysis", "test_recovery", "agent_stall", "agent_status",
-        "import_repair", "integration_repair",
-    })
+    _ALL_FEATURES: frozenset = frozenset(
+        {
+            "file_review",
+            "test_analysis",
+            "test_recovery",
+            "agent_stall",
+            "agent_status",
+            "import_repair",
+            "integration_repair",
+        }
+    )
 
     # Per-kind cooldown (seconds between same-kind events)
     _KIND_COOLDOWN: ClassVar[dict[str, float]] = {
-        "file_modified":       15.0,
-        "test_failed":         10.0,
-        "test_recovered":      10.0,
-        "agent_stall":          5.0,
-        "agent_completed":      2.0,
-        "agent_failed":         5.0,
-        "import_error":         5.0,
+        "file_modified": 15.0,
+        "test_failed": 10.0,
+        "test_recovered": 10.0,
+        "agent_stall": 5.0,
+        "agent_completed": 2.0,
+        "agent_failed": 5.0,
+        "import_error": 5.0,
         "integration_missing": 30.0,
-        "schedule":             0.0,   # scheduler manages its own interval
+        "schedule": 0.0,  # scheduler manages its own interval
     }
 
     # AUTO_FIX rate limit: max N per hour
@@ -91,18 +98,16 @@ class TriggerPolicy:
 
     _AUTO_FIX_PER_HOUR = 10
 
-    def __init__(self, model_tier: str = "small", enabled_features: Optional[set] = None):
+    def __init__(self, model_tier: str = "small", enabled_features: set | None = None):
         self._lock = threading.Lock()
         # model_tier is a normalized property: unknown tiers fail CLOSED to
         # "none" (P0-1) — the setter runs under _lock, so create it first.
         self.model_tier = model_tier
         # Per-feature on/off — default all enabled
-        self.enabled_features: set = (
-            set(enabled_features) if enabled_features is not None else set(self._ALL_FEATURES)
-        )
+        self.enabled_features: set = set(enabled_features) if enabled_features is not None else set(self._ALL_FEATURES)
         self._file_last: dict[tuple[str, str], float] = {}  # (source_file, kind) → last emit
-        self._kind_last: dict[str, float] = {}              # kind → last emit
-        self._auto_fix_ts: list[float] = []                 # recent AUTO_FIX decision times
+        self._kind_last: dict[str, float] = {}  # kind → last emit
+        self._auto_fix_ts: list[float] = []  # recent AUTO_FIX decision times
 
     @property
     def model_tier(self) -> str:

@@ -17,6 +17,7 @@ Usage:
 
 Baseline key: ``<field_name>`` (one per line).
 """
+
 from __future__ import annotations
 
 import ast
@@ -59,11 +60,17 @@ def _is_referenced_outside_defining(field: str) -> bool:
     try:
         result = subprocess.run(
             ["git", "grep", "-l", "-e", field, "--", "*.py"],
-            capture_output=True, text=True, cwd=REPO, timeout=60,
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            timeout=60,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        print(f"❌ git grep for {field!r} timed out after 60s — failing closed rather than guess reachability.", file=sys.stderr)
+        print(
+            f"❌ git grep for {field!r} timed out after 60s — failing closed rather than guess reachability.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     for f in result.stdout.splitlines():
         if not f:

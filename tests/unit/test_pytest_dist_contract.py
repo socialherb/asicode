@@ -25,6 +25,7 @@ Contract (definition <-> behaviour, same shape as test_version_drift_gate):
 * R3  the ``dev`` extra pins ``pytest-xdist >= 3.6`` (worksteal landed in
        3.5; older xdist rejects the value at startup with a hard error).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -69,9 +70,7 @@ def test_addopts_pins_worksteal_as_split_pair() -> None:
 
 def test_xdist_parallelism_flag_present() -> None:
     opts = _addopts(_parse())
-    assert _flag_value(opts, "-n") is not None, (
-        "--dist=worksteal is inert without -n; keep the parallelism flag"
-    )
+    assert _flag_value(opts, "-n") is not None, "--dist=worksteal is inert without -n; keep the parallelism flag"
 
 
 # --- R3: the installed xdist must understand worksteal ---------------------
@@ -81,9 +80,7 @@ def test_dev_extra_pins_worksteal_capable_xdist() -> None:
     deps = _parse()["project"]["optional-dependencies"]["dev"]
     pin = next((d for d in deps if d.startswith("pytest-xdist")), "")
     major_minor = tuple(int(x) for x in pin.split(">=")[1].split(".")[:2])
-    assert major_minor >= (3, 5), (
-        f"{pin!r} predates --dist=worksteal (xdist 3.5.0)"
-    )
+    assert major_minor >= (3, 5), f"{pin!r} predates --dist=worksteal (xdist 3.5.0)"
 
 
 # --- vacuity guards: the extractor must catch real mutations ---------------

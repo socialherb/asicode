@@ -13,9 +13,7 @@ from typing import Any
 _TRUNCATION_REASONS: tuple[str, ...] = ("length", "truncated")
 
 
-def extract_llm_reasoning(
-    response: dict[str, Any], *, default: str = "", strip: bool = False
-) -> str:
+def extract_llm_reasoning(response: dict[str, Any], *, default: str = "", strip: bool = False) -> str:
     """Extract LLM reasoning_content from a standard OpenAI-format response dict.
 
     DeepSeek Reasoner / GLM-5.2 (thinking ON) models may place the analysis in

@@ -20,6 +20,7 @@ recall hints, retry exhaustion, noop detection, cache 3-state), post-tool
 auto-observation / TDD early finish, deferred semantic settling, patch
 recovery ladder, cancellation/error handlers, and the eviction stub helpers.
 """
+
 from __future__ import annotations
 
 import queue as queue_mod
@@ -56,6 +57,7 @@ from external_llm.client import (
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
+
 
 def _make_loop(**config_over):
     """Minimal TurnPipelineMixin with mocked host dependencies."""
@@ -151,15 +153,22 @@ def _prep_result(ctx, messages=None):
 # RED: token fallback parity in _handle_max_turns_reached
 # ---------------------------------------------------------------------------
 
+
 def test_max_turns_real_zero_prompt_tokens_must_not_fall_back():
     """A REAL prompt_tokens=0 is a valid value (main-loop contract, L338-341):
     the tokens_used fallback must fire only on None, never on 0."""
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=True)
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 0, "completion_tokens": 5, "tokens_used": 777,
-        "content": "summary", "tool_calls": [], "finish_reason": "stop",
-    })
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 0,
+            "completion_tokens": 5,
+            "tokens_used": 777,
+            "content": "summary",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
     result = loop._handle_max_turns_reached(ctx)
     assert result.status == "success"
     assert ctx.total_prompt_tokens == 0  # RED before fix: 777
@@ -171,10 +180,21 @@ def test_max_turns_wrapup_real_zero_prompt_tokens_must_not_fall_back():
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=True)
     responses = [
-        {"prompt_tokens": 10, "completion_tokens": 1, "content": "",
-         "tool_calls": [{"name": "read_file", "args": {}}], "finish_reason": "tool_use"},
-        {"prompt_tokens": 0, "completion_tokens": 2, "tokens_used": 888,
-         "content": "wrapped", "tool_calls": [], "finish_reason": "stop"},
+        {
+            "prompt_tokens": 10,
+            "completion_tokens": 1,
+            "content": "",
+            "tool_calls": [{"name": "read_file", "args": {}}],
+            "finish_reason": "tool_use",
+        },
+        {
+            "prompt_tokens": 0,
+            "completion_tokens": 2,
+            "tokens_used": 888,
+            "content": "wrapped",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        },
     ]
     loop._llm_call_with_tools = mock.MagicMock(side_effect=responses)
     result = loop._handle_max_turns_reached(ctx)
@@ -188,10 +208,16 @@ def test_max_turns_none_prompt_tokens_still_falls_back():
     """Regression pin: None (provider omitted the split) still uses tokens_used."""
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=True)
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": None, "completion_tokens": None, "tokens_used": 432,
-        "content": "summary", "tool_calls": [], "finish_reason": "stop",
-    })
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "tokens_used": 432,
+            "content": "summary",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
     result = loop._handle_max_turns_reached(ctx)
     assert result.status == "success"
     assert ctx.total_prompt_tokens == 432
@@ -202,13 +228,19 @@ def test_max_turns_none_prompt_tokens_still_falls_back():
 # _handle_max_turns_reached — remaining branches
 # ---------------------------------------------------------------------------
 
+
 def test_max_turns_write_intent_without_patches_falls_back_to_max_turns():
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=False)
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 3, "completion_tokens": 1, "content": "done",
-        "tool_calls": [], "finish_reason": "stop",
-    })
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 3,
+            "completion_tokens": 1,
+            "content": "done",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
     result = loop._handle_max_turns_reached(ctx)
     # RuntimeError("... without any applied patches") is swallowed → max_turns
     assert result.status == "max_turns"
@@ -219,10 +251,20 @@ def test_max_turns_still_requesting_tools_after_wrapup_falls_back():
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=True)
     responses = [
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "",
-         "tool_calls": [{"name": "read_file"}], "finish_reason": "tool_use"},
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "",
-         "tool_calls": [{"name": "read_file"}], "finish_reason": "tool_use"},
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "",
+            "tool_calls": [{"name": "read_file"}],
+            "finish_reason": "tool_use",
+        },
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "",
+            "tool_calls": [{"name": "read_file"}],
+            "finish_reason": "tool_use",
+        },
     ]
     loop._llm_call_with_tools = mock.MagicMock(side_effect=responses)
     result = loop._handle_max_turns_reached(ctx)
@@ -233,10 +275,15 @@ def test_max_turns_self_review_appends_summary():
     loop = _make_loop(self_review_enabled=True)
     ctx = _full_ctx(read_only_request=True)
     loop.registry.applied_patches = ["a.py"]
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "base summary",
-        "tool_calls": [], "finish_reason": "stop",
-    })
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "base summary",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
     loop._run_self_review = mock.MagicMock(return_value="found one issue: X")
     loop._is_trivial_edit_request = mock.MagicMock(return_value=False)
     result = loop._handle_max_turns_reached(ctx)
@@ -249,10 +296,15 @@ def test_max_turns_trivial_request_skips_review():
     loop = _make_loop(self_review_enabled=True)
     ctx = _full_ctx(read_only_request=True)
     loop.registry.applied_patches = ["a.py"]
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "s",
-        "tool_calls": [], "finish_reason": "stop",
-    })
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "s",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
     loop._run_self_review = mock.MagicMock()
     loop._is_trivial_edit_request = mock.MagicMock(return_value=True)
     result = loop._handle_max_turns_reached(ctx)
@@ -272,6 +324,7 @@ def test_max_turns_llm_failure_returns_max_turns():
 # ---------------------------------------------------------------------------
 # _handle_final_answer_turn
 # ---------------------------------------------------------------------------
+
 
 def _fa_ctx(**over):
     ctx = _full_ctx(**over)
@@ -313,8 +366,7 @@ def test_final_answer_nudge_then_exhaustion_blocks_false_success():
     assert "[ACTION REQUIRED]" in out.nudge_message.content
 
     # Exhausted nudges → false-success error result.
-    ctx2 = _fa_ctx(read_only_request=False, any_tool_called=True,
-                   no_tool_nudge_count=atp._NO_TOOL_NUDGE_MAX)
+    ctx2 = _fa_ctx(read_only_request=False, any_tool_called=True, no_tool_nudge_count=atp._NO_TOOL_NUDGE_MAX)
     out2 = loop._handle_final_answer_turn(ctx2, "still no patch")
     assert out2.result.status == "error"
     assert out2.result.error == "write_intent_finished_without_patch"
@@ -358,15 +410,16 @@ def test_final_answer_review_trivial_skip():
 # _run_llm_loop — branches
 # ---------------------------------------------------------------------------
 
+
 def _loop_ready(ctx, responses, **config_over):
     loop = _make_loop(**config_over)
     loop._build_initial_messages = mock.MagicMock(return_value=[])
     loop._prepare_turn_messages = mock.MagicMock(return_value=_prep_result(ctx))
     loop._llm_call_with_tools = mock.MagicMock(side_effect=responses)
-    loop._handle_final_answer_turn = mock.MagicMock(return_value=_FinalAnswerOutcome(
-        result=AgentResult(status="text_reply", final_message="done")))
-    loop._handle_loop_error = mock.MagicMock(
-        side_effect=AssertionError("_handle_loop_error must not run"))
+    loop._handle_final_answer_turn = mock.MagicMock(
+        return_value=_FinalAnswerOutcome(result=AgentResult(status="text_reply", final_message="done"))
+    )
+    loop._handle_loop_error = mock.MagicMock(side_effect=AssertionError("_handle_loop_error must not run"))
     return loop
 
 
@@ -375,15 +428,29 @@ def test_run_llm_loop_uses_continuation_messages_for_non_planner():
     loop._continuation_data = {"conversation": [LLMMessage(role="user", content="hi")]}
     loop._build_continuation_messages = mock.MagicMock(return_value=[LLMMessage(role="user", content="c")])
     loop._build_initial_messages = mock.MagicMock(
-        side_effect=AssertionError("initial build must not run for continuation"))
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "done",
-        "tool_calls": [], "finish_reason": "stop"})
-    loop._handle_final_answer_turn = mock.MagicMock(return_value=_FinalAnswerOutcome(
-        result=AgentResult(status="text_reply")))
+        side_effect=AssertionError("initial build must not run for continuation")
+    )
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "done",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
+    loop._handle_final_answer_turn = mock.MagicMock(
+        return_value=_FinalAnswerOutcome(result=AgentResult(status="text_reply"))
+    )
     ctx = _full_ctx()
     result = loop._run_llm_loop(ctx)
     assert result.status == "text_reply"
@@ -393,36 +460,57 @@ def test_run_llm_loop_uses_continuation_messages_for_non_planner():
 def test_run_llm_loop_planner_lane_ignores_continuation():
     loop = _make_loop()
     loop._continuation_data = {"conversation": []}
-    loop._build_continuation_messages = mock.MagicMock(
-        side_effect=AssertionError("planner must build fresh messages"))
+    loop._build_continuation_messages = mock.MagicMock(side_effect=AssertionError("planner must build fresh messages"))
     loop._build_initial_messages = mock.MagicMock(return_value=[])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "done",
-        "tool_calls": [], "finish_reason": "stop"})
-    loop._handle_final_answer_turn = mock.MagicMock(return_value=_FinalAnswerOutcome(
-        result=AgentResult(status="text_reply")))
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "done",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
+    loop._handle_final_answer_turn = mock.MagicMock(
+        return_value=_FinalAnswerOutcome(result=AgentResult(status="text_reply"))
+    )
     ctx = _full_ctx()
     ctx.route = SimpleNamespace(lane="PLANNER")
     assert loop._run_llm_loop(ctx).status == "text_reply"
     loop._build_initial_messages.assert_called_once()
 
 
-@pytest.mark.parametrize("exc,expected_fragment", [
-    (LLMConnectionError("x"), "connection error"),
-    (LLMServerUnavailableError("x"), "server unavailable"),
-    (LLMQuotaExceededError("x"), "quota exceeded"),
-    (LLMAuthenticationError("x"), "authentication error"),
-    (LLMRateLimitError("x"), "rate limit"),
-])
+@pytest.mark.parametrize(
+    "exc,expected_fragment",
+    [
+        (LLMConnectionError("x"), "connection error"),
+        (LLMServerUnavailableError("x"), "server unavailable"),
+        (LLMQuotaExceededError("x"), "quota exceeded"),
+        (LLMAuthenticationError("x"), "authentication error"),
+        (LLMRateLimitError("x"), "rate limit"),
+    ],
+)
 def test_run_llm_loop_typed_llm_errors_return_error_result(exc, expected_fragment):
     loop = _make_loop()
     loop._build_initial_messages = mock.MagicMock(return_value=[])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
     loop._llm_call_with_tools = mock.MagicMock(side_effect=exc)
     ctx = _full_ctx()
     result = loop._run_llm_loop(ctx)
@@ -435,25 +523,43 @@ def test_run_llm_loop_typed_llm_errors_return_error_result(exc, expected_fragmen
 def test_run_llm_loop_tokens_used_fallback_and_usage_cb():
     """prompt_tokens=None (provider omitted split) → tokens_used fallback;
     token_usage cb carries the four cost fields."""
-    loop = _loop_ready(_full_ctx(), [{
-        "prompt_tokens": None, "completion_tokens": 2, "tokens_used": 31,
-        "content": "done", "tool_calls": [], "finish_reason": "stop"}])
+    loop = _loop_ready(
+        _full_ctx(),
+        [
+            {
+                "prompt_tokens": None,
+                "completion_tokens": 2,
+                "tokens_used": 31,
+                "content": "done",
+                "tool_calls": [],
+                "finish_reason": "stop",
+            }
+        ],
+    )
     ctx = _full_ctx()
     result = loop._run_llm_loop(ctx)
     assert result.status == "text_reply"
     assert ctx.total_prompt_tokens == 31
     calls = [c.args[0] for c in loop._cb.call_args_list if c.args and c.args[0] == "token_usage"]
     assert calls, "token_usage cb must fire when tokens are present"
-    payload = next(c.args[1] for c in loop._cb.call_args_list
-                   if c.args and c.args[0] == "token_usage")
+    payload = next(c.args[1] for c in loop._cb.call_args_list if c.args and c.args[0] == "token_usage")
     assert payload["prompt_tokens"] == 31
     assert "turn_cost_usd" in payload and "total_actual_cost_usd" in payload
 
 
 def test_run_llm_loop_agent_thinking_cb_fires_for_content():
-    loop = _loop_ready(_full_ctx(), [{
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "thinking aloud",
-        "tool_calls": [], "finish_reason": "stop"}])
+    loop = _loop_ready(
+        _full_ctx(),
+        [
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "content": "thinking aloud",
+                "tool_calls": [],
+                "finish_reason": "stop",
+            }
+        ],
+    )
     ctx = _full_ctx()
     loop._run_llm_loop(ctx)
     kinds = [c.args[0] for c in loop._cb.call_args_list if c.args]
@@ -462,24 +568,36 @@ def test_run_llm_loop_agent_thinking_cb_fires_for_content():
 
 def test_run_llm_loop_finish_reason_stop_with_tool_calls_is_completion():
     """finish_reason=stop + tool_calls → treated as final answer (tools dropped)."""
-    loop = _loop_ready(_full_ctx(), [{
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "final",
-        "tool_calls": [{"name": "read_file", "args": {}}], "finish_reason": "stop"}])
+    loop = _loop_ready(
+        _full_ctx(),
+        [
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "content": "final",
+                "tool_calls": [{"name": "read_file", "args": {}}],
+                "finish_reason": "stop",
+            }
+        ],
+    )
     ctx = _full_ctx()
     loop._run_llm_loop(ctx)
     loop._handle_final_answer_turn.assert_called_once()
-    loop._execute_and_process_tool_calls = mock.MagicMock(
-        side_effect=AssertionError("tools must not execute"))
+    loop._execute_and_process_tool_calls = mock.MagicMock(side_effect=AssertionError("tools must not execute"))
     # (the assertion above documents intent; second run confirms no execution)
 
 
 def test_run_llm_loop_nudge_continues_then_text_reply_finishes():
     loop = _make_loop()
     responses = [
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "no tools",
-         "tool_calls": [], "finish_reason": "stop"},
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "still prose",
-         "tool_calls": [], "finish_reason": "stop"},
+        {"prompt_tokens": 1, "completion_tokens": 1, "content": "no tools", "tool_calls": [], "finish_reason": "stop"},
+        {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "still prose",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        },
     ]
     loop = _loop_ready(_full_ctx(), responses)
     outcomes = [
@@ -501,16 +619,36 @@ def test_run_llm_loop_tool_early_return_propagates():
     early = AgentResult(status="success", final_message="early")
     loop = _make_loop()
     loop._build_initial_messages = mock.MagicMock(return_value=[])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "",
-        "tool_calls": [{"name": "read_file"}], "finish_reason": "tool_use"})
-    loop._execute_and_process_tool_calls = mock.MagicMock(return_value=_ToolTurnOutcome(
-        new_messages=[], prepared_calls=[], write_tool_used=False,
-        any_tool_called=True, fail_streak={}, reads_since_last_edit=0,
-        plan_current_index=0, early_return=early))
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "",
+            "tool_calls": [{"name": "read_file"}],
+            "finish_reason": "tool_use",
+        }
+    )
+    loop._execute_and_process_tool_calls = mock.MagicMock(
+        return_value=_ToolTurnOutcome(
+            new_messages=[],
+            prepared_calls=[],
+            write_tool_used=False,
+            any_tool_called=True,
+            fail_streak={},
+            reads_since_last_edit=0,
+            plan_current_index=0,
+            early_return=early,
+        )
+    )
     ctx = _full_ctx()
     assert loop._run_llm_loop(ctx) is early
 
@@ -519,22 +657,45 @@ def test_run_llm_loop_should_continue_appends_phase_rules():
     loop = _make_loop()
     rule = LLMMessage(role="user", content="[PHASE RULE] no writes")
     loop._build_initial_messages = mock.MagicMock(return_value=[LLMMessage(role="user", content="base")])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[LLMMessage(role="user", content="base")], budget_warned=False,
-        goal_reminder_injected=0, search_first_hint_done=False, reads_since_last_edit=0))
-    loop._llm_call_with_tools = mock.MagicMock(side_effect=[
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "",
-         "tool_calls": [{"name": "nope"}], "finish_reason": "tool_use"},
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "done",
-         "tool_calls": [], "finish_reason": "stop"},
-    ])
-    loop._execute_and_process_tool_calls = mock.MagicMock(side_effect=[
-        _ToolTurnOutcome(new_messages=[], prepared_calls=[], write_tool_used=False,
-                         any_tool_called=False, fail_streak={}, reads_since_last_edit=0,
-                         plan_current_index=0, should_continue=True, phase_rule_messages=[rule]),
-    ])
-    loop._handle_final_answer_turn = mock.MagicMock(return_value=_FinalAnswerOutcome(
-        result=AgentResult(status="text_reply")))
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[LLMMessage(role="user", content="base")],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        side_effect=[
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "content": "",
+                "tool_calls": [{"name": "nope"}],
+                "finish_reason": "tool_use",
+            },
+            {"prompt_tokens": 1, "completion_tokens": 1, "content": "done", "tool_calls": [], "finish_reason": "stop"},
+        ]
+    )
+    loop._execute_and_process_tool_calls = mock.MagicMock(
+        side_effect=[
+            _ToolTurnOutcome(
+                new_messages=[],
+                prepared_calls=[],
+                write_tool_used=False,
+                any_tool_called=False,
+                fail_streak={},
+                reads_since_last_edit=0,
+                plan_current_index=0,
+                should_continue=True,
+                phase_rule_messages=[rule],
+            ),
+        ]
+    )
+    loop._handle_final_answer_turn = mock.MagicMock(
+        return_value=_FinalAnswerOutcome(result=AgentResult(status="text_reply"))
+    )
     ctx = _full_ctx()
     assert loop._run_llm_loop(ctx).status == "text_reply"
     # The phase rule was folded into history for the next turn.
@@ -567,12 +728,17 @@ def test_run_llm_loop_generic_exception_routes_to_error_handler():
 # _process_post_tool_turn
 # ---------------------------------------------------------------------------
 
+
 def _patch_turn(tool, ok=True, metadata=None, turn_num=1):
     """AgentTurn whose turn_num matches _post_ctx()."""
     from external_llm.agent.agent_loop_types import AgentTurn
+
     return AgentTurn(
-        turn_num=turn_num, tool_name=tool, tool_args={},
-        tool_result=ToolResult(ok=ok, content="c", metadata=metadata or {}))
+        turn_num=turn_num,
+        tool_name=tool,
+        tool_args={},
+        tool_result=ToolResult(ok=ok, content="c", metadata=metadata or {}),
+    )
 
 
 def _post_ctx(**over):
@@ -585,9 +751,11 @@ def _post_ctx(**over):
 def test_post_tool_turn_auto_observation_scopes_git_diff_to_touched_files():
     loop = _make_loop(auto_observation_enabled=True)
     ctx = _post_ctx()
-    ctx.turns = [_patch_turn("write_plan", metadata={"touched_files": ["a.py", "b.py"]}),
-                 _patch_turn("write_plan", metadata={"touched_files": ["a.py"]}),
-                 _patch_turn("read_file")]
+    ctx.turns = [
+        _patch_turn("write_plan", metadata={"touched_files": ["a.py", "b.py"]}),
+        _patch_turn("write_plan", metadata={"touched_files": ["a.py"]}),
+        _patch_turn("read_file"),
+    ]
     ctx.messages = []
     loop._strip_thinking_text = staticmethod(lambda s: s)
     loop._append_native_tool_messages = lambda msgs, resp, new: msgs
@@ -694,6 +862,7 @@ def test_post_tool_turn_thinking_strip_and_passthrough():
 # _prepare_turn_messages
 # ---------------------------------------------------------------------------
 
+
 def _prep_ctx(**over):
     ctx = _full_ctx(**over)
     ctx.turn_num = 1
@@ -742,8 +911,7 @@ def test_prepare_messages_goal_reminder_first_and_urgent():
 
 def test_prepare_messages_plan_progress_hint():
     loop = _prep_loop()
-    ctx = _prep_ctx(plan_subtasks=[{"title": "step one", "files": ["a.py", "b.py"]}],
-                    plan_current_index=0)
+    ctx = _prep_ctx(plan_subtasks=[{"title": "step one", "files": ["a.py", "b.py"]}], plan_current_index=0)
     res = loop._prepare_turn_messages(ctx)
     hint = [m for m in res.messages if "PLAN PROGRESS" in m.content]
     assert hint and "step one" in hint[0].content and "a.py, b.py" in hint[0].content
@@ -767,8 +935,7 @@ def test_prepare_messages_known_target_file_strategy():
     loop = _prep_loop()
     ctx = _prep_ctx(read_only_request=False, known_target_file="src/app.py")
     res = loop._prepare_turn_messages(ctx)
-    assert any("TARGET FILE STRATEGY" in m.content and "src/app.py" in m.content
-               for m in res.messages)
+    assert any("TARGET FILE STRATEGY" in m.content and "src/app.py" in m.content for m in res.messages)
 
 
 def test_prepare_messages_trajectory_compressed_after_turn_two():
@@ -787,6 +954,7 @@ def test_prepare_messages_trajectory_compressed_after_turn_two():
 
 def test_prepare_messages_cancel_event_raises():
     import threading
+
     loop = _prep_loop()
     evt = threading.Event()
     evt.set()
@@ -833,30 +1001,41 @@ def test_prepare_messages_tool_hint_exception_suppressed():
 # _build_and_filter_prepared_calls
 # ---------------------------------------------------------------------------
 
+
 def _filter_loop(**config_over):
     loop = _make_loop(**config_over)
     loop.registry.get_tool_names = mock.MagicMock(
-        side_effect=lambda lang_filter=None:
-            frozenset({"read_file"}) if lang_filter is not None
-            else frozenset({"read_file", "edit_ast"}))
+        side_effect=lambda lang_filter=None: (
+            frozenset({"read_file"}) if lang_filter is not None else frozenset({"read_file", "edit_ast"})
+        )
+    )
     return loop
 
 
 def test_filter_advances_plan_index_after_patch_tool():
     loop = _filter_loop()
     from external_llm.agent.agent_loop_types import AgentTurn
+
     turns = [AgentTurn(turn_num=1, tool_name="write_plan", tool_args={}, tool_result=None)]
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {"path": "a"}}],
-        turns=turns, plan_subtasks=[{"title": "s1"}, {"title": "s2"}],
-        plan_current_index=0, read_only_request=True, turn_num=2)
+        turns=turns,
+        plan_subtasks=[{"title": "s1"}, {"title": "s2"}],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=2,
+    )
     assert res.plan_current_index == 1
     # Non-patch last tool does not advance.
     turns2 = [AgentTurn(turn_num=1, tool_name="read_file", tool_args={}, tool_result=None)]
     res2 = loop._build_and_filter_prepared_calls(
-        tool_calls=[{"name": "read_file", "args": {}}], turns=turns2,
+        tool_calls=[{"name": "read_file", "args": {}}],
+        turns=turns2,
         plan_subtasks=[{"title": "s1"}, {"title": "s2"}],
-        plan_current_index=0, read_only_request=True, turn_num=2)
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=2,
+    )
     assert res2.plan_current_index == 0
 
 
@@ -864,8 +1043,12 @@ def test_filter_skips_non_dict_and_nameless_calls():
     loop = _filter_loop()
     res = loop._build_and_filter_prepared_calls(
         tool_calls=["not-a-dict", {"args": {"path": "x"}}, {"name": "  ", "args": {}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert res.prepared_calls == []
     assert res.should_continue is True
     assert res.phase_rule_messages == []
@@ -877,12 +1060,16 @@ def test_filter_accepts_tool_key_and_function_variants():
         tool_calls=[
             {"tool": "read_file", "args": {"path": "a"}, "id": "id-1"},
             {"function": {"name": "read_file", "arguments": '{"path": "b"}'}},
-            {"function": {"name": "read_file", "arguments": "garbage {\"path\": \"z\"} trailing"}},
+            {"function": {"name": "read_file", "arguments": 'garbage {"path": "z"} trailing'}},
             {"function": {"name": "read_file", "arguments": "[1, 2, 3]"}},
             {"function": {"name": "read_file", "arguments": ""}},
         ],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=3)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=3,
+    )
     assert len(res.prepared_calls) == 5
     assert res.prepared_calls[0]["call_id"] == "id-1"
     assert res.prepared_calls[1]["args"] == {"path": "b"}
@@ -900,8 +1087,12 @@ def test_filter_language_masked_tool_notice():
     loop.registry.repo_language = "java"
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "edit_ast", "args": {}}, {"name": "read_file", "args": {}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert [pc["tool"] for pc in res.prepared_calls] == ["read_file"]
     assert len(res.phase_rule_messages) == 1
     assert "Python-only tool" in res.phase_rule_messages[0].content
@@ -912,15 +1103,23 @@ def test_filter_unknown_tool_notice_readonly_vs_write_mode():
     loop = _filter_loop()
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "nonexistent_tool", "args": {}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert res.should_continue is True
     assert "read-only" in res.phase_rule_messages[0].content
 
     res2 = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "nonexistent_tool", "args": {}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=False, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=False,
+        turn_num=1,
+    )
     assert "current mode" in res2.phase_rule_messages[0].content
 
 
@@ -928,8 +1127,12 @@ def test_filter_stream_preview_emitted():
     loop = _filter_loop(stream_callback=lambda *a, **k: None)
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {"path": "a.py"}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     kinds = [c.args[0] for c in loop._cb.call_args_list if c.args]
     assert "tool_call_preview" in kinds
     assert res.prepared_calls
@@ -937,6 +1140,7 @@ def test_filter_stream_preview_emitted():
 
 def test_filter_cancel_event_raises_before_execution():
     import threading
+
     loop = _filter_loop()
     evt = threading.Event()
     evt.set()
@@ -944,26 +1148,20 @@ def test_filter_cancel_event_raises_before_execution():
     with pytest.raises(AgentCancelled):
         loop._build_and_filter_prepared_calls(
             tool_calls=[{"name": "read_file", "args": {}}],
-            turns=[], plan_subtasks=[], plan_current_index=0,
-            read_only_request=True, turn_num=1)
+            turns=[],
+            plan_subtasks=[],
+            plan_current_index=0,
+            read_only_request=True,
+            turn_num=1,
+        )
 
 
 # ---------------------------------------------------------------------------
 # _process_tool_results
 # ---------------------------------------------------------------------------
 
-_TEST_PATCH = (
-    "--- a/tests/unit/test_x.py\n"
-    "+++ b/tests/unit/test_x.py\n"
-    "@@ -1,2 +1,2 @@\n"
-    "-old\n"
-    "+new\n")
-_SRC_PATCH = (
-    "--- a/src/app.py\n"
-    "+++ b/src/app.py\n"
-    "@@ -1,2 +1,2 @@\n"
-    "-old\n"
-    "+new\n")
+_TEST_PATCH = "--- a/tests/unit/test_x.py\n+++ b/tests/unit/test_x.py\n@@ -1,2 +1,2 @@\n-old\n+new\n"
+_SRC_PATCH = "--- a/src/app.py\n+++ b/src/app.py\n@@ -1,2 +1,2 @@\n-old\n+new\n"
 
 
 def _ptr_loop(**config_over):
@@ -971,16 +1169,18 @@ def _ptr_loop(**config_over):
     loop._try_readonly_early_finish = mock.MagicMock(return_value=None)
     loop._advance_phase_after_success = mock.MagicMock()
     loop._build_tool_result_message = mock.MagicMock(
-        side_effect=lambda cid, tool, result, args: LLMMessage(role="tool", content="{}"))
+        side_effect=lambda cid, tool, result, args: LLMMessage(role="tool", content="{}")
+    )
     return loop
 
 
 def _ptr(results, calls, loop=None, **kw):
     loop = loop or _ptr_loop()
-    prepared = [{"tool": t, "args": a, "call_id": f"c{i}", "original_call": {}}
-                for i, (t, a) in enumerate(calls)]
+    prepared = [{"tool": t, "args": a, "call_id": f"c{i}", "original_call": {}} for i, (t, a) in enumerate(calls)]
     out = loop._process_tool_results(
-        results=results, prepared_calls=prepared, new_messages=[],
+        results=results,
+        prepared_calls=prepared,
+        new_messages=[],
         write_tool_used=kw.get("write_tool_used", False),
         reads_since_last_edit=kw.get("reads_since_last_edit", 0),
         fail_streak=kw.get("fail_streak", {}),
@@ -988,24 +1188,28 @@ def _ptr(results, calls, loop=None, **kw):
         session_key=kw.get("session_key", "rk-1"),
         write_tools={"apply_patch", "write_plan"},
         read_only_request=kw.get("read_only_request", True),
-        request="find it", session_id="sess-1", git_state=None,
-        turn_num=kw.get("turn_num", 1), turns=[])
+        request="find it",
+        session_id="sess-1",
+        git_state=None,
+        turn_num=kw.get("turn_num", 1),
+        turns=[],
+    )
     return out, loop, prepared
 
 
 def test_ptr_cache_outcome_three_states():
     loop = _ptr_loop()
-    loop.registry.is_result_cacheable = mock.MagicMock(
-        side_effect=lambda tool: tool in {"read_file", "read_symbol"})
+    loop.registry.is_result_cacheable = mock.MagicMock(side_effect=lambda tool: tool in {"read_file", "read_symbol"})
     ok_cached = ToolResult(ok=True, content="x", metadata={"cache_hit": True})
     ok_cacheable = ToolResult(ok=True, content="x")
     write_res = ToolResult(ok=True, content="x")
-    _, loop, _ = _ptr([ok_cached, ok_cacheable, write_res],
-                        [("read_file", {}), ("read_symbol", {}), ("apply_patch", {})], loop=loop)
+    _, loop, _ = _ptr(
+        [ok_cached, ok_cacheable, write_res], [("read_file", {}), ("read_symbol", {}), ("apply_patch", {})], loop=loop
+    )
     calls = loop.performance_collector.record_tool_call.call_args_list
-    assert calls[0].kwargs["cache_hit"] is True     # metadata cache_hit → hit
-    assert calls[1].kwargs["cache_hit"] is False    # cacheable read tool → miss
-    assert calls[2].kwargs["cache_hit"] is None     # write tool → not probed
+    assert calls[0].kwargs["cache_hit"] is True  # metadata cache_hit → hit
+    assert calls[1].kwargs["cache_hit"] is False  # cacheable read tool → miss
+    assert calls[2].kwargs["cache_hit"] is None  # write tool → not probed
 
 
 def test_ptr_readonly_early_finish_returns_annotated_result():
@@ -1014,11 +1218,13 @@ def test_ptr_readonly_early_finish_returns_annotated_result():
     loop._try_readonly_early_finish = mock.MagicMock(return_value=early)
     big = "x" * 9000
     res = ToolResult(ok=True, content=big)
-    out, loop, _ = _ptr([res], [("bash", {"command": "ls -la"})],
-                        loop=loop, read_only_request=True)
+    out, loop, _ = _ptr([res], [("bash", {"command": "ls -la"})], loop=loop, read_only_request=True)
     # _STREAM_VERBOSE_TOOLS cap (6000) applied in the streamed tool_call payload.
-    tc = [c.args[1] for c in loop._cb.call_args_list
-          if c.args and c.args[0] == "tool_call" and c.args[1].get("tool") == "bash"]
+    tc = [
+        c.args[1]
+        for c in loop._cb.call_args_list
+        if c.args and c.args[0] == "tool_call" and c.args[1].get("tool") == "bash"
+    ]
     assert tc and len(tc[0]["result"]["content"]) == 6000
     assert out.early_return is early
     assert out.early_return is early
@@ -1031,9 +1237,13 @@ def test_ptr_readonly_early_finish_returns_annotated_result():
 def test_ptr_failure_classification_and_recall_hint():
     loop = _ptr_loop()
     failed = ToolResult(ok=False, content="", error="bad anchor", metadata=None)
-    with mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome") as rro, \
-         mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure",
-                    return_value="[RECALL] this anchor failed before"):
+    with (
+        mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome") as rro,
+        mock.patch(
+            "external_llm.agent.failure_pattern_store.recall_on_failure",
+            return_value="[RECALL] this anchor failed before",
+        ),
+    ):
         out, _, _ = _ptr([failed], [("edit_text", {"file_path": "a.py"})], loop=loop)
     assert failed.metadata["failure_classification"] == {"action": "retry", "reason": "bad args"}
     recall_msgs = [m for m in out.new_messages if "RECALL" in m.content]
@@ -1051,35 +1261,46 @@ def test_ptr_failure_classify_metadata_error_suppressed():
         def __setitem__(self, k, v):
             raise TypeError("immutable metadata")
 
-    with mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"), \
-         mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None):
+    with (
+        mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"),
+        mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None),
+    ):
         out, loop, _ = _ptr(
-            [ToolResult(ok=False, content="", error="x", metadata=BadDict())],
-            [("edit_text", {})], loop=loop)
+            [ToolResult(ok=False, content="", error="x", metadata=BadDict())], [("edit_text", {})], loop=loop
+        )
     assert out.early_return is None  # pipeline survived the suppressed failure
 
 
 def test_ptr_retry_exhaustion_emits_strategy_warning():
     loop = _ptr_loop()
     loop._tool_retry_counter["edit_text"] = atp._TOOL_RETRY_LIMIT - 1
-    with mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"), \
-         mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None):
-        out, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")],
-                            [("edit_text", {"anchor": "p"})], loop=loop)
-    warns = [m for m in out.new_messages if "STRATEGY WARNING" in m.content and "switch to a completely different strategy" in m.content]
+    with (
+        mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"),
+        mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None),
+    ):
+        out, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")], [("edit_text", {"anchor": "p"})], loop=loop)
+    warns = [
+        m
+        for m in out.new_messages
+        if "STRATEGY WARNING" in m.content and "switch to a completely different strategy" in m.content
+    ]
     assert warns
     events = [c.args[0] for c in loop._cb.call_args_list if c.args]
     assert "fail_loop_detected" in events
     assert loop._tool_retry_counter["edit_text"] == 0  # reset after exhaustion
 
 
-@pytest.mark.parametrize("tool,recovery_fragment", [
-    ("write_plan", "Do NOT call write_plan with the same arguments"),
-    ("apply_patch", "Switch to write_plan with edit_blocks"),
-    ("edit_text", "Try a different tool or a different approach"),
-])
+@pytest.mark.parametrize(
+    "tool,recovery_fragment",
+    [
+        ("write_plan", "Do NOT call write_plan with the same arguments"),
+        ("apply_patch", "Switch to write_plan with edit_blocks"),
+        ("edit_text", "Try a different tool or a different approach"),
+    ],
+)
 def test_ptr_fail_streak_threshold_recovery_variants(tool, recovery_fragment):
     from external_llm.agent._shared_utils import make_tool_signature
+
     loop = _ptr_loop()
     key_calls = {  # identical args → same signature → streak accumulates
         "write_plan": ("write_plan", {"plan": "p"}),
@@ -1087,11 +1308,17 @@ def test_ptr_fail_streak_threshold_recovery_variants(tool, recovery_fragment):
         "edit_text": ("edit_text", {"anchor": "a"}),
     }[tool]
     sig = make_tool_signature(tool, key_calls[1])
-    with mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"), \
-         mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None):
-        out, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")],
-                            [key_calls], loop=loop,
-                            fail_streak={sig: 1}, fail_streak_threshold=2)
+    with (
+        mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"),
+        mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None),
+    ):
+        out, loop, _ = _ptr(
+            [ToolResult(ok=False, content="", error="x")],
+            [key_calls],
+            loop=loop,
+            fail_streak={sig: 1},
+            fail_streak_threshold=2,
+        )
     warns = [m for m in out.new_messages if "STRATEGY WARNING" in m.content]
     assert warns and recovery_fragment in warns[0].content
     assert out.fail_streak[sig] == 2
@@ -1099,22 +1326,21 @@ def test_ptr_fail_streak_threshold_recovery_variants(tool, recovery_fragment):
 
 def test_ptr_success_resets_streak_and_retry_counter():
     from external_llm.agent._shared_utils import make_tool_signature
+
     loop = _ptr_loop()
     loop._tool_retry_counter["read_file"] = 1
     sig_key = make_tool_signature("read_file", {"path": "a"})
-    out, loop, _ = _ptr([ToolResult(ok=True, content="ok")],
-                        [("read_file", {"path": "a"})], loop=loop,
-                        fail_streak={sig_key: 1})
+    out, loop, _ = _ptr(
+        [ToolResult(ok=True, content="ok")], [("read_file", {"path": "a"})], loop=loop, fail_streak={sig_key: 1}
+    )
     assert out.fail_streak == {}
     assert loop._tool_retry_counter["read_file"] == 0
 
 
 def test_ptr_noop_detection_via_empty_error_variants():
-    for err in ("No-op patch", "no change detected", "empty diff", "empty patch",
-                "compiled to empty plan"):
+    for err in ("No-op patch", "no change detected", "empty diff", "empty patch", "compiled to empty plan"):
         loop = _ptr_loop()
-        out, loop, _ = _ptr([ToolResult(ok=False, content="", error=err)],
-                            [("apply_patch", {})], loop=loop)
+        out, loop, _ = _ptr([ToolResult(ok=False, content="", error=err)], [("apply_patch", {})], loop=loop)
         assert out.noop_confirmed is True, err
 
 
@@ -1124,48 +1350,59 @@ def test_ptr_stream_emit_suppressed_on_cb_error():
     # First cb call (tool_call emit) ok, second (nothing) raises — the emit
     # inside the loop is wrapped; use a raising cb from the start:
     loop._cb = mock.MagicMock(side_effect=TypeError("cb exploded"))
-    with mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"), \
-         mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None):
-        _, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")],
-                           [("read_file", {})], loop=loop)
+    with (
+        mock.patch("external_llm.agent.failure_pattern_store.record_recall_outcome"),
+        mock.patch("external_llm.agent.failure_pattern_store.recall_on_failure", return_value=None),
+    ):
+        _, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")], [("read_file", {})], loop=loop)
     # emit failure must not break the pipeline
 
 
 def test_ptr_scoped_verification_invalidates_test_index_on_test_write():
     loop = _ptr_loop(scoped_verification=True)
     with mock.patch("external_llm.agent.test_impact_selector.invalidate_index") as inv:
-        _, loop, _ = _ptr([ToolResult(ok=True, content="ok")],
-                           [("apply_patch", {"patch": _TEST_PATCH})],
-                           loop=loop, read_only_request=False)
+        _, loop, _ = _ptr(
+            [ToolResult(ok=True, content="ok")],
+            [("apply_patch", {"patch": _TEST_PATCH})],
+            loop=loop,
+            read_only_request=False,
+        )
     inv.assert_called_once_with("/tmp")
 
 
 def test_ptr_scoped_verification_no_invalidation_for_non_test_write():
     loop = _ptr_loop(scoped_verification=True)
     with mock.patch("external_llm.agent.test_impact_selector.invalidate_index") as inv:
-        _, loop, _ = _ptr([ToolResult(ok=True, content="ok")],
-                           [("apply_patch", {"patch": _SRC_PATCH})],
-                           loop=loop, read_only_request=False)
+        _, loop, _ = _ptr(
+            [ToolResult(ok=True, content="ok")],
+            [("apply_patch", {"patch": _SRC_PATCH})],
+            loop=loop,
+            read_only_request=False,
+        )
     inv.assert_not_called()
 
 
 def test_ptr_scoped_verification_failure_suppressed():
     loop = _ptr_loop(scoped_verification=True)
-    with mock.patch("external_llm.agent.test_impact_selector.invalidate_index",
-                    side_effect=RuntimeError("boom")):
-        out, loop, _ = _ptr([ToolResult(ok=True, content="ok")],
-                            [("apply_patch", {"patch": _TEST_PATCH})],
-                            loop=loop, read_only_request=False)
+    with mock.patch("external_llm.agent.test_impact_selector.invalidate_index", side_effect=RuntimeError("boom")):
+        out, loop, _ = _ptr(
+            [ToolResult(ok=True, content="ok")],
+            [("apply_patch", {"patch": _TEST_PATCH})],
+            loop=loop,
+            read_only_request=False,
+        )
     assert out.early_return is None
 
 
 def test_ptr_exploration_reads_counted_and_write_resets():
     loop = _ptr_loop()
-    out1, _, _ = _ptr([ToolResult(ok=True, content="ok")], [("grep", {"pattern": "x"})],
-                      loop=loop, reads_since_last_edit=2)
+    out1, _, _ = _ptr(
+        [ToolResult(ok=True, content="ok")], [("grep", {"pattern": "x"})], loop=loop, reads_since_last_edit=2
+    )
     assert out1.reads_since_last_edit == 3
-    out2, _, _ = _ptr([ToolResult(ok=True, content="ok")], [("write_plan", {"plan": "p"})],
-                      loop=loop, reads_since_last_edit=5)
+    out2, _, _ = _ptr(
+        [ToolResult(ok=True, content="ok")], [("write_plan", {"plan": "p"})], loop=loop, reads_since_last_edit=5
+    )
     assert out2.reads_since_last_edit == 0
     assert out2.write_tool_used is True
 
@@ -1178,9 +1415,14 @@ def test_ptr_stream_content_limits_by_tool_tier():
     _, loop, _ = _ptr(
         [ToolResult(ok=True, content=big), ToolResult(ok=True, content=big)],
         [("apply_patch", {"patch": "x"}), ("read_file", {"path": "a"})],
-        loop=loop, read_only_request=False)
-    tc = {c.args[1]["tool"]: c.args[1]["result"]["content"]
-          for c in loop._cb.call_args_list if c.args and c.args[0] == "tool_call"}
+        loop=loop,
+        read_only_request=False,
+    )
+    tc = {
+        c.args[1]["tool"]: c.args[1]["result"]["content"]
+        for c in loop._cb.call_args_list
+        if c.args and c.args[0] == "tool_call"
+    }
     assert len(tc["apply_patch"]) == 8000
     assert len(tc["read_file"]) == 2000
 
@@ -1189,22 +1431,30 @@ def test_ptr_stream_content_limits_by_tool_tier():
 # _settle_deferred_semantics
 # ---------------------------------------------------------------------------
 
+
 def _deferred_msg(path, extra_syn=None):
-    payload = {"content": "applied", "metadata": {"syntax_check": {
-        "semantic_deferred": True, "semantic_deferred_path": path, **(extra_syn or {}),
-    }}}
+    payload = {
+        "content": "applied",
+        "metadata": {
+            "syntax_check": {
+                "semantic_deferred": True,
+                "semantic_deferred_path": path,
+                **(extra_syn or {}),
+            }
+        },
+    }
     return LLMMessage(role="tool", content=json_dumps(payload))
 
 
 def json_dumps(obj):
     import json as _j
+
     return _j.dumps(obj, ensure_ascii=False)
 
 
 def test_settle_semantics_drain_failure_returns_quietly():
     loop = _make_loop()
-    loop.registry.drain_pending_semantic_checks = mock.MagicMock(
-        side_effect=RuntimeError("drain boom"))
+    loop.registry.drain_pending_semantic_checks = mock.MagicMock(side_effect=RuntimeError("drain boom"))
     msgs = [_deferred_msg("a.py")]
     loop._settle_deferred_semantics(msgs)  # must not raise
     assert msgs[0].content.startswith("{")
@@ -1212,17 +1462,19 @@ def test_settle_semantics_drain_failure_returns_quietly():
 
 def test_settle_semantics_fills_last_write_only():
     loop = _make_loop()
-    outcome = SimpleNamespace(checked=True, skip_reason=None,
-                              diagnostics=[{"line": 3, "message": "bad indent", "severity": "error"}])
-    loop.registry.drain_pending_semantic_checks = mock.MagicMock(
-        return_value={"a.py": outcome})
+    outcome = SimpleNamespace(
+        checked=True, skip_reason=None, diagnostics=[{"line": 3, "message": "bad indent", "severity": "error"}]
+    )
+    loop.registry.drain_pending_semantic_checks = mock.MagicMock(return_value={"a.py": outcome})
     early_msg = _deferred_msg("a.py")
     late_msg = _deferred_msg("a.py")
     loop._settle_deferred_semantics([early_msg, late_msg])
     import json as _j
+
     late = _j.loads(late_msg.content)
     assert late["metadata"]["syntax_check"]["semantic_diagnostics"] == [
-        {"line": 3, "message": "bad indent", "severity": "error"}]
+        {"line": 3, "message": "bad indent", "severity": "error"}
+    ]
     assert "semantic_diagnostics" not in _j.loads(early_msg.content)["metadata"]["syntax_check"]
     # internal deferred keys stripped from the filled message
     assert "semantic_deferred_path" not in late["metadata"]["syntax_check"]
@@ -1234,11 +1486,11 @@ def test_settle_semantics_fills_last_write_only():
 def test_settle_semantics_skipped_check_reports_reason():
     loop = _make_loop()
     outcome = SimpleNamespace(checked=False, skip_reason="no toolchain", diagnostics=[])
-    loop.registry.drain_pending_semantic_checks = mock.MagicMock(
-        return_value={"a.py": outcome})
+    loop.registry.drain_pending_semantic_checks = mock.MagicMock(return_value={"a.py": outcome})
     msg = _deferred_msg("a.py")
     loop._settle_deferred_semantics([msg])
     import json as _j
+
     syn = _j.loads(msg.content)["metadata"]["syntax_check"]
     assert syn["semantic_check_skipped"] == "no toolchain"
     assert "semantic_diagnostics" not in syn
@@ -1246,14 +1498,14 @@ def test_settle_semantics_skipped_check_reports_reason():
 
 def test_settle_semantics_bad_payload_not_fatal():
     loop = _make_loop()
-    outcome = SimpleNamespace(checked=True, skip_reason=None,
-                              diagnostics=[{"line": 1, "message": "E1", "severity": "error"}])
-    loop.registry.drain_pending_semantic_checks = mock.MagicMock(
-        return_value={"a.py": outcome})
-    msgs = [LLMMessage(role="tool", content="semantic_deferred but not json {{{"),
-            _deferred_msg("a.py")]
+    outcome = SimpleNamespace(
+        checked=True, skip_reason=None, diagnostics=[{"line": 1, "message": "E1", "severity": "error"}]
+    )
+    loop.registry.drain_pending_semantic_checks = mock.MagicMock(return_value={"a.py": outcome})
+    msgs = [LLMMessage(role="tool", content="semantic_deferred but not json {{{"), _deferred_msg("a.py")]
     loop._settle_deferred_semantics(msgs)  # bad payload skipped, good one filled
     import json as _j
+
     assert "semantic_diagnostics" in _j.loads(msgs[1].content)["metadata"]["syntax_check"]
 
 
@@ -1261,24 +1513,29 @@ def test_settle_semantics_bad_payload_not_fatal():
 # _execute_and_process_tool_calls — remaining branches
 # ---------------------------------------------------------------------------
 
+
 def _exec_loop(**config_over):
     loop = _make_loop(**config_over)
     loop._record_tool_success = mock.MagicMock()
     loop._record_tool_failure = mock.MagicMock()
     loop._auto_repair_apply_patch_args = mock.MagicMock(return_value=None)
     loop._settle_deferred_semantics = mock.MagicMock()
-    loop._process_tool_results = mock.MagicMock(return_value=_ResultsProcessingOutcome(
-        new_messages=[], write_tool_used=False, reads_since_last_edit=0,
-        noop_confirmed=False, fail_streak={}))
+    loop._process_tool_results = mock.MagicMock(
+        return_value=_ResultsProcessingOutcome(
+            new_messages=[], write_tool_used=False, reads_since_last_edit=0, noop_confirmed=False, fail_streak={}
+        )
+    )
     return loop
 
 
 def test_exec_should_continue_returns_phase_rules():
     loop = _exec_loop()
     rule = LLMMessage(role="user", content="[PHASE RULE]")
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=[], phase_rule_messages=[rule], plan_current_index=0,
-        should_continue=True))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(
+            prepared_calls=[], phase_rule_messages=[rule], plan_current_index=0, should_continue=True
+        )
+    )
     out = loop._execute_and_process_tool_calls(_full_ctx(), tool_calls=[])
     assert out.should_continue is True
     assert out.phase_rule_messages == [rule]
@@ -1286,10 +1543,10 @@ def test_exec_should_continue_returns_phase_rules():
 
 def test_exec_parallel_stopiteration_yields_failed_results():
     loop = _exec_loop(parallel_tool_execution_enabled=True)
-    calls = [{"tool": "read_file", "args": {}, "call_id": "c1"},
-             {"tool": "read_file", "args": {}, "call_id": "c2"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
+    calls = [{"tool": "read_file", "args": {}, "call_id": "c1"}, {"tool": "read_file", "args": {}, "call_id": "c2"}]
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
     loop.registry.dispatch_parallel = mock.MagicMock(side_effect=StopIteration())
     with mock.patch.object(atp, "_log_parallel_write_failures"):
         ctx = _full_ctx()
@@ -1302,8 +1559,9 @@ def test_exec_parallel_stopiteration_yields_failed_results():
 def test_exec_serial_stopiteration_yields_failed_result():
     loop = _exec_loop()
     calls = [{"tool": "read_file", "args": {}, "call_id": "c1"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
     loop.registry.dispatch = mock.MagicMock(side_effect=StopIteration())
     ctx = _full_ctx()
     out = loop._execute_and_process_tool_calls(ctx, tool_calls=calls)
@@ -1314,8 +1572,9 @@ def test_exec_serial_stopiteration_yields_failed_result():
 def test_exec_serial_write_tool_failure_recorded_to_jsonl():
     loop = _exec_loop()
     calls = [{"tool": "apply_patch", "args": {"patch": "x"}, "call_id": "c1"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
     loop.registry.dispatch = mock.MagicMock(return_value=ToolResult(ok=False, content="", error="bad"))
     with mock.patch("external_llm.agent.tool_failure_log.record_write_tool_failure_from_tr") as rec:
         loop._execute_and_process_tool_calls(_full_ctx(), tool_calls=calls)
@@ -1326,12 +1585,20 @@ def test_exec_serial_write_tool_failure_recorded_to_jsonl():
 def test_exec_early_return_from_results_propagates():
     loop = _exec_loop()
     early = AgentResult(status="success")
-    loop._process_tool_results = mock.MagicMock(return_value=_ResultsProcessingOutcome(
-        new_messages=[], write_tool_used=False, reads_since_last_edit=0,
-        noop_confirmed=False, fail_streak={}, early_return=early))
+    loop._process_tool_results = mock.MagicMock(
+        return_value=_ResultsProcessingOutcome(
+            new_messages=[],
+            write_tool_used=False,
+            reads_since_last_edit=0,
+            noop_confirmed=False,
+            fail_streak={},
+            early_return=early,
+        )
+    )
     calls = [{"tool": "read_file", "args": {}, "call_id": "c1"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
     out = loop._execute_and_process_tool_calls(_full_ctx(), tool_calls=calls)
     assert out.early_return is early
 
@@ -1340,6 +1607,7 @@ def test_exec_early_return_from_results_propagates():
 # _post_dispatch_patch_recovery — tolerant edit_blocks ladder
 # ---------------------------------------------------------------------------
 
+
 def test_recovery_repair_retry_failure_records_metadata():
     loop = _make_loop()
     loop._auto_repair_apply_patch_args = mock.MagicMock(return_value={"patch": "fixed"})
@@ -1347,8 +1615,11 @@ def test_recovery_repair_retry_failure_records_metadata():
     failed = ToolResult(ok=False, error="orig", content="", metadata={})
     out = loop._post_dispatch_patch_recovery("apply_patch", {"patch": "broken"}, failed)
     assert out.metadata["auto_repair"] == {
-        "attempted": True, "kind": "patch_format_fix",
-        "original_error": "orig", "success": False, "retry_error": "still bad",
+        "attempted": True,
+        "kind": "patch_format_fix",
+        "original_error": "orig",
+        "success": False,
+        "retry_error": "still bad",
     }
     assert loop._patch_fail_count == 1
 
@@ -1363,7 +1634,8 @@ def test_recovery_tolerant_conversion_success():
     with mock.patch("external_llm.patch_engine.PatchEngine") as pe:
         pe.return_value.convert_patch_to_edit_blocks.return_value = converted
         out = loop._post_dispatch_patch_recovery(
-            "apply_patch", {"patch": "*** p", "path": "a.py"}, ToolResult(ok=False, error="fail", content=""))
+            "apply_patch", {"patch": "*** p", "path": "a.py"}, ToolResult(ok=False, error="fail", content="")
+        )
     assert out is eb_ok
     assert out.metadata["auto_converted_from_patch"] is True
     assert out.metadata["edit_blocks_count"] == 1
@@ -1373,6 +1645,7 @@ def test_recovery_tolerant_conversion_success():
     sent = loop.registry.dispatch.call_args
     assert sent.args[0] == "write_plan"
     import json as _j
+
     assert _j.loads(sent.args[1]["plan"])["ops"][0]["op"] == "edit_blocks"
 
 
@@ -1384,7 +1657,8 @@ def test_recovery_tolerant_conversion_failure_keeps_error_metadata():
     with mock.patch("external_llm.patch_engine.PatchEngine") as pe:
         pe.return_value.convert_patch_to_edit_blocks.return_value = {"file_path": "a.py", "blocks": [{}]}
         out = loop._post_dispatch_patch_recovery(
-            "apply_patch", {"patch": "p"}, ToolResult(ok=False, error="orig", content="", metadata={}))
+            "apply_patch", {"patch": "p"}, ToolResult(ok=False, error="orig", content="", metadata={})
+        )
     assert out.metadata["edit_blocks_fallback_error"] == "eb fail"
     assert out.ok is False
 
@@ -1396,7 +1670,8 @@ def test_recovery_tolerant_engine_exception_suppressed():
     with mock.patch("external_llm.patch_engine.PatchEngine") as pe:
         pe.return_value.convert_patch_to_edit_blocks.side_effect = RuntimeError("engine boom")
         out = loop._post_dispatch_patch_recovery(
-            "apply_patch", {"patch": "p"}, ToolResult(ok=False, error="orig", content="", metadata={}))
+            "apply_patch", {"patch": "p"}, ToolResult(ok=False, error="orig", content="", metadata={})
+        )
     assert out.ok is False and loop._patch_fail_count == 2
 
 
@@ -1407,7 +1682,8 @@ def test_recovery_tolerant_conversion_empty_result_ignored():
     with mock.patch("external_llm.patch_engine.PatchEngine") as pe:
         pe.return_value.convert_patch_to_edit_blocks.return_value = None
         out = loop._post_dispatch_patch_recovery(
-            "apply_patch", {"patch": "p"}, ToolResult(ok=False, error="orig", content="", metadata={}))
+            "apply_patch", {"patch": "p"}, ToolResult(ok=False, error="orig", content="", metadata={})
+        )
     assert out.ok is False and "edit_blocks_fallback_error" not in out.metadata
 
 
@@ -1423,11 +1699,11 @@ def test_recovery_ok_patch_resets_fail_count():
 # _handle_loop_cancellation / _handle_loop_error
 # ---------------------------------------------------------------------------
 
+
 def test_cancellation_successful_rollback_clears_patches():
     loop = _make_loop()
     loop.registry.applied_patches = ["a.py", "b.py"]
-    loop._rollback_patches = mock.MagicMock(return_value={
-        "success": True, "rolled_back": 2, "total": 2, "results": []})
+    loop._rollback_patches = mock.MagicMock(return_value={"success": True, "rolled_back": 2, "total": 2, "results": []})
     result = loop._handle_loop_cancellation(turns=[], git_state=None)
     assert result.status == "cancelled"
     assert "successfully rolled back" in result.final_message
@@ -1438,9 +1714,14 @@ def test_cancellation_successful_rollback_clears_patches():
 def test_cancellation_partial_rollback_keeps_patches():
     loop = _make_loop()
     loop.registry.applied_patches = ["a.py", "b.py"]
-    loop._rollback_patches = mock.MagicMock(return_value={
-        "success": False, "rolled_back": 1, "total": 2,
-        "results": [{"success": True}, {"success": False, "patch_index": 1, "message": "conflict"}]})
+    loop._rollback_patches = mock.MagicMock(
+        return_value={
+            "success": False,
+            "rolled_back": 1,
+            "total": 2,
+            "results": [{"success": True}, {"success": False, "patch_index": 1, "message": "conflict"}],
+        }
+    )
     result = loop._handle_loop_cancellation(turns=[], git_state=None)
     assert result.status == "cancelled"
     assert "partially failed" in result.final_message
@@ -1457,36 +1738,36 @@ def test_cancellation_no_patches_short_circuits():
 def test_loop_error_types_and_rollback():
     loop = _make_loop()
     loop.registry.applied_patches = ["a.py"]
-    loop._rollback_patches = mock.MagicMock(return_value={
-        "success": True, "rolled_back": 1, "total": 1, "results": []})
+    loop._rollback_patches = mock.MagicMock(return_value={"success": True, "rolled_back": 1, "total": 1, "results": []})
     result = loop._handle_loop_error(
-        error=LLMConnectionError("down"), turns=[], git_state=None,
-        rollback_performed=False, rollback_result=None)
+        error=LLMConnectionError("down"), turns=[], git_state=None, rollback_performed=False, rollback_result=None
+    )
     assert result.status == "error"
     assert "connection" in result.error or "Unexpected" in result.error
     loop.performance_collector.record_agent_result.assert_called_once_with(failed=True)
 
 
 def test_loop_error_classification_variants():
-    for exc, frag in [(LLMRateLimitError("x"), "rate_limit"),
-                      (LLMServerUnavailableError("x"), "server_unavailable"),
-                      (ValueError("x"), "api")]:
+    for exc, frag in [
+        (LLMRateLimitError("x"), "rate_limit"),
+        (LLMServerUnavailableError("x"), "server_unavailable"),
+        (ValueError("x"), "api"),
+    ]:
         loop = _make_loop()
-        kinds = [c.args[1].get("error_type")
-                 for c in _err_calls(loop, exc)]
+        kinds = [c.args[1].get("error_type") for c in _err_calls(loop, exc)]
         assert kinds == [frag]
 
 
 def _err_calls(loop, exc):
     loop._cb = mock.MagicMock()
-    loop._handle_loop_error(error=exc, turns=[], git_state=None,
-                            rollback_performed=False, rollback_result=None)
+    loop._handle_loop_error(error=exc, turns=[], git_state=None, rollback_performed=False, rollback_result=None)
     return [c for c in loop._cb.call_args_list if c.args and c.args[0] == "error"]
 
 
 # ---------------------------------------------------------------------------
 # _log_parallel_write_failures
 # ---------------------------------------------------------------------------
+
 
 def _pwf_pipeline(write_tools):
     loop = _make_loop()
@@ -1496,10 +1777,8 @@ def _pwf_pipeline(write_tools):
 
 def test_pwf_records_write_tool_outcomes():
     loop = _pwf_pipeline({"apply_patch"})
-    results = [ToolResult(ok=False, content="", error="bad"),
-               ToolResult(ok=True, content="ok")]
-    calls = [{"tool": "apply_patch", "args": {"patch": "x"}},
-             {"tool": "read_file", "args": {}}]
+    results = [ToolResult(ok=False, content="", error="bad"), ToolResult(ok=True, content="ok")]
+    calls = [{"tool": "apply_patch", "args": {"patch": "x"}}, {"tool": "read_file", "args": {}}]
     with mock.patch("external_llm.agent.tool_failure_log.record_write_tool_failure_from_tr") as rec:
         atp._log_parallel_write_failures(results, calls, loop, session_key="rk-9")
     rec.assert_called_once()
@@ -1527,6 +1806,7 @@ def test_pwf_registry_failure_suppressed():
 # ---------------------------------------------------------------------------
 # eviction helpers
 # ---------------------------------------------------------------------------
+
 
 def test_evict_for_loop_estimate_failure_returns_messages(monkeypatch):
     monkeypatch.setattr(atp, "_EVICTION_ENABLED", True)
@@ -1559,17 +1839,30 @@ def test_stub_tool_result_unserializable_raw_content_keeps_content_size():
 
 
 def test_is_stubbed_tool_result_gemini_and_noise_blocks():
-    gem = LLMMessage(role="user", content="", raw_content=[
-        "not-a-dict",
-        {"text": "hi"},
-        {"functionResponse": {"name": "read_file", "response": {
-            "content": f"{atp._EVICTED_MARKER}: read_file — 100 chars evicted]"}}},
-    ])
+    gem = LLMMessage(
+        role="user",
+        content="",
+        raw_content=[
+            "not-a-dict",
+            {"text": "hi"},
+            {
+                "functionResponse": {
+                    "name": "read_file",
+                    "response": {"content": f"{atp._EVICTED_MARKER}: read_file — 100 chars evicted]"},
+                }
+            },
+        ],
+    )
     assert atp._is_stubbed_tool_result(gem) is True
-    clean = LLMMessage(role="user", content="", raw_content=[
-        "noise", {"text": "hi"},
-        {"functionResponse": {"name": "grep", "response": {"content": "results"}}},
-    ])
+    clean = LLMMessage(
+        role="user",
+        content="",
+        raw_content=[
+            "noise",
+            {"text": "hi"},
+            {"functionResponse": {"name": "grep", "response": {"content": "results"}}},
+        ],
+    )
     assert atp._is_stubbed_tool_result(clean) is False
 
 
@@ -1580,10 +1873,14 @@ def test_stub_blocks_non_list_raw_content_falls_back_to_standard():
 
 
 def test_stub_anthropic_leaves_text_blocks_intact():
-    m = LLMMessage(role="user", content="", raw_content=[
-        {"type": "text", "text": "strategy warning"},
-        {"type": "tool_result", "tool_use_id": "tu_1", "content": "y" * 300},
-    ])
+    m = LLMMessage(
+        role="user",
+        content="",
+        raw_content=[
+            {"type": "text", "text": "strategy warning"},
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": "y" * 300},
+        ],
+    )
     out = atp._stub_anthropic_tool_result(m, "STUB", {"tu_1": "apply_patch"})
     blocks = out.raw_content
     assert blocks[0] == {"type": "text", "text": "strategy warning"}  # untouched
@@ -1593,10 +1890,14 @@ def test_stub_anthropic_leaves_text_blocks_intact():
 
 
 def test_stub_gemini_non_function_response_passthrough():
-    m = LLMMessage(role="user", content="", raw_content=[
-        {"text": "hello"},
-        {"functionResponse": {"name": "bash", "response": {"content": "z" * 400}}},
-    ])
+    m = LLMMessage(
+        role="user",
+        content="",
+        raw_content=[
+            {"text": "hello"},
+            {"functionResponse": {"name": "bash", "response": {"content": "z" * 400}}},
+        ],
+    )
     out = atp._stub_gemini_tool_result(m, "STUB")
     assert out.raw_content[0] == {"text": "hello"}
     stubbed = out.raw_content[1]["functionResponse"]["response"]["content"]
@@ -1607,16 +1908,20 @@ def test_stub_gemini_non_function_response_passthrough():
 # module helpers
 # ---------------------------------------------------------------------------
 
+
 def test_write_touched_test_file_json_list_plan():
     plan = [{"op": "create_file", "path": "tests/unit/test_new.py"}]
-    assert atp._write_touched_test_file(
-        "write_plan", {"plan": __import__("json").dumps(plan)}) is True
+    assert atp._write_touched_test_file("write_plan", {"plan": __import__("json").dumps(plan)}) is True
 
 
 def test_effective_final_content_reasoning_fallback_and_suppressed_error():
     # dict response with raw.raw_response carrying reasoning_content
-    msg = {"content": "", "raw": SimpleNamespace(raw_response={
-        "choices": [{"message": {"reasoning_content": "the final answer is 42"}}]})}
+    msg = {
+        "content": "",
+        "raw": SimpleNamespace(
+            raw_response={"choices": [{"message": {"reasoning_content": "the final answer is 42"}}]}
+        ),
+    }
     assert "42" in TurnPipelineMixin._effective_final_content(msg)
     # extraction raising must be suppressed → returns plain content
     bad = {"content": "plain", "raw": SimpleNamespace(raw_response=object())}
@@ -1628,31 +1933,59 @@ def test_effective_final_content_reasoning_fallback_and_suppressed_error():
 # tail coverage: remaining branches
 # ---------------------------------------------------------------------------
 
+
 def test_run_llm_loop_full_tool_flow_assignments():
     """Normal tool-turn flow: assignments from _ToolTurnOutcome/_PostToolResult
     propagate onto ctx and the loop continues to the final answer."""
     loop = _make_loop()
     base = [LLMMessage(role="user", content="task")]
     loop._build_initial_messages = mock.MagicMock(return_value=list(base))
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=list(base), budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
-    loop._llm_call_with_tools = mock.MagicMock(side_effect=[
-        {"prompt_tokens": 2, "completion_tokens": 1, "content": "",
-         "tool_calls": [{"name": "read_file"}], "finish_reason": "tool_use"},
-        {"prompt_tokens": 1, "completion_tokens": 1, "content": "all done",
-         "tool_calls": [], "finish_reason": "stop"},
-    ])
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=list(base),
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        side_effect=[
+            {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "content": "",
+                "tool_calls": [{"name": "read_file"}],
+                "finish_reason": "tool_use",
+            },
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "content": "all done",
+                "tool_calls": [],
+                "finish_reason": "stop",
+            },
+        ]
+    )
     tool_out = _ToolTurnOutcome(
-        new_messages=[LLMMessage(role="tool", content="{}")], prepared_calls=[],
-        write_tool_used=False, any_tool_called=True, fail_streak={"s": 1},
-        reads_since_last_edit=3, plan_current_index=1, noop_confirmed=True)
+        new_messages=[LLMMessage(role="tool", content="{}")],
+        prepared_calls=[],
+        write_tool_used=False,
+        any_tool_called=True,
+        fail_streak={"s": 1},
+        reads_since_last_edit=3,
+        plan_current_index=1,
+        noop_confirmed=True,
+    )
     loop._execute_and_process_tool_calls = mock.MagicMock(return_value=tool_out)
-    loop._process_post_tool_turn = mock.MagicMock(return_value=_PostToolResult(
-        messages=base + tool_out.new_messages, tdd_fail_count=0,
-        tdd_total_runs=1, tdd_total_pass=1))
-    loop._handle_final_answer_turn = mock.MagicMock(return_value=_FinalAnswerOutcome(
-        result=AgentResult(status="success")))
+    loop._process_post_tool_turn = mock.MagicMock(
+        return_value=_PostToolResult(
+            messages=base + tool_out.new_messages, tdd_fail_count=0, tdd_total_runs=1, tdd_total_pass=1
+        )
+    )
+    loop._handle_final_answer_turn = mock.MagicMock(
+        return_value=_FinalAnswerOutcome(result=AgentResult(status="success"))
+    )
     ctx = _full_ctx(read_only_request=False)
     ctx.messages = list(base)
     assert loop._run_llm_loop(ctx).status == "success"
@@ -1680,14 +2013,27 @@ def test_run_llm_loop_attribute_response_object():
     """Non-dict response object → _rget getattr fallback + tokens_used fallback."""
     loop = _make_loop()
     loop._build_initial_messages = mock.MagicMock(return_value=[])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
-    resp = SimpleNamespace(prompt_tokens=None, tokens_used=17, completion_tokens=3,
-                           content="obj answer", tool_calls=[], finish_reason="stop")
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    resp = SimpleNamespace(
+        prompt_tokens=None,
+        tokens_used=17,
+        completion_tokens=3,
+        content="obj answer",
+        tool_calls=[],
+        finish_reason="stop",
+    )
     loop._llm_call_with_tools = mock.MagicMock(return_value=resp)
-    loop._handle_final_answer_turn = mock.MagicMock(return_value=_FinalAnswerOutcome(
-        result=AgentResult(status="text_reply")))
+    loop._handle_final_answer_turn = mock.MagicMock(
+        return_value=_FinalAnswerOutcome(result=AgentResult(status="text_reply"))
+    )
     ctx = _full_ctx()
     loop._run_llm_loop(ctx)
     assert ctx.total_prompt_tokens == 17  # object attr fallback path
@@ -1697,10 +2043,21 @@ def test_max_turns_wrapup_none_prompt_tokens_fallback():
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=True)
     responses = [
-        {"prompt_tokens": 5, "completion_tokens": 1, "content": "",
-         "tool_calls": [{"name": "read_file"}], "finish_reason": "tool_use"},
-        {"prompt_tokens": None, "tokens_used": 40, "completion_tokens": None,
-         "content": "wrapped", "tool_calls": [], "finish_reason": "stop"},
+        {
+            "prompt_tokens": 5,
+            "completion_tokens": 1,
+            "content": "",
+            "tool_calls": [{"name": "read_file"}],
+            "finish_reason": "tool_use",
+        },
+        {
+            "prompt_tokens": None,
+            "tokens_used": 40,
+            "completion_tokens": None,
+            "content": "wrapped",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        },
     ]
     loop._llm_call_with_tools = mock.MagicMock(side_effect=responses)
     result = loop._handle_max_turns_reached(ctx)
@@ -1712,11 +2069,13 @@ def test_max_turns_rget_getter_raising_falls_back_to_getattr():
     class WeirdResp:
         def get(self, k, d=None):
             raise KeyError("nope")
+
         prompt_tokens = 7
         completion_tokens = 1
         content = "weird"
         tool_calls: ClassVar[list] = []
         finish_reason = "stop"
+
     loop = _make_loop()
     ctx = _full_ctx(read_only_request=True)
     loop._llm_call_with_tools = mock.MagicMock(return_value=WeirdResp())
@@ -1781,12 +2140,17 @@ def test_prepare_messages_queue_empty_break():
 def test_filter_registry_without_get_tool_names_uses_schemas():
     loop = _make_loop()
     del loop.registry.get_tool_names
-    loop.registry.get_tool_schemas = mock.MagicMock(return_value=[
-        {"name": "read_file"}, {"name": "edit_text"}, {"no_name": 1}])
+    loop.registry.get_tool_schemas = mock.MagicMock(
+        return_value=[{"name": "read_file"}, {"name": "edit_text"}, {"no_name": 1}]
+    )
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {}}, {"name": "mystery", "args": {}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert [pc["tool"] for pc in res.prepared_calls] == ["read_file"]
     assert "not available in read-only mode" in res.phase_rule_messages[0].content
 
@@ -1794,10 +2158,16 @@ def test_filter_registry_without_get_tool_names_uses_schemas():
 def test_filter_non_dict_args_coerced():
     loop = _filter_loop()
     res = loop._build_and_filter_prepared_calls(
-        tool_calls=[{"name": "read_file", "args": "just a string"},
-                    {"function": {"name": "read_file", "arguments": None}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        tool_calls=[
+            {"name": "read_file", "args": "just a string"},
+            {"function": {"name": "read_file", "arguments": None}},
+        ],
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert all(pc["args"] == {} for pc in res.prepared_calls)
 
 
@@ -1806,8 +2176,11 @@ def test_filter_plan_advance_bad_turns_suppressed():
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {}}],
         turns="not-a-list",  # turns[-1] raises TypeError → guarded, index unchanged
-        plan_subtasks=[{"title": "s"}], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        plan_subtasks=[{"title": "s"}],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert res.plan_current_index == 0
 
 
@@ -1816,13 +2189,13 @@ def test_ptr_readonly_early_finish_emit_exception_suppressed():
     early = AgentResult(status="success")
     loop._try_readonly_early_finish = mock.MagicMock(return_value=early)
     loop._cb = mock.MagicMock(side_effect=TypeError("cb boom"))
-    out, loop, _ = _ptr([ToolResult(ok=True, content="r")], [("read_file", {})],
-                        loop=loop, read_only_request=True)
+    out, loop, _ = _ptr([ToolResult(ok=True, content="r")], [("read_file", {})], loop=loop, read_only_request=True)
     assert out.early_return is early  # emit failure did not break early finish
 
 
 def test_ptr_recall_bookkeeping_import_failure_suppressed():
     import builtins
+
     real_import = builtins.__import__
 
     def broken_import(name, *a, **k):
@@ -1832,8 +2205,7 @@ def test_ptr_recall_bookkeeping_import_failure_suppressed():
 
     loop = _ptr_loop()
     with mock.patch("builtins.__import__", side_effect=broken_import):
-        out, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")],
-                            [("read_file", {})], loop=loop)
+        out, loop, _ = _ptr([ToolResult(ok=False, content="", error="x")], [("read_file", {})], loop=loop)
     assert out.early_return is None  # recall bookkeeping failure is non-fatal
 
 
@@ -1845,21 +2217,32 @@ def test_settle_semantics_empty_and_non_syn_payloads():
     # deferred marker present but syntax_check not a dict → skipped
     loop2 = _make_loop()
     loop2.registry.drain_pending_semantic_checks = mock.MagicMock(
-        return_value={"a.py": SimpleNamespace(checked=True, skip_reason=None,
-                                              diagnostics=[{"line": 1, "message": "E", "severity": "error"}])})
+        return_value={
+            "a.py": SimpleNamespace(
+                checked=True, skip_reason=None, diagnostics=[{"line": 1, "message": "E", "severity": "error"}]
+            )
+        }
+    )
     import json as _j
-    msg = LLMMessage(role="tool", content=_j.dumps({"metadata": {"syntax_check": "not-a-dict",
-                                                                  "semantic_deferred": True}}))
+
+    msg = LLMMessage(
+        role="tool", content=_j.dumps({"metadata": {"syntax_check": "not-a-dict", "semantic_deferred": True}})
+    )
     loop2._settle_deferred_semantics([msg])
     assert "semantic_diagnostics" not in msg.content
 
 
 def test_settle_semantics_unfilled_path_and_repeat_write_skip():
     import json as _j
+
     loop = _make_loop()
     loop.registry.drain_pending_semantic_checks = mock.MagicMock(
-        return_value={"b.py": SimpleNamespace(checked=True, skip_reason=None,
-                                              diagnostics=[{"line": 9, "message": "E", "severity": "error"}])})
+        return_value={
+            "b.py": SimpleNamespace(
+                checked=True, skip_reason=None, diagnostics=[{"line": 9, "message": "E", "severity": "error"}]
+            )
+        }
+    )
     # a.py deferred but not in diags → left untouched; b.py filled.
     a = _deferred_msg("a.py")
     b1 = _deferred_msg("b.py")
@@ -1874,12 +2257,11 @@ def test_settle_semantics_unfilled_path_and_repeat_write_skip():
 
 def test_exec_parallel_record_failure_suppressed():
     loop = _exec_loop(parallel_tool_execution_enabled=True)
-    calls = [{"tool": "read_file", "args": {}, "call_id": "c1"},
-             {"tool": "read_file", "args": {}, "call_id": "c2"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
-    loop.registry.dispatch_parallel = mock.MagicMock(return_value=[
-        ToolResult(ok=True), ToolResult(ok=True)])
+    calls = [{"tool": "read_file", "args": {}, "call_id": "c1"}, {"tool": "read_file", "args": {}, "call_id": "c2"}]
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
+    loop.registry.dispatch_parallel = mock.MagicMock(return_value=[ToolResult(ok=True), ToolResult(ok=True)])
     loop._record_tool_success = mock.MagicMock(side_effect=TypeError("bookkeeping gone"))
     with mock.patch.object(atp, "_log_parallel_write_failures"):
         ctx = _full_ctx()
@@ -1889,6 +2271,7 @@ def test_exec_parallel_record_failure_suppressed():
 
 def test_exec_serial_write_tool_record_import_failure_suppressed():
     import builtins
+
     real_import = builtins.__import__
 
     def broken_import(name, *a, **k):
@@ -1898,8 +2281,9 @@ def test_exec_serial_write_tool_record_import_failure_suppressed():
 
     loop = _exec_loop()
     calls = [{"tool": "apply_patch", "args": {"patch": "x"}, "call_id": "c1"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
     loop.registry.dispatch = mock.MagicMock(return_value=ToolResult(ok=True))
     with mock.patch("builtins.__import__", side_effect=broken_import):
         ctx = _full_ctx()
@@ -1910,11 +2294,12 @@ def test_exec_serial_write_tool_record_import_failure_suppressed():
 def test_loop_error_partial_rollback_logs_failures():
     loop = _make_loop()
     loop.registry.applied_patches = ["a.py", "b.py"]
-    loop._rollback_patches = mock.MagicMock(return_value={
-        "success": False, "rolled_back": 1, "total": 2, "results": []})
+    loop._rollback_patches = mock.MagicMock(
+        return_value={"success": False, "rolled_back": 1, "total": 2, "results": []}
+    )
     result = loop._handle_loop_error(
-        error=ValueError("x"), turns=[], git_state=None,
-        rollback_performed=False, rollback_result=None)
+        error=ValueError("x"), turns=[], git_state=None, rollback_performed=False, rollback_result=None
+    )
     assert result.status == "error"
     assert "partially failed" in result.error or "Unexpected" in result.error
     assert loop.registry.applied_patches  # kept
@@ -1924,9 +2309,14 @@ def test_summarize_rollback_manual_variants():
     msg, meta = atp._summarize_rollback(None)
     assert meta["performed"] is False and "No patches" in msg
 
-    rr = {"success": False, "rolled_back": 1, "total": 2, "results": [
-        {"needs_manual_rollback": True, "affected_files": ["shared.py", "shared.py", "x.py"]},
-    ]}
+    rr = {
+        "success": False,
+        "rolled_back": 1,
+        "total": 2,
+        "results": [
+            {"needs_manual_rollback": True, "affected_files": ["shared.py", "shared.py", "x.py"]},
+        ],
+    }
     msg2, meta2 = atp._summarize_rollback(rr)
     assert "Manual targeted rollback required" in msg2
     assert meta2["needs_manual_rollback"] is True
@@ -1942,11 +2332,13 @@ def test_evict_for_loop_empty_messages_short_circuit():
 
 
 def test_is_stubbed_gemini_non_str_inner_content():
-    m = LLMMessage(role="user", content="", raw_content=[
-        {"functionResponse": {"name": "t", "response": {"content": ["not", "str"]}}}])
+    m = LLMMessage(
+        role="user",
+        content="",
+        raw_content=[{"functionResponse": {"name": "t", "response": {"content": ["not", "str"]}}}],
+    )
     assert atp._is_stubbed_tool_result(m) is False
-    m2 = LLMMessage(role="user", content="", raw_content=[
-        {"functionResponse": "not-a-dict-response"}])
+    m2 = LLMMessage(role="user", content="", raw_content=[{"functionResponse": "not-a-dict-response"}])
     assert atp._is_stubbed_tool_result(m2) is False
 
 
@@ -1961,19 +2353,40 @@ def test_run_llm_loop_post_tool_early_return_propagates():
     early = AgentResult(status="success", final_message="tdd finished it")
     loop = _make_loop()
     loop._build_initial_messages = mock.MagicMock(return_value=[])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=_TurnPrepResult(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0))
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": 1, "completion_tokens": 1, "content": "",
-        "tool_calls": [{"name": "write_plan"}], "finish_reason": "tool_use"})
-    loop._execute_and_process_tool_calls = mock.MagicMock(return_value=_ToolTurnOutcome(
-        new_messages=[], prepared_calls=[], write_tool_used=True,
-        any_tool_called=True, fail_streak={}, reads_since_last_edit=0,
-        plan_current_index=0))
-    loop._process_post_tool_turn = mock.MagicMock(return_value=_PostToolResult(
-        messages=[], tdd_fail_count=0, tdd_total_runs=1, tdd_total_pass=1,
-        early_return=early))
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=_TurnPrepResult(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "content": "",
+            "tool_calls": [{"name": "write_plan"}],
+            "finish_reason": "tool_use",
+        }
+    )
+    loop._execute_and_process_tool_calls = mock.MagicMock(
+        return_value=_ToolTurnOutcome(
+            new_messages=[],
+            prepared_calls=[],
+            write_tool_used=True,
+            any_tool_called=True,
+            fail_streak={},
+            reads_since_last_edit=0,
+            plan_current_index=0,
+        )
+    )
+    loop._process_post_tool_turn = mock.MagicMock(
+        return_value=_PostToolResult(
+            messages=[], tdd_fail_count=0, tdd_total_runs=1, tdd_total_pass=1, early_return=early
+        )
+    )
     ctx = _full_ctx()
     assert loop._run_llm_loop(ctx) is early
 
@@ -1995,10 +2408,13 @@ def test_post_tool_turn_observation_skips_failed_patch_turns():
 def test_filter_function_arguments_as_dict():
     loop = _filter_loop()
     res = loop._build_and_filter_prepared_calls(
-        tool_calls=[{"function": {"name": "read_file",
-                                  "arguments": {"path": "direct-dict"}}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        tool_calls=[{"function": {"name": "read_file", "arguments": {"path": "direct-dict"}}}],
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert res.prepared_calls[0]["args"] == {"path": "direct-dict"}
 
 
@@ -2012,6 +2428,7 @@ def test_effective_final_content_empty_content_extraction_raise():
 # ---------------------------------------------------------------------------
 # Round 30: remaining miss lines (exception-suppression + fallback branches)
 # ---------------------------------------------------------------------------
+
 
 class _AppendBoom(list):
     """ephemeral_pending whose append() raises AttributeError (suppressed paths)."""
@@ -2089,15 +2506,18 @@ def test_filter_schema_fallback_without_get_tool_names():
     loop.registry = SimpleNamespace(
         repo_root="/tmp",
         repo_language=None,
-        get_tool_schemas=mock.MagicMock(
-            return_value=[{"name": "read_file"}, {"name": "edit_ast"}]),
+        get_tool_schemas=mock.MagicMock(return_value=[{"name": "read_file"}, {"name": "edit_ast"}]),
         normalize_args_for_display=staticmethod(lambda a: a),
         _WRITE_TOOLS={"apply_patch", "write_plan"},
     )
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {"path": "a"}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert res.prepared_calls and res.prepared_calls[0]["tool"] == "read_file"
 
 
@@ -2112,8 +2532,12 @@ def test_filter_stream_preview_exception_suppressed():
     loop._cb = _cb_boom
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {"path": "a.py"}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     assert res.prepared_calls and res.prepared_calls[0]["tool"] == "read_file"
 
 
@@ -2124,21 +2548,25 @@ def test_ptr_failure_classification_exception_suppressed():
     loop.registry.is_result_cacheable = mock.MagicMock(return_value=False)
     out, loop, _ = _ptr(
         results=[ToolResult(ok=False, content="", error="boom", metadata={})],
-        calls=[("read_file", {"path": "a"})], loop=loop)
+        calls=[("read_file", {"path": "a"})],
+        loop=loop,
+    )
     assert out is not None
 
 
 def test_settle_deferred_semantics_skips_messages_without_marker():
     """Messages without the semantic_deferred marker are left untouched."""
     loop = _make_loop()
-    loop.registry.drain_pending_semantic_checks = mock.MagicMock(return_value={
-        "/tmp/a.py": SimpleNamespace(
-            checked=True, skip_reason=None, diagnostics=[{"severity": "info"}])})
+    loop.registry.drain_pending_semantic_checks = mock.MagicMock(
+        return_value={"/tmp/a.py": SimpleNamespace(checked=True, skip_reason=None, diagnostics=[{"severity": "info"}])}
+    )
     plain = LLMMessage(role="tool", content="plain result")
-    deferred = LLMMessage(role="tool", content=__import__("json").dumps({
-        "metadata": {"syntax_check": {
-            "semantic_deferred_path": "/tmp/a.py",
-            "semantic_deferred": True}}}))
+    deferred = LLMMessage(
+        role="tool",
+        content=__import__("json").dumps(
+            {"metadata": {"syntax_check": {"semantic_deferred_path": "/tmp/a.py", "semantic_deferred": True}}}
+        ),
+    )
     loop._settle_deferred_semantics([plain, deferred])
     filled = __import__("json").loads(deferred.content)["metadata"]["syntax_check"]
     assert "semantic_diagnostics" in filled
@@ -2150,10 +2578,10 @@ def test_exec_serial_record_success_exception_suppressed():
     loop = _exec_loop()
     loop._record_tool_success = mock.MagicMock(side_effect=AttributeError("boom"))
     calls = [{"tool": "read_file", "args": {}, "call_id": "c1"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0))
-    loop.registry.dispatch = mock.MagicMock(
-        return_value=ToolResult(ok=True, content="c", metadata={}))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(prepared_calls=calls, phase_rule_messages=[], plan_current_index=0)
+    )
+    loop.registry.dispatch = mock.MagicMock(return_value=ToolResult(ok=True, content="c", metadata={}))
     ctx = _full_ctx()
     out = loop._execute_and_process_tool_calls(ctx, tool_calls=calls)
     assert len(ctx.turns) == 1 and ctx.turns[0].tool_result.ok
@@ -2164,9 +2592,17 @@ def test_is_stubbed_tool_result_gemini_function_response():
     """Gemini functionResponse block with EVICTED marker counts as stubbed."""
     m = SimpleNamespace(
         content="",
-        raw_content=[{"functionResponse": {"response": {
-            "content": f"{atp._EVICTED_MARKER}: read_file — 1234 chars "
-                       "evicted to save context; re-read if still needed.]"}}}])
+        raw_content=[
+            {
+                "functionResponse": {
+                    "response": {
+                        "content": f"{atp._EVICTED_MARKER}: read_file — 1234 chars "
+                        "evicted to save context; re-read if still needed.]"
+                    }
+                }
+            }
+        ],
+    )
     assert atp._is_stubbed_tool_result(m) is True
 
 
@@ -2176,8 +2612,12 @@ def test_filter_registry_errors_fall_back_to_empty_sets():
     loop.registry.get_tool_names = mock.MagicMock(side_effect=KeyError("boom"))
     res = loop._build_and_filter_prepared_calls(
         tool_calls=[{"name": "read_file", "args": {}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=True, turn_num=1)
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=True,
+        turn_num=1,
+    )
     # Empty known set = no filtering: the call still goes through.
     assert res.prepared_calls and res.prepared_calls[0]["tool"] == "read_file"
     assert res.phase_rule_messages == []
@@ -2187,7 +2627,12 @@ def test_is_stubbed_tool_result_anthropic_tool_result_block():
     """Anthropic tool_result block with EVICTED marker counts as stubbed."""
     m = SimpleNamespace(
         content="",
-        raw_content=[{"type": "tool_result",
-                      "content": f"{atp._EVICTED_MARKER}: read_file — 1234 chars "
-                                 "evicted to save context; re-read if still needed.]"}])
+        raw_content=[
+            {
+                "type": "tool_result",
+                "content": f"{atp._EVICTED_MARKER}: read_file — 1234 chars "
+                "evicted to save context; re-read if still needed.]",
+            }
+        ],
+    )
     assert atp._is_stubbed_tool_result(m) is True

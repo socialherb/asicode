@@ -9,9 +9,11 @@ Covers:
   Part 4 — placement_uncertain=True is set on anchor_edit fallbacks that have
             no guard_add, no ast_ops, and no precise anchor lineno.
 """
+
 from types import SimpleNamespace
 
 # ─── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _make_op(**kwargs):
     """Return a minimal Operation-like SimpleNamespace."""
@@ -34,6 +36,7 @@ def _make_op(**kwargs):
 
 
 # ─── Part 1: metadata propagation through large-symbol redirect ───────────────
+
 
 class TestLargeSymbolMetadataPreservation:
     """Verify that op.metadata survives the modify_symbol → anchor_edit redirect."""
@@ -71,6 +74,7 @@ class TestLargeSymbolMetadataPreservation:
 
 # ─── Part 4: placement_uncertain flag ──────────────────────────────────────────
 
+
 class TestPlacementUncertainFlag:
     """Verify placement_uncertain=True is set when the fallback has no precise semantic info."""
 
@@ -105,24 +109,25 @@ class TestPlacementUncertainFlag:
 
 # ─── Part 2: spec → op metadata propagation ────────────────────────────────────
 
+
 class TestSpecToOpMetadataPropagation:
     """Verify _attach_edit_contracts sees edit_kind/guard_statement from spec.metadata."""
 
     def _propagate(self, spec_metadata: dict, ops: list) -> list:
         """Replicate the propagation loop from planner_agent.py."""
-        spec_ek = spec_metadata.get('edit_kind', '')
-        spec_gs = spec_metadata.get('guard_statement', '')
+        spec_ek = spec_metadata.get("edit_kind", "")
+        spec_gs = spec_metadata.get("guard_statement", "")
         if not spec_ek and not spec_gs:
             return ops
         for op in ops:
-            if getattr(op, 'kind', '') != 'MODIFY_SYMBOL':
+            if getattr(op, "kind", "") != "MODIFY_SYMBOL":
                 continue
             if op.metadata is None:
                 op.metadata = {}
-            if spec_ek and not op.metadata.get('edit_kind'):
-                op.metadata['edit_kind'] = spec_ek
-            if spec_gs and not op.metadata.get('guard_statement'):
-                op.metadata['guard_statement'] = spec_gs
+            if spec_ek and not op.metadata.get("edit_kind"):
+                op.metadata["edit_kind"] = spec_ek
+            if spec_gs and not op.metadata.get("guard_statement"):
+                op.metadata["guard_statement"] = spec_gs
         return ops
 
     def test_edit_kind_propagated_to_op(self):

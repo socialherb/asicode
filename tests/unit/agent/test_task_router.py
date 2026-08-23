@@ -92,21 +92,19 @@ class TestDeterministicClassifier:
     # ── _compute_confidence ────────────────────────────────────────────
 
     def test_compute_confidence_default(self):
-        assert DeterministicClassifier._compute_confidence(
-            self._make_features()
-        ) == 0.70
+        assert DeterministicClassifier._compute_confidence(self._make_features()) == 0.70
 
     def test_compute_confidence_with_file(self):
-        conf = DeterministicClassifier._compute_confidence(
-            self._make_features(has_explicit_file=True)
-        )
+        conf = DeterministicClassifier._compute_confidence(self._make_features(has_explicit_file=True))
         assert conf == pytest.approx(0.78)
 
     def test_compute_confidence_all_penalties(self):
         conf = DeterministicClassifier._compute_confidence(
             self._make_features(
-                is_multi_file=True, is_project_wide=True,
-                has_conflicting_intent=True, all_targets_non_structured=True,
+                is_multi_file=True,
+                is_project_wide=True,
+                has_conflicting_intent=True,
+                all_targets_non_structured=True,
             )
         )
         assert conf == 0.55  # clamped to min 0.55
@@ -122,86 +120,66 @@ class TestDeterministicClassifier:
     def test_build_main_agent_reason_non_structured(self):
         reason = DeterministicClassifier._build_main_agent_reason(
             self._make_features(
-                all_targets_non_structured=True, has_edit_intent=True,
+                all_targets_non_structured=True,
+                has_edit_intent=True,
             )
         )
         assert "non-structured targets" in reason
         assert "edit request" in reason
 
     def test_build_main_agent_reason_ui_change(self):
-        reason = DeterministicClassifier._build_main_agent_reason(
-            self._make_features(requests_ui_change=True)
-        )
+        reason = DeterministicClassifier._build_main_agent_reason(self._make_features(requests_ui_change=True))
         assert "UI/style change" in reason
 
     def test_build_main_agent_reason_filesystem(self):
-        reason = DeterministicClassifier._build_main_agent_reason(
-            self._make_features(requests_filesystem_op=True)
-        )
+        reason = DeterministicClassifier._build_main_agent_reason(self._make_features(requests_filesystem_op=True))
         assert "filesystem operation" in reason
 
     # ── _classify_task_meta ────────────────────────────────────────────
 
     def test_classify_task_meta_micro_edit(self):
-        tk, _cx, _sc = self.clf._classify_task_meta(
-            self._make_features(looks_trivial_edit=True)
-        )
+        tk, _cx, _sc = self.clf._classify_task_meta(self._make_features(looks_trivial_edit=True))
         assert tk == TaskKind.MICRO_EDIT
 
     def test_classify_task_meta_style_fix(self):
-        tk, _, _ = self.clf._classify_task_meta(
-            self._make_features(requests_style_change=True)
-        )
+        tk, _, _ = self.clf._classify_task_meta(self._make_features(requests_style_change=True))
         assert tk == TaskKind.STYLE_FIX
 
     def test_classify_task_meta_refactor(self):
-        tk, _, _ = self.clf._classify_task_meta(
-            self._make_features(requests_refactor=True)
-        )
+        tk, _, _ = self.clf._classify_task_meta(self._make_features(requests_refactor=True))
         assert tk == TaskKind.REFACTOR
 
     def test_classify_task_meta_test_write(self):
-        tk, _, _ = self.clf._classify_task_meta(
-            self._make_features(requests_test_work=True)
-        )
+        tk, _, _ = self.clf._classify_task_meta(self._make_features(requests_test_work=True))
         assert tk == TaskKind.TEST_WRITE
 
     def test_classify_task_meta_boilerplate(self):
-        tk, _, _ = self.clf._classify_task_meta(
-            self._make_features(requests_boilerplate=True)
-        )
+        tk, _, _ = self.clf._classify_task_meta(self._make_features(requests_boilerplate=True))
         assert tk == TaskKind.BOILERPLATE
 
     def test_classify_task_meta_exploration(self):
         tk, _, _ = self.clf._classify_task_meta(
             self._make_features(
-                has_edit_intent=False, has_read_intent=True,
+                has_edit_intent=False,
+                has_read_intent=True,
             )
         )
         assert tk == TaskKind.EXPLORATION
 
     def test_classify_task_meta_multi_file(self):
-        tk, _, _ = self.clf._classify_task_meta(
-            self._make_features(is_multi_file=True)
-        )
+        tk, _, _ = self.clf._classify_task_meta(self._make_features(is_multi_file=True))
         assert tk == TaskKind.MULTI_FILE_FEATURE
 
     def test_classify_task_meta_single_file(self):
-        tk, _, _ = self.clf._classify_task_meta(
-            self._make_features()
-        )
+        tk, _, _ = self.clf._classify_task_meta(self._make_features())
         assert tk == TaskKind.SINGLE_FILE_EDIT
 
     def test_classify_complexity_high(self):
-        _, cx, _ = self.clf._classify_task_meta(
-            self._make_features(file_count=5)
-        )
+        _, cx, _ = self.clf._classify_task_meta(self._make_features(file_count=5))
         assert cx == Complexity.HIGH
 
     def test_classify_complexity_medium(self):
-        _, cx, _ = self.clf._classify_task_meta(
-            self._make_features(is_multi_file=True)
-        )
+        _, cx, _ = self.clf._classify_task_meta(self._make_features(is_multi_file=True))
         assert cx == Complexity.MEDIUM
 
     def test_classify_complexity_vague_refactor_is_high(self):
@@ -230,15 +208,11 @@ class TestDeterministicClassifier:
         assert cx == Complexity.MEDIUM
 
     def test_classify_scope_project_wide(self):
-        _, _, sc = self.clf._classify_task_meta(
-            self._make_features(is_project_wide=True)
-        )
+        _, _, sc = self.clf._classify_task_meta(self._make_features(is_project_wide=True))
         assert sc == Scope.PROJECT_WIDE
 
     def test_classify_scope_single_file(self):
-        _, _, sc = self.clf._classify_task_meta(
-            self._make_features(is_multi_file=False)
-        )
+        _, _, sc = self.clf._classify_task_meta(self._make_features(is_multi_file=False))
         assert sc == Scope.SINGLE_FILE
 
     # ── _build_main_agent_decision ─────────────────────────────────────

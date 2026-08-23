@@ -16,6 +16,7 @@ by clearing.  These tests pin:
 * previously-cached entries survive a full-cache build and keep serving
   without recompute.
 """
+
 import os
 import textwrap
 
@@ -126,9 +127,7 @@ def test_disk_tier_insert_refused_when_full(tmp_path, monkeypatch):
     assert (str(tmp_path), str(a)) not in _names_cache
 
 
-def test_full_cache_keeps_serving_cached_entries_without_recompute(
-    tmp_path, monkeypatch
-):
+def test_full_cache_keeps_serving_cached_entries_without_recompute(tmp_path, monkeypatch):
     """The thrash fix: an at-cap build must not evict previously-cached names."""
     monkeypatch.setattr(rg_module._names_cache, "cap", 8)
     repo = _make_repo(tmp_path, {"a.py": "def fa():\n    return 1\n"})

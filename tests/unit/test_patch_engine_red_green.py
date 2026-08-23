@@ -14,6 +14,7 @@ Covers the untested repair/rollback/salvage surface:
     (failed update), _snapshot_patch_targets, _restore_patch_targets
   - static helpers: _trim/_sanitize/_keep/_force/_ensure/_normalize edges
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -78,9 +79,7 @@ class TestSynthesizeAndApply:
             error = "boom"
             mode = None
 
-        monkeypatch.setattr(
-            engine.hybrid_parser, "parse", lambda *a, **k: _Parsed()
-        )
+        monkeypatch.setattr(engine.hybrid_parser, "parse", lambda *a, **k: _Parsed())
         r = engine.synthesize_and_apply("junk", "app.py")
         assert r.success is False
         assert "boom" in r.error
@@ -92,9 +91,7 @@ class TestSynthesizeAndApply:
             error = None
             mode = None
 
-        monkeypatch.setattr(
-            engine.hybrid_parser, "parse", lambda *a, **k: _Parsed()
-        )
+        monkeypatch.setattr(engine.hybrid_parser, "parse", lambda *a, **k: _Parsed())
         r = engine.synthesize_and_apply("ambiguous", "app.py")
         assert r.success is False
         assert r.metadata["synth_reason"] == "needs_disambiguation"
@@ -178,9 +175,7 @@ class TestSynthesizeAndApply:
                 value = "full_file"
 
         monkeypatch.setattr(engine.hybrid_parser, "parse", lambda *a, **k: _Parsed())
-        monkeypatch.setattr(
-            engine.patch_synthesizer, "synthesize", lambda p, t: "not a diff at all"
-        )
+        monkeypatch.setattr(engine.patch_synthesizer, "synthesize", lambda p, t: "not a diff at all")
 
         def _apply_boom(*a, **k):
             raise RuntimeError("apply blew up")
@@ -196,21 +191,13 @@ class TestSynthesizeAndApply:
 
 class TestAutoRepairPatch:
     def test_function_replace(self, engine, git_repo):
-        bad_patch = (
-            "@@ -6,2 +6,2 @@\n"
-            "-def add(a, b):\n"
-            "-    return a + b\n"
-            "+def add(a, b):\n"
-            "+    return a + b + 1\n"
-        )
+        bad_patch = "@@ -6,2 +6,2 @@\n-def add(a, b):\n-    return a + b\n+def add(a, b):\n+    return a + b + 1\n"
         out = engine._auto_repair_patch(bad_patch, "app.py")
         assert out is not None
         assert "diff --git a/app.py b/app.py" in out
 
     def test_class_replace(self, engine, git_repo):
-        (git_repo / "cls.py").write_text(
-            "class Widget:\n    def run(self):\n        return 1\n"
-        )
+        (git_repo / "cls.py").write_text("class Widget:\n    def run(self):\n        return 1\n")
         patch = (
             "@@ -1,3 +1,3 @@\n"
             "-class Widget:\n"
@@ -256,9 +243,7 @@ class TestFileBlockSynthGuards:
             def stat(self):
                 raise OSError("no stat")
 
-        monkeypatch.setattr(
-            "external_llm.patch_engine.Path", lambda p: _P(p) if str(p).endswith("app.py") else Path(p)
-        )
+        monkeypatch.setattr("external_llm.patch_engine.Path", lambda p: _P(p) if str(p).endswith("app.py") else Path(p))
         try:
             _patch, reason = engine._try_synthesize_diff_from_file_blocks(
                 str(git_repo), "app.py", "FILE: app.py\n```x=1```"
@@ -275,9 +260,7 @@ class TestFileBlockSynthGuards:
         assert reason == "file_too_large"
 
     def test_no_blocks(self, engine, git_repo):
-        _patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", "nothing here"
-        )
+        _patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", "nothing here")
         assert reason == "no_file_block"
 
     def test_legacy_regex_fallback_picks_target(self, engine, git_repo):
@@ -299,55 +282,41 @@ class TestFileBlockSynthGuards:
             "def new_fn():\n"
             "    return 42\n"
         )
-        patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "file_block_synth"
         assert "new_fn" in patch
 
     def test_block_for_other_file(self, engine, git_repo):
         llm = "FILE: other.py\n```y = 2\n```\n"
-        _patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        _patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "no_target_file_block"
 
     def test_multi_file_block_rejected(self, engine, git_repo):
         llm = "FILE: app.py\n```x = 1\n```\nFILE: other.py\n```y = 2\n```\n"
-        _patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        _patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "multi_file_block"
 
     def test_basename_fallback(self, engine, git_repo):
         llm = "FILE: app.py\n```def add(a, b):\n    return a + b + 5\n```\n"
-        patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "./app.py", llm
-        )
+        patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "./app.py", llm)
         assert reason == "file_block_synth", reason
         assert "a + b + 5" in patch
 
     def test_identical_content_no_changes(self, engine, git_repo):
         cur = (git_repo / "app.py").read_text()
         llm = f"FILE: app.py\n```{cur}```\n"
-        _patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        _patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "no_changes"
 
     def test_rewrite_valve_rejects_whole_file(self, engine, git_repo):
         llm = "FILE: app.py\n```brand = 'new'\n```\n"
-        _patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        _patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "file_rewrite_too_large"
 
     def test_new_text_oversize(self, engine, git_repo):
         big = "x = 1\n" * 60000
         llm = f"FILE: app.py\n```{big}```\n"
-        _patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        _patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "file_too_large"
 
     def test_fence_inside_block_stripped(self, engine, git_repo):
@@ -371,9 +340,7 @@ class TestFileBlockSynthGuards:
             "\n"
             "```\n"
         )
-        patch, reason = engine._try_synthesize_diff_from_file_blocks(
-            str(git_repo), "app.py", llm
-        )
+        patch, reason = engine._try_synthesize_diff_from_file_blocks(str(git_repo), "app.py", llm)
         assert reason == "file_block_synth", reason
         # trailing fence must not leak into the synthesized diff
         assert "```\n+" not in patch
@@ -404,53 +371,31 @@ class TestSalvageStrategies:
         assert r is None
 
     def test_strategy1_fuzzy_replacement(self, engine, git_repo):
-        malformed = (
-            "Here is the fix:\n"
-            "-    msg = \"Hello, \" + name\n"
-            "+    msg = \"Bonjour, \" + name\n"
-        )
+        malformed = 'Here is the fix:\n-    msg = "Hello, " + name\n+    msg = "Bonjour, " + name\n'
         out = engine._salvage_small_model_output(malformed, "app.py")
         assert out is not None
         assert 'msg = "Bonjour, " + name' in out
         assert out.startswith("diff --git a/app.py b/app.py")
 
     def test_strategy1_below_threshold_rejected(self, engine, git_repo):
-        malformed = (
-            "-def greet(name):\n"
-            "-    msg = \"Hello, \" + name\n"
-            "+zzzzz completely unrelated zzzzz\n"
-        )
+        malformed = '-def greet(name):\n-    msg = "Hello, " + name\n+zzzzz completely unrelated zzzzz\n'
         out = engine._salvage_small_model_output(malformed, "app.py")
         assert out is None
 
     def test_strategy2_before_after_exact(self, engine, git_repo):
-        malformed = (
-            "before:\n"
-            "    return a + b\n"
-            "after:\n"
-            "    return (a + b) * 2\n"
-        )
+        malformed = "before:\n    return a + b\nafter:\n    return (a + b) * 2\n"
         out = engine._salvage_small_model_output(malformed, "app.py")
         assert out is not None
         assert "(a + b) * 2" in out
 
     def test_strategy2_before_after_fuzzy(self, engine, git_repo):
-        malformed = (
-            "before:\n"
-            "def add(a, b):\n"
-            "    return a + b\n"
-            "after:\n"
-            "def add(a, b):\n"
-            "    return a + b + 10\n"
-        )
+        malformed = "before:\ndef add(a, b):\n    return a + b\nafter:\ndef add(a, b):\n    return a + b + 10\n"
         out = engine._salvage_small_model_output(malformed, "app.py")
         assert out is not None
         assert "a + b + 10" in out
 
     def test_strategy3_insert_html_anchor(self, engine, git_repo):
-        (git_repo / "page.html").write_text(
-            "<!doctype html>\n<html>\n<body>hi</body>\n</html>\n"
-        )
+        (git_repo / "page.html").write_text("<!doctype html>\n<html>\n<body>hi</body>\n</html>\n")
         malformed = "+<p>new paragraph</p>\n"
         out = engine._salvage_small_model_output(malformed, "page.html")
         assert out is not None
@@ -484,13 +429,7 @@ class TestSalvageStrategies:
 class TestRepairPatchLadder:
     def test_no_llm_auto_repair_success(self, engine, git_repo):
         # patch whose + lines form a full function → auto-repair replaces it
-        bad_patch = (
-            "@@ -6,2 +6,2 @@\n"
-            "-def add(a, b):\n"
-            "-    return a + b\n"
-            "+def add(a, b):\n"
-            "+    return a + b + 100\n"
-        )
+        bad_patch = "@@ -6,2 +6,2 @@\n-def add(a, b):\n-    return a + b\n+def add(a, b):\n+    return a + b + 100\n"
         r = engine.repair_patch(bad_patch, "app.py", failure_reason="git apply failed")
         assert r.success is True, r.error
         assert r.metadata["mode"] == "auto_repair"
@@ -587,7 +526,7 @@ class TestRepairPatchLadder:
         monkeypatch.setattr(engine, "ast_rewriter", None)
         monkeypatch.setattr(engine, "symbol_searcher", None)
         monkeypatch.setattr(engine, "semantic_patcher", None)
-        llm = "```\ndef greet(name):\n    msg = \"Hello, \" + name\n    return msg\n\n\ndef add(a, b):\n    return a + b + 12\n\n\ndef multiply(a, b):\n    return a * b\n```"
+        llm = '```\ndef greet(name):\n    msg = "Hello, " + name\n    return msg\n\n\ndef add(a, b):\n    return a + b + 12\n\n\ndef multiply(a, b):\n    return a * b\n```'
         r = engine.repair_patch("p", "app.py", failure_reason="x", llm_output=llm)
         assert r.success is True, r.error
         assert r.metadata["mode"] == "file_block_synth"
@@ -628,19 +567,12 @@ class TestApplyPatchPaths:
         assert r.success is True, r.error
 
     def test_p1_target_from_bare_plus_header(self, engine, git_repo):
-        patch = (
-            "--- app.py\t2020-01-02\n"
-            "+++ app.py\t2020-01-02\n"
-            "@@ -2,1 +2,1 @@\n"
-            ' msg = "Hello, " + name\n'
-        )
+        patch = '--- app.py\t2020-01-02\n+++ app.py\t2020-01-02\n@@ -2,1 +2,1 @@\n msg = "Hello, " + name\n'
         r = engine.apply_patch(patch, None)
         assert r.success is True, r.error
 
     def test_file_not_found_early_exit(self, engine):
-        patch = (
-            "--- a/ghost.py\n+++ b/ghost.py\n@@ -1 +1 @@\n-a\n+b\n"
-        )
+        patch = "--- a/ghost.py\n+++ b/ghost.py\n@@ -1 +1 @@\n-a\n+b\n"
         r = engine.apply_patch(patch, "ghost.py")
         assert r.success is False
         assert "does not exist" in r.error
@@ -654,7 +586,7 @@ class TestApplyPatchPaths:
         monkeypatch.setattr(engine, "_diff_apply", _boom)
         patch = (
             "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -2,1 +2,1 @@\n-    msg = \"Hello, \" + name\n+    msg = \"Hi, \" + name\n"
+            '@@ -2,1 +2,1 @@\n-    msg = "Hello, " + name\n+    msg = "Hi, " + name\n'
         )
         r = engine.apply_patch(patch, "app.py")
         assert r.success is False
@@ -664,7 +596,7 @@ class TestApplyPatchPaths:
         monkeypatch.setattr(engine, "_diff_apply", None)
         patch = (
             "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -2,1 +2,1 @@\n-    msg = \"Hello, \" + name\n+    msg = \"Hi, \" + name\n"
+            '@@ -2,1 +2,1 @@\n-    msg = "Hello, " + name\n+    msg = "Hi, " + name\n'
         )
         r = engine.apply_patch(patch, "app.py")
         assert r.success is False
@@ -734,10 +666,7 @@ class TestApplyPatchPaths:
             metadata: ClassVar[dict] = {"reason": "r", "mode": "m", "fallback_used": ["x"]}
 
         monkeypatch.setattr(engine, "repair_patch", lambda **k: _FakeRepair())
-        patch = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -6,2 +6,2 @@\n-ZZZZ\n-ZZZZ\n+q\n+w\n"
-        )
+        patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -6,2 +6,2 @@\n-ZZZZ\n-ZZZZ\n+q\n+w\n"
         r = engine.apply_patch(patch, "app.py", context=ctx)
         assert r.success is False
         assert r.metadata["reason"] == "repaired_patch_missing"
@@ -770,8 +699,7 @@ class TestApplyPatchPaths:
         (git_repo / ".gitignore").write_text("ignored.py\n")
         (git_repo / "ignored.py").write_text("x = 1\ny = 2\n")
         patch = (
-            "diff --git a/ignored.py b/ignored.py\n--- a/ignored.py\n"
-            "+++ b/ignored.py\n@@ -1,2 +1,2 @@\n-XXXX\n+new\n"
+            "diff --git a/ignored.py b/ignored.py\n--- a/ignored.py\n+++ b/ignored.py\n@@ -1,2 +1,2 @@\n-XXXX\n+new\n"
         )
         r = engine.apply_patch(patch, "ignored.py")
         assert r.success is False
@@ -787,9 +715,7 @@ class TestApplyPatchPaths:
 
 class TestRollbackHelpers:
     def test_snapshot_patch_targets_roundtrip(self, engine, git_repo):
-        snap = engine._snapshot_patch_targets(
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-        )
+        snap = engine._snapshot_patch_targets("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
         (app_abs,) = snap.keys()
         assert snap[app_abs] is not None
         # mutate + restore
@@ -833,9 +759,7 @@ class TestRollbackHelpers:
             calls.append(a)
             raise AssertionError("must not be called when entries equal")
 
-        monkeypatch.setattr(
-            engine, "_read_index_entries", lambda rels: {"app.py": ("100644", "abc")}
-        )
+        monkeypatch.setattr(engine, "_read_index_entries", lambda rels: {"app.py": ("100644", "abc")})
         snapshot = {"app.py": ("100644", "abc")}
         engine._restore_index_entries(snapshot)
         assert calls == []
@@ -870,9 +794,11 @@ class TestRollbackHelpers:
 
         def _fake_run(cmd, *a, **k):
             if cmd[1] == "ls-files":
+
                 class _L:
                     returncode = 0
                     stdout = b"100644 sha1 0\tapp.py\x00100644 sha2 0\tother.py\x00"
+
                 return _L()
             updates.append(cmd)
             return _R()
@@ -886,9 +812,7 @@ class TestRollbackHelpers:
         assert "other.py" in updates[0][2]
 
     def test_snapshot_index_entries(self, engine, git_repo):
-        snap = engine._snapshot_index_entries(
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-        )
+        snap = engine._snapshot_index_entries("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
         assert "app.py" in snap  # committed in fixture
 
 
@@ -905,19 +829,13 @@ class TestConvertPatchToEditBlocksEdges:
         assert engine.convert_patch_to_edit_blocks(p) is None
 
     def test_diff_git_header_extract(self, engine):
-        p = (
-            "diff --git a/deep/mod.py b/deep/mod.py\n"
-            "--- a/deep/mod.py\n+++ b/deep/mod.py\n@@ -1 +1 @@\n-a\n+b\n"
-        )
+        p = "diff --git a/deep/mod.py b/deep/mod.py\n--- a/deep/mod.py\n+++ b/deep/mod.py\n@@ -1 +1 @@\n-a\n+b\n"
         out = engine.convert_patch_to_edit_blocks(p)
         assert out["file_path"] == "deep/mod.py"
         assert out["blocks"] == [{"before": "a", "after": "b"}]
 
     def test_only_add_lines(self, engine):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -0,0 +1 @@\n+brand_new = 1\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -0,0 +1 @@\n+brand_new = 1\n"
         out = engine.convert_patch_to_edit_blocks(p)
         assert out["blocks"] == [{"before": "", "after": "brand_new = 1"}]
 
@@ -948,9 +866,7 @@ class TestStaticSanitizerEdges:
         assert PatchEngine._trim_patch_to_first_header("  junk only  ") == "junk only"
 
     def test_trim_trims_to_diff_git(self):
-        out = PatchEngine._trim_patch_to_first_header(
-            "preamble\nnoise\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n"
-        )
+        out = PatchEngine._trim_patch_to_first_header("preamble\nnoise\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n")
         assert out.startswith("--- a/f")
         assert out.endswith("\n")
 
@@ -959,14 +875,7 @@ class TestStaticSanitizerEdges:
         assert PatchEngine._sanitize_patch_lines("") == ""
 
     def test_sanitize_bom_and_indent_and_fence(self):
-        p = (
-            "\ufeff```diff\n"
-            "  --- a/f\n"
-            "\t+++ b/f\n"
-            "  @@ -1 +1 @@\n"
-            " -a\n"
-            " +b\n"
-        )
+        p = "\ufeff```diff\n  --- a/f\n\t+++ b/f\n  @@ -1 +1 @@\n -a\n +b\n"
         out = PatchEngine._sanitize_patch_lines(p)
         assert "```" not in out
         assert out.startswith("--- a/f")
@@ -974,20 +883,12 @@ class TestStaticSanitizerEdges:
 
     def test_sanitize_body_context_marker_preserved(self):
         # context line whose CONTENT looks like a header must stay verbatim
-        p = (
-            "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n"
-            " normal\n"
-            " +++ b/other.py\n"
-        )
+        p = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n normal\n +++ b/other.py\n"
         out = PatchEngine._sanitize_patch_lines(p)
         assert " +++ b/other.py\n" in out
 
     def test_sanitize_git_marker_in_body_returns_to_header(self):
-        p = (
-            "--- a/f\n+++ b/f\n@@ -1 +1 @@\n x\n"
-            "diff --git a/g b/g\n"
-            "    --- a/g\n"
-        )
+        p = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n x\ndiff --git a/g b/g\n    --- a/g\n"
         out = PatchEngine._sanitize_patch_lines(p)
         assert "--- a/g" in out
 
@@ -1019,18 +920,12 @@ class TestStaticSanitizerEdges:
         assert out == "@@ -1 +1 @@\n-a\n+b\n"
 
     def test_keep_no_diff_git_second_section_stops(self):
-        p = (
-            "--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b\n"
-            "--- a/g.py\n+++ b/g.py\n@@ -1 +1 @@\n-c\n+d\n"
-        )
+        p = "--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b\n--- a/g.py\n+++ b/g.py\n@@ -1 +1 @@\n-c\n+d\n"
         out = PatchEngine._keep_only_target_file_section(p, "f.py")
         assert "g.py" not in out
 
     def test_keep_no_diff_git_unparseable_first_header(self):
-        p = (
-            "--- weird header\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b\n"
-            "--- a/g.py\n+++ b/g.py\n@@ -1 +1 @@\n-c\n+d\n"
-        )
+        p = "--- weird header\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b\n--- a/g.py\n+++ b/g.py\n@@ -1 +1 @@\n-c\n+d\n"
         out = PatchEngine._keep_only_target_file_section(p, "f.py")
         # first_file is None → stop at the second '--- ' regardless
         assert "g.py" not in out
@@ -1044,10 +939,7 @@ class TestStaticSanitizerEdges:
         assert PatchEngine._force_target_file_paths(p, "") == p
 
     def test_force_rewrites_basename_headers(self):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -1 +1 @@\n-a\n+b\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-a\n+b\n"
         out = PatchEngine._force_target_file_paths(p, "pkg/sub/app.py")
         assert "diff --git a/pkg/sub/app.py b/pkg/sub/app.py" in out
         assert "--- a/pkg/sub/app.py" in out
@@ -1112,10 +1004,7 @@ class TestStaticSanitizerEdges:
         assert PatchEngine._normalize_patch_headers(p, None) == p
 
     def test_normalize_second_section_resets_flags(self):
-        p = (
-            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n"
-            "diff --git a/g b/g\n@@ -1 +1 @@\n-c\n+d\n"
-        )
+        p = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/g b/g\n@@ -1 +1 @@\n-c\n+d\n"
         out = PatchEngine._normalize_patch_headers(p, None)
         assert "--- a/g" in out
         assert "+++ b/g" in out
@@ -1191,9 +1080,7 @@ class TestTolerantApplyEdges:
             raise OSError("git vanished")
 
         monkeypatch.setattr(pe.subprocess, "run", _fake_run)
-        ok, _err, mode = engine._tolerant_git_apply(
-            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n", "f"
-        )
+        ok, _err, mode = engine._tolerant_git_apply("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n", "f")
         assert ok is False
         assert mode == "none"
         assert calls["n"] >= 5  # every variant attempted
@@ -1255,37 +1142,24 @@ class TestReanchorEdges:
             "+    return a + b + 1\n"
         )
         # finder reports the anchor at 0-index 6 (= line 7), 0 context before
-        out = engine._reanchor_patch_core(
-            patch, "app.py", lambda body, fl, old: (6, 0, "(test)"), "p"
-        )
+        out = engine._reanchor_patch_core(patch, "app.py", lambda body, fl, old: (6, 0, "(test)"), "p")
         assert out is not None
         assert "@@ -7,2 +7,2 @@" in out
 
     def test_core_counts_default_to_one(self, engine, git_repo):
         patch = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -6 +6 @@\n"
-            "-def add(a, b):\n"
-            "+def add(a, b):\n"
+            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -6 +6 @@\n-def add(a, b):\n+def add(a, b):\n"
         )
-        out = engine._reanchor_patch_core(
-            patch, "app.py", lambda body, fl, old: (6, 0, "(t)"), "p"
-        )
+        out = engine._reanchor_patch_core(patch, "app.py", lambda body, fl, old: (6, 0, "(t)"), "p")
         assert out is not None
         assert "@@ -7,1 +7,1 @@" in out
 
     def test_exact_no_removed_lines(self, engine, git_repo):
-        patch = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -1,0 +2 @@\n+new\n"
-        )
+        patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,0 +2 @@\n+new\n"
         assert engine._exact_reanchor_patch(patch, "app.py") is None
 
     def test_exact_removed_line_too_short(self, engine, git_repo):
-        patch = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -1 +1 @@\n-ab\n+cd\n"
-        )
+        patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-ab\n+cd\n"
         assert engine._exact_reanchor_patch(patch, "app.py") is None
 
     def test_exact_no_match_in_file(self, engine, git_repo):
@@ -1299,9 +1173,9 @@ class TestReanchorEdges:
         patch = (
             "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
             "@@ -2,2 +2,2 @@\n"
-            "-    msg = \"Hello, \" + name\n"
+            '-    msg = "Hello, " + name\n'
             "-    return msg\n"
-            "+    msg = \"Hi, \" + name\n"
+            '+    msg = "Hi, " + name\n'
             "+    return msg\n"
         )
         assert engine._exact_reanchor_patch(patch, "app.py") is None
@@ -1320,25 +1194,19 @@ class TestReanchorEdges:
         patch = (
             "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
             "@@ -2,2 +2,2 @@\n"
-            "-    msg = \"Hello, \" + name\n"
+            '-    msg = "Hello, " + name\n'
             "-TOTALLY WRONG SECOND\n"
             "+a\n+b\n"
         )
         assert engine._exact_reanchor_patch(patch, "app.py") is None
 
     def test_fuzzy_no_search_lines(self, engine, git_repo):
-        patch = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -1,0 +2 @@\n+insert\n"
-        )
+        patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,0 +2 @@\n+insert\n"
         assert engine._reanchor_patch(patch, "app.py") is None
 
     def test_fuzzy_file_over_2000_lines(self, engine, git_repo):
         (git_repo / "big.py").write_text("v = 1\n" * 2100)
-        patch = (
-            "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n"
-            "@@ -2,2 +2,2 @@\n-v = 1\n-v = 1\n+x\n+y\n"
-        )
+        patch = "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n@@ -2,2 +2,2 @@\n-v = 1\n-v = 1\n+x\n+y\n"
         assert engine._reanchor_patch(patch, "big.py") is None
 
     def test_fuzzy_reanchors_stale_header(self, engine, git_repo):
@@ -1370,42 +1238,27 @@ class TestReanchorEdges:
 
 class TestContextFreeHunks:
     def test_new_file_excluded(self):
-        p = (
-            "diff --git a/n.py b/n.py\nnew file mode 100644\n"
-            "--- /dev/null\n+++ b/n.py\n@@ -0,0 +1 @@\n+x\n"
-        )
+        p = "diff --git a/n.py b/n.py\nnew file mode 100644\n--- /dev/null\n+++ b/n.py\n@@ -0,0 +1 @@\n+x\n"
         assert PatchEngine.context_free_hunks(p) == []
 
     def test_context_free_hunk_reported(self):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -8,0 +9,2 @@\n+stmt1\n+stmt2\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -8,0 +9,2 @@\n+stmt1\n+stmt2\n"
         out = PatchEngine.context_free_hunks(p)
         assert len(out) == 1
         assert "app.py" in out[0]
 
     def test_hunk_with_context_not_reported(self):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -1,2 +1,2 @@\n keep\n-a\n+b\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n keep\n-a\n+b\n"
         assert PatchEngine.context_free_hunks(p) == []
 
     def test_junk_line_ends_hunk(self):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -1,0 +2,1 @@\n+x\nJUNK-NO-PREFIX\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,0 +2,1 @@\n+x\nJUNK-NO-PREFIX\n"
         out = PatchEngine.context_free_hunks(p)
         # hunk body ended at JUNK before flush → reported with the '+x' only
         assert len(out) == 1
 
     def test_deletion_to_devnull_not_reported(self):
-        p = (
-            "diff --git a/old.py b/old.py\n--- a/old.py\n+++ /dev/null\n"
-            "@@ -1,1 +0,0 @@\n-gone\n"
-        )
+        p = "diff --git a/old.py b/old.py\n--- a/old.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n"
         assert PatchEngine.context_free_hunks(p) == []
 
 
@@ -1414,18 +1267,12 @@ class TestContextFreeHunks:
 
 class TestVerifyC0Edges:
     def test_deleted_file_skipped(self, engine, git_repo):
-        p = (
-            "diff --git a/ghost.py b/ghost.py\n--- a/ghost.py\n+++ b/ghost.py\n"
-            "@@ -1,2 +1,2 @@\n a\n-b\n+c\n"
-        )
+        p = "diff --git a/ghost.py b/ghost.py\n--- a/ghost.py\n+++ b/ghost.py\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n"
         ok, _detail = engine._verify_c0_placement(p)
         assert ok is True
 
     def test_context_free_hunk_accepted(self, engine, git_repo):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -8,0 +9,2 @@\n+zzz\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -8,0 +9,2 @@\n+zzz\n"
         ok, _detail = engine._verify_c0_placement(p)
         assert ok is True
 
@@ -1449,10 +1296,7 @@ class TestVerifyC0Edges:
         assert "app.py" in detail
 
     def test_new_file_skipped(self, engine, git_repo):
-        p = (
-            "diff --git a/n.py b/n.py\nnew file mode 100644\n"
-            "--- /dev/null\n+++ b/n.py\n@@ -0,0 +1 @@\n+anything\n"
-        )
+        p = "diff --git a/n.py b/n.py\nnew file mode 100644\n--- /dev/null\n+++ b/n.py\n@@ -0,0 +1 @@\n+anything\n"
         ok, _detail = engine._verify_c0_placement(p)
         assert ok is True
 
@@ -1510,7 +1354,7 @@ class TestMiscEdges:
         assert "stdout msg" in err
 
     def test_normalize_and_validate_adds_trailing_newline(self, engine, git_repo):
-        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -2,1 +2,1 @@\n-    msg = \"Hello, \" + name\n+    msg = \"Hello, \" + name\n"  # context-equal
+        p = 'diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -2,1 +2,1 @@\n-    msg = "Hello, " + name\n+    msg = "Hello, " + name\n'  # context-equal
         out, err = engine.normalize_and_validate(p.rstrip("\n"), "app.py")
         assert err is None
         assert out.endswith("\n")
@@ -1541,10 +1385,7 @@ class TestMiscEdges:
         assert "diff_apply exception" in err
 
     def test_apply_diff_once_rejects(self, engine, git_repo):
-        p = (
-            "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
-            "@@ -2,1 +2,1 @@\n-ZZZZ absent ZZZZ\n+new line\n"
-        )
+        p = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -2,1 +2,1 @@\n-ZZZZ absent ZZZZ\n+new line\n"
         ok, err = engine._apply_diff_once(p, "app.py")
         assert ok is False
         assert err

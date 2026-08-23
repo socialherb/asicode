@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
 class ContextPack:
     """Container for a rendered context string and metadata."""
+
     content: str
     metadata: dict[str, Any]
 
@@ -27,9 +28,9 @@ class HelperContextBuilder:
     def build(
         self,
         task: str,
-        function_signature: Optional[str] = None,
-        local_snippet: Optional[str] = None,
-        constraints: Optional[str] = None,
+        function_signature: str | None = None,
+        local_snippet: str | None = None,
+        constraints: str | None = None,
     ) -> ContextPack:
         """Build helper context."""
         lines: list[str] = []
@@ -54,10 +55,12 @@ class HelperContextBuilder:
             lines.append(constraints)
             lines.append("")
 
-        metadata.update({
-            "has_signature": bool(function_signature),
-            "has_snippet": bool(local_snippet),
-            "has_constraints": bool(constraints),
-        })
+        metadata.update(
+            {
+                "has_signature": bool(function_signature),
+                "has_snippet": bool(local_snippet),
+                "has_constraints": bool(constraints),
+            }
+        )
 
         return ContextPack(content="\n".join(lines), metadata=metadata)

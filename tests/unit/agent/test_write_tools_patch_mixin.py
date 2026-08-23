@@ -9,6 +9,7 @@ anchor_edit entry-point validation.
 The harness mirrors test_write_tools_reread_retry._Harness — a minimal
 concrete host for the mixin with stubbed side-effect hooks.
 """
+
 from __future__ import annotations
 
 import difflib
@@ -31,9 +32,7 @@ def _wipe_patch(name: str, n: int, keep: int) -> str:
     """Build a valid unified diff wiping ``name`` from ``n`` lines down to ``keep``."""
     old = [f"line{i}" for i in range(n)]
     new = old[:keep]
-    diff = difflib.unified_diff(
-        old, new, fromfile=f"a/{name}", tofile=f"b/{name}", lineterm=""
-    )
+    diff = difflib.unified_diff(old, new, fromfile=f"a/{name}", tofile=f"b/{name}", lineterm="")
     # difflib applies lineterm only to the ---/+++/@@ control lines; body
     # lines are echoed from the newline-free input lists as-is.  Joining with
     # "\n" therefore yields a valid unified diff on every Python version,
@@ -64,6 +63,7 @@ class _Harness(WriteToolsMixin):
 
     def _secure_path(self, path, *, confine=False):
         from pathlib import Path as _Path
+
         repo = _Path(self.repo_root).resolve()
         p = _Path(path)
         resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -87,6 +87,7 @@ def harness(tmp_path):
 
 # ── _resolve_ast_anchor_line (module-level pure helper) ─────────────────────
 
+
 class TestResolveAstAnchorLine:
     def test_valid_lineno_returns_zero_indexed(self):
         assert _resolve_ast_anchor_line(2, ["a", "b", "c"], None) == 1
@@ -102,6 +103,7 @@ class TestResolveAstAnchorLine:
 
 
 # ── _normalize_op_path ──────────────────────────────────────────────────────
+
 
 class TestNormalizeOpPath:
     def test_relative_path_passthrough(self, harness):
@@ -127,6 +129,7 @@ class TestNormalizeOpPath:
 
 
 # ── _normalize_plan_op ──────────────────────────────────────────────────────
+
 
 class TestNormalizePlanOp:
     def test_action_mapped_to_op(self, harness):
@@ -161,9 +164,7 @@ class TestNormalizePlanOp:
 
     def test_edit_blocks_before_after_to_blocks(self, harness):
         repairs = []
-        op = harness._normalize_plan_op(
-            {"op": "edit_blocks", "path": "f.py", "before": "old", "after": "new"}, repairs
-        )
+        op = harness._normalize_plan_op({"op": "edit_blocks", "path": "f.py", "before": "old", "after": "new"}, repairs)
         assert op["blocks"] == [{"before": "old", "after": "new"}]
         assert "before" not in op
 
@@ -177,8 +178,7 @@ class TestNormalizePlanOp:
     def test_edit_blocks_alias_normalization(self, harness):
         repairs = []
         op = harness._normalize_plan_op(
-            {"op": "edit_blocks", "path": "f.py",
-             "blocks": [{"old": "a", "new": "b"}]}, repairs
+            {"op": "edit_blocks", "path": "f.py", "blocks": [{"old": "a", "new": "b"}]}, repairs
         )
         assert op["blocks"][0]["before"] == "a"
         assert op["blocks"][0]["after"] == "b"
@@ -186,8 +186,7 @@ class TestNormalizePlanOp:
     def test_edit_blocks_strip_line_number_prefixes(self, harness):
         repairs = []
         op = harness._normalize_plan_op(
-            {"op": "edit_blocks", "path": "f.py",
-             "blocks": [{"before": "12: foo\n13: bar", "after": "new"}]}, repairs
+            {"op": "edit_blocks", "path": "f.py", "blocks": [{"before": "12: foo\n13: bar", "after": "new"}]}, repairs
         )
         assert op["blocks"][0]["before"] == "foo\nbar"
         assert any("line-number" in r for r in repairs)
@@ -205,8 +204,7 @@ class TestNormalizePlanOp:
         (tmp_path / "t.txt").write_text("a\nb\nc\n", encoding="utf-8")
         repairs = []
         op = harness._normalize_plan_op(
-            {"op": "edit_blocks", "path": "t.txt",
-             "blocks": [{"start_line": 1, "end_line": 2, "after": "z"}]}, repairs
+            {"op": "edit_blocks", "path": "t.txt", "blocks": [{"start_line": 1, "end_line": 2, "after": "z"}]}, repairs
         )
         assert op["blocks"][0]["before"] == "a\nb"
 
@@ -214,8 +212,7 @@ class TestNormalizePlanOp:
         (tmp_path / "t.txt").write_text("def f():\n    body\n", encoding="utf-8")
         repairs = []
         op = harness._normalize_plan_op(
-            {"op": "edit_blocks", "path": "t.txt",
-             "blocks": [{"before": "body", "after": "x"}]}, repairs
+            {"op": "edit_blocks", "path": "t.txt", "blocks": [{"before": "body", "after": "x"}]}, repairs
         )
         assert op["blocks"][0]["before"] == "    body"
 
@@ -228,6 +225,7 @@ class TestNormalizePlanOp:
 
 
 # ── _detect_placeholder_op ──────────────────────────────────────────────────
+
 
 class TestDetectPlaceholderOp:
     def test_placeholder_before_detected(self, harness):
@@ -251,32 +249,34 @@ class TestDetectPlaceholderOp:
 
 # ── _enrich_plan_error ──────────────────────────────────────────────────────
 
+
 class TestEnrichPlanError:
     def test_missing_before_hint(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("hello world\n", encoding="utf-8")
-        plan = {"kind": "ASICODE_PLAN_V1", "ops": [
-            {"op": "edit_blocks", "path": "t.txt", "blocks": [{"before": "x"}]}]}
+        plan = {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "edit_blocks", "path": "t.txt", "blocks": [{"before": "x"}]}]}
         out = harness._enrich_plan_error(plan, "missing 'before'")
         assert "HINT" in out and "Current file content" in out
 
     def test_not_found_hint_with_close_match(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
-        plan = {"kind": "ASICODE_PLAN_V1", "ops": [
-            {"op": "edit_blocks", "path": "t.txt",
-             "blocks": [{"before": "alpa", "after": "x"}]}]}
+        plan = {
+            "kind": "ASICODE_PLAN_V1",
+            "ops": [{"op": "edit_blocks", "path": "t.txt", "blocks": [{"before": "alpa", "after": "x"}]}],
+        }
         out = harness._enrich_plan_error(plan, "'before' text not found")
         assert "HINT" in out and ("Closest match" in out or "First 60 lines" in out)
 
     def test_create_file_already_exists_hint(self, harness):
-        plan = {"kind": "ASICODE_PLAN_V1", "ops": [
-            {"op": "create_file", "path": "t.txt", "content": "x"}]}
+        plan = {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "create_file", "path": "t.txt", "content": "x"}]}
         out = harness._enrich_plan_error(plan, "file already exists")
         assert "already exists" in out and "replace_file" in out
 
     def test_insert_anchor_hint(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("one\ntwo\n", encoding="utf-8")
-        plan = {"kind": "ASICODE_PLAN_V1", "ops": [
-            {"op": "insert_after", "path": "t.txt", "anchor": "missing", "lines": ["x"]}]}
+        plan = {
+            "kind": "ASICODE_PLAN_V1",
+            "ops": [{"op": "insert_after", "path": "t.txt", "anchor": "missing", "lines": ["x"]}],
+        }
         out = harness._enrich_plan_error(plan, "anchor not found")
         assert "HINT" in out and "First 10 lines" in out
 
@@ -286,6 +286,7 @@ class TestEnrichPlanError:
 
 
 # ── _looks_like_unified_diff ────────────────────────────────────────────────
+
 
 class TestLooksLikeUnifiedDiff:
     def test_full_diff(self, harness):
@@ -304,6 +305,7 @@ class TestLooksLikeUnifiedDiff:
 
 
 # ── _parse_unified_diff_files ───────────────────────────────────────────────
+
 
 class TestParseUnifiedDiffFiles:
     PATCH = (
@@ -328,12 +330,10 @@ class TestParseUnifiedDiffFiles:
         assert files[0]["hunks"][0]["old_start"] == 1
         assert files[0]["hunks"][0]["old_count"] == 2
         assert files[0]["hunks"][0]["new_start"] == 1
-        assert files[0]["hunks"][0]["lines"] == [
-            (" ", "x"), ("-", "old"), ("+", "new")]
+        assert files[0]["hunks"][0]["lines"] == [(" ", "x"), ("-", "old"), ("+", "new")]
 
     def test_hunk_without_count_defaults_to_one(self, harness):
-        files = harness._parse_unified_diff_files(
-            "--- a/f\n+++ b/f\n@@ -5 +5 @@\n-x\n+y\n")
+        files = harness._parse_unified_diff_files("--- a/f\n+++ b/f\n@@ -5 +5 @@\n-x\n+y\n")
         assert files[0]["hunks"][0]["old_count"] == 1
         assert files[0]["hunks"][0]["new_count"] == 1
 
@@ -347,6 +347,7 @@ class TestParseUnifiedDiffFiles:
 
 
 # ── _extract_new_file_target ────────────────────────────────────────────────
+
 
 class TestExtractNewFileTarget:
     def test_new_file_mode_extraction(self, harness):
@@ -363,25 +364,12 @@ class TestExtractNewFileTarget:
         assert out == {"file_path": "new.txt", "content": "line1\nline2\n"}
 
     def test_creation_with_blank_line(self, harness):
-        patch = (
-            "--- /dev/null\n"
-            "+++ b/new.txt\n"
-            "@@ -0,0 +1,3 @@\n"
-            "+a\n"
-            "+\n"
-            "+c\n"
-        )
+        patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,3 @@\n+a\n+\n+c\n"
         out = harness._extract_new_file_target(patch, "new.txt")
         assert out["content"] == "a\n\nc\n"
 
     def test_deletion_line_disqualifies(self, harness):
-        patch = (
-            "--- /dev/null\n"
-            "+++ b/new.txt\n"
-            "@@ -0,0 +1,2 @@\n"
-            "+a\n"
-            "-b\n"
-        )
+        patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+a\n-b\n"
         assert harness._extract_new_file_target(patch, None) is None
 
     def test_no_creation_signal_returns_none(self, harness):
@@ -392,18 +380,13 @@ class TestExtractNewFileTarget:
         assert harness._extract_new_file_target("", None) is None
 
     def test_no_newline_marker_preserved(self, harness):
-        patch = (
-            "--- /dev/null\n"
-            "+++ b/new.txt\n"
-            "@@ -0,0 +1 @@\n"
-            "+a\n"
-            "\\ No newline at end of file\n"
-        )
+        patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+a\n\\ No newline at end of file\n"
         out = harness._extract_new_file_target(patch, None)
         assert out["content"] == "a"
 
 
 # ── _analyze_patch_symbol_change / extractors ───────────────────────────────
+
 
 class TestAnalyzePatchSymbolChange:
     def test_single_python_symbol_change(self, harness, tmp_path):
@@ -440,10 +423,7 @@ class TestAnalyzePatchSymbolChange:
         assert harness._analyze_patch_symbol_change(patch) is None
 
     def test_missing_file_returns_none(self, harness):
-        patch = (
-            "diff --git a/nope.py b/nope.py\n--- a/nope.py\n+++ b/nope.py\n"
-            "@@ -1,2 +1,2 @@\n def a():\n-pass\n+go\n"
-        )
+        patch = "diff --git a/nope.py b/nope.py\n--- a/nope.py\n+++ b/nope.py\n@@ -1,2 +1,2 @@\n def a():\n-pass\n+go\n"
         assert harness._analyze_patch_symbol_change(patch) is None
 
     def test_non_python_language_unknown_returns_none(self, harness, tmp_path):
@@ -455,18 +435,12 @@ class TestAnalyzePatchSymbolChange:
         )
         assert harness._analyze_patch_symbol_change(patch) is None
 
-
     def test_headerless_patch_with_path_hint(self, harness, tmp_path):
         (tmp_path / "mod.py").write_text(
             "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n",
             encoding="utf-8",
         )
-        patch = (
-            "@@ -1,3 +1,3 @@\n"
-            " def foo():\n"
-            "-    return 1\n"
-            "+    return 42\n"
-        )
+        patch = "@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 42\n"
         # No header → the path is unresolvable without a hint.
         assert harness._analyze_patch_symbol_change(patch) is None
         info = harness._analyze_patch_symbol_change(patch, "mod.py")
@@ -482,10 +456,7 @@ class TestAnalyzePatchSymbolChange:
             encoding="utf-8",
         )
         # The header names mod.py; a conflicting hint must NOT redirect the patch.
-        patch = (
-            "--- a/mod.py\n+++ b/mod.py\n"
-            "@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 42\n"
-        )
+        patch = "--- a/mod.py\n+++ b/mod.py\n@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 42\n"
         info = harness._analyze_patch_symbol_change(patch, "other.py")
         assert info is not None
         assert info["file_path"] == "mod.py"
@@ -532,12 +503,7 @@ class TestExtractModifySymbolTarget:
             "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n",
             encoding="utf-8",
         )
-        patch = (
-            "@@ -1,3 +1,3 @@\n"
-            " def foo():\n"
-            "-    return 1\n"
-            "+    return 42\n"
-        )
+        patch = "@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 42\n"
         assert harness._extract_modify_symbol_target(patch, None) is None
         out = harness._extract_modify_symbol_target(patch, "mod.py")
         assert out is not None
@@ -548,8 +514,7 @@ class TestExtractModifySymbolTarget:
 
 class TestExtractMultiSymbolRewrite:
     def test_two_symbols_python(self, harness, tmp_path):
-        (tmp_path / "mod.py").write_text(
-            "def a():\n    return 1\n\n\ndef b():\n    return 2\n", encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def a():\n    return 1\n\n\ndef b():\n    return 2\n", encoding="utf-8")
         patch = (
             "diff --git a/mod.py b/mod.py\n--- a/mod.py\n+++ b/mod.py\n"
             "@@ -1,2 +1,2 @@\n def a():\n-    return 1\n+    return 11\n"
@@ -570,6 +535,7 @@ class TestExtractMultiSymbolRewrite:
 
 
 # ── _find_block / _apply_hunks_in_memory ────────────────────────────────────
+
 
 class TestFindBlock:
     def test_exact_match(self, harness):
@@ -602,23 +568,34 @@ class TestFindBlock:
 class TestApplyHunksInMemory:
     def test_applies_hunks_with_drift(self, harness):
         lines = ["a", "b", "c", "d", "e"]
-        hunks = [{
-            "old_start": 2, "old_count": 2, "new_start": 2, "new_count": 3,
-            "lines": [(" ", "b"), ("-", "c"), ("+", "C1"), ("+", "C2")],
-        }]
+        hunks = [
+            {
+                "old_start": 2,
+                "old_count": 2,
+                "new_start": 2,
+                "new_count": 3,
+                "lines": [(" ", "b"), ("-", "c"), ("+", "C1"), ("+", "C2")],
+            }
+        ]
         out = harness._apply_hunks_in_memory(lines, hunks)
         assert out == ["a", "b", "C1", "C2", "d", "e"]
 
     def test_unanchored_hunk_returns_none(self, harness):
         lines = ["a", "b"]
-        hunks = [{
-            "old_start": 1, "old_count": 1, "new_start": 1, "new_count": 1,
-            "lines": [("-", "zzz"), ("+", "y")],
-        }]
+        hunks = [
+            {
+                "old_start": 1,
+                "old_count": 1,
+                "new_start": 1,
+                "new_count": 1,
+                "lines": [("-", "zzz"), ("+", "y")],
+            }
+        ]
         assert harness._apply_hunks_in_memory(lines, hunks) is None
 
 
 # ── _check_patch_content_ratio ──────────────────────────────────────────────
+
 
 class TestCheckPatchContentRatio:
     def test_large_removal_warns(self, harness, tmp_path):
@@ -627,22 +604,14 @@ class TestCheckPatchContentRatio:
         patch = (
             "diff --git a/big.txt b/big.txt\n"
             "--- a/big.txt\n+++ b/big.txt\n"
-            "@@ -1,100 +1,5 @@\n"
-            + "".join(f"-line{i}\n" for i in range(80))
-            + "+kept\n"
+            "@@ -1,100 +1,5 @@\n" + "".join(f"-line{i}\n" for i in range(80)) + "+kept\n"
         )
         out = harness._check_patch_content_ratio(patch)
         assert out is not None and "CONTENT LOSS WARNING" in out
 
     def test_small_removal_no_warning(self, harness, tmp_path):
         (tmp_path / "big.txt").write_text("line0\n" * 100, encoding="utf-8")
-        patch = (
-            "diff --git a/big.txt b/big.txt\n"
-            "--- a/big.txt\n+++ b/big.txt\n"
-            "@@ -1,100 +1,98 @@\n"
-            "-line0\n-line0\n"
-            "+x\n"
-        )
+        patch = "diff --git a/big.txt b/big.txt\n--- a/big.txt\n+++ b/big.txt\n@@ -1,100 +1,98 @@\n-line0\n-line0\n+x\n"
         assert harness._check_patch_content_ratio(patch) is None
 
     def test_missing_file_skipped(self, harness):
@@ -661,10 +630,7 @@ class TestCheckPatchContentRatio:
         body = "\n".join(f"line{i}" for i in range(100))
         (tmp_path / "big.txt").write_text(body + "\n", encoding="utf-8")
         patch = (
-            "--- a/big.txt\n+++ b/big.txt\n"
-            "@@ -1,100 +1,5 @@\n"
-            + "".join(f"-line{i}\n" for i in range(80))
-            + "+kept\n"
+            "--- a/big.txt\n+++ b/big.txt\n@@ -1,100 +1,5 @@\n" + "".join(f"-line{i}\n" for i in range(80)) + "+kept\n"
         )
         out = harness._check_patch_content_ratio(patch)
         assert out is not None and "CONTENT LOSS WARNING" in out
@@ -679,9 +645,7 @@ class TestCheckPatchContentRatio:
         patch = (
             "diff --git a/big.sql b/big.sql\n"
             "--- a/big.sql\n+++ b/big.sql\n"
-            "@@ -1,50 +1,5 @@\n"
-            + "".join("---comment\n" for _ in range(40))
-            + "+kept\n"
+            "@@ -1,50 +1,5 @@\n" + "".join("---comment\n" for _ in range(40)) + "+kept\n"
         )
         out = harness._check_patch_content_ratio(patch)
         assert out is not None and "CONTENT LOSS WARNING" in out
@@ -693,21 +657,17 @@ class TestCheckPatchContentRatio:
         # pre_image 20, so the guard fires instead of staying silent).
         (tmp_path / "big.txt").write_text("x\n" * 50, encoding="utf-8")
         hunks = "".join(f"@@ -{i} +{i} @@\n-x\n" for i in range(1, 21))
-        patch = (
-            "diff --git a/big.txt b/big.txt\n"
-            "--- a/big.txt\n+++ b/big.txt\n"
-            + hunks
-        )
+        patch = "diff --git a/big.txt b/big.txt\n--- a/big.txt\n+++ b/big.txt\n" + hunks
         out = harness._check_patch_content_ratio(patch)
         assert out is not None and "CONTENT LOSS WARNING" in out
 
 
 # ── _write_staged_files_directly ────────────────────────────────────────────
 
+
 class TestWriteStagedFilesDirectly:
     def test_creates_new_files(self, harness, tmp_path):
-        result = harness._write_staged_files_directly(
-            {"a.txt": "hello", "sub/b.txt": "world"}, ["a.txt", "sub/b.txt"])
+        result = harness._write_staged_files_directly({"a.txt": "hello", "sub/b.txt": "world"}, ["a.txt", "sub/b.txt"])
         assert result.ok
         assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "hello"
         assert (tmp_path / "sub" / "b.txt").read_text(encoding="utf-8") == "world"
@@ -720,21 +680,22 @@ class TestWriteStagedFilesDirectly:
 
     def test_syntax_error_rolls_back(self, harness, tmp_path):
         (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
-        result = harness._write_staged_files_directly(
-            {"a.py": "def broken(:\n"}, ["a.py"])
+        result = harness._write_staged_files_directly({"a.py": "def broken(:\n"}, ["a.py"])
         assert not result.ok
         assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x = 1\n"  # restored
 
     def test_unreadable_existing_file_aborts(self, harness, tmp_path):
         (tmp_path / "a.txt").write_text("data", encoding="utf-8")
         result = harness._write_staged_files_directly(
-            {"a.txt": "new", "b.txt": "other"}, ["a.txt", "b.txt"],
+            {"a.txt": "new", "b.txt": "other"},
+            ["a.txt", "b.txt"],
         )
         assert result.ok  # readable in test env; just ensure no crash
         assert (tmp_path / "b.txt").exists()
 
 
 # ── _tool_write_plan validation ─────────────────────────────────────────────
+
 
 class TestToolWritePlanValidation:
     def test_plan_required(self, harness):
@@ -746,54 +707,71 @@ class TestToolWritePlanValidation:
         assert not r.ok and "ASICODE_PLAN_V1" in r.error
 
     def test_path_required(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "create_file", "content": "x"}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "create_file", "content": "x"}]}}
+        )
         assert not r.ok and "path" in r.error
 
     def test_path_traversal_rejected(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "create_file", "path": "../evil.txt", "content": "x"}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "create_file", "path": "../evil.txt", "content": "x"}]}}
+        )
         assert not r.ok and "traversal" in r.error
 
     def test_missing_op_type(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"path": "a.txt"}]}})
+        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"path": "a.txt"}]}})
         assert not r.ok and "missing 'op' or 'type'" in r.error
 
     def test_unsupported_op_type(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "teleport", "path": "a.txt"}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "teleport", "path": "a.txt"}]}}
+        )
         assert not r.ok and "unsupported op type" in r.error
 
     def test_create_file_missing_content(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "create_file", "path": "a.txt"}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "create_file", "path": "a.txt"}]}}
+        )
         assert not r.ok and "content" in r.error
 
     def test_edit_blocks_missing_blocks(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "edit_blocks", "path": "a.txt"}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "edit_blocks", "path": "a.txt"}]}}
+        )
         assert not r.ok and "blocks" in r.error
 
     def test_insert_after_missing_anchor(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "insert_after", "path": "a.txt", "lines": ["x"]}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "insert_after", "path": "a.txt", "lines": ["x"]}]}}
+        )
         assert not r.ok and "anchor" in r.error
 
     def test_insert_after_missing_lines(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "insert_after", "path": "a.txt", "anchor": "x"}]}})
+        r = harness._tool_write_plan(
+            {"plan": {"kind": "ASICODE_PLAN_V1", "ops": [{"op": "insert_after", "path": "a.txt", "anchor": "x"}]}}
+        )
         assert not r.ok and "lines" in r.error
 
     def test_insert_after_line_invalid_line(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "insert_after_line", "path": "a.txt", "line": 0, "lines": ["x"]}]}})
+        r = harness._tool_write_plan(
+            {
+                "plan": {
+                    "kind": "ASICODE_PLAN_V1",
+                    "ops": [{"op": "insert_after_line", "path": "a.txt", "line": 0, "lines": ["x"]}],
+                }
+            }
+        )
         assert not r.ok and "line" in r.error
 
     def test_placeholder_rejected(self, harness):
-        r = harness._tool_write_plan({"plan": {"kind": "ASICODE_PLAN_V1",
-                                               "ops": [{"op": "edit_blocks", "path": "a.txt",
-                                                        "blocks": [{"before": "OLD TEXT", "after": "x"}]}]}})
+        r = harness._tool_write_plan(
+            {
+                "plan": {
+                    "kind": "ASICODE_PLAN_V1",
+                    "ops": [{"op": "edit_blocks", "path": "a.txt", "blocks": [{"before": "OLD TEXT", "after": "x"}]}],
+                }
+            }
+        )
         assert not r.ok and "placeholder" in r.error
 
     def test_non_dict_op_rejected(self, harness):
@@ -815,6 +793,7 @@ class TestToolWritePlanValidation:
 
 # ── _tool_anchor_edit entry-point validation ────────────────────────────────
 
+
 class TestToolAnchorEditValidation:
     def test_file_path_required(self, harness):
         r = harness._tool_anchor_edit({"anchor_pattern": "x"})
@@ -823,8 +802,7 @@ class TestToolAnchorEditValidation:
     def test_path_blocked_outside_repo(self, harness, tmp_path):
         outside = tmp_path.parent / "outside.txt"
         outside.write_text("x", encoding="utf-8")
-        r = harness._tool_anchor_edit(
-            {"file_path": str(outside), "anchor_pattern": "x", "edit_mode": "delete"})
+        r = harness._tool_anchor_edit({"file_path": str(outside), "anchor_pattern": "x", "edit_mode": "delete"})
         assert not r.ok and "outside repo" in r.error
 
     def test_anchor_required(self, harness, tmp_path):
@@ -834,33 +812,35 @@ class TestToolAnchorEditValidation:
 
     def test_invalid_edit_mode(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_anchor_edit(
-            {"file_path": "t.txt", "anchor_pattern": "a", "edit_mode": "explode"})
+        r = harness._tool_anchor_edit({"file_path": "t.txt", "anchor_pattern": "a", "edit_mode": "explode"})
         assert not r.ok and "edit_mode" in r.error
 
     def test_code_snippet_required_for_insert(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_anchor_edit(
-            {"file_path": "t.txt", "anchor_pattern": "a", "edit_mode": "insert_after"})
+        r = harness._tool_anchor_edit({"file_path": "t.txt", "anchor_pattern": "a", "edit_mode": "insert_after"})
         assert not r.ok and "code_snippet" in r.error
 
     def test_insert_before_success(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("b\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "b",
-            "edit_mode": "insert_before", "code_snippet": "a",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "b",
+                "edit_mode": "insert_before",
+                "code_snippet": "a",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nb\n"
 
     def test_file_not_found_with_suggestion_suffix(self, harness, tmp_path):
         (tmp_path / "real.txt").write_text("x\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "real.txx", "anchor_pattern": "x", "edit_mode": "delete"})
+        r = harness._tool_anchor_edit({"file_path": "real.txx", "anchor_pattern": "x", "edit_mode": "delete"})
         assert not r.ok and "File not found" in r.error
 
 
 # ── apply_patch auto-fallback chain ─────────────────────────────────────────
+
 
 class TestApplyPatchFallbacks:
     def test_create_file_fallback_success(self, harness, tmp_path):
@@ -889,6 +869,7 @@ class TestApplyPatchFallbacks:
         )
         # force _tool_create_file to raise by patching it
         import unittest.mock as um
+
         with um.patch.object(harness, "_tool_create_file", side_effect=RuntimeError("boom")):
             r = harness._try_apply_patch_create_file_fallback(patch, None, "orig err", 0.0)
         assert not r.ok
@@ -916,8 +897,7 @@ class TestApplyPatchFallbacks:
         assert r.metadata.get("auto_fallback_failed") is True
 
     def test_multi_symbol_fallback_success(self, harness, tmp_path):
-        (tmp_path / "mod.py").write_text(
-            "def a():\n    return 1\n\n\ndef b():\n    return 2\n", encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def a():\n    return 1\n\n\ndef b():\n    return 2\n", encoding="utf-8")
         patch = (
             "diff --git a/mod.py b/mod.py\n--- a/mod.py\n+++ b/mod.py\n"
             "@@ -1,2 +1,2 @@\n def a():\n-    return 1\n+    return 11\n"
@@ -930,8 +910,7 @@ class TestApplyPatchFallbacks:
         assert "return 11" in content and "return 22" in content
 
     def test_modify_symbol_fallback_success(self, harness, tmp_path):
-        (tmp_path / "mod.py").write_text(
-            "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n", encoding="utf-8")
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n\n\ndef bar():\n    return 2\n", encoding="utf-8")
         patch = (
             "diff --git a/mod.py b/mod.py\n--- a/mod.py\n+++ b/mod.py\n"
             "@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 42\n"
@@ -955,25 +934,15 @@ class TestApplyPatchFallbacks:
         (tmp_path / "mod.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
         # patch claims to modify foo but hunk anchors poorly → extracted code may
         # fail to apply; either way the result must carry auto_fallback metadata
-        patch = (
-            "diff --git a/mod.py b/mod.py\n--- a/mod.py\n+++ b/mod.py\n"
-            "@@ -1,1 +1,1 @@\n-def foo():\n+def foo():\n"
-        )
+        patch = "diff --git a/mod.py b/mod.py\n--- a/mod.py\n+++ b/mod.py\n@@ -1,1 +1,1 @@\n-def foo():\n+def foo():\n"
         r = harness._try_apply_patch_modify_symbol_fallback(patch, None, "orig", 0.0)
         assert isinstance(r, ToolResult)
         if not r.ok:
             assert r.metadata.get("auto_fallback_attempted") in ("modify_symbol", None)
 
-
     def test_modify_symbol_fallback_headerless_patch_with_hint(self, harness, tmp_path):
-        (tmp_path / "mod.py").write_text(
-            "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n", encoding="utf-8")
-        patch = (
-            "@@ -1,3 +1,3 @@\n"
-            " def foo():\n"
-            "-    return 1\n"
-            "+    return 42\n"
-        )
+        (tmp_path / "mod.py").write_text("def foo():\n    return 1\n\n\ndef bar():\n    return 2\n", encoding="utf-8")
+        patch = "@@ -1,3 +1,3 @@\n def foo():\n-    return 1\n+    return 42\n"
         r = harness._try_apply_patch_modify_symbol_fallback(patch, "mod.py", "orig", 0.0)
         assert r.ok, r.error
         assert r.metadata.get("auto_fallback_attempted") == "modify_symbol"
@@ -988,6 +957,7 @@ class TestApplyPatchFallbacks:
 
 
 # ── _tool_apply_patch entry-point ───────────────────────────────────────────
+
 
 class TestToolApplyPatch:
     def test_empty_patch_fails(self, harness):
@@ -1008,10 +978,7 @@ class TestToolApplyPatch:
     def test_session_edited_file_refused(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("x = 1\n", encoding="utf-8")
         harness._text_edited_files.add("t.py")
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1 +1 @@\n-x = 1\n+x = 2\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
         r = harness._tool_apply_patch({"patch": patch, "path": "t.py"})
         assert not r.ok
         assert "refused" in r.error and "already edited this session" in r.error
@@ -1019,10 +986,7 @@ class TestToolApplyPatch:
 
     def test_apply_patch_success_via_engine(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("x = 1\ny = 2\n", encoding="utf-8")
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
         r = harness._tool_apply_patch({"patch": patch, "path": "t.py"})
         assert r.ok, r.error
         assert "y = 20" in (tmp_path / "t.py").read_text(encoding="utf-8")
@@ -1030,10 +994,7 @@ class TestToolApplyPatch:
     def test_apply_patch_unverifiable_hunk_note(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
         # context-free hunk (no context lines) → unverifiable placement note
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -2 +2 @@\n-b = 2\n+b = 20\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -2 +2 @@\n-b = 2\n+b = 20\n"
         r = harness._tool_apply_patch({"patch": patch, "path": "t.py"})
         assert r.ok, r.error
         if r.metadata and r.metadata.get("unverifiable_hunks"):
@@ -1041,10 +1002,7 @@ class TestToolApplyPatch:
 
     def test_apply_patch_failure_enriched_with_snippet(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("real = 1\n", encoding="utf-8")
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1 +1 @@\n-fake = 1\n+fake = 2\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-fake = 1\n+fake = 2\n"
         r = harness._tool_apply_patch({"patch": patch, "path": "t.py"})
         assert not r.ok
         if r.metadata and r.metadata.get("reread_snippet"):
@@ -1053,9 +1011,11 @@ class TestToolApplyPatch:
 
 # ── _apply_patch_text (git apply chain) — needs a real git repo ─────────────
 
+
 class TestApplyPatchText:
     def _git_repo(self, tmp_path):
         import subprocess as sp
+
         sp.run(["git", "init", "-q", str(tmp_path)], check=True)
         sp.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
         sp.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
@@ -1066,10 +1026,7 @@ class TestApplyPatchText:
 
     def test_apply_success(self, tmp_path):
         h = self._git_repo(tmp_path)
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
         r = h._apply_patch_text(patch, path_hint="t.py")
         assert r.ok, r.error
         assert "y = 20" in (tmp_path / "t.py").read_text(encoding="utf-8")
@@ -1077,10 +1034,7 @@ class TestApplyPatchText:
 
     def test_apply_failure_analyzed(self, tmp_path):
         h = self._git_repo(tmp_path)
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,2 +1,2 @@\n zzz = 1\n-y = 2\n+y = 20\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n zzz = 1\n-y = 2\n+y = 20\n"
         r = h._apply_patch_text(patch, path_hint="t.py")
         assert not r.ok
         assert r.error  # diff_apply surfaces its own failure message
@@ -1093,15 +1047,15 @@ class TestApplyPatchText:
 
         import diff_apply as _da
         from external_llm.patch_engine import PatchEngine as _PE  # noqa: N814 — private lazy-import alias
+
         h = self._git_repo(tmp_path)
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,2 +1,2 @@\n zzz = 1\n-y = 2\n+y = 20\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n zzz = 1\n-y = 2\n+y = 20\n"
         # diff_apply + the small-model salvager both disabled so the pure
         # git-apply chain's --check failure path is exercised end to end
-        with um.patch.object(_da, "apply_patch", None), \
-             um.patch.object(_PE, "_salvage_small_model_output", return_value=None):
+        with (
+            um.patch.object(_da, "apply_patch", None),
+            um.patch.object(_PE, "_salvage_small_model_output", return_value=None),
+        ):
             r = h._apply_patch_text(patch, path_hint="t.py")
         assert not r.ok
         assert "failure_analysis" in (r.metadata or {})
@@ -1114,12 +1068,10 @@ class TestApplyPatchText:
         h = self._git_repo(tmp_path)
         (tmp_path / "t.py").write_text("def f():\n    pass\n", encoding="utf-8")
         import subprocess as sp
+
         sp.run(["git", "-C", str(tmp_path), "add", "t.py"], check=True)
         sp.run(["git", "-C", str(tmp_path), "commit", "-qm", "t"], check=True)
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,2 +1,2 @@\n def f():\n-    pass\n+pass\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n def f():\n-    pass\n+pass\n"
         r = h._apply_patch_text(patch, path_hint="t.py")
         assert not r.ok
         # either diff_apply or the internal chain rolls the file back to HEAD
@@ -1128,20 +1080,14 @@ class TestApplyPatchText:
     def test_session_edited_file_refused(self, tmp_path):
         h = self._git_repo(tmp_path)
         h._text_edited_files.add("t.py")
-        patch = (
-            "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
-        )
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
         r = h._apply_patch_text(patch, path_hint="t.py")
         assert not r.ok and "refused" in r.error
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "x = 1\ny = 2\n"
 
     def test_unsafe_traversal_rejected(self, tmp_path):
         h = self._git_repo(tmp_path)
-        patch = (
-            "diff --git a/../evil b/../evil\n--- a/../evil\n+++ b/../evil\n"
-            "@@ -1 +1 @@\n-a\n+b\n"
-        )
+        patch = "diff --git a/../evil b/../evil\n--- a/../evil\n+++ b/../evil\n@@ -1 +1 @@\n-a\n+b\n"
         r = h._apply_patch_text(patch, path_hint=None)
         assert not r.ok and ("traversal" in r.error or "unsafe path" in r.error)
 
@@ -1149,24 +1095,23 @@ class TestApplyPatchText:
         h = self._git_repo(tmp_path)
         r = h._apply_patch_text("not a patch at all\njust text\n", path_hint="t.py")
         assert not r.ok and "empty diff" in r.error
-    def test_internal_chain_success_without_applied_patches(self, tmp_path):
-            # Regression: the pure git-apply chain's recording site used to be the
-            # only unguarded append — a host without _applied_patches crashed with
-            # AttributeError AFTER a successful apply. The shared guarded helper
-            # must keep the apply successful.
-            import unittest.mock as um
 
-            import diff_apply as _da
-            h = self._git_repo(tmp_path)
-            del h._applied_patches
-            patch = (
-                "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n"
-                "@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
-            )
-            with um.patch.object(_da, "apply_patch", None):
-                r = h._apply_patch_text(patch, path_hint="t.py")
-            assert r.ok, r.error
-            assert "y = 20" in (tmp_path / "t.py").read_text(encoding="utf-8")
+    def test_internal_chain_success_without_applied_patches(self, tmp_path):
+        # Regression: the pure git-apply chain's recording site used to be the
+        # only unguarded append — a host without _applied_patches crashed with
+        # AttributeError AFTER a successful apply. The shared guarded helper
+        # must keep the apply successful.
+        import unittest.mock as um
+
+        import diff_apply as _da
+
+        h = self._git_repo(tmp_path)
+        del h._applied_patches
+        patch = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1,2 +1,2 @@\n x = 1\n-y = 2\n+y = 20\n"
+        with um.patch.object(_da, "apply_patch", None):
+            r = h._apply_patch_text(patch, path_hint="t.py")
+        assert r.ok, r.error
+        assert "y = 20" in (tmp_path / "t.py").read_text(encoding="utf-8")
 
     def test_wipe_applied_via_diff_apply_warns(self, tmp_path):
         # P26-1/P26-2: the accidental-wipe guard must fire on the LIVE
@@ -1174,11 +1119,10 @@ class TestApplyPatchText:
         # guard on this branch, and the old guard skipped exactly this case
         # (post-apply file = 5 lines < 20 → continue → no warning).
         import subprocess as sp
+
         n = 1000
         h = self._git_repo(tmp_path)
-        (tmp_path / "big.txt").write_text(
-            "".join(f"line{i}\n" for i in range(n)), encoding="utf-8"
-        )
+        (tmp_path / "big.txt").write_text("".join(f"line{i}\n" for i in range(n)), encoding="utf-8")
         sp.run(["git", "-C", str(tmp_path), "add", "big.txt"], check=True)
         sp.run(["git", "-C", str(tmp_path), "commit", "-qm", "add big"], check=True)
         r = h._apply_patch_text(_wipe_patch("big.txt", n, keep=5), path_hint="big.txt")
@@ -1197,6 +1141,7 @@ class TestApplyPatchText:
         # Before P26-1 the content-loss guard was never wired to this branch,
         # so such a churn applied silently.
         import subprocess as sp
+
         n = 1000
         h = self._git_repo(tmp_path)
         body = "\n".join(f"def fn_{i}():\n    return {i}\n" for i in range(n // 2))
@@ -1211,16 +1156,17 @@ class TestApplyPatchText:
         # ladder exhausts instead of reaching the success branch the guard
         # is wired to.
         diff = difflib.unified_diff(
-            body_lines, body_lines[: n // 2],
-            fromfile="a/big.py", tofile="b/big.py", lineterm="",
+            body_lines,
+            body_lines[: n // 2],
+            fromfile="a/big.py",
+            tofile="b/big.py",
+            lineterm="",
         )
         patch = "diff --git a/big.py b/big.py\n" + "\n".join(diff) + "\n"
         # Fixture sanity: this churn must stay UNDER the engine's rewrite
         # valve (P22-1) — otherwise the engine rejects it before the
         # content-loss guard ever runs.
-        ratio = 1.0 - float(
-            difflib.SequenceMatcher(a=body_lines, b=body_lines[: n // 2], autojunk=False).ratio()
-        )
+        ratio = 1.0 - float(difflib.SequenceMatcher(a=body_lines, b=body_lines[: n // 2], autojunk=False).ratio())
         assert ratio < 0.5, f"test fixture not under the engine valve: {ratio:.2f}"
         r = h._tool_apply_patch({"patch": patch, "path": "big.py"})
         assert r.ok, r.error
@@ -1240,9 +1186,7 @@ class TestApplyPatchText:
 
         n = 1000
         h = self._git_repo(tmp_path)
-        (tmp_path / "big.txt").write_text(
-            "".join(f"line{i}\n" for i in range(n)), encoding="utf-8"
-        )
+        (tmp_path / "big.txt").write_text("".join(f"line{i}\n" for i in range(n)), encoding="utf-8")
         sp.run(["git", "-C", str(tmp_path), "add", "big.txt"], check=True)
         sp.run(["git", "-C", str(tmp_path), "commit", "-qm", "add big"], check=True)
 
@@ -1264,6 +1208,7 @@ class TestApplyPatchText:
 
 
 # ── _append_applied_patch (shared guarded-append SSOT) ──────────────────────
+
 
 class TestAppendAppliedPatch:
     def test_appends_records_in_order(self, harness):
@@ -1287,13 +1232,12 @@ class TestAppendAppliedPatch:
         # future rewrite.
         calls: list[str] = []
         monkeypatch.setattr(
-            type(harness), "_append_applied_patch",
+            type(harness),
+            "_append_applied_patch",
             lambda self, record: calls.append(record),
         )
         (tmp_path / "t.py").write_text("x = 1\n", encoding="utf-8")
-        r = harness._tool_edit_text(
-            {"file_path": "t.py", "old_string": "x = 1", "new_string": "x = 10"}
-        )
+        r = harness._tool_edit_text({"file_path": "t.py", "old_string": "x = 1", "new_string": "x = 10"})
         assert r.ok, r.error
         assert calls == ["edit_text:t.py:replace:False"]
 
@@ -1302,19 +1246,23 @@ class TestAppendAppliedPatch:
         # is the helper itself (count == 1); the edit mixin must have none
         # (count == 0). Any inline recording site breaks this count.
         from pathlib import Path as _Path
+
         for _mod, _expected in (
             (write_tools_patch_mixin, 1),
             (write_tools_edit_mixin, 0),
         ):
             _src = _Path(_mod.__file__).read_text(encoding="utf-8")
             assert _src.count("_applied_patches.append(") == _expected, _mod.__name__
+
+
 # ── _analyze_patch_failure ──────────────────────────────────────────────────
+
 
 class TestAnalyzePatchFailure:
     def test_already_applied(self, harness):
         out = harness._analyze_patch_failure(
-            "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-a\n+b\n",
-            "error: patch already applied")
+            "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-a\n+b\n", "error: patch already applied"
+        )
         assert out["reason"] == "already_applied"
         assert "already applied" in out["hint"]
         assert out["file_path"] == "t.py"
@@ -1327,7 +1275,8 @@ class TestAnalyzePatchFailure:
         (tmp_path / "t.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
         out = harness._analyze_patch_failure(
             "--- a/t.py\n+++ b/t.py\n@@ -1,3 +1,3 @@\n alpha\n-betax\n+beta\n gamma\n",
-            "error: patch failed: t.py:1: hunk failed, does not apply at line 1")
+            "error: patch failed: t.py:1: hunk failed, does not apply at line 1",
+        )
         assert out["reason"] == "context_mismatch"
         assert out["conflicting_lines"] == [1]
         assert "Context mismatch" in out["hint"]
@@ -1337,7 +1286,8 @@ class TestAnalyzePatchFailure:
         (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
         out = harness._analyze_patch_failure(
             "--- a/real.py\n+++ b/real.py\n@@ -1 +1 @@\n-a\n+b\n",
-            "error: cannot stat real.py: No such file or directory")
+            "error: cannot stat real.py: No such file or directory",
+        )
         assert out["reason"] == "file_not_found"
         assert "create_file" in out["error_message"]
 
@@ -1356,10 +1306,7 @@ class TestAnalyzePatchFailure:
         assert "standard diff headers" in out["error_message"]
 
     def test_hunk_parsing(self, harness):
-        patch = (
-            "--- a/t.py\n+++ b/t.py\n"
-            "@@ -1,3 +1,3 @@\n ctx\n-rm\n+add\n"
-        )
+        patch = "--- a/t.py\n+++ b/t.py\n@@ -1,3 +1,3 @@\n ctx\n-rm\n+add\n"
         out = harness._analyze_patch_failure(patch, "does not apply")
         assert out["hunk_count"] == 1
         assert out["file_path"] == "t.py"
@@ -1367,106 +1314,157 @@ class TestAnalyzePatchFailure:
 
 # ── _tool_anchor_edit deeper paths ──────────────────────────────────────────
 
+
 class TestToolAnchorEditPaths:
     def test_insert_after_success(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "a",
-            "edit_mode": "insert_after", "code_snippet": "x",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "a",
+                "edit_mode": "insert_after",
+                "code_snippet": "x",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nx\nb\n"
 
     def test_replace_line_success(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\nc\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "b",
-            "edit_mode": "replace_line", "code_snippet": "B",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "b",
+                "edit_mode": "replace_line",
+                "code_snippet": "B",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nB\nc\n"
 
     def test_delete_success(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\nc\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "b", "edit_mode": "delete",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "b",
+                "edit_mode": "delete",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nc\n"
 
     def test_delete_multiline_success(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "b\nc", "edit_mode": "delete",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "b\nc",
+                "edit_mode": "delete",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nd\n"
 
     def test_delete_pattern_not_found(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "zzz", "edit_mode": "delete",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "zzz",
+                "edit_mode": "delete",
+            }
+        )
         assert not r.ok and "not found" in r.error
 
     def test_delete_empty_pattern(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "  ", "edit_mode": "delete",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "  ",
+                "edit_mode": "delete",
+            }
+        )
         assert not r.ok and "required" in r.error
 
     def test_anchor_miss_failure_class(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "nope",
-            "edit_mode": "insert_after", "code_snippet": "x",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "nope",
+                "edit_mode": "insert_after",
+                "code_snippet": "x",
+            }
+        )
         assert not r.ok
         assert r.metadata.get("failure_class") == "anchor_miss"
 
     def test_anchor_ast_lineno_bypasses_search(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\nc\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_ast_lineno": 2,
-            "edit_mode": "insert_after", "code_snippet": "x",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_ast_lineno": 2,
+                "edit_mode": "insert_after",
+                "code_snippet": "x",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nb\nx\nc\n"
 
     def test_anchor_ast_lineno_out_of_range_falls_back_to_pattern(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_ast_lineno": 99, "anchor_pattern": "b",
-            "edit_mode": "insert_before", "code_snippet": "x",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_ast_lineno": 99,
+                "anchor_pattern": "b",
+                "edit_mode": "insert_before",
+                "code_snippet": "x",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nx\nb\n"
 
     def test_anchor_not_unique_guard(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("x\ny\nx\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "x",
-            "edit_mode": "insert_after", "code_snippet": "z",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "x",
+                "edit_mode": "insert_after",
+                "code_snippet": "z",
+            }
+        )
         assert not r.ok
         assert r.metadata.get("failure_class") == "anchor_not_unique"
 
     def test_delete_not_unique_guard(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("x\ny\nx\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "x", "edit_mode": "delete",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "x",
+                "edit_mode": "delete",
+            }
+        )
         assert not r.ok
         assert r.metadata.get("failure_class") == "anchor_not_unique"
         assert "irreversible" in r.error
 
     def test_occurrence_disambiguates(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("x\ny\nx\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "x", "occurrence": 1,
-            "edit_mode": "insert_after", "code_snippet": "z",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "x",
+                "occurrence": 1,
+                "edit_mode": "insert_after",
+                "code_snippet": "z",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "x\nz\ny\nx\n"
 
@@ -1475,58 +1473,82 @@ class TestToolAnchorEditPaths:
         # the forward scan consumes the following `);` close line, expanding the
         # replacement from 1 line to 2
         (tmp_path / "t.js").write_text("foo(\n);\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.js", "anchor_pattern": "foo(",
-            "edit_mode": "replace_line", "code_snippet": "foo(a)",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.js",
+                "anchor_pattern": "foo(",
+                "edit_mode": "replace_line",
+                "code_snippet": "foo(a)",
+            }
+        )
         assert r.ok, r.error
         content = (tmp_path / "t.js").read_text(encoding="utf-8")
         assert "foo(a)" in content and ");" not in content
 
     def test_replace_line_bracket_imbalance_refused(self, harness, tmp_path):
         (tmp_path / "t.js").write_text("foo()\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.js", "anchor_pattern": "foo()",
-            "edit_mode": "replace_line", "code_snippet": "foo(a,",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.js",
+                "anchor_pattern": "foo()",
+                "edit_mode": "replace_line",
+                "code_snippet": "foo(a,",
+            }
+        )
         # no closing line exists → structural gate violation
         assert not r.ok
         assert r.metadata.get("failure_class") == "structural_gate_violation"
 
     def test_insert_before_collection_literal_indent_fix(self, harness, tmp_path):
         (tmp_path / "t.js").write_text("const x = {\n    a: 1,\n};\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.js", "anchor_pattern": "};",
-            "edit_mode": "insert_before", "code_snippet": "    b: 2,",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.js",
+                "anchor_pattern": "};",
+                "edit_mode": "insert_before",
+                "code_snippet": "    b: 2,",
+            }
+        )
         assert r.ok, r.error
         content = (tmp_path / "t.js").read_text(encoding="utf-8")
         assert "b: 2" in content
 
     def test_multiline_anchor_resolution(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n  b\n  c\nd\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "b\nc",
-            "edit_mode": "insert_after", "code_snippet": "x",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "b\nc",
+                "edit_mode": "insert_after",
+                "code_snippet": "x",
+            }
+        )
         assert r.ok, r.error
         content = (tmp_path / "t.txt").read_text(encoding="utf-8")
         assert content.index("x") > content.index("c")
 
     def test_multiline_anchor_failure(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\n", encoding="utf-8")
-        r = harness._tool_anchor_edit({
-            "file_path": "t.txt", "anchor_pattern": "b\nzzz",
-            "edit_mode": "insert_after", "code_snippet": "x",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.txt",
+                "anchor_pattern": "b\nzzz",
+                "edit_mode": "insert_after",
+                "code_snippet": "x",
+            }
+        )
         assert not r.ok
 
     def test_delete_syntax_gate(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("def f():\n    pass\n", encoding="utf-8")
         # deleting `pass` leaves an empty def → syntax error → gate refuses
-        r = harness._tool_anchor_edit({
-            "file_path": "t.py", "anchor_pattern": "pass", "edit_mode": "delete",
-        })
+        r = harness._tool_anchor_edit(
+            {
+                "file_path": "t.py",
+                "anchor_pattern": "pass",
+                "edit_mode": "delete",
+            }
+        )
         assert not r.ok
         assert r.metadata.get("failure_class") == "syntax_invalid_after_edit"
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "def f():\n    pass\n"  # untouched
@@ -1534,14 +1556,20 @@ class TestToolAnchorEditPaths:
     def test_read_failure_reported(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
         import unittest.mock as um
+
         with um.patch.object(harness, "repo_root", str(tmp_path / "nonexistent")):
-            r = harness._tool_anchor_edit({
-                "file_path": "t.txt", "anchor_pattern": "a", "edit_mode": "delete",
-            })
+            r = harness._tool_anchor_edit(
+                {
+                    "file_path": "t.txt",
+                    "anchor_pattern": "a",
+                    "edit_mode": "delete",
+                }
+            )
         assert not r.ok
 
 
 # ── B2: symlink preservation (anchor_edit) ──────────────────────────────────
+
 
 def test_anchor_edit_preserves_symlink(harness, tmp_path):
     """anchor_edit must write through a repo-internal symlink (resolved path),
@@ -1549,13 +1577,11 @@ def test_anchor_edit_preserves_symlink(harness, tmp_path):
     (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
     (tmp_path / "link.py").symlink_to("real.py")
 
-    r = harness._tool_anchor_edit({
-        "file_path": "link.py", "edit_mode": "insert_after",
-        "anchor_pattern": "x = 1", "code_snippet": "y = 2"})
-    assert r.ok, r.error
-    assert (tmp_path / "link.py").is_symlink(), (
-        "symlink must not be replaced by a regular file"
+    r = harness._tool_anchor_edit(
+        {"file_path": "link.py", "edit_mode": "insert_after", "anchor_pattern": "x = 1", "code_snippet": "y = 2"}
     )
+    assert r.ok, r.error
+    assert (tmp_path / "link.py").is_symlink(), "symlink must not be replaced by a regular file"
     assert (tmp_path / "real.py").read_text(encoding="utf-8") == "x = 1\ny = 2\n"
 
 
@@ -1567,10 +1593,9 @@ def test_anchor_edit_preserves_symlink(harness, tmp_path):
 # normalization just to extract one line / a window / a 10-line hint.
 # ────────────────────────────────────────────────────────────────────────
 
+
 def _boom(*args, **kwargs):
-    raise AssertionError(
-        "read_text must not be called — normalization/enrichment must stream"
-    )
+    raise AssertionError("read_text must not be called — normalization/enrichment must stream")
 
 
 def _big_file(path: Path, anchor_line: int = 12345) -> None:
@@ -1606,9 +1631,12 @@ def test_enrich_plan_error_first_lines_hint_streams(tmp_path, monkeypatch):
     _big_file(target)
     monkeypatch.setattr(_Path, "read_text", _boom)
 
-    plan = {"kind": "ASICODE_PLAN_V1", "ops": [
-        {"op": "insert_after", "path": "big.txt", "anchor": "no such line", "lines": ["x"]},
-    ]}
+    plan = {
+        "kind": "ASICODE_PLAN_V1",
+        "ops": [
+            {"op": "insert_after", "path": "big.txt", "anchor": "no such line", "lines": ["x"]},
+        ],
+    }
     out = harness._enrich_plan_error(plan, "anchor not found")
 
     assert "First 10 lines" in out
@@ -1626,10 +1654,12 @@ def test_enrich_plan_error_closest_match_streams(tmp_path, monkeypatch):
         fh.write("x = 2\n")
     monkeypatch.setattr(_Path, "read_text", _boom)
 
-    plan = {"kind": "ASICODE_PLAN_V1", "ops": [
-        {"op": "edit_blocks", "path": "mod.py",
-         "blocks": [{"before": "def similar_fn():", "after": "..."}]},
-    ]}
+    plan = {
+        "kind": "ASICODE_PLAN_V1",
+        "ops": [
+            {"op": "edit_blocks", "path": "mod.py", "blocks": [{"before": "def similar_fn():", "after": "..."}]},
+        ],
+    }
     out = harness._enrich_plan_error(plan, "before text not found")
 
     assert "Closest match" in out
@@ -1637,6 +1667,7 @@ def test_enrich_plan_error_closest_match_streams(tmp_path, monkeypatch):
 
 
 # ── WP-B1 regression: content lines starting with '--'/'++' must survive ─────
+
 
 class TestDoubleMarkerContentLines:
     """WP-B1: bare '---'/'+++' prefix checks dropped real content lines whose
@@ -1652,25 +1683,21 @@ class TestDoubleMarkerContentLines:
             "+++ b/f.py\n"
             "@@ -1,2 +1,2 @@\n"
             " keep\n"
-            "---comment\n"   # removed line whose content is '--comment'
-            "+++line\n"      # added line whose content is '++line'
+            "---comment\n"  # removed line whose content is '--comment'
+            "+++line\n"  # added line whose content is '++line'
         )
         files = harness._parse_unified_diff_files(patch)
         assert len(files) == 1
         assert files[0]["hunks"][0]["lines"] == [
-            (" ", "keep"), ("-", "--comment"), ("+", "++line"),
+            (" ", "keep"),
+            ("-", "--comment"),
+            ("+", "++line"),
         ]
 
     def test_dev_null_header_still_skipped(self, harness):
         # Regression guard: header markers (marker + space) must keep being
         # recognized as headers, not content, after the fix.
-        patch = (
-            "diff --git a/n b/n\n"
-            "--- /dev/null\n"
-            "+++ b/n\n"
-            "@@ -0,0 +1 @@\n"
-            "+x\n"
-        )
+        patch = "diff --git a/n b/n\n--- /dev/null\n+++ b/n\n@@ -0,0 +1 @@\n+x\n"
         files = harness._parse_unified_diff_files(patch)
         assert [f["file"] for f in files] == ["n"]
         assert files[0]["hunks"][0]["lines"] == [("+", "x")]
@@ -1681,7 +1708,7 @@ class TestDoubleMarkerContentLines:
             "+++ b/new.txt\n"
             "@@ -0,0 +1,3 @@\n"
             "+a\n"
-            "+++tail\n"    # added line whose content is '++tail'
+            "+++tail\n"  # added line whose content is '++tail'
             "+c\n"
         )
         out = harness._extract_new_file_target(patch, None)
@@ -1695,6 +1722,6 @@ class TestDoubleMarkerContentLines:
             "+++ b/new.txt\n"
             "@@ -0,0 +1,2 @@\n"
             "+a\n"
-            "---gone\n"    # removed line — not a pure creation
+            "---gone\n"  # removed line — not a pure creation
         )
         assert harness._extract_new_file_target(patch, None) is None

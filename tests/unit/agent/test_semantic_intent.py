@@ -6,6 +6,7 @@ cosine similarity when an embedding model is available, and degrade to a no-op
 (returning None / False) when it is not. These tests use a deterministic fake
 embedding model so they don't depend on the real SentenceTransformer.
 """
+
 import os
 import sys
 import threading
@@ -25,8 +26,7 @@ class _FakeModel:
     _REMOVAL = ("remove", "delete", "drop", "purge", "rid", "wipe")
     _ADD = ("add", "create", "new", "fix", "refactor")
 
-    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=True,
-               show_progress_bar=False):
+    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False):
         rows = []
         for t in texts:
             low = t.lower()
@@ -112,8 +112,7 @@ class _AngleModel:
     mean-per-label and margin logic can be exercised deterministically.
     """
 
-    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=True,
-               show_progress_bar=False):
+    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False):
         rows = []
         for t in texts:
             deg = float(t.split("ANG:")[1])
@@ -134,8 +133,7 @@ def _angle_matcher(monkeypatch, threshold=0.0, margin=0.0):
         "external_llm.agent.semantic_intent.get_global_embedding_model",
         lambda: _AngleModel(),
     )
-    return SemanticIntentMatcher(ANGLE_EXAMPLES, threshold=threshold, margin=margin,
-                                 name="angle")
+    return SemanticIntentMatcher(ANGLE_EXAMPLES, threshold=threshold, margin=margin, name="angle")
 
 
 def test_mean_aggregation_picks_nearer_label(monkeypatch):
@@ -148,9 +146,9 @@ def test_mean_aggregation_picks_nearer_label(monkeypatch):
 def test_margin_rejects_ambiguous_query(monkeypatch):
     # 44° sits almost equidistant between the two centroids → tiny margin.
     near = _angle_matcher(monkeypatch, margin=0.02)
-    assert near.classify("ANG:44") is not None      # small margin tolerated
+    assert near.classify("ANG:44") is not None  # small margin tolerated
     strict = _angle_matcher(monkeypatch, margin=0.2)
-    assert strict.classify("ANG:44") is None         # large margin rejects it
+    assert strict.classify("ANG:44") is None  # large margin rejects it
 
 
 def test_margin_keeps_confident_query(monkeypatch):
@@ -277,9 +275,9 @@ class TestInLockDoubleBuildGuard:
 
         t = threading.Thread(target=m._ensure_built)
         t.start()
-        assert m._lock.entered.wait(5)          # B가 락 게이트에서 대기
-        m._ensure_built()                        # A: 락 자유 — 빌드 완료
-        m._lock.release.set()                    # B가 락 획득 → _built True → 81행
+        assert m._lock.entered.wait(5)  # B가 락 게이트에서 대기
+        m._ensure_built()  # A: 락 자유 — 빌드 완료
+        m._lock.release.set()  # B가 락 획득 → _built True → 81행
         t.join(timeout=5)
         assert not t.is_alive()
         assert m._available is True

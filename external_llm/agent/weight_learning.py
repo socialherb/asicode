@@ -30,6 +30,7 @@ Static profiles always act as a regularisation anchor — never 100% learned.
 Update deltas are intentionally small (0.01-0.03) and always followed by
 clamp → normalise to keep weights in [_W_MIN, _W_MAX] and sum == 1.0.
 """
+
 from __future__ import annotations
 
 import logging
@@ -37,7 +38,7 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 _AXES: tuple[str, ...] = ("success", "repair", "contract", "complexity", "cost")
 
 # Conservative update deltas
-_DELTA_SMALL:  float = 0.01
+_DELTA_SMALL: float = 0.01
 _DELTA_MEDIUM: float = 0.02
 
 # Per-axis weight clamp bounds
@@ -58,16 +59,16 @@ _W_MAX: float = 0.50
 # Confidence gating tiers: (min_signal_count, learned_fraction, static_fraction)
 # Applied in descending order of min_count; first match wins.
 _CONFIDENCE_TIERS: tuple[tuple[int, float, float], ...] = (
-    (10, 0.60, 0.40),   # >= 10 signals → 60% learned, 40% static
-    (5,  0.30, 0.70),   # >=  5 signals → 30% learned, 70% static
+    (10, 0.60, 0.40),  # >= 10 signals → 60% learned, 40% static
+    (5, 0.30, 0.70),  # >=  5 signals → 30% learned, 70% static
 )
 # Below lowest tier → pure static
 _MIN_SIGNALS_FOR_LEARNING: int = 5
 
 # Bucket identifiers
 BUCKET_STRICT_REFERENCE: str = "strict_reference_create"
-BUCKET_GRAPH_HEAVY: str      = "graph_heavy"
-BUCKET_DEFAULT: str          = "default"
+BUCKET_GRAPH_HEAVY: str = "graph_heavy"
+BUCKET_DEFAULT: str = "default"
 
 _ALL_BUCKETS: tuple[str, ...] = (
     BUCKET_STRICT_REFERENCE,
@@ -78,24 +79,33 @@ _ALL_BUCKETS: tuple[str, ...] = (
 # Maps bucket → base static profile name (mirrors adaptive_scoring.WEIGHT_PROFILES)
 _BUCKET_PROFILE_MAP: dict[str, str] = {
     BUCKET_STRICT_REFERENCE: "CONTRACT_HEAVY",
-    BUCKET_GRAPH_HEAVY:      "GRAPH_HEAVY",
-    BUCKET_DEFAULT:          "DEFAULT",
+    BUCKET_GRAPH_HEAVY: "GRAPH_HEAVY",
+    BUCKET_DEFAULT: "DEFAULT",
 }
 
 # Static profile weights — duplicated here to avoid circular imports with
 # adaptive_scoring.py; both modules must stay independently importable.
 _STATIC_BASE: dict[str, dict[str, float]] = {
     "CONTRACT_HEAVY": {
-        "success": 0.30, "repair": 0.25, "contract": 0.35,
-        "complexity": 0.05, "cost": 0.05,
+        "success": 0.30,
+        "repair": 0.25,
+        "contract": 0.35,
+        "complexity": 0.05,
+        "cost": 0.05,
     },
     "GRAPH_HEAVY": {
-        "success": 0.25, "repair": 0.20, "contract": 0.15,
-        "complexity": 0.20, "cost": 0.20,
+        "success": 0.25,
+        "repair": 0.20,
+        "contract": 0.15,
+        "complexity": 0.20,
+        "cost": 0.20,
     },
     "DEFAULT": {
-        "success": 0.35, "repair": 0.30, "contract": 0.20,
-        "complexity": 0.10, "cost": 0.05,
+        "success": 0.35,
+        "repair": 0.30,
+        "contract": 0.20,
+        "complexity": 0.10,
+        "cost": 0.05,
     },
 }
 
@@ -108,13 +118,14 @@ _BUDGET_FAILURE_KINDS: frozenset[str] = frozenset({"max_turns", "cost_limit", "a
 
 # Axis weights that should relax toward DEFAULT baseline on clean success
 _DEFAULT_CONTRACT_BASELINE: float = 0.20
-_DEFAULT_REPAIR_BASELINE:   float = 0.30
-_RELAX_THRESHOLD:           float = 0.05   # relax only if > baseline + threshold
+_DEFAULT_REPAIR_BASELINE: float = 0.30
+_RELAX_THRESHOLD: float = 0.05  # relax only if > baseline + threshold
 
 
 # ---------------------------------------------------------------------------
 # Data structures — Weight learning (existing)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LearningSignal:
@@ -122,44 +133,46 @@ class LearningSignal:
 
     All fields are serialisable (no rich objects).
     """
-    bucket: str                      # one of BUCKET_* constants
-    selected_weight_profile: str     # "CONTRACT_HEAVY" | "GRAPH_HEAVY" | "DEFAULT"
-    selected_strategy: str           # e.g. "generic_create", "reference_bound_create"
+
+    bucket: str  # one of BUCKET_* constants
+    selected_weight_profile: str  # "CONTRACT_HEAVY" | "GRAPH_HEAVY" | "DEFAULT"
+    selected_strategy: str  # e.g. "generic_create", "reference_bound_create"
     success: bool
-    repair_attempts: int             # 0 = no repair
-    repair_burden: str               # "none" | "low" | "medium" | "high"
+    repair_attempts: int  # 0 = no repair
+    repair_burden: str  # "none" | "low" | "medium" | "high"
     contract_violation: bool
-    semantic_failures: list[str]     # free-form reason strings
+    semantic_failures: list[str]  # free-form reason strings
     budget_failure: bool
-    graph_impact_level: str          # "low" | "medium" | "high"
+    graph_impact_level: str  # "low" | "medium" | "high"
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "bucket":                  self.bucket,
+            "bucket": self.bucket,
             "selected_weight_profile": self.selected_weight_profile,
-            "selected_strategy":       self.selected_strategy,
-            "success":                 self.success,
-            "repair_attempts":         self.repair_attempts,
-            "repair_burden":           self.repair_burden,
-            "contract_violation":      self.contract_violation,
-            "semantic_failures":       list(self.semantic_failures),
-            "budget_failure":          self.budget_failure,
-            "graph_impact_level":      self.graph_impact_level,
-            "timestamp":               self.timestamp,
+            "selected_strategy": self.selected_strategy,
+            "success": self.success,
+            "repair_attempts": self.repair_attempts,
+            "repair_burden": self.repair_burden,
+            "contract_violation": self.contract_violation,
+            "semantic_failures": list(self.semantic_failures),
+            "budget_failure": self.budget_failure,
+            "graph_impact_level": self.graph_impact_level,
+            "timestamp": self.timestamp,
         }
 
 
 @dataclass
 class WeightBucketState:
     """Learned weight state for one context bucket."""
+
     weights: dict[str, float]
-    signal_count: int  = 0
+    signal_count: int = 0
     last_updated: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "weights":      dict(self.weights),
+            "weights": dict(self.weights),
             "signal_count": self.signal_count,
             "last_updated": self.last_updated,
         }
@@ -168,6 +181,7 @@ class WeightBucketState:
 # ---------------------------------------------------------------------------
 # Bucket classification
 # ---------------------------------------------------------------------------
+
 
 def resolve_bucket(
     has_strict_reference: bool = False,
@@ -192,6 +206,7 @@ def resolve_bucket(
 # Weight arithmetic helpers
 # ---------------------------------------------------------------------------
 
+
 def _normalize_weights(w: dict[str, float]) -> dict[str, float]:
     """Return a copy of ``w`` scaled so values sum to exactly 1.0."""
     total = sum(w.values())
@@ -213,10 +228,7 @@ def _blend_weights(
     static_frac: float,
 ) -> dict[str, float]:
     """Linear blend of learned and static weights, normalised."""
-    blended = {
-        k: learned_frac * learned.get(k, 0.0) + static_frac * static.get(k, 0.0)
-        for k in _AXES
-    }
+    blended = {k: learned_frac * learned.get(k, 0.0) + static_frac * static.get(k, 0.0) for k in _AXES}
     return _normalize_weights(blended)
 
 
@@ -250,14 +262,14 @@ def _compute_weight_delta(
     # controlled vocabulary appended by the producer, not a match target.
     if signal.contract_violation:
         delta["contract"] += _DELTA_MEDIUM
-        delta["repair"]   += _DELTA_SMALL
-        delta["success"]  -= _DELTA_SMALL
+        delta["repair"] += _DELTA_SMALL
+        delta["success"] -= _DELTA_SMALL
 
     # ── B: Repair burden ──────────────────────────────────────────────────
     burden_rank = _BURDEN_RANK.get(signal.repair_burden, 0)
-    if burden_rank >= 3:   # high
+    if burden_rank >= 3:  # high
         delta["repair"] += _DELTA_MEDIUM
-    elif burden_rank >= 2: # medium
+    elif burden_rank >= 2:  # medium
         delta["repair"] += _DELTA_SMALL
     # Graph-heavy bucket: also lift complexity on significant burden
     if signal.bucket == BUCKET_GRAPH_HEAVY and burden_rank >= 2:
@@ -266,8 +278,8 @@ def _compute_weight_delta(
     # ── C: Graph-heavy failure ─────────────────────────────────────────────
     if not signal.success and signal.graph_impact_level == "high":
         delta["complexity"] += _DELTA_MEDIUM
-        delta["cost"]       += _DELTA_SMALL
-        delta["success"]    -= _DELTA_SMALL
+        delta["cost"] += _DELTA_SMALL
+        delta["success"] -= _DELTA_SMALL
 
     # ── D: Clean success ──────────────────────────────────────────────────
     if signal.success and signal.repair_attempts == 0 and not signal.contract_violation:
@@ -303,7 +315,7 @@ def _apply_weight_delta(
        the residual, so this converges in at most len(_AXES) passes.
     """
     updated = {k: weights.get(k, 0.0) + delta.get(k, 0.0) for k in _AXES}
-    normed  = _normalize_weights(updated)
+    normed = _normalize_weights(updated)
     clamped = _clamp_weights(normed)
 
     deficit = round(1.0 - sum(clamped.values()), 9)
@@ -332,6 +344,7 @@ def _apply_weight_delta(
 # ---------------------------------------------------------------------------
 # WeightLearner
 # ---------------------------------------------------------------------------
+
 
 class WeightLearner:
     """Manages per-bucket learned weight state with conservative online updates.
@@ -370,7 +383,9 @@ class WeightLearner:
         """Return state for ``bucket``; falls back to default bucket."""
         return self._states.get(bucket, self._states[BUCKET_DEFAULT])
 
-    def get_learned_weights(self, bucket: str) -> dict[str, float]:  # live via AdaptiveLearnerHub.tool_learner (run_store lazy import)
+    def get_learned_weights(
+        self, bucket: str
+    ) -> dict[str, float]:  # live via AdaptiveLearnerHub.tool_learner (run_store lazy import)
         """Return the current learned (possibly still equal to static) weights."""
         return dict(self.get_bucket_state(bucket).weights)
 
@@ -415,9 +430,7 @@ class WeightLearner:
         with self._lock:
             bucket = signal.bucket
             if bucket not in self._states:
-                logger.debug(
-                    "weight_learning: unknown bucket %r — skipping update", bucket
-                )
+                logger.debug("weight_learning: unknown bucket %r — skipping update", bucket)
                 return
 
             state = self._states[bucket]
@@ -425,13 +438,11 @@ class WeightLearner:
 
             # Only persist the update if at least one axis changed meaningfully
             if all(abs(v) < 1e-9 for v in delta.values()):
-                logger.debug(
-                    "weight_learning: bucket=%s zero-delta signal — no update", bucket
-                )
+                logger.debug("weight_learning: bucket=%s zero-delta signal — no update", bucket)
                 return
 
             new_weights = _apply_weight_delta(state.weights, delta)
-            state.weights     = new_weights
+            state.weights = new_weights
             state.signal_count += 1
             state.last_updated = signal.timestamp
 
@@ -453,7 +464,7 @@ class WeightLearner:
         """
         return {
             bucket: {
-                "weights":      dict(state.weights),
+                "weights": dict(state.weights),
                 "signal_count": state.signal_count,
                 "last_updated": state.last_updated,
                 "base_profile": _BUCKET_PROFILE_MAP.get(bucket, "DEFAULT"),
@@ -461,7 +472,9 @@ class WeightLearner:
             for bucket, state in self._states.items()
         }
 
-    def load_state(self, state_dict: dict[str, Any]) -> None:  # live via AdaptiveLearnerHub.tool_learner (run_store lazy import)
+    def load_state(
+        self, state_dict: dict[str, Any]
+    ) -> None:  # live via AdaptiveLearnerHub.tool_learner (run_store lazy import)
         """Restore bucket states from a previously persisted dict.
 
         Accepts the format produced by :meth:`get_summary`.  Unknown bucket
@@ -475,12 +488,15 @@ class WeightLearner:
             raw_weights = data.get("weights")
             if not isinstance(raw_weights, dict):
                 continue
-            with suppress(ValueError, TypeError, KeyError):  # Keep existing state on per-bucket error; silently continue
-                restored = _normalize_weights(_clamp_weights({
-                    k: float(raw_weights.get(k, self._states[bucket].weights.get(k, 0.0)))
-                    for k in _AXES
-                }))
-                self._states[bucket].weights      = restored
+            with suppress(
+                ValueError, TypeError, KeyError
+            ):  # Keep existing state on per-bucket error; silently continue
+                restored = _normalize_weights(
+                    _clamp_weights(
+                        {k: float(raw_weights.get(k, self._states[bucket].weights.get(k, 0.0))) for k in _AXES}
+                    )
+                )
+                self._states[bucket].weights = restored
                 self._states[bucket].signal_count = int(data.get("signal_count", 0))
                 self._states[bucket].last_updated = float(data.get("last_updated", 0.0))
 
@@ -488,6 +504,7 @@ class WeightLearner:
 # ---------------------------------------------------------------------------
 # AdaptiveLearnerHub — unified learning for tool selection
 # ---------------------------------------------------------------------------
+
 
 class MiniQLearner:
     """Lightweight Q-table learner for a single decision domain.
@@ -499,9 +516,9 @@ class MiniQLearner:
     def __init__(self, name: str, alpha: float = 0.1):
         self.name = name
         self._alpha = alpha
-        self._q: dict[str, dict[str, float]] = {}        # {state: {action: Q}}
-        self._counts: dict[str, dict[str, int]] = {}     # {state: {action: count}}
-        self._perf: dict[str, dict[str, float]] = {}     # {action: {trials, successes, total_reward}}
+        self._q: dict[str, dict[str, float]] = {}  # {state: {action: Q}}
+        self._counts: dict[str, dict[str, int]] = {}  # {state: {action: count}}
+        self._perf: dict[str, dict[str, float]] = {}  # {action: {trials, successes, total_reward}}
 
     def update(self, state: str, action: str, reward: float) -> None:
         q_row = self._q.setdefault(state, {})
@@ -529,18 +546,21 @@ class MiniQLearner:
             return
         raw_q = d.get("q")
         if isinstance(raw_q, dict):
-            self._q = {k: {ak: float(av) for ak, av in v.items()}
-                       for k, v in raw_q.items() if isinstance(v, dict)}
+            self._q = {k: {ak: float(av) for ak, av in v.items()} for k, v in raw_q.items() if isinstance(v, dict)}
         raw_c = d.get("counts")
         if isinstance(raw_c, dict):
-            self._counts = {k: {ak: int(av) for ak, av in v.items()}
-                           for k, v in raw_c.items() if isinstance(v, dict)}
+            self._counts = {k: {ak: int(av) for ak, av in v.items()} for k, v in raw_c.items() if isinstance(v, dict)}
         raw_p = d.get("perf")
         if isinstance(raw_p, dict):
-            self._perf = {k: {"trials": float(v.get("trials", 0)),
-                              "successes": float(v.get("successes", 0)),
-                              "total_reward": float(v.get("total_reward", 0))}
-                         for k, v in raw_p.items() if isinstance(v, dict)}
+            self._perf = {
+                k: {
+                    "trials": float(v.get("trials", 0)),
+                    "successes": float(v.get("successes", 0)),
+                    "total_reward": float(v.get("total_reward", 0)),
+                }
+                for k, v in raw_p.items()
+                if isinstance(v, dict)
+            }
 
 
 class AdaptiveLearnerHub:  # live cross-module edge (run_store.py lazy import)
@@ -560,7 +580,11 @@ class AdaptiveLearnerHub:  # live cross-module edge (run_store.py lazy import)
     # ── Tool selection learning ──────────────────────────────
 
     def record_tool_usage(  # live cross-module edge (run_store.py lazy import)
-        self, phase: str, tool_name: str, success: bool, context_bucket: str = "",
+        self,
+        phase: str,
+        tool_name: str,
+        success: bool,
+        context_bucket: str = "",
     ) -> None:
         """Record tool usage outcome in MAIN_AGENT lane."""
         reward = 0.5 if success else -0.3
@@ -588,17 +612,17 @@ class AdaptiveLearnerHub:  # live cross-module edge (run_store.py lazy import)
                     learner.load_dict(raw)
 
 
-
 # ---------------------------------------------------------------------------
 # Integration entry points
 # ---------------------------------------------------------------------------
+
 
 def build_learning_signal_from_execution_metadata(
     metadata: dict[str, Any],
     *,
     success: bool,
-    bucket: Optional[str] = None,
-) -> Optional[LearningSignal]:
+    bucket: str | None = None,
+) -> LearningSignal | None:
     """Build a ``LearningSignal`` from execution metadata.
 
     Reads keys already written to plan.metadata / spec.metadata by existing
@@ -620,17 +644,15 @@ def build_learning_signal_from_execution_metadata(
     try:
         return _build_signal_inner(metadata, success=success, bucket=bucket)
     except Exception:
-        logger.debug(
-            "build_learning_signal_from_execution_metadata: error", exc_info=True
-        )
+        logger.debug("build_learning_signal_from_execution_metadata: error", exc_info=True)
         return None
 
 
 def _build_signal_inner(
     metadata: dict[str, Any],
     success: bool,
-    bucket: Optional[str],
-) -> Optional[LearningSignal]:
+    bucket: str | None,
+) -> LearningSignal | None:
     # Pre-execution strategy selection metadata
     pre_sel = metadata.get("pre_execution_strategy_selection") or {}
     selected_strategy = pre_sel.get("selected_strategy", "generic_create")
@@ -639,8 +661,8 @@ def _build_signal_inner(
     ranking = pre_sel.get("strategy_ranking", [])
     selected_profile = (
         ranking[0].get("selected_weight_profile", "DEFAULT")
-        if ranking else
-        pre_sel.get("weight_source_profile", "DEFAULT")
+        if ranking
+        else pre_sel.get("weight_source_profile", "DEFAULT")
     )
 
     # Graph impact
@@ -649,17 +671,14 @@ def _build_signal_inner(
 
     # Repair / contract signals
     repair_attempts = int(metadata.get("repair_attempts", 0))
-    repair_burden   = metadata.get("repair_burden", "none") or "none"
-    contract_viol   = bool(metadata.get("contract_violation", False))
-    semantic_fails  = list(metadata.get("semantic_failures", []) or [])
-    budget_fail     = bool(metadata.get("budget_failure", False))
+    repair_burden = metadata.get("repair_burden", "none") or "none"
+    contract_viol = bool(metadata.get("contract_violation", False))
+    semantic_fails = list(metadata.get("semantic_failures", []) or [])
+    budget_fail = bool(metadata.get("budget_failure", False))
 
     # Derive bucket if not provided
     if not bucket:
-        has_strict = bool(
-            metadata.get("has_strict_reference") or
-            metadata.get("reference_files")
-        )
+        has_strict = bool(metadata.get("has_strict_reference") or metadata.get("reference_files"))
         rb_ctx = bool(metadata.get("reference_bound_context"))
         bucket = resolve_bucket(has_strict, rb_ctx, graph_impact_level)
 
@@ -758,16 +777,9 @@ def update_weights_from_monitor_result(  # live dev-CLI edge (auto_learning_loop
     """
     try:
         status = result_dict.get("status", "")
-        success_val = bool(
-            result_dict.get("success") or
-            (status in ("success", "partial_success"))
-        )
+        success_val = bool(result_dict.get("success") or (status in ("success", "partial_success")))
         meta = dict(result_dict.get("metadata") or {})
-        semantic_fails = list(
-            result_dict.get("failure_reasons") or
-            result_dict.get("semantic_failures") or
-            []
-        )
+        semantic_fails = list(result_dict.get("failure_reasons") or result_dict.get("semantic_failures") or [])
         if semantic_fails:
             meta.setdefault("semantic_failures", semantic_fails)
         # Forward the monitor's structured evaluation flags (top-level keys in
@@ -788,17 +800,13 @@ def update_weights_from_monitor_result(  # live dev-CLI edge (auto_learning_loop
                 success_val,
             )
 
-        sig = build_learning_signal_from_execution_metadata(
-            meta, success=success_val
-        )
+        sig = build_learning_signal_from_execution_metadata(meta, success=success_val)
         if sig is None:
             return False
 
         weight_learner.update(sig)
     except Exception:
-        logger.debug(
-            "update_weights_from_monitor_result: error", exc_info=True
-        )
+        logger.debug("update_weights_from_monitor_result: error", exc_info=True)
         return False
     else:
         return True

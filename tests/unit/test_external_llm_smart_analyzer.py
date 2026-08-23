@@ -7,6 +7,7 @@ words (``'ui'`` ⊂ ``'fluid'``/``'guide'``, ``'fix'`` ⊂ ``'suffix'``). The fi
 anchors every keyword with word boundaries (``\\b...\\b``). These tests lock
 the word-boundary contract and bring ``smart_analyzer.py`` from 0% coverage.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

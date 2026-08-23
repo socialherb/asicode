@@ -4,6 +4,7 @@ Unit tests for _SlashCommandCompleter — /model and /model dev_N auto-completio
 Covers the slot-token regex detection (dev / dev_ / dev_N) and the
 dev_N <model> model-name completion path, including 'off'.
 """
+
 from prompt_toolkit.formatted_text import FormattedText
 
 import asi

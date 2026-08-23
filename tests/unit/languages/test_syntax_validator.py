@@ -5,6 +5,7 @@ Covers both dispatch branches of every static method: the provider path
 or a monkeypatched dispatch), plus find_symbol_in_file's file-read / OSError /
 kind-resolution branches and _ts_find_symbol_in_file.
 """
+
 from __future__ import annotations
 
 from external_llm.languages import tree_sitter_utils as ts_utils
@@ -16,6 +17,7 @@ UNK = LanguageId.UNKNOWN
 
 
 # ── validate_syntax ─────────────────────────────────────────────────────────
+
 
 class TestValidateSyntax:
     def test_python_valid(self):
@@ -34,6 +36,7 @@ class TestValidateSyntax:
 
 # ── find_symbol_range ───────────────────────────────────────────────────────
 
+
 class TestFindSymbolRange:
     def test_python_found(self):
         rng = SyntaxValidator.find_symbol_range("def foo():\n    pass\n", "foo", PY)
@@ -48,6 +51,7 @@ class TestFindSymbolRange:
 
 # ── find_symbols ────────────────────────────────────────────────────────────
 
+
 class TestFindSymbols:
     def test_python(self):
         syms = SyntaxValidator.find_symbols("def foo():\n    pass\n", PY)
@@ -59,6 +63,7 @@ class TestFindSymbols:
 
 # ── extract_symbol_body ─────────────────────────────────────────────────────
 
+
 class TestExtractSymbolBody:
     def test_python(self):
         body = SyntaxValidator.extract_symbol_body("def foo():\n    x = 1\n    return x\n", "foo", PY)
@@ -69,6 +74,7 @@ class TestExtractSymbolBody:
 
 
 # ── is_dead_code_introduced ─────────────────────────────────────────────────
+
 
 class TestIsDeadCodeIntroduced:
     def test_python_valid_new(self):
@@ -84,8 +90,10 @@ class TestIsDeadCodeIntroduced:
     def test_fallback_failing(self, monkeypatch):
         import external_llm.languages.base as base_mod
         from external_llm.languages.models import SyntaxValidationResult
+
         monkeypatch.setattr(
-            base_mod, "tree_sitter_syntax_fallback",
+            base_mod,
+            "tree_sitter_syntax_fallback",
             lambda content, lang, file_path="": SyntaxValidationResult(ok=False, errors=["boom"]),
         )
         assert SyntaxValidator.is_dead_code_introduced("a", "b", UNK) is True
@@ -93,13 +101,13 @@ class TestIsDeadCodeIntroduced:
 
 # ── find_symbol_in_file ─────────────────────────────────────────────────────
 
+
 class TestFindSymbolInFile:
     def test_unknown_extension(self):
         assert SyntaxValidator.find_symbol_in_file("file.xyz", "anything") is None
 
     def test_python_with_content_found(self):
-        info = SyntaxValidator.find_symbol_in_file(
-            "t.py", "foo", content="def foo():\n    pass\n")
+        info = SyntaxValidator.find_symbol_in_file("t.py", "foo", content="def foo():\n    pass\n")
         assert info["file"] == "t.py"
         assert info["line"] == 1
         assert info["end_line"] == 2
@@ -107,8 +115,7 @@ class TestFindSymbolInFile:
         assert info["name"] == "foo"
 
     def test_python_with_content_missing(self):
-        assert SyntaxValidator.find_symbol_in_file(
-            "t.py", "nope", content="def foo():\n    pass\n") is None
+        assert SyntaxValidator.find_symbol_in_file("t.py", "nope", content="def foo():\n    pass\n") is None
 
     def test_python_reads_file_when_content_none(self, tmp_path):
         p = tmp_path / "t.py"
@@ -118,17 +125,19 @@ class TestFindSymbolInFile:
         assert info["kind"] == "function"
 
     def test_python_missing_file_oserror(self):
-        assert SyntaxValidator.find_symbol_in_file(
-            "/nonexistent_dir_xyz/t.py", "foo") is None
+        assert SyntaxValidator.find_symbol_in_file("/nonexistent_dir_xyz/t.py", "foo") is None
 
     def test_kind_stays_symbol_when_enumeration_mismatches(self, monkeypatch):
         class _FakeProvider:
             def find_symbol_in_file(self, file_path, symbol_name, content):
                 return (3, 5)
+
             def find_symbols(self, content):
                 # Same name but different start line → kind resolution must miss
                 return [("foo", "function", 1, 2)]
+
         import external_llm.languages.syntax_validator as sv
+
         monkeypatch.setattr(sv, "_get_provider", lambda lang: _FakeProvider())
         info = SyntaxValidator.find_symbol_in_file("t.py", "foo", content="x")
         assert info["kind"] == "symbol"
@@ -137,15 +146,16 @@ class TestFindSymbolInFile:
         # Dispatch returns None for a real language → falls through to
         # _ts_find_symbol_in_file (tree-sitter direct lookup).
         import external_llm.languages.syntax_validator as sv
+
         monkeypatch.setattr(sv, "_get_provider", lambda lang: None)
-        info = SyntaxValidator.find_symbol_in_file(
-            "t.py", "foo", content="def foo():\n    pass\n")
+        info = SyntaxValidator.find_symbol_in_file("t.py", "foo", content="def foo():\n    pass\n")
         assert info["line"] == 1
         assert info["end_line"] == 2
         assert info["kind"] == "function"
 
 
 # ── _ts_find_symbol_in_file ─────────────────────────────────────────────────
+
 
 class TestTsFindSymbolInFile:
     def test_no_range(self, monkeypatch):
@@ -155,7 +165,8 @@ class TestTsFindSymbolInFile:
     def test_range_with_kind_match(self, monkeypatch):
         monkeypatch.setattr(ts_utils, "find_symbol_range", lambda *a: (2, 4))
         monkeypatch.setattr(
-            ts_utils, "find_all_symbols",
+            ts_utils,
+            "find_all_symbols",
             lambda *a: [("foo", "function", 2, 4), ("bar", "variable", 5, 5)],
         )
         info = SyntaxValidator._ts_find_symbol_in_file("t.go", "foo", "x", LanguageId.GO)

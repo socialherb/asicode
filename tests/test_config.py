@@ -1,6 +1,7 @@
 """
 Tests for config.py — environment variable helpers and module constants.
 """
+
 from __future__ import annotations
 
 import os
@@ -125,21 +126,26 @@ class TestModuleConstants:
 
     def test_runs_dir_default(self):
         from config import ASICODE_RUNS_DIR
+
         assert isinstance(ASICODE_RUNS_DIR, str)
 
     def test_multilang_flags(self):
         from config import MULTILANG_CALLGRAPH, MULTILANG_SYMBOL_SEARCH
+
         assert isinstance(MULTILANG_SYMBOL_SEARCH, bool)
         assert isinstance(MULTILANG_CALLGRAPH, bool)
 
     def test_learning_enabled_default(self):
         from config import LEARNING_ENABLED
+
         assert isinstance(LEARNING_ENABLED, bool)
 
     def test_allowed_repo_roots_default(self):
         from config import ALLOWED_REPO_ROOTS
+
         assert isinstance(ALLOWED_REPO_ROOTS, list)
 
     def test_patch_dump_type(self):
         from config import PATCH_DUMP
+
         assert isinstance(PATCH_DUMP, Path)

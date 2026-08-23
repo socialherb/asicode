@@ -10,6 +10,7 @@ a matching one turned the whole call into
 ``ok=False, "grep failed (exit=2): rg: ./locked.py: Permission denied"`` and the
 real match in the readable file was never reported.
 """
+
 import os
 import pathlib
 import shutil
@@ -52,7 +53,9 @@ class TestUnreadableFileDoesNotFailTheSearch:
         assert "skipped" in result.content.lower()
 
     def test_no_matches_plus_an_unreadable_file_is_still_no_matches(
-        self, tool_registry, locked_repo,
+        self,
+        tool_registry,
+        locked_repo,
     ):
         """Exit 2 with zero output is not automatically a failed call.
 
@@ -66,7 +69,9 @@ class TestUnreadableFileDoesNotFailTheSearch:
         assert result.metadata.get("files_skipped") is True
 
     def test_the_regex_is_not_silently_downgraded_to_a_literal(
-        self, tool_registry, locked_repo,
+        self,
+        tool_registry,
+        locked_repo,
     ):
         r"""The old retry answered a regex query with a fixed-string search.
 
@@ -80,7 +85,8 @@ class TestUnreadableFileDoesNotFailTheSearch:
 
 
 def test_a_genuine_pattern_error_still_falls_back_to_a_literal(
-    tool_registry, temp_repo_root,
+    tool_registry,
+    temp_repo_root,
 ):
     """The behaviour the exit-2 branch existed for must survive the fix."""
     pathlib.Path(temp_repo_root, "brackets.py").write_text("x = foo(1)\n")
@@ -95,14 +101,10 @@ class TestStderrClassification:
     """The discriminator itself, away from the filesystem."""
 
     def test_access_noise_means_the_search_ran(self):
-        assert _search_ran_despite_errors(
-            "rg: ./locked.py: Permission denied (os error 13)"
-        )
+        assert _search_ran_despite_errors("rg: ./locked.py: Permission denied (os error 13)")
 
     def test_a_pattern_error_means_it_did_not(self):
-        assert not _search_ran_despite_errors(
-            "rg: regex parse error:\n    (?:foo()\nerror: unclosed group"
-        )
+        assert not _search_ran_despite_errors("rg: regex parse error:\n    (?:foo()\nerror: unclosed group")
 
     def test_an_unknown_error_is_not_assumed_benign(self):
         assert not _search_ran_despite_errors("rg: something nobody predicted")
@@ -112,16 +114,12 @@ class TestStderrClassification:
 
     def test_a_pattern_error_wins_over_a_stray_access_word(self):
         """Truncated stderr must not be read as 'the search ran'."""
-        assert not _search_ran_despite_errors(
-            "rg: regex parse error: permission denied"
-        )
+        assert not _search_ran_despite_errors("rg: regex parse error: permission denied")
 
 
 class TestUnsupportedFlagDetection:
     def test_it_names_the_rejected_flag(self):
-        assert _unsupported_flag(
-            "rg: unrecognized flag --max-columns-preview"
-        ) == "--max-columns-preview"
+        assert _unsupported_flag("rg: unrecognized flag --max-columns-preview") == "--max-columns-preview"
 
     def test_a_normal_error_is_not_a_flag_problem(self):
         assert _unsupported_flag("rg: ./x: Permission denied") is None
@@ -132,7 +130,10 @@ class TestUnsupportedFlagDetection:
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="needs a real rg to wrap")
 def test_an_rg_too_old_for_max_columns_preview_still_searches(
-    tool_registry, temp_repo_root, monkeypatch, tmp_path,
+    tool_registry,
+    temp_repo_root,
+    monkeypatch,
+    tmp_path,
 ):
     """``--max-columns-preview`` is rg >= 12.0; Ubuntu 20.04 ships 11.0.2.
 

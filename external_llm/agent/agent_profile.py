@@ -7,7 +7,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from external_llm.agent.tool_registry import AgentConfig
@@ -44,17 +44,17 @@ class AgentProfile:
     description: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     blocked_tools: list[str] = field(default_factory=list)
-    model: Optional[str] = None
-    provider: Optional[str] = None
-    system_prompt_prefix: Optional[str] = None
-    max_turns: Optional[int] = None
+    model: str | None = None
+    provider: str | None = None
+    system_prompt_prefix: str | None = None
+    max_turns: int | None = None
 
     # ------------------------------------------------------------------ #
     # Construction helpers                                                 #
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def load(cls, name: str, repo_root: str) -> "AgentProfile":
+    def load(cls, name: str, repo_root: str) -> AgentProfile:
         """Load a profile from .asicode/agents/{name}.json.
 
         Args:
@@ -70,9 +70,7 @@ class AgentProfile:
         """
         profile_path = Path(repo_root) / ".asicode" / "agents" / f"{name}.json"
         if not profile_path.exists():
-            raise FileNotFoundError(
-                f"Agent profile '{name}' not found at {profile_path}"
-            )
+            raise FileNotFoundError(f"Agent profile '{name}' not found at {profile_path}")
         try:
             data = json.loads(profile_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
@@ -80,7 +78,7 @@ class AgentProfile:
         return cls.from_dict(data)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AgentProfile":
+    def from_dict(cls, data: dict[str, Any]) -> AgentProfile:
         return cls(
             name=data.get("name", "unnamed"),
             description=data.get("description", ""),
@@ -108,13 +106,13 @@ class AgentProfile:
     # Application                                                          #
     # ------------------------------------------------------------------ #
 
-    def apply(self, agent_config: "AgentConfig") -> None:
+    def apply(self, agent_config: AgentConfig) -> None:
         """Override AgentConfig fields from this profile (non-None values only)."""
         if self.model is not None:
-            agent_config.model = self.model
+            agent_config.model = self.model  # type: ignore[attr-defined]  # dynamic AgentConfig extension
             logger.debug("AgentProfile '%s': model → %s", self.name, self.model)
         if self.provider is not None:
-            agent_config.provider = self.provider
+            agent_config.provider = self.provider  # type: ignore[attr-defined]  # dynamic AgentConfig extension
             logger.debug("AgentProfile '%s': provider → %s", self.name, self.provider)
         if self.max_turns is not None:
             agent_config.max_turns = self.max_turns
@@ -130,8 +128,10 @@ BUILTIN_PROFILES: dict[str, dict] = {
         "name": "reviewer",
         "description": "Read-only code review — no file modifications allowed",
         "allowed_tools": [
-            "find_symbol", "find_references",
-            "get_project_info", "find_relevant_files",
+            "find_symbol",
+            "find_references",
+            "get_project_info",
+            "find_relevant_files",
         ],
         "blocked_tools": [],
     },
@@ -139,8 +139,11 @@ BUILTIN_PROFILES: dict[str, dict] = {
         "name": "patcher",
         "description": "Edit-focused agent — read + patch only, no tests or shell",
         "allowed_tools": [
-            "find_symbol", "find_references",
-            "write_plan", "apply_patch", "find_relevant_files",
+            "find_symbol",
+            "find_references",
+            "write_plan",
+            "apply_patch",
+            "find_relevant_files",
         ],
         "blocked_tools": ["bash"],
     },
@@ -148,7 +151,8 @@ BUILTIN_PROFILES: dict[str, dict] = {
         "name": "tester",
         "description": "Test-focused agent — runs tests and reports results",
         "allowed_tools": [
-            "find_symbol", "get_project_info",
+            "find_symbol",
+            "get_project_info",
             # run_tests removed from LLM tool set (internal dispatch only; use bash("pytest ..."))
         ],
         "blocked_tools": ["apply_patch", "bash"],
@@ -156,7 +160,7 @@ BUILTIN_PROFILES: dict[str, dict] = {
 }
 
 
-def get_builtin_profile(name: str) -> Optional[AgentProfile]:
+def get_builtin_profile(name: str) -> AgentProfile | None:
     """Return a built-in profile by name, or None if not found."""
     data = BUILTIN_PROFILES.get(name)
     return AgentProfile.from_dict(data) if data else None

@@ -104,13 +104,15 @@ def test_ruff_findings_normalizes_findings(monkeypatch):
     def fake_run(cmd, **kwargs):
         seen["cmd"] = cmd
         seen["input"] = kwargs.get("input")
-        payload = json.dumps([
-            {
-                "code": "F401",
-                "location": {"row": 3, "column": 1},
-                "message": "`os` imported but unused",
-            },
-        ])
+        payload = json.dumps(
+            [
+                {
+                    "code": "F401",
+                    "location": {"row": 3, "column": 1},
+                    "message": "`os` imported but unused",
+                },
+            ]
+        )
         return _proc(returncode=1, stdout=payload)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -126,18 +128,14 @@ def test_ruff_findings_normalizes_findings(monkeypatch):
 def test_ruff_findings_nonstandard_rc_returns_empty(monkeypatch):
     """rc outside {0, 1} (ruff crashed) degrades gracefully to []."""
     monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
-    monkeypatch.setattr(
-        subprocess, "run", lambda cmd, **kw: _proc(returncode=2, stderr="boom")
-    )
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=2, stderr="boom"))
     assert semantic_lint.ruff_findings("x = 1\n") == []
 
 
 def test_ruff_findings_bad_json_returns_empty(monkeypatch):
     """Unparseable stdout degrades gracefully to []."""
     monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
-    monkeypatch.setattr(
-        subprocess, "run", lambda cmd, **kw: _proc(returncode=0, stdout="not json")
-    )
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=0, stdout="not json"))
     assert semantic_lint.ruff_findings("x = 1\n") == []
 
 
@@ -189,8 +187,7 @@ class TestRuffFindingsCacheAndBatch:
         f = tmp_path / "a.py"
         f.write_text("x = 1")
         monkeypatch.setattr(semantic_lint, "_RUFF_AVAILABLE", True)
-        monkeypatch.setattr(subprocess, "run",
-                            lambda cmd, **kw: _proc(returncode=2, stdout="", stderr="boom"))
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=2, stdout="", stderr="boom"))
         assert semantic_lint.ruff_findings_many([str(f)]) == {}
 
     def test_many_empty_stdout_returns_all_empty(self, monkeypatch, tmp_path):
@@ -245,10 +242,17 @@ class TestRuffFindingsManyParseLoop:
 
         f = tmp_path / "a.py"
         f.write_text("import os\n")
-        payload = json.dumps([
-            {"filename": str(f), "location": {"row": 2}, "code": "F401",
-             "message": "unused import", "severity": "warning"},
-        ])
+        payload = json.dumps(
+            [
+                {
+                    "filename": str(f),
+                    "location": {"row": 2},
+                    "code": "F401",
+                    "message": "unused import",
+                    "severity": "warning",
+                },
+            ]
+        )
         monkeypatch.setattr(semantic_lint, "_check_ruff_available", lambda: True)
         monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _proc(returncode=1, stdout=payload))
         out = semantic_lint.ruff_findings_many([str(f)])

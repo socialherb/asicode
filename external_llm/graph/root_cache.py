@@ -116,11 +116,7 @@ class RootCache:
 
     def __iter__(self) -> Iterator[tuple[str, Any]]:
         with self._lock:
-            keys = [
-                (root, sub)
-                for root, inner in self._roots.items()
-                for sub in inner
-            ]
+            keys = [(root, sub) for root, inner in self._roots.items() for sub in inner]
         return iter(keys)
 
     def __len__(self) -> int:

@@ -36,10 +36,14 @@ class CheckpointStore:
     Manages file checkpoints with timeline UI support.
     """
 
-    def __init__(self, repo_root: str, store_dir: str = '.asicode/checkpoints',
-                 max_checkpoints: int = 50,
-                 max_bytes: int = _DEFAULT_MAX_STORE_BYTES,
-                 max_blob_bytes: int = 0):
+    def __init__(
+        self,
+        repo_root: str,
+        store_dir: str = ".asicode/checkpoints",
+        max_checkpoints: int = 50,
+        max_bytes: int = _DEFAULT_MAX_STORE_BYTES,
+        max_blob_bytes: int = 0,
+    ):
         """
         Initialize checkpoint store.
 
@@ -81,7 +85,7 @@ class CheckpointStore:
         self.checkpoint_dir = self.store_dir / repo_name
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        self.checkpoint_file = self.checkpoint_dir / 'checkpoints.json'
+        self.checkpoint_file = self.checkpoint_dir / "checkpoints.json"
         self._load_checkpoints()
 
     def _load_checkpoints(self) -> None:
@@ -99,13 +103,13 @@ class CheckpointStore:
             self.checkpoints = self._rebuild_index_from_disk()
             if self.checkpoints:
                 logger.warning(
-                    "checkpoint index %s missing; recovered %d checkpoint(s) "
-                    "from payload files",
-                    self.checkpoint_file, len(self.checkpoints),
+                    "checkpoint index %s missing; recovered %d checkpoint(s) from payload files",
+                    self.checkpoint_file,
+                    len(self.checkpoints),
                 )
             return
         try:
-            with open(self.checkpoint_file, encoding='utf-8') as f:
+            with open(self.checkpoint_file, encoding="utf-8") as f:
                 self.checkpoints = json.load(f)
             if not isinstance(self.checkpoints, list):
                 raise TypeError("index is not a JSON list")
@@ -114,8 +118,7 @@ class CheckpointStore:
             self.checkpoints = self._rebuild_index_from_disk()
             if self.checkpoints:
                 logger.warning(
-                    "recovered %d checkpoint(s) from payload files; "
-                    "next save will heal the index",
+                    "recovered %d checkpoint(s) from payload files; next save will heal the index",
                     len(self.checkpoints),
                 )
 
@@ -130,25 +133,27 @@ class CheckpointStore:
         saved index.
         """
         rebuilt: list[dict] = []
-        for cp_file in sorted(self.checkpoint_dir.glob('checkpoint_*.json')):
+        for cp_file in sorted(self.checkpoint_dir.glob("checkpoint_*.json")):
             try:
-                with open(cp_file, encoding='utf-8') as f:
+                with open(cp_file, encoding="utf-8") as f:
                     data = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 logger.debug("rebuild: cannot read payload %s: %s", cp_file, e)
                 continue
-            cid = data.get('id')
+            cid = data.get("id")
             if not cid:
                 continue
-            rebuilt.append({
-                'id': cid,
-                'timestamp': data.get('timestamp', 0),
-                'description': data.get('description', ''),
-                'scope': data.get('scope', 'full'),
-                'file_count': data.get('file_count', 0),
-                'path': cp_file.name,
-            })
-        rebuilt.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+            rebuilt.append(
+                {
+                    "id": cid,
+                    "timestamp": data.get("timestamp", 0),
+                    "description": data.get("description", ""),
+                    "scope": data.get("scope", "full"),
+                    "file_count": data.get("file_count", 0),
+                    "path": cp_file.name,
+                }
+            )
+        rebuilt.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
         return rebuilt
 
     def _index_payload_path(self, entry: dict) -> Path | None:
@@ -160,7 +165,7 @@ class CheckpointStore:
         None when the entry has no path or the path would resolve outside the
         checkpoint dir.
         """
-        rel = entry.get('path')
+        rel = entry.get("path")
         if not rel:
             return None
         p = Path(rel)
@@ -195,13 +200,13 @@ class CheckpointStore:
         without ``fcntl`` (e.g. Windows), the lock is a no-op but the
         atomic-rename + merge still mitigates most races.
         """
-        lock_path = self.checkpoint_file.with_suffix('.json.lock')
+        lock_path = self.checkpoint_file.with_suffix(".json.lock")
         with cross_process_flock(lock_path):
             # Re-load under the lock and merge concurrent additions.
             try:
                 disk = []
                 if self.checkpoint_file.exists():
-                    with open(self.checkpoint_file, encoding='utf-8') as f:
+                    with open(self.checkpoint_file, encoding="utf-8") as f:
                         disk = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 # Corrupt disk index: the in-memory state is authoritative and
@@ -216,10 +221,10 @@ class CheckpointStore:
                     type(disk).__name__,
                 )
                 disk = []
-            known = {cp['id'] for cp in self.checkpoints}
+            known = {cp["id"] for cp in self.checkpoints}
             merged = list(self.checkpoints)
             for cp in disk:
-                cid = cp.get('id')
+                cid = cp.get("id")
                 if cid in known:
                     continue
                 # Only resurrect a disk entry if its checkpoint file still
@@ -231,7 +236,7 @@ class CheckpointStore:
                 cp_file = self._index_payload_path(cp)
                 if cp_file is not None and cp_file.exists():
                     merged.append(cp)
-            merged.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+            merged.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
             self.checkpoints = merged
 
             # The merge can grow the list past the retention caps again (a
@@ -249,8 +254,10 @@ class CheckpointStore:
             # imported above and used for the payloads.
             try:
                 atomic_write_json(
-                    self.checkpoint_file, self.checkpoints,
-                    indent=2, ensure_ascii=False,
+                    self.checkpoint_file,
+                    self.checkpoints,
+                    indent=2,
+                    ensure_ascii=False,
                 )
             except OSError as e:
                 logger.exception("Failed to save checkpoints: %s", e)
@@ -273,9 +280,22 @@ class CheckpointStore:
         if files is not None:
             return self._scan_listed_files(files)
         file_hashes = {}
-        exclude_dirs = {'.git', '.asicode', '__pycache__', '.pytest_cache', '.mypy_cache',
-                        'node_modules', '.venv', 'venv', 'env', 'dist', 'build', '.eggs', '.tox'}
-        exclude_extensions = {'.pyc', '.pyo', '.pyd', '.so', '.dll', '.exe'}
+        exclude_dirs = {
+            ".git",
+            ".asicode",
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            "node_modules",
+            ".venv",
+            "venv",
+            "env",
+            "dist",
+            "build",
+            ".eggs",
+            ".tox",
+        }
+        exclude_extensions = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".exe"}
 
         # Use os.walk with directory pruning instead of rglob('*') to avoid
         # descending into excluded subtrees (node_modules, .git, etc.).
@@ -288,9 +308,7 @@ class CheckpointStore:
             # targets and hashing them dominated scan cost (a single .ruff_cache
             # held 26k files = 95% of the SHA256 time). Aligns with
             # common.walk_policy._walk_should_skip_dir's dot-dir heuristic.
-            dirs[:] = sorted(
-                d for d in dirs if d not in exclude_dirs and not d.startswith('.')
-            )
+            dirs[:] = sorted(d for d in dirs if d not in exclude_dirs and not d.startswith("."))
             for fname in sorted(fnames):
                 file_path = Path(root) / fname
 
@@ -358,7 +376,7 @@ class CheckpointStore:
         """
         hit = self._resolve_repo_relative(entry)
         if hit is None:
-            return ''
+            return ""
         return str(hit[1])
 
     def _scan_absent_files(self, files) -> list[str]:
@@ -406,10 +424,7 @@ class CheckpointStore:
         content is written once no matter how many paths hold it, and a rewrite
         of the index moves only paths and hashes.
         """
-        if (
-            "/" in checkpoint_id or "\\" in checkpoint_id
-            or checkpoint_id in (".", "..")
-        ):
+        if "/" in checkpoint_id or "\\" in checkpoint_id or checkpoint_id in (".", ".."):
             raise ValueError(f"suspicious checkpoint id {checkpoint_id!r}")
         return self.checkpoint_dir / f"{checkpoint_id}.files"
 
@@ -437,9 +452,10 @@ class CheckpointStore:
             size = file_path.stat().st_size
             if size > self.max_blob_bytes:
                 logger.warning(
-                    "Skipping blob for %s (%d bytes > %d cap) — restore() will "
-                    "leave this file untouched",
-                    file_path, size, self.max_blob_bytes,
+                    "Skipping blob for %s (%d bytes > %d cap) — restore() will leave this file untouched",
+                    file_path,
+                    size,
+                    self.max_blob_bytes,
                 )
                 return False
         blob_dir = self._blob_dir(checkpoint_id)
@@ -447,7 +463,7 @@ class CheckpointStore:
         blob_path = blob_dir / file_hash
         if blob_path.exists():
             return True  # content-addressed: same hash means same bytes
-        tmp_path = blob_path.with_suffix('.tmp')
+        tmp_path = blob_path.with_suffix(".tmp")
         with open(tmp_path, "wb") as out, open(file_path, "rb") as src:
             for chunk in iter(lambda: src.read(65536), b""):
                 out.write(chunk)
@@ -456,15 +472,12 @@ class CheckpointStore:
 
     def _read_blob(self, checkpoint_id: str, file_hash: str) -> bytes:
         """Return the bytes stored under *file_hash* (raises OSError if absent)."""
-        with open(self._blob_dir(checkpoint_id) / file_hash, 'rb') as f:
+        with open(self._blob_dir(checkpoint_id) / file_hash, "rb") as f:
             return f.read()
 
     def _remove_blobs(self, checkpoint_id: str) -> None:
         """Delete a checkpoint's blob directory, if any."""
-        if (
-            "/" in checkpoint_id or "\\" in checkpoint_id
-            or checkpoint_id in (".", "..")
-        ):
+        if "/" in checkpoint_id or "\\" in checkpoint_id or checkpoint_id in (".", ".."):
             logger.error("Refusing to remove blob dir for suspicious id %r", checkpoint_id)
             return
         blob_dir = self._blob_dir(checkpoint_id)
@@ -491,12 +504,12 @@ class CheckpointStore:
         portable across all supported versions.
         """
         h = hashlib.sha256()
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(chunk_size), b""):
                 h.update(chunk)
         return h.hexdigest()
 
-    def create(self, description: str = '', files=None, absent=None) -> str:
+    def create(self, description: str = "", files=None, absent=None) -> str:
         """
         Create a timestamped checkpoint with SHA256 + contents of tracked files.
 
@@ -530,26 +543,26 @@ class CheckpointStore:
 
         # Create checkpoint data
         checkpoint_data = {
-            'id': checkpoint_id,
-            'timestamp': timestamp,
-            'description': description,
-            'scope': 'files' if files is not None else 'full',
-            'file_count': len(file_hashes),
-            'file_hashes': {str(k): v for k, v in file_hashes.items()},
+            "id": checkpoint_id,
+            "timestamp": timestamp,
+            "description": description,
+            "scope": "files" if files is not None else "full",
+            "file_count": len(file_hashes),
+            "file_hashes": {str(k): v for k, v in file_hashes.items()},
             # Contents live in _blob_dir(checkpoint_id), keyed by the hashes
             # above. 'files' stays as an empty dict so a reader that predates
             # blob storage sees a well-formed (if empty) index rather than a
             # KeyError.
-            'storage': _STORAGE_BLOBS,
-            'files': {},
+            "storage": _STORAGE_BLOBS,
+            "files": {},
             # Repo-relative paths that did not exist when captured; restore()
             # unlinks them. Absent from checkpoints written before tombstones
             # existed, so every reader must default it.
-            'absent': absent,
+            "absent": absent,
             # Paths whose content was NOT captured because they exceed
             # max_blob_bytes — restore() leaves them untouched (never writes
             # wrong bytes), and file_count excludes them.
-            'skipped_files': [],
+            "skipped_files": [],
         }
 
         # Store file contents as blobs. A file that cannot be read is dropped
@@ -558,7 +571,7 @@ class CheckpointStore:
         # truncating a file it was supposed to be protecting.
         unreadable: list[str] = []
         skipped: list[str] = []
-        for relative_path_str, _file_hash in checkpoint_data['file_hashes'].items():
+        for relative_path_str, _file_hash in checkpoint_data["file_hashes"].items():
             relative_path = Path(relative_path_str)
             file_path = self.repo_root / relative_path
             try:
@@ -568,13 +581,10 @@ class CheckpointStore:
                 logger.warning("Could not read file content for %s: %s", file_path, e)
                 unreadable.append(relative_path_str)
         for relative_path_str in unreadable + skipped:
-            del checkpoint_data['file_hashes'][relative_path_str]
-        checkpoint_data['skipped_files'] = skipped
-        checkpoint_data['file_count'] = len(checkpoint_data['file_hashes'])
-        file_hashes = {
-            k: v for k, v in file_hashes.items()
-            if str(k) not in unreadable and str(k) not in skipped
-        }
+            del checkpoint_data["file_hashes"][relative_path_str]
+        checkpoint_data["skipped_files"] = skipped
+        checkpoint_data["file_count"] = len(checkpoint_data["file_hashes"])
+        file_hashes = {k: v for k, v in file_hashes.items() if str(k) not in unreadable and str(k) not in skipped}
 
         # Save checkpoint to individual file
         checkpoint_path = self.checkpoint_dir / f"{checkpoint_id}.json"
@@ -585,17 +595,19 @@ class CheckpointStore:
             raise
 
         # Update checkpoints list
-        self.checkpoints.append({
-            'id': checkpoint_id,
-            'timestamp': timestamp,
-            'description': description,
-            'scope': 'files' if files is not None else 'full',
-            'file_count': len(file_hashes),
-            'path': str(checkpoint_path.relative_to(self.checkpoint_dir))
-        })
+        self.checkpoints.append(
+            {
+                "id": checkpoint_id,
+                "timestamp": timestamp,
+                "description": description,
+                "scope": "files" if files is not None else "full",
+                "file_count": len(file_hashes),
+                "path": str(checkpoint_path.relative_to(self.checkpoint_dir)),
+            }
+        )
 
         # Sort checkpoints by timestamp (newest first)
-        self.checkpoints.sort(key=lambda x: x['timestamp'], reverse=True)
+        self.checkpoints.sort(key=lambda x: x["timestamp"], reverse=True)
 
         # Evict oldest checkpoints when retention (count or bytes) is exceeded.
         self._enforce_retention()
@@ -627,11 +639,11 @@ class CheckpointStore:
         tombstones (0 when nothing was added, including when ``checkpoint_id``
         is unknown).
         """
-        entry = next((c for c in self.checkpoints if c['id'] == checkpoint_id), None)
+        entry = next((c for c in self.checkpoints if c["id"] == checkpoint_id), None)
         if entry is None:
             logger.warning("extend: unknown checkpoint %s", checkpoint_id)
             return 0
-        if entry.get('scope') != 'files':
+        if entry.get("scope") != "files":
             return 0  # full-repo snapshot already contains everything
 
         checkpoint_path = self._index_payload_path(entry)
@@ -639,7 +651,7 @@ class CheckpointStore:
             logger.warning("extend: refusing suspicious stored path for %s", checkpoint_id)
             return 0
         try:
-            with open(checkpoint_path, encoding='utf-8') as f:
+            with open(checkpoint_path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("extend: cannot read checkpoint %s: %s", checkpoint_id, e)
@@ -647,24 +659,16 @@ class CheckpointStore:
 
         # `files` may be a one-shot iterable and is consumed three times below.
         files = list(files)
-        stored_absent = list(data.get('absent', []))
+        stored_absent = list(data.get("absent", []))
         # The union, so first-seen-wins holds ACROSS the two record kinds and
         # not merely within each. A path seen absent then written must stay a
         # tombstone; a path captured with content must never become one.
-        known = set(data.get('file_hashes', {})) | set(stored_absent)
-        fresh = {
-            rel: h for rel, h in self._scan_listed_files(files).items()
-            if str(rel) not in known
-        }
+        known = set(data.get("file_hashes", {})) | set(stored_absent)
+        fresh = {rel: h for rel, h in self._scan_listed_files(files).items() if str(rel) not in known}
         # As in create(): an explicit list is authoritative, because the caller
         # confirming a creation looks at paths that now exist.
-        candidate_absent = (
-            self._scan_absent_files(files) if absent is None
-            else [self._relativize(p) for p in absent]
-        )
-        fresh_absent = [
-            rel for rel in candidate_absent if rel and rel not in known
-        ]
+        candidate_absent = self._scan_absent_files(files) if absent is None else [self._relativize(p) for p in absent]
+        fresh_absent = [rel for rel in candidate_absent if rel and rel not in known]
         if not fresh and not fresh_absent:
             return 0
 
@@ -674,23 +678,21 @@ class CheckpointStore:
         for relative_path, file_hash in fresh.items():
             rel_str = str(relative_path)
             try:
-                if not self._copy_file_to_blob(
-                    checkpoint_id, file_hash, self.repo_root / relative_path
-                ):
+                if not self._copy_file_to_blob(checkpoint_id, file_hash, self.repo_root / relative_path):
                     # Over max_blob_bytes: record so the skip is diagnosable,
                     # but keep the path OUT of file_hashes — restore() then
                     # never touches it (a hash without a blob would fall to
                     # the legacy inline branch and write empty content).
-                    data.setdefault('skipped_files', []).append(rel_str)
+                    data.setdefault("skipped_files", []).append(rel_str)
                     continue
             except OSError as e:
                 logger.warning("extend: could not read %s: %s", relative_path, e)
                 continue
-            data['file_hashes'][rel_str] = file_hash
-            data.setdefault('blob_paths', []).append(rel_str)
+            data["file_hashes"][rel_str] = file_hash
+            data.setdefault("blob_paths", []).append(rel_str)
 
-        data['absent'] = stored_absent + fresh_absent
-        data['file_count'] = len(data['file_hashes'])
+        data["absent"] = stored_absent + fresh_absent
+        data["file_count"] = len(data["file_hashes"])
         try:
             atomic_write_json(checkpoint_path, data, indent=2, ensure_ascii=True)
         except OSError as e:
@@ -700,8 +702,8 @@ class CheckpointStore:
         # Against the union, so a checkpoint extended only with tombstones
         # still reports the work it did. Counting file_count against `known`
         # (which now includes tombstones) would report a negative number.
-        added = (data['file_count'] + len(data['absent'])) - len(known)
-        entry['file_count'] = data['file_count']
+        added = (data["file_count"] + len(data["absent"])) - len(known)
+        entry["file_count"] = data["file_count"]
         self._save_checkpoints()
         logger.debug("Extended checkpoint %s with %d file(s)", checkpoint_id, added)
         return added
@@ -753,10 +755,10 @@ class CheckpointStore:
             # Blobs are the bulk of a checkpoint's bytes; leaving them behind
             # would make retention bound the index count while the store grew
             # without limit.
-            self._remove_blobs(oldest['id'])
-            logger.info("Evicted old checkpoint %s", oldest['id'])
+            self._remove_blobs(oldest["id"])
+            logger.info("Evicted old checkpoint %s", oldest["id"])
         except (OSError, KeyError) as e:
-            logger.warning("Failed to evict checkpoint %s: %s", oldest.get('id', '?'), e)
+            logger.warning("Failed to evict checkpoint %s: %s", oldest.get("id", "?"), e)
 
     def list(self) -> list[dict]:
         """
@@ -767,11 +769,11 @@ class CheckpointStore:
         """
         return [
             {
-                'id': cp['id'],
-                'timestamp': cp['timestamp'],
-                'description': cp['description'],
-                'scope': cp.get('scope', 'full'),
-                'file_count': cp['file_count']
+                "id": cp["id"],
+                "timestamp": cp["timestamp"],
+                "description": cp["description"],
+                "scope": cp.get("scope", "full"),
+                "file_count": cp["file_count"],
             }
             for cp in self.checkpoints
         ]
@@ -787,7 +789,7 @@ class CheckpointStore:
         # Find checkpoint
         checkpoint_info = None
         for cp in self.checkpoints:
-            if cp['id'] == checkpoint_id:
+            if cp["id"] == checkpoint_id:
                 checkpoint_info = cp
                 break
         if not checkpoint_info:
@@ -802,7 +804,7 @@ class CheckpointStore:
             logger.error("Checkpoint file %s not found", checkpoint_path)
             return False
         try:
-            with open(checkpoint_path, encoding='utf-8') as f:
+            with open(checkpoint_path, encoding="utf-8") as f:
                 checkpoint_data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.exception("Failed to load checkpoint %s: %s", checkpoint_id, e)
@@ -811,10 +813,10 @@ class CheckpointStore:
         # Blob and inline entries coexist inside one checkpoint: a checkpoint
         # created before blob storage and extended after it has both, so the
         # choice is made per path (see _content_for) rather than per file.
-        inline = checkpoint_data.get('files', {})
-        blob_paths = set(checkpoint_data.get('blob_paths', []))
-        if checkpoint_data.get('storage') == _STORAGE_BLOBS:
-            blob_paths |= set(checkpoint_data.get('file_hashes', {}))
+        inline = checkpoint_data.get("files", {})
+        blob_paths = set(checkpoint_data.get("blob_paths", []))
+        if checkpoint_data.get("storage") == _STORAGE_BLOBS:
+            blob_paths |= set(checkpoint_data.get("file_hashes", {}))
 
         # Restore files
         success = True
@@ -834,7 +836,7 @@ class CheckpointStore:
 
             # Skip if file content hasn't changed (preserves mtime, avoids
             # invalidating build/test caches unnecessarily — Bug #5 fix).
-            stored_hash = checkpoint_data.get('file_hashes', {}).get(relative_path_str)
+            stored_hash = checkpoint_data.get("file_hashes", {}).get(relative_path_str)
             if stored_hash and file_path.exists():
                 try:
                     current_hash = self._sha256_file(file_path)
@@ -842,7 +844,9 @@ class CheckpointStore:
                         logger.debug("Skipping unchanged file %s", relative_path_str)
                         continue
                 except OSError:
-                    logger.debug("sha256 read failed, re-write %s", relative_path_str, exc_info=True)  # Fall through to re-write on read error.
+                    logger.debug(
+                        "sha256 read failed, re-write %s", relative_path_str, exc_info=True
+                    )  # Fall through to re-write on read error.
 
             # Resolve the stored bytes BEFORE touching the target. A blob that
             # cannot be read must abort this path, not truncate the file it was
@@ -858,11 +862,11 @@ class CheckpointStore:
                 # Legacy inline entry. Binary files were stored as a sentinel +
                 # base64 payload so the exact bytes come back (a plain UTF-8
                 # write would corrupt them / silently truncate to 0 bytes).
-                content = inline.get(relative_path_str, '')
+                content = inline.get(relative_path_str, "")
                 if isinstance(content, str) and content.startswith(_BINARY_SENTINEL):
-                    raw = base64.b64decode(content[len(_BINARY_SENTINEL):])
+                    raw = base64.b64decode(content[len(_BINARY_SENTINEL) :])
                 else:
-                    raw = content.encode('utf-8')
+                    raw = content.encode("utf-8")
 
             # Ensure parent directory exists
             file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -884,7 +888,7 @@ class CheckpointStore:
         # — and under the accumulating gate a created-then-edited file was
         # captured at its half-written state, leaving a tree the run never
         # passed through while reporting success.
-        for relative_path_str in checkpoint_data.get('absent', []):
+        for relative_path_str in checkpoint_data.get("absent", []):
             # Same defence-in-depth as the write loop above, and it matters
             # strictly more here: this branch UNLINKS, so a tampered checkpoint
             # containing "../" would delete outside the repo.
@@ -902,16 +906,12 @@ class CheckpointStore:
                 # Already gone — the desired end state either way, so not an
                 # error. Logged because a tombstone that never finds its file
                 # is also what a wrongly-recorded creation looks like.
-                logger.debug(
-                    "Run-created file %s was already absent", relative_path_str
-                )
+                logger.debug("Run-created file %s was already absent", relative_path_str)
             except IsADirectoryError:
                 # _scan_absent_files excludes directories, so the path became a
                 # directory after capture. Removing a tree is far beyond an
                 # undo of one file.
-                logger.warning(
-                    "Refusing to delete directory %r recorded as absent", relative_path_str
-                )
+                logger.warning("Refusing to delete directory %r recorded as absent", relative_path_str)
                 success = False
             except OSError as e:
                 logger.exception("Failed to delete %s: %s", relative_path_str, e)
@@ -934,8 +934,9 @@ class CheckpointStore:
         """
         # Find checkpoint
         checkpoint_info = None
+        checkpoint_index = -1
         for i, cp in enumerate(self.checkpoints):
-            if cp['id'] == checkpoint_id:
+            if cp["id"] == checkpoint_id:
                 checkpoint_info = cp
                 checkpoint_index = i
                 break
@@ -968,4 +969,3 @@ class CheckpointStore:
 
         logger.info("Deleted checkpoint %s", checkpoint_id)
         return True
-

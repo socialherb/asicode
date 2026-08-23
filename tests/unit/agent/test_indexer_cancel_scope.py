@@ -8,6 +8,7 @@ caller (MCP ``wait_for`` timeout, aborted ``dispatch_parallel`` batch) sets a
 per-call scope the build checkpoints never saw, so the walk ran to completion
 while the abandoned dispatch's pool slot stayed occupied.
 """
+
 from __future__ import annotations
 
 import threading
@@ -56,9 +57,7 @@ def test_call_graph_build_short_circuits_under_pre_set_scope(tmp_path):
     caller already abandoned it must discard any partial index and leave
     ``_built`` False — no file is worth walking for a caller that left."""
     for i in range(4):
-        (tmp_path / f"m{i}.py").write_text(
-            f"def f{i}():\n    pass\n", encoding="utf-8"
-        )
+        (tmp_path / f"m{i}.py").write_text(f"def f{i}():\n    pass\n", encoding="utf-8")
     idx = CallGraphIndexer(str(tmp_path))
     scope_ev = threading.Event()
     scope_ev.set()

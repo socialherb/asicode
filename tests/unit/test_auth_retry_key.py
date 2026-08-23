@@ -6,6 +6,7 @@ that — the function must detect the "not supported" signal in the error
 body and steer the user to ``/model`` instead of prompting for a key,
 breaking the infinite 401 loop.
 """
+
 from __future__ import annotations
 
 import asi
@@ -34,11 +35,15 @@ class TestAuthRetryDetectsUnsupportedModel:
     def test_not_supported_short_circuits_before_key_prompt(self, monkeypatch):
         # If the guard works, input() must never be called. A bomb makes the
         # test fail loudly if the guard is bypassed.
-        monkeypatch.setattr("builtins.input", lambda *_: (_ for _ in ()).throw(AssertionError("input() must not be called for unsupported-model 401")))
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *_: (_ for _ in ()).throw(AssertionError("input() must not be called for unsupported-model 401")),
+        )
         svc = _FakeSvc()
 
         result = asi._prompt_auth_retry_key(
-            "opencode", svc,
+            "opencode",
+            svc,
             error_message="⚠️ LLM API authentication failed.\n(server message: Model qwen3.7-max is not supported)",
         )
 
@@ -48,6 +53,7 @@ class TestAuthRetryDetectsUnsupportedModel:
         # /model. (_print routes through a Rich console bound at import time,
         # so capsys can't capture it — we assert the source instead.)
         import inspect
+
         src = inspect.getsource(asi._prompt_auth_retry_key)
         assert "not supported" in src
         assert "/model" in src
@@ -58,13 +64,15 @@ class TestAuthRetryDetectsUnsupportedModel:
         monkeypatch.setattr("builtins.input", lambda *_: "sk-newkey")
         # Stub create_llm_client so no network call happens.
         import external_llm.client as _client
+
         monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
         monkeypatch.setattr(asi, "_save_key_to_dotenv", _bomb_dotenv)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
         svc = _FakeSvc(model="deepseek-chat")
 
         result = asi._prompt_auth_retry_key(
-            "deepseek", svc,
+            "deepseek",
+            svc,
             error_message="⚠️ LLM API authentication failed.\n(server message: Invalid API key)",
         )
 
@@ -85,6 +93,7 @@ class TestUnverifiedKeyIsNeverPersisted:
     def test_prompt_alone_does_not_touch_dotenv(self, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda *_: "sk-unverified")
         import external_llm.client as _client
+
         monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
         monkeypatch.setattr(asi, "_save_key_to_dotenv", _bomb_dotenv)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
@@ -96,9 +105,9 @@ class TestUnverifiedKeyIsNeverPersisted:
         saved: list[tuple] = []
         monkeypatch.setattr("builtins.input", lambda *_: "sk-verified")
         import external_llm.client as _client
+
         monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
-        monkeypatch.setattr(asi, "_save_key_to_dotenv",
-                            lambda root, k, v: saved.append((k, v)))
+        monkeypatch.setattr(asi, "_save_key_to_dotenv", lambda root, k, v: saved.append((k, v)))
         monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
 
         asi._prompt_auth_retry_key("deepseek", _FakeSvc(model="deepseek-chat"))
@@ -110,7 +119,7 @@ class TestUnverifiedKeyIsNeverPersisted:
     def test_commit_is_a_noop_without_a_pending_key(self, monkeypatch):
         asi._PENDING_API_KEY.clear()
         monkeypatch.setattr(asi, "_save_key_to_dotenv", _bomb_dotenv)
-        asi._commit_verified_api_key()   # skipped prompt / failed retry
+        asi._commit_verified_api_key()  # skipped prompt / failed retry
 
     def test_skipped_prompt_leaves_nothing_pending(self, monkeypatch):
         asi._PENDING_API_KEY.clear()
@@ -123,6 +132,7 @@ class TestUnverifiedKeyIsNeverPersisted:
         warned: list[str] = []
         monkeypatch.setattr("builtins.input", lambda *_: "sk-verified")
         import external_llm.client as _client
+
         monkeypatch.setattr(_client, "create_llm_client", lambda **kw: object())
         monkeypatch.setattr(asi, "_save_key_to_dotenv", lambda *a: None)
         monkeypatch.setattr(asi, "_print", lambda msg, *a, **k: warned.append(msg))

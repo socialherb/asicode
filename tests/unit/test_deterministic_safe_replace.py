@@ -15,6 +15,7 @@ output is cleaned before finalize" purely to prevent silent sibling drift.
 These tests lock (a) the idempotency property that makes the change safe, and
 (b) the structural invariant that the safe path routes through ``_clean_diff``.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,7 +32,11 @@ from patch_synth import synthesize_replace_line_unified_diff
 
 def _git_apply_ok(patch_text: str, cwd: str) -> bool:
     p = subprocess.run(
-        ["git", "apply", "--check"], input=patch_text, cwd=cwd, text=True, capture_output=True,
+        ["git", "apply", "--check"],
+        input=patch_text,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
         check=False,
     )
     return p.returncode == 0
@@ -44,8 +49,8 @@ SAFE_MODE_CASES = [
     # (name, file_content, old_line, new_line)
     ("mid_with_nl", "line1\nline2\nline3\nline4\n", "line2", "LINE_TWO"),
     ("last_with_nl", "a\nb\nc\n", "c", "C"),
-    ("last_no_nl_eof_marker", "a\nb\nc", "c", "C"),          # forces \ No newline
-    ("single_line_no_nl", "only", "only", "ONLY"),            # forces \ No newline
+    ("last_no_nl_eof_marker", "a\nb\nc", "c", "C"),  # forces \ No newline
+    ("single_line_no_nl", "only", "only", "ONLY"),  # forces \ No newline
     ("cjk_boundary", "x\n한글\nz\n", "한글", "KOREAN"),
     ("emoji", "a\n🎉\nb\n", "🎉", "PARTY"),
 ]
@@ -85,7 +90,12 @@ def test_safe_mode_eof_marker_present_when_file_lacks_trailing_newline(tmp_path)
     with open(os.path.join(d, rel), "w") as f:
         f.write("alpha\nbeta\ngamma")  # NO trailing newline
     raw = synthesize_replace_line_unified_diff(
-        d, rel, "gamma", "GAMMA", require_unique=True, context_lines=12,
+        d,
+        rel,
+        "gamma",
+        "GAMMA",
+        require_unique=True,
+        context_lines=12,
         lines=["alpha", "beta", "gamma"],
     )
     assert "\\ No newline at end of file" in raw, "synthesizer must emit EOF marker directly"
@@ -102,7 +112,8 @@ def test_safe_single_line_path_routes_through_clean_diff():
     try-block so it does not pass via the downstream block-level finalize."""
     src_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        "webapp", "llm_execution.py",
+        "webapp",
+        "llm_execution.py",
     )
     if not os.path.exists(src_path):
         pytest.skip("webapp/ not present (public CLI-only snapshot)")
@@ -117,12 +128,8 @@ def test_safe_single_line_path_routes_through_clean_diff():
     i = fn_body.index("# SAFE LINE-REPLACE MODE")
     j = fn_body.index("safe single-line replace mode failed")
     region = fn_body[i:j]
-    assert "_clean_diff(det" in region, (
-        "safe-single-line path must call _clean_diff on synth output before finalize"
-    )
-    assert "diff_patch=cleaned" in region, (
-        "safe-single-line path must finalize with _clean_diff output, not raw synth"
-    )
+    assert "_clean_diff(det" in region, "safe-single-line path must call _clean_diff on synth output before finalize"
+    assert "diff_patch=cleaned" in region, "safe-single-line path must finalize with _clean_diff output, not raw synth"
     assert "diff_patch_raw=det" in region, (
         "safe-single-line path should expose the raw synth via diff_patch_raw for parity"
     )

@@ -15,6 +15,7 @@ Three properties are pinned here: the wait observes the event, the process tree
 is actually torn down, and the ordinary paths — success, output produced across
 several poll slices, timeout-to-background — are unchanged.
 """
+
 from __future__ import annotations
 
 import os
@@ -75,9 +76,7 @@ def test_cancel_returns_what_the_command_had_already_printed(cancel_reg):
     result = _dispatch(cancel_reg, "echo BEFORE-CANCEL; sleep 30")
 
     assert not result.ok
-    assert "BEFORE-CANCEL" in (result.content or ""), (
-        f"partial output dropped on cancel: {result.content!r}"
-    )
+    assert "BEFORE-CANCEL" in (result.content or ""), f"partial output dropped on cancel: {result.content!r}"
     assert (result.metadata or {}).get("partial_output") is True
 
 
@@ -137,14 +136,18 @@ def test_the_pump_decodes_exactly_as_text_mode_did(raw, tmp_path):
     src = tmp_path / "raw.bin"
     src.write_bytes(raw)
     proc = subprocess.Popen(
-        ["cat", str(src)], stdout=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
+        ["cat", str(src)],
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     expected, _ = proc.communicate()
 
     for cut in range(len(raw) + 1):
         dec = io.IncrementalNewlineDecoder(
-            codecs.getincrementaldecoder("utf-8")("replace"), True,
+            codecs.getincrementaldecoder("utf-8")("replace"),
+            True,
         )
         got = dec.decode(raw[:cut]) + dec.decode(raw[cut:], True)
         assert got == expected, (
@@ -163,9 +166,7 @@ def test_timeout_still_transitions_to_background(cancel_reg):
     try:
         time.sleep(0.5)
         out = cancel_reg.dispatch("job", {"action": "output", "job_id": job_id})
-        assert "EARLY" in (out.content or ""), (
-            "pre-timeout output lost on handoff"
-        )
+        assert "EARLY" in (out.content or ""), "pre-timeout output lost on handoff"
     finally:
         cancel_reg.dispatch("job", {"action": "kill", "job_id": job_id})
 
@@ -217,7 +218,9 @@ def test_no_orphans_remain_after_cancel(cancel_reg):
     assert time.monotonic() - t0 < 5, "the cancel never interrupted the wait"
     time.sleep(1)
     survivors = subprocess.run(
-        ["pgrep", "-f", marker], capture_output=True, text=True,
+        ["pgrep", "-f", marker],
+        capture_output=True,
+        text=True,
         check=False,
     ).stdout.split()
     # pgrep matches its own invocation shell in some environments; allow none.

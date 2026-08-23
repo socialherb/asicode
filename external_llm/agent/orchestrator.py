@@ -28,6 +28,7 @@ File-level locking prevents concurrent writes to the same file.
 When a subagent hits max_turns, its partial results are forwarded as context
 to dependent subtasks so work continues gracefully.
 """
+
 from __future__ import annotations
 
 import ast
@@ -49,7 +50,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.common.walk_policy import _walk_dir_sort_key, _walk_should_skip_dir
@@ -74,7 +75,7 @@ logger = logging.getLogger(__name__)
 # FileLockManager references it (via acquire()/_held). A plain dict would grow
 # unboundedly in long-running server processes as unique file paths accumulate.
 
-_file_locks: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
+_file_locks: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _file_locks_meta = threading.Lock()
 
 
@@ -127,7 +128,7 @@ _DUMMY_LOCK = _DummyLock()
 class FileLockManager:
     """Acquire per-file threading locks before write operations."""
 
-    def __init__(self, repo_root: Optional[str] = None):
+    def __init__(self, repo_root: str | None = None):
         self.repo_root = repo_root
         # Normalised path → Lock object this manager instance has acquired but
         # not yet released. Two jobs:
@@ -140,7 +141,7 @@ class FileLockManager:
         #      would mint a fresh Lock — silently breaking mutual exclusion.
         self._held: dict[str, threading.Lock] = {}
 
-    def _normalize_path(self, path: str) -> Optional[str]:
+    def _normalize_path(self, path: str) -> str | None:
         """Convert a path to a canonical absolute realpath for use as lock key.
 
         Returns None if the path is outside repo_root or invalid.
@@ -165,7 +166,14 @@ class FileLockManager:
             # If realpath fails, fall back to absolute path
             return os.path.abspath(abs_path)
 
-    def acquire(self, path: str) -> threading.Lock:
+    def acquire(self, path: str) -> threading.Lock | _DummyLock:
+        """Acquire the per-file lock for *path*.
+
+        Returns a real ``threading.Lock`` when the path is inside the repo,
+        else the module-level no-op ``_DummyLock`` (invalid/outside-repo paths
+        skip locking). Callers treat both uniformly (``acquire``/``release``
+        /``__enter__``/``__exit__``), so the union type is the honest contract.
+        """
         norm_path = self._normalize_path(path)
         if norm_path is None:
             # Path is invalid or outside repo - skip locking
@@ -247,9 +255,7 @@ class FileLockManager:
         """
         return plan_target_paths(normalize_plan({"plan": plan}))
 
-    def acquire_relevant(
-        self, tool_args: dict[str, Any], tool_name: Optional[str] = None
-    ) -> list[str]:
+    def acquire_relevant(self, tool_args: dict[str, Any], tool_name: str | None = None) -> list[str]:
         """Acquire locks for all file paths referenced in tool_args. Returns locked paths.
 
         *tool_name* is optional because the webapp calls this with a bare
@@ -330,9 +336,13 @@ class FileLockManager:
         edit_apply and the agent lane's) resolve the SAME Lock for the same
         repo, while distinct repos stay independent.
         """
+        if not self.repo_root:
+            # Unset repo root — nothing to serialize on. Mirrors acquire_repo()'s
+            # ``return ""`` guard so callers only see a key when there is a repo.
+            return ""
         return os.path.join(os.path.realpath(self.repo_root), ".asr-edit", "__worktree_lock__")
 
-    def acquire_repo(self) -> Optional[str]:
+    def acquire_repo(self) -> str | None:
         """Acquire the per-repo worktree mutex, NON-blocking (fail-fast).
 
         Coarse-grained complement to the per-file locks: it serializes whole
@@ -439,45 +449,41 @@ class OrderedEventDispatcher:
 
             # Add metadata
             enriched_data = dict(data)
-            enriched_data.update({
-                "global_sequence_id": global_seq,
-                "agent_sequence_id": agent_seq,
-                "agent_id": agent_id,
-                "timestamp": time.monotonic(),
-                "event_type": event
-            })
+            enriched_data.update(
+                {
+                    "global_sequence_id": global_seq,
+                    "agent_sequence_id": agent_seq,
+                    "agent_id": agent_id,
+                    "timestamp": time.monotonic(),
+                    "event_type": event,
+                }
+            )
 
             # Invoke callback
             self._callback(event, enriched_data)
 
 
-
 # ── Data classes ──────────────────────────────────────────────────────────────
+
 
 @dataclass
 class SubTaskSpec:
-    task_id: str          # "dev_1", "dev_2" …
+    task_id: str  # "dev_1", "dev_2" …
     title: str
-    description: str      # the actual task text for the sub-agent
+    description: str  # the actual task text for the sub-agent
     assigned_files: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)  # task_id of dependencies
-    priority: int = 0     # 0=highest (run first), 1=normal, 2=lowest
+    priority: int = 0  # 0=highest (run first), 1=normal, 2=lowest
 
 
-def _resolve_subagent_base_max_turns(
-    orch_config: "OrchestratorConfig", extra_turns: int = 0
-) -> int:
+def _resolve_subagent_base_max_turns(orch_config: OrchestratorConfig, extra_turns: int = 0) -> int:
     """Turn budget for an IPC-dispatched sub-agent.
 
     Base = the orchestrator's AgentConfig.max_turns when one is configured,
     else the SSOT ``AGENT_MAX_TURNS_DEFAULT`` (no magic 12 fallback) — plus
     ``extra_turns`` for revision retries.
     """
-    base = (
-        orch_config.agent_config.max_turns
-        if orch_config.agent_config
-        else _cfg.counts.AGENT_MAX_TURNS_DEFAULT
-    )
+    base = orch_config.agent_config.max_turns if orch_config.agent_config else _cfg.counts.AGENT_MAX_TURNS_DEFAULT
     return base + extra_turns
 
 
@@ -485,12 +491,12 @@ def _resolve_subagent_base_max_turns(
 class OrchestratorConfig:
     max_subagents: int = 3
     parallel: bool = True
-    agent_config: Optional[Any] = None  # AgentConfig forwarded to each SubAgent
-    cancel_event: Optional[threading.Event] = None  # For server-side cancellation
-    subagent_provider: Optional[str] = None   # e.g. "ollama"
-    subagent_model: Optional[str] = None      # e.g. "qwen2.5-coder:3b"
-    subagent_api_key: Optional[str] = None
-    subagent_ollama_url: Optional[str] = None  # custom Ollama endpoint
+    agent_config: Any | None = None  # AgentConfig forwarded to each SubAgent
+    cancel_event: threading.Event | None = None  # For server-side cancellation
+    subagent_provider: str | None = None  # e.g. "ollama"
+    subagent_model: str | None = None  # e.g. "qwen2.5-coder:3b"
+    subagent_api_key: str | None = None
+    subagent_ollama_url: str | None = None  # custom Ollama endpoint
     # Per-subagent model overrides keyed by 1-based slot number as string
     # ("1" → first spawned sub-agent).  Value: (provider, model, api_key).
     # Resolution (see OrchestratorAgent._resolve_subagent_model):
@@ -561,12 +567,12 @@ class OrchestratorConfig:
     tool_loop_max_iterations: int = 40
     # Thinking-mode overrides forwarded to the DesignChatLoop the orchestrator
     # drives in tool-loop mode (mirrors the interactive REPL's thinking state).
-    thinking_mode: Optional[bool] = None
-    reasoning_effort: Optional[str] = None
+    thinking_mode: bool | None = None
+    reasoning_effort: str | None = None
     # DesignSessionManager forwarded to the DesignChatLoop in tool-loop mode, so the
     # orchestrator can call search_design_history (recall past decisions) exactly like
     # the interactive design-chat.  None disables that one tool.
-    session_mgr: Optional[Any] = None
+    session_mgr: Any | None = None
     # ── Scope-violation policy ─────────────────────────────────────────────
     # What to do when a sub-agent makes genuine out-of-scope writes (files outside
     # its assignment that are NOT pre-run baseline dirt, NOT a parallel peer's own
@@ -606,7 +612,7 @@ class OrchestratorConfig:
 
 @dataclass
 class OrchestratorResult:
-    status: str           # "success" | "partial" | "error"
+    status: str  # "success" | "partial" | "error"
     summary: str
     subtask_results: list[Any] = field(default_factory=list)  # List[AgentResult]
     total_turns: int = 0
@@ -615,7 +621,8 @@ class OrchestratorResult:
 
 # ── Decompose prompt ──────────────────────────────────────────────────────────
 
-def _build_git_context(repo_root: Optional[str]) -> str:
+
+def _build_git_context(repo_root: str | None) -> str:
     """Return a compact git-history block for the planner to avoid regression.
 
     Includes:
@@ -627,17 +634,24 @@ def _build_git_context(repo_root: Optional[str]) -> str:
     if not repo_root:
         return ""
     import subprocess as _sp
+
     try:
         log = _sp.run(
             ["git", "log", "--oneline", "-10"],
-            cwd=repo_root, capture_output=True, text=True, timeout=5,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
             check=False,
         ).stdout.strip()
         changed = _sp.run(
             # core.quotePath=false: this list is shown to the planner LLM, and
             # git C-quotes non-ASCII paths by default (한글.py -> "\355\225\234...").
             ["git", "-c", "core.quotePath=false", "diff", "--name-only", "HEAD~3..HEAD"],
-            cwd=repo_root, capture_output=True, text=True, timeout=5,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
             check=False,
         ).stdout.strip()
     except (OSError, _sp.SubprocessError):
@@ -708,7 +722,7 @@ def _coerce_str_list(value) -> list[str]:
 _MAX_DIR_EXPANSION_FILES = 500
 
 
-def _expand_directory_assignments(repo_root: Optional[str], files: list[str]) -> list[str]:
+def _expand_directory_assignments(repo_root: str | None, files: list[str]) -> list[str]:
     """Expand any directory entries in *files* into the files they contain.
 
     The planner LLM's ``assigned_files`` field is validated as ``list[str]``
@@ -783,14 +797,16 @@ def _expand_directory_assignments(repo_root: Optional[str], files: list[str]) ->
                     "snapshot capture) — left as a bare directory path, so "
                     "its snapshot/revert/scope-matching will be skipped. "
                     "Assign specific files instead.",
-                    f, _MAX_DIR_EXPANSION_FILES,
+                    f,
+                    _MAX_DIR_EXPANSION_FILES,
                 )
                 expanded.append(f)
             else:
                 logger.warning(
                     "assigned_files entry %r is a directory; expanded to %d "
                     "file(s) so snapshot/revert/scope-matching stay correct.",
-                    f, len(_dir_files),
+                    f,
+                    len(_dir_files),
                 )
                 expanded.extend(_dir_files)
         else:
@@ -819,7 +835,7 @@ def _norm_assigned_file(path: str) -> str:
         return str(path)
 
 
-def _split_batch_by_file_conflict(specs: list["SubTaskSpec"]) -> list[list["SubTaskSpec"]]:
+def _split_batch_by_file_conflict(specs: list[SubTaskSpec]) -> list[list[SubTaskSpec]]:
     """Partition specs into sequential conflict-free sub-batches.
 
     Two tasks conflict when their assigned_files overlap.  Greedy bin-packing:
@@ -844,7 +860,7 @@ def _split_batch_by_file_conflict(specs: list["SubTaskSpec"]) -> list[list["SubT
     from other unscoped specs and from every file-bearing spec), instead of the
     old behavior where ``not spec_files`` let it ride in the first sub-batch.
     """
-    sub_batches: list[list["SubTaskSpec"]] = []
+    sub_batches: list[list[SubTaskSpec]] = []
     sub_batch_files: list[set[str]] = []  # cumulative file-set, parallel to sub_batches
     for spec in specs:
         spec_files = {_norm_assigned_file(f) for f in (spec.assigned_files or [])}
@@ -915,9 +931,9 @@ _SYNTH_DIFF_FILE_BYTES = 64 * 1024
 # recorded, but each subsequent task receives only the most recent few (later
 # batches are more relevant) within a total char budget. This keeps each task's
 # prompt O(1) in the number of sub-agents instead of O(N²) across a large run.
-_SHARED_MEMORY_INJECT_LIMIT = 12        # max summaries injected per task
+_SHARED_MEMORY_INJECT_LIMIT = 12  # max summaries injected per task
 _SHARED_MEMORY_INJECT_MAX_CHARS = 6000  # char budget for the injected block
-_SHARED_MEMORY_STORE_LIMIT = 50         # ring cap on the stored list itself
+_SHARED_MEMORY_STORE_LIMIT = 50  # ring cap on the stored list itself
 
 
 def _read_synth_diff_head(abs_path: str, max_bytes: int = _SYNTH_DIFF_FILE_BYTES) -> tuple[str, bool, int]:
@@ -961,7 +977,7 @@ def _capture_assigned_snapshots(repo_root: str, file_paths: list[str]) -> dict:
     _cum = 0
     _agg_cap_hit = False
     _loaded = 0  # files actually read into the byte budget (excludes _MISSING_SNAP sentinels)
-    for _fp in (file_paths or []):
+    for _fp in file_paths or []:
         _abs = os.path.join(repo_root, _fp) if repo_root else _fp
         if os.path.isdir(_abs):
             # Cap-exceeded directory (not expanded to individual files).
@@ -988,9 +1004,10 @@ def _capture_assigned_snapshots(repo_root: str, file_paths: list[str]) -> dict:
         # Check size BEFORE reading to avoid loading huge files into RAM
         if _size > _SNAPSHOT_MAX_BYTES:
             logger.warning(
-                "Snapshot skip %r — file size %d bytes exceeds %d byte cap; "
-                "no revert available for this file.",
-                _fp, _size, _SNAPSHOT_MAX_BYTES,
+                "Snapshot skip %r — file size %d bytes exceeds %d byte cap; no revert available for this file.",
+                _fp,
+                _size,
+                _SNAPSHOT_MAX_BYTES,
             )
             continue  # same semantics as unreadable: no revert for this file
         if _cum + _size > _SNAPSHOT_AGGREGATE_MAX_BYTES:
@@ -1001,7 +1018,8 @@ def _capture_assigned_snapshots(repo_root: str, file_paths: list[str]) -> dict:
                     "Snapshot aggregate cap %d bytes exceeded after %d "
                     "file(s); remaining assigned files skip revert snapshot "
                     "(per-file revert degraded for them).",
-                    _SNAPSHOT_AGGREGATE_MAX_BYTES, _loaded,
+                    _SNAPSHOT_AGGREGATE_MAX_BYTES,
+                    _loaded,
                 )
                 _agg_cap_hit = True
             continue
@@ -1082,7 +1100,9 @@ def _restore_assigned_snapshots(repo_root: str, snaps: dict) -> list[str]:
 # WITHOUT a matching .gitignore (scratch repos, freshly-cloned foreign repos)
 # would otherwise flood ``unassigned_changes`` with framework noise on every run.
 _UNASSIGNED_INFRA_PREFIXES: tuple[str, ...] = (
-    ".asicode/", "logs/", ".git/",
+    ".asicode/",
+    "logs/",
+    ".git/",
 )
 
 
@@ -1104,6 +1124,7 @@ def _snapshot_dirty_path_set(repo_root: str) -> set:
     """
     try:
         from .subagent_ipc import partition_changed_files
+
         _in_scope, _ = partition_changed_files(repo_root, [])
         return {os.path.normpath(_p["file"]) for _p in _in_scope if _p.get("file")}
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError):  # git best-effort
@@ -1123,6 +1144,7 @@ def _symbol_hint_for_source(src: str, fpath: str) -> list[str]:
     try:
         from ..languages.models import LanguageId
         from ..languages.tree_sitter_utils import find_all_symbols
+
         lang_id = LanguageId.from_path(fpath)
         if lang_id is not LanguageId.UNKNOWN:
             syms = find_all_symbols(src, lang_id.value)
@@ -1142,7 +1164,9 @@ def _symbol_hint_for_source(src: str, fpath: str) -> list[str]:
         return []
     else:
         return out
-def _symbol_def_line(src: str, fpath: str, symbol: str) -> Optional[int]:
+
+
+def _symbol_def_line(src: str, fpath: str, symbol: str) -> int | None:
     """Return the 1-indexed definition line of *symbol* in *src*, or ``None``.
 
     Multi-language via the tree-sitter ``find_all_symbols`` single source of
@@ -1154,9 +1178,10 @@ def _symbol_def_line(src: str, fpath: str, symbol: str) -> Optional[int]:
     try:
         from ..languages.models import LanguageId
         from ..languages.tree_sitter_utils import find_all_symbols
+
         lang_id = LanguageId.from_path(fpath)
         if lang_id is not LanguageId.UNKNOWN:
-            for (_n, _k, s, _e) in find_all_symbols(src, lang_id.value):
+            for _n, _k, s, _e in find_all_symbols(src, lang_id.value):
                 if _n == symbol:
                     return s
     except Exception:
@@ -1165,12 +1190,13 @@ def _symbol_def_line(src: str, fpath: str, symbol: str) -> Optional[int]:
     try:
         tree = ast.parse(src)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) \
-                    and node.name == symbol:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == symbol:
                 return node.lineno
     except Exception:
         logger.debug("ast symbol lookup failed for %s", fpath, exc_info=True)
     return None
+
+
 _DECOMPOSE_SYSTEM = """\
 You are a software engineering task orchestrator. Your job is to decompose a
 complex coding task into subtasks that can be executed by separate coding agents.
@@ -1242,7 +1268,7 @@ class _OrchestratorBackedRegistry:
     parallel-read phase handles them like any other read tool.
     """
 
-    def __init__(self, base_registry: Any, orchestrator: "OrchestratorAgent") -> None:
+    def __init__(self, base_registry: Any, orchestrator: OrchestratorAgent) -> None:
         # Store via object.__setattr__ to avoid tripping our own __setattr__
         # override (which delegates everything to the base registry).
         object.__setattr__(self, "_obr_base", base_registry)
@@ -1275,6 +1301,7 @@ class _OrchestratorBackedRegistry:
     def dispatch(self, tool_name: str, args: dict[str, Any]) -> Any:
         if tool_name in ("spawn_subagent", "poll_subagent", "list_subagents"):
             from .tool_registry import ToolResult
+
             try:
                 _content = self._obr_orch._dispatch_native_tool(tool_name, args)
                 return ToolResult(ok=True, content=_content, execution_time=0.0)
@@ -1288,6 +1315,8 @@ class _OrchestratorBackedRegistry:
                 logger.exception("Orchestrator-backed dispatch of %s failed", tool_name)
                 return ToolResult(ok=False, content="", error=str(exc), execution_time=0.0)
         return self._obr_base.dispatch(tool_name, args)
+
+
 class OrchestratorAgent:
     """
     Scheduler: executes subtasks across multiple DeveloperAgents (SubAgents).
@@ -1312,12 +1341,12 @@ class OrchestratorAgent:
     def __init__(
         self,
         llm_client: Any,
-        registry: Any,         # ToolRegistry — cloned per sub-agent
+        registry: Any,  # ToolRegistry — cloned per sub-agent
         orch_config: OrchestratorConfig,
         model: str = "",
-        callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
-        run_store: Optional[Any] = None,  # InMemoryRunStore — shared across sub-agents
-        design_stream_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        callback: Callable[[str, dict[str, Any]], None] | None = None,
+        run_store: Any | None = None,  # InMemoryRunStore — shared across sub-agents
+        design_stream_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.llm_client = llm_client
         self._registry_proto = registry  # used only for repo_root / config access
@@ -1334,7 +1363,7 @@ class OrchestratorAgent:
         # The original user request for the current tool-loop run; native tool
         # handlers (spawn_subagent) need it to seed sub-agent context.
         self._current_request: str = ""
-        self._file_lock_mgr = FileLockManager(repo_root=getattr(registry, 'repo_root', None))
+        self._file_lock_mgr = FileLockManager(repo_root=getattr(registry, "repo_root", None))
         self._event_dispatcher = OrderedEventDispatcher(self._cb)
         self.subagent_provider = orch_config.subagent_provider or ""
         self.subagent_model = orch_config.subagent_model or ""
@@ -1378,7 +1407,7 @@ class OrchestratorAgent:
         # spawn so a non-tool-loop Orchestrator pays no thread-pool cost.
         self._bg_subagents: dict[str, dict[str, Any]] = {}
         self._bg_lock = threading.Lock()
-        self._bg_executor: Optional[ThreadPoolExecutor] = None
+        self._bg_executor: ThreadPoolExecutor | None = None
         # Monotonic counter for auto-generated agent_ids (sub_1, sub_2, …).
         self._bg_counter = 0
         # Ordered results accumulated as background sub-agents complete, so the
@@ -1400,8 +1429,10 @@ class OrchestratorAgent:
     # ── Public API ─────────────────────────────────────────────────────────
 
     def run(self, request: str, session_id: str = "") -> OrchestratorResult:
-        logger.info("OrchestratorAgent.run() — %s",
-                    "tool-loop mode" if self.orch_config.tool_loop_enabled else "decomposition mode")
+        logger.info(
+            "OrchestratorAgent.run() — %s",
+            "tool-loop mode" if self.orch_config.tool_loop_enabled else "decomposition mode",
+        )
 
         # The shared design-chat session id — enables context inheritance in
         # tool-loop mode (the orchestrator reads prior turns / insights via the
@@ -1452,18 +1483,21 @@ class OrchestratorAgent:
                     summary="Task decomposition failed. Please retry with a single agent.",
                 )
 
-            self._cb("orchestrator_plan", {
-                "subtasks": [
-                    {
-                        "id": st.task_id,
-                        "title": st.title,
-                        "assigned_files": st.assigned_files,
-                        "dependencies": st.dependencies,
-                        "priority": st.priority,
-                    }
-                    for st in subtasks
-                ],
-            })
+            self._cb(
+                "orchestrator_plan",
+                {
+                    "subtasks": [
+                        {
+                            "id": st.task_id,
+                            "title": st.title,
+                            "assigned_files": st.assigned_files,
+                            "dependencies": st.dependencies,
+                            "priority": st.priority,
+                        }
+                        for st in subtasks
+                    ],
+                },
+            )
 
             # Capture the scope-violation baseline (B5 / findings 2+3) BEFORE any
             # sub-agent runs: the pre-run dirty set + the union of all assignments.
@@ -1489,11 +1523,14 @@ class OrchestratorAgent:
             any_ok = any(r.status in ("success", "already_satisfied", "max_turns") for r in results if r)
             status = "success" if all_ok else ("partial" if any_ok else "error")
 
-            self._cb("orchestrator_done", {
-                "status": status,
-                "summary": summary,
-                "total_turns": total_turns,
-            })
+            self._cb(
+                "orchestrator_done",
+                {
+                    "status": status,
+                    "summary": summary,
+                    "total_turns": total_turns,
+                },
+            )
 
             return OrchestratorResult(
                 status=status,
@@ -1572,7 +1609,7 @@ class OrchestratorAgent:
 
         # Inject recent git history so the planner knows what was recently changed
         # and avoids re-introducing just-fixed bugs or conflicting with recent work.
-        repo_root = getattr(self._registry_proto, 'repo_root', None)
+        repo_root = getattr(self._registry_proto, "repo_root", None)
         git_context = _build_git_context(repo_root)
 
         user_content = f"Task: {request}"
@@ -1599,19 +1636,22 @@ class OrchestratorAgent:
         specs: list[SubTaskSpec] = []
         _id_remap: dict[str, str] = {}
         for i, item in enumerate(obj["subtasks"][: self.orch_config.max_subagents]):
-            _planner_id = item.get("id") or f"sub_{i+1}"
-            _new_id = f"dev_{i+1}"
+            _planner_id = item.get("id") or f"sub_{i + 1}"
+            _new_id = f"dev_{i + 1}"
             _id_remap[_planner_id] = _new_id
-            specs.append(SubTaskSpec(
-                task_id=_new_id,
-                title=str(item.get("title") or f"Subtask {i+1}"),
-                description=str(item.get("description") or ""),
-                assigned_files=_expand_directory_assignments(
-                    repo_root, _coerce_str_list(item.get("assigned_files")),
-                ),
-                dependencies=_coerce_str_list(item.get("dependencies")),
-                priority=_coerce_priority(item.get("priority")),
-            ))
+            specs.append(
+                SubTaskSpec(
+                    task_id=_new_id,
+                    title=str(item.get("title") or f"Subtask {i + 1}"),
+                    description=str(item.get("description") or ""),
+                    assigned_files=_expand_directory_assignments(
+                        repo_root,
+                        _coerce_str_list(item.get("assigned_files")),
+                    ),
+                    dependencies=_coerce_str_list(item.get("dependencies")),
+                    priority=_coerce_priority(item.get("priority")),
+                )
+            )
         # Drop dependencies that reference truncated (unmapped) task ids.
         # An orphan planner id is absent from task_map, which would make the
         # ``dep not in remaining`` readiness check always True — silently
@@ -1630,7 +1670,8 @@ class OrchestratorAgent:
                 "(%s) — no pre-run snapshot / scope-detection / review can "
                 "apply, and each will run serialized; the planner likely "
                 "omitted the field by mistake.",
-                len(_unscoped), _unscoped,
+                len(_unscoped),
+                _unscoped,
             )
         return specs
 
@@ -1647,11 +1688,14 @@ class OrchestratorAgent:
 
         if cycles:
             # Report cycles via SSE event
-            self._cb("orchestrator_warning", {
-                "type": "dependency_cycle",
-                "cycles": cycles,
-                "message": f"Found {len(cycles)} dependency cycle(s). Attempting to break cycles."
-            })
+            self._cb(
+                "orchestrator_warning",
+                {
+                    "type": "dependency_cycle",
+                    "cycles": cycles,
+                    "message": f"Found {len(cycles)} dependency cycle(s). Attempting to break cycles.",
+                },
+            )
             logger.warning("Dependency cycles detected: %s", cycles)
 
             # Try to break cycles by removing minimal dependencies.
@@ -1667,17 +1711,19 @@ class OrchestratorAgent:
                 return self._run_dependency_aware(broken_subtasks, original_request=original_request)
             # Fall back to original order with warning
             logger.warning("Could not break cycles, falling back to original order")
-            self._cb("orchestrator_warning", {
-                "type": "dependency_cycle_fallback",
-                "message": "Could not automatically break cycles, using original task order."
-            })
+            self._cb(
+                "orchestrator_warning",
+                {
+                    "type": "dependency_cycle_fallback",
+                    "message": "Could not automatically break cycles, using original task order.",
+                },
+            )
 
         idx_map = {st.task_id: i for i, st in enumerate(subtasks)}
         results: list[Any] = [None] * len(subtasks)
-        results_map: dict[str, Any] = {}   # task_id -> AgentResult (completed)
+        results_map: dict[str, Any] = {}  # task_id -> AgentResult (completed)
         remaining: set = set(task_map.keys())
         cancel_event = self.orch_config.cancel_event
-
 
         while remaining:
             # Check cancellation
@@ -1692,26 +1738,27 @@ class OrchestratorAgent:
                 break
 
             # Find ready tasks (all dependencies completed)
-            ready = [
-                tid for tid in remaining
-                if all(dep not in remaining for dep in task_map[tid].dependencies)
-            ]
+            ready = [tid for tid in remaining if all(dep not in remaining for dep in task_map[tid].dependencies)]
 
             if not ready:
                 # This shouldn't happen if we used topological order, but handle gracefully
                 logger.error(
                     "No ready tasks found despite topological ordering. "
                     "Possible bug in cycle detection or dynamic dependency changes. "
-                    "Forcing remaining: %s", remaining
+                    "Forcing remaining: %s",
+                    remaining,
                 )
                 # Try to find and report the actual cycle
                 current_cycles = self._find_current_cycles(remaining, task_map)
                 if current_cycles:
-                    self._cb("orchestrator_error", {
-                        "type": "execution_deadlock",
-                        "cycles": current_cycles,
-                        "message": f"Execution deadlock detected with cycles: {current_cycles}"
-                    })
+                    self._cb(
+                        "orchestrator_error",
+                        {
+                            "type": "execution_deadlock",
+                            "cycles": current_cycles,
+                            "message": f"Execution deadlock detected with cycles: {current_cycles}",
+                        },
+                    )
 
                 # Force execution as fallback
                 ready = list(remaining)
@@ -1731,21 +1778,27 @@ class OrchestratorAgent:
                 logger.info(
                     "OrchestratorAgent: priority=%d batch=%s split into %d "
                     "sequential sub-batches due to file conflicts",
-                    top_priority, batch, len(sub_batches),
+                    top_priority,
+                    batch,
+                    len(sub_batches),
                 )
-                self._cb("orchestrator_warning", {
-                    "type": "file_conflict_serialized",
-                    "batch": batch,
-                    "sub_batch_count": len(sub_batches),
-                    "message": (
-                        f"{len(sub_batches)} tasks targeting the same file(s) were "
-                        "serialized to prevent parallel overwrite."
-                    ),
-                })
+                self._cb(
+                    "orchestrator_warning",
+                    {
+                        "type": "file_conflict_serialized",
+                        "batch": batch,
+                        "sub_batch_count": len(sub_batches),
+                        "message": (
+                            f"{len(sub_batches)} tasks targeting the same file(s) were "
+                            "serialized to prevent parallel overwrite."
+                        ),
+                    },
+                )
             else:
                 logger.info(
                     "OrchestratorAgent: running batch priority=%d tasks=%s",
-                    top_priority, batch,
+                    top_priority,
+                    batch,
                 )
 
             all_batch_tids: list[str] = []
@@ -1753,7 +1806,10 @@ class OrchestratorAgent:
             for sub_batch_specs in sub_batches:
                 sub_batch_tids = [s.task_id for s in sub_batch_specs]
                 sub_results = self._run_parallel_batch(
-                    sub_batch_specs, results_map, task_map, original_request=original_request,
+                    sub_batch_specs,
+                    results_map,
+                    task_map,
+                    original_request=original_request,
                 )
                 all_batch_tids.extend(sub_batch_tids)
                 all_batch_results.extend(sub_results)
@@ -1787,27 +1843,33 @@ class OrchestratorAgent:
 
         # emit batch start event
         batch_id = str(uuid.uuid4())[:8]
-        self._event_dispatcher.emit("orchestrator", "batch_start", {
-            "batch_id": batch_id,
-            "task_count": len(batch),
-            "task_ids": [st.task_id for st in batch],
-            "priority": batch[0].priority if batch else 0,
-        })
+        self._event_dispatcher.emit(
+            "orchestrator",
+            "batch_start",
+            {
+                "batch_id": batch_id,
+                "task_count": len(batch),
+                "task_ids": [st.task_id for st in batch],
+                "priority": batch[0].priority if batch else 0,
+            },
+        )
 
         if len(batch) == 1:
             # Single task — no need for thread pool
             st = batch[0]
-            task_text = self._build_task_with_predecessor_context(
-                st, completed_results, task_map
-            )
+            task_text = self._build_task_with_predecessor_context(st, completed_results, task_map)
             result = [self._run_subagent(st, task_text=task_text, original_request=original_request)]
 
             # emit batch complete event
-            self._event_dispatcher.emit("orchestrator", "batch_complete", {
-                "batch_id": batch_id,
-                "success_count": sum(1 for r in result if r.status in ("success", "already_satisfied")),
-                "total_count": len(result),
-            })
+            self._event_dispatcher.emit(
+                "orchestrator",
+                "batch_complete",
+                {
+                    "batch_id": batch_id,
+                    "success_count": sum(1 for r in result if r.status in ("success", "already_satisfied")),
+                    "total_count": len(result),
+                },
+            )
             return result
 
         cancel_event = self.orch_config.cancel_event
@@ -1819,9 +1881,7 @@ class OrchestratorAgent:
         try:
             futures: dict[concurrent.futures.Future, int] = {}
             for idx, st in enumerate(batch):
-                task_text = self._build_task_with_predecessor_context(
-                    st, completed_results, task_map
-                )
+                task_text = self._build_task_with_predecessor_context(st, completed_results, task_map)
                 futures[pool.submit(self._run_subagent, st, 0, task_text, original_request)] = idx
 
             pending = set(futures.keys())
@@ -1852,9 +1912,7 @@ class OrchestratorAgent:
                                 error="Cancelled",
                             )
                         except Exception as exc:
-                            logger.exception(
-                                "SubAgent %s raised an exception", batch[idx].task_id
-                            )
+                            logger.exception("SubAgent %s raised an exception", batch[idx].task_id)
                             results[idx] = AgentResult(
                                 status="error",
                                 error=str(exc),
@@ -1884,9 +1942,7 @@ class OrchestratorAgent:
                             error="Cancelled",
                         )
                     except Exception as exc:
-                        logger.exception(
-                            "SubAgent %s raised an exception", batch[idx].task_id
-                        )
+                        logger.exception("SubAgent %s raised an exception", batch[idx].task_id)
                         results[idx] = AgentResult(
                             status="error",
                             error=str(exc),
@@ -1906,11 +1962,15 @@ class OrchestratorAgent:
 
         # emit batch complete event
         success_count = sum(1 for r in results if r is not None and r.status in ("success", "already_satisfied"))
-        self._event_dispatcher.emit("orchestrator", "batch_complete", {
-            "batch_id": batch_id,
-            "success_count": success_count,
-            "total_count": len(results),
-        })
+        self._event_dispatcher.emit(
+            "orchestrator",
+            "batch_complete",
+            {
+                "batch_id": batch_id,
+                "success_count": success_count,
+                "total_count": len(results),
+            },
+        )
         return results
 
     def _build_task_with_predecessor_context(
@@ -1943,27 +2003,18 @@ class OrchestratorAgent:
 
         if predecessor_parts:
             context_block = "\n".join(predecessor_parts)
-            task_text = (
-                f"[Predecessor task status]\n{context_block}\n\n"
-                f"[Current task]\n{task_text}"
-            )
+            task_text = f"[Predecessor task status]\n{context_block}\n\n[Current task]\n{task_text}"
 
         # Inject shared memory: summaries of previously completed SubAgents (not
         # just direct dependencies). Excludes tasks already covered above, then
         # caps the block to the most recent entries within a char budget so the
         # prompt stays O(1) in the number of sub-agents (see _cap_shared_memory_injection).
         dep_ids = set(subtask.dependencies)
-        shared = [
-            s for s in self._shared_memory
-            if not any(s.startswith(f"[{dep_id}:") for dep_id in dep_ids)
-        ]
+        shared = [s for s in self._shared_memory if not any(s.startswith(f"[{dep_id}:") for dep_id in dep_ids)]
         if shared:
             shared = self._cap_shared_memory_injection(shared)
             shared_block = "\n".join(shared)
-            task_text = (
-                f"[Orchestration progress]\n{shared_block}\n\n"
-                + task_text
-            )
+            task_text = f"[Orchestration progress]\n{shared_block}\n\n" + task_text
 
         return task_text
 
@@ -2047,7 +2098,7 @@ class OrchestratorAgent:
         IDs resolve identically.
         """
         models = self.subagent_models
-        _m = re.search(r'(\d+)$', agent_id)
+        _m = re.search(r"(\d+)$", agent_id)
         _slot = _m.group(1) if _m else ""
         if _slot and _slot in models:
             return tuple(models[_slot])  # type: ignore[return-value]
@@ -2082,93 +2133,96 @@ class OrchestratorAgent:
                     shutil.rmtree(_path, ignore_errors=True)
                     logger.info(
                         "GC: removed stale subagent dir %r (age %.1f days)",
-                        _entry, (time.time() - _mtime) / 86400,
+                        _entry,
+                        (time.time() - _mtime) / 86400,
                     )
         except Exception:
             logger.warning("GC of subagent artifacts failed (non-critical)", exc_info=True)
 
     def _run_subagent_ipc(
-            self,
-            subtask: SubTaskSpec,
-            extra_turns: int = 0,
-            task_text: Optional[str] = None,
-            original_request: str = "",
-        ) -> Any:
-            """IPC mode: write task.json, wait for an external sub-agent to write result.json.
+        self,
+        subtask: SubTaskSpec,
+        extra_turns: int = 0,
+        task_text: str | None = None,
+        original_request: str = "",
+    ) -> Any:
+        """IPC mode: write task.json, wait for an external sub-agent to write result.json.
 
-            The external sub-agent is an ``asi --subagent`` process that polls
-            ``.asicode/subagents/<agent_id>/task.json``.  When it finishes it writes
-            ``result.json`` which this method reads back and wraps in an AgentResult
-            so downstream code (review loop, shared memory, synthesis) works the same
-            as the in-process path.
-            """
-            from .agent_loop import AgentResult, AgentTurn
-            from .subagent_ipc import SubagentTask, clear_result, wait_for_result, write_task
+        The external sub-agent is an ``asi --subagent`` process that polls
+        ``.asicode/subagents/<agent_id>/task.json``.  When it finishes it writes
+        ``result.json`` which this method reads back and wraps in an AgentResult
+        so downstream code (review loop, shared memory, synthesis) works the same
+        as the in-process path.
+        """
+        from .agent_loop import AgentResult, AgentTurn
+        from .subagent_ipc import SubagentTask, clear_result, wait_for_result, write_task
 
-            agent_id = subtask.task_id
-            logger.info("SubAgent %s (IPC) dispatching: %s", agent_id, subtask.title)
+        agent_id = subtask.task_id
+        logger.info("SubAgent %s (IPC) dispatching: %s", agent_id, subtask.title)
 
-            # Per-subagent model: explicit dev_<N> config → lowest dev slot →
-            # orchestrator model (see _resolve_subagent_model).
-            _provider, _model, _api_key = self._resolve_subagent_model(agent_id)
+        # Per-subagent model: explicit dev_<N> config → lowest dev slot →
+        # orchestrator model (see _resolve_subagent_model).
+        _provider, _model, _api_key = self._resolve_subagent_model(agent_id)
 
-            _base_max_turns = _resolve_subagent_base_max_turns(
-                self.orch_config, extra_turns
+        _base_max_turns = _resolve_subagent_base_max_turns(self.orch_config, extra_turns)
+        ipc_task = SubagentTask(
+            task_id=subtask.task_id,
+            title=subtask.title,
+            description=subtask.description,
+            assigned_files=list(subtask.assigned_files),
+            original_request=original_request,
+            priority=subtask.priority,
+            dependencies=list(subtask.dependencies),
+            max_turns=_base_max_turns,
+            provider=_provider,
+            model=_model,
+            api_key=_api_key or "",
+            predecessor_context=task_text or "",
+        )
+
+        repo_root = getattr(self._registry_proto, "repo_root", None) or "."
+        # Clear stale result.json so wait_for_result does not read the previous
+        # run's result before the sub-agent has started this new task.
+        clear_result(repo_root, agent_id)
+
+        # Snapshot assigned files' pre-run bytes so a rejected IPC attempt can
+        # be reverted to a clean baseline — mirroring the in-process path.
+        # Without this the external sub-agent would retry ON TOP of its own
+        # rejected edits (diverging semantics vs in-process, where the retry
+        # starts fresh).
+        _revert_snapshots = _capture_assigned_snapshots(repo_root, subtask.assigned_files)
+
+        # ── Reusable worker POOL: claim an idle worker from the pool instead
+        # of spawning a fresh one. Works in BOTH sequential and parallel modes
+        # (P3): after a batch completes its workers go idle, so the NEXT batch
+        # reuses them (saving ~5-8s spawn per worker). _claim_reusable_worker
+        # atomically removes the worker from the pool under _bg_lock (so two
+        # parallel threads never claim the same worker) and verifies the
+        # tracked Popen is still alive before returning it.
+        _reuse_worker_id = self._claim_reusable_worker(repo_root)
+
+        if _reuse_worker_id is not None:
+            _worker_id: str = _reuse_worker_id
+            write_task(repo_root, ipc_task, worker_id=_worker_id)
+            logger.info(
+                "SubAgent %s (IPC) reusing worker %s — no new terminal",
+                agent_id,
+                _worker_id,
             )
-            ipc_task = SubagentTask(
-                task_id=subtask.task_id,
-                title=subtask.title,
-                description=subtask.description,
-                assigned_files=list(subtask.assigned_files),
-                original_request=original_request,
-                priority=subtask.priority,
-                dependencies=list(subtask.dependencies),
-                max_turns=_base_max_turns,
-                provider=_provider,
-                model=_model,
-                api_key=_api_key or "",
-                predecessor_context=task_text or "",
-            )
+        else:
+            _worker_id = agent_id
+            write_task(repo_root, ipc_task)
 
-            repo_root = getattr(self._registry_proto, "repo_root", None) or "."
-            # Clear stale result.json so wait_for_result does not read the previous
-            # run's result before the sub-agent has started this new task.
-            clear_result(repo_root, agent_id)
+        # Record the worker's actual poll directory so _cleanup_ipc_workers
+        # (and the cancel path) can write sentinels where this worker will
+        # see them.  In reuse mode worker_id != task_id.
+        self._ipc_worker_ids.add(_worker_id)
 
-            # Snapshot assigned files' pre-run bytes so a rejected IPC attempt can
-            # be reverted to a clean baseline — mirroring the in-process path.
-            # Without this the external sub-agent would retry ON TOP of its own
-            # rejected edits (diverging semantics vs in-process, where the retry
-            # starts fresh).
-            _revert_snapshots = _capture_assigned_snapshots(repo_root, subtask.assigned_files)
-
-            # ── Reusable worker POOL: claim an idle worker from the pool instead
-            # of spawning a fresh one. Works in BOTH sequential and parallel modes
-            # (P3): after a batch completes its workers go idle, so the NEXT batch
-            # reuses them (saving ~5-8s spawn per worker). _claim_reusable_worker
-            # atomically removes the worker from the pool under _bg_lock (so two
-            # parallel threads never claim the same worker) and verifies the
-            # tracked Popen is still alive before returning it.
-            _reuse_worker_id = self._claim_reusable_worker(repo_root)
-
-            if _reuse_worker_id is not None:
-                _worker_id: str = _reuse_worker_id
-                write_task(repo_root, ipc_task, worker_id=_worker_id)
-                logger.info(
-                    "SubAgent %s (IPC) reusing worker %s — no new terminal",
-                    agent_id, _worker_id,
-                )
-            else:
-                _worker_id = agent_id
-                write_task(repo_root, ipc_task)
-
-            # Record the worker's actual poll directory so _cleanup_ipc_workers
-            # (and the cancel path) can write sentinels where this worker will
-            # see them.  In reuse mode worker_id != task_id.
-            self._ipc_worker_ids.add(_worker_id)
-
-            # Emit start event.
-            self._event_dispatcher.emit(agent_id, "subagent_start", {
+        # Emit start event.
+        self._event_dispatcher.emit(
+            agent_id,
+            "subagent_start",
+            {
                 "task_id": subtask.task_id,
                 "title": subtask.title,
                 "description": subtask.description,
@@ -2176,73 +2230,257 @@ class OrchestratorAgent:
                 "dependencies": list(subtask.dependencies),
                 "priority": subtask.priority,
                 "mode": "ipc",
-            })
+            },
+        )
 
-            # Store the launch command (for the macOS Terminal.app `do script`
-            # and the manual-launch hint).  Derived from the SAME argv the
-            # background spawn uses (asr_subagent_argv) via shlex.join, so the
-            # worker invocation is defined in exactly one place.
-            _shell_argv = [
-                *asr_subagent_argv(repo_root),
-                "--subagent-id", _worker_id, "--orch-pid", str(os.getpid()),
-            ]
-            if _provider:
-                _shell_argv += ["--provider", _provider]
-            if _model:
-                _shell_argv += ["--model", _model]
-            self._subagent_ipc_commands[agent_id] = (
-                f"cd {shlex.quote(repo_root)} && " + shlex.join(_shell_argv)
-            )
+        # Store the launch command (for the macOS Terminal.app `do script`
+        # and the manual-launch hint).  Derived from the SAME argv the
+        # background spawn uses (asr_subagent_argv) via shlex.join, so the
+        # worker invocation is defined in exactly one place.
+        _shell_argv = [
+            *asr_subagent_argv(repo_root),
+            "--subagent-id",
+            _worker_id,
+            "--orch-pid",
+            str(os.getpid()),
+        ]
+        if _provider:
+            _shell_argv += ["--provider", _provider]
+        if _model:
+            _shell_argv += ["--model", _model]
+        self._subagent_ipc_commands[agent_id] = f"cd {shlex.quote(repo_root)} && " + shlex.join(_shell_argv)
 
-            # ── Auto-launch the worker — only for NEW workers (a reused worker is
-            #    already a live process polling this directory).  Two strategies:
-            #      * macOS + auto_launch_terminal → a VISIBLE Terminal.app window
-            #        (osascript) so the user can watch the worker run.
-            #      * otherwise (any OS) + auto_spawn_worker → a HEADLESS background
-            #        subprocess (cross-platform; no console window).  This is what
-            #        makes IPC work on Linux/Windows, and the macOS fallback when
-            #        the Terminal.app launch fails.
-            if _reuse_worker_id is None:
-                _launched = False
-                if self.auto_launch_terminal and sys.platform == "darwin":
-                    _launched = self._launch_ipc_worker_terminal_macos(agent_id, _worker_id)
-                if not _launched and (self.auto_spawn_worker or self.auto_launch_terminal):
-                    _launched = self._spawn_ipc_worker_background(
-                        repo_root, _worker_id, _provider, _model,
-                    )
-                if not _launched:
-                    logger.warning(
-                        "Sub-agent %s: no auto-launch path succeeded — the worker "
-                        "must be started manually: %s",
-                        agent_id, self._subagent_ipc_commands.get(agent_id, ""),
-                    )
+        # ── Auto-launch the worker — only for NEW workers (a reused worker is
+        #    already a live process polling this directory).  Two strategies:
+        #      * macOS + auto_launch_terminal → a VISIBLE Terminal.app window
+        #        (osascript) so the user can watch the worker run.
+        #      * otherwise (any OS) + auto_spawn_worker → a HEADLESS background
+        #        subprocess (cross-platform; no console window).  This is what
+        #        makes IPC work on Linux/Windows, and the macOS fallback when
+        #        the Terminal.app launch fails.
+        if _reuse_worker_id is None:
+            _launched = False
+            if self.auto_launch_terminal and sys.platform == "darwin":
+                _launched = self._launch_ipc_worker_terminal_macos(agent_id, _worker_id)
+            if not _launched and (self.auto_spawn_worker or self.auto_launch_terminal):
+                _launched = self._spawn_ipc_worker_background(
+                    repo_root,
+                    _worker_id,
+                    _provider,
+                    _model,
+                )
+            if not _launched:
+                logger.warning(
+                    "Sub-agent %s: no auto-launch path succeeded — the worker must be started manually: %s",
+                    agent_id,
+                    self._subagent_ipc_commands.get(agent_id, ""),
+                )
 
-            # ── Wait for the external sub-agent to finish.
-            def _on_poll(elapsed_s: float, _aid: str) -> None:
-                # Surface heartbeat progress hints (F3) so the UI shows
-                # "turn N, <tool>" rather than only an elapsed counter.
-                _hb_turn, _hb_tool = 0, ""
-                try:
-                    from .subagent_ipc import read_heartbeat_state
-                    _st = read_heartbeat_state(repo_root, _aid)
-                    if isinstance(_st, dict):
-                        _hb_turn = int(_st.get("turn", 0) or 0)
-                        _hb_tool = str(_st.get("last_tool", "") or "")
-                except Exception:
-                    logger.debug("heartbeat read failed for %s", _aid)
-                self._event_dispatcher.emit(_aid, "subagent_waiting_ipc", {
+        # ── Wait for the external sub-agent to finish.
+        def _on_poll(elapsed_s: float, _aid: str) -> None:
+            # Surface heartbeat progress hints (F3) so the UI shows
+            # "turn N, <tool>" rather than only an elapsed counter.
+            _hb_turn, _hb_tool = 0, ""
+            try:
+                from .subagent_ipc import read_heartbeat_state
+
+                _st = read_heartbeat_state(repo_root, _aid)
+                if isinstance(_st, dict):
+                    _hb_turn = int(_st.get("turn", 0) or 0)
+                    _hb_tool = str(_st.get("last_tool", "") or "")
+            except Exception:
+                logger.debug("heartbeat read failed for %s", _aid)
+            self._event_dispatcher.emit(
+                _aid,
+                "subagent_waiting_ipc",
+                {
                     "agent_id": _aid,
                     "elapsed_s": elapsed_s,
                     "turn": _hb_turn,
                     "last_tool": _hb_tool,
-                })
-            # Emit an initial "waiting" event so the UI can show the launch command.
-            self._event_dispatcher.emit(agent_id, "subagent_waiting_ipc", {
+                },
+            )
+
+        # Emit an initial "waiting" event so the UI can show the launch command.
+        self._event_dispatcher.emit(
+            agent_id,
+            "subagent_waiting_ipc",
+            {
                 "agent_id": agent_id,
                 "elapsed_s": 0.0,
-            })
+            },
+        )
 
-            result = wait_for_result(
+        result = wait_for_result(
+            repo_root,
+            agent_id,
+            timeout_s=self.orch_config.ipc_timeout_s,
+            startup_timeout_s=self.orch_config.ipc_startup_timeout_s,
+            max_timeout_s=self.orch_config.ipc_max_timeout_s,
+            heartbeat_stale_s=self.orch_config.ipc_heartbeat_stale_s,
+            cancel_event=self.orch_config.cancel_event,
+            on_poll=_on_poll,
+        )
+
+        if result is None:
+            logger.warning("SubAgent %s (IPC) did not return a result", agent_id)
+            # If we bailed because the orchestrator was cancelled (Ctrl-C),
+            # tell the worker to abort its IN-FLIGHT task: it has no PID
+            # handle for an osascript-launched terminal, so a cancel.json
+            # sentinel is the only signal that reaches a mid-task worker.
+            # Without this the worker keeps burning tokens until its task
+            # finishes or max_turns elapses.
+            _reusable = self._abandon_ipc_worker(
+                repo_root,
+                _worker_id,
+                _revert_snapshots,
+                task_id=agent_id,
+            )
+            # Only a worker that soft-quiesced (alive & idle, B6) is reusable.
+            # One that failed to quiesce was terminated (tracked Popen) or is
+            # hung (Terminal-launched, no PID handle — invisible to the claim's
+            # liveness check). Returning a hung slot re-dispatches a dead
+            # worker that then burns the full ipc_timeout_s on the next claim.
+            # A hard cancel ends the run, so the pool is cleared regardless.
+            if _reusable:
+                self._return_worker_to_pool(_worker_id)
+            return AgentResult(
+                status="error",
+                final_message=f"Sub-agent '{agent_id}' timed out or was cancelled.",
+                turns=[],
+                error="no result from sub-agent",
+            )
+
+        # Reconstruct an AgentResult from the IPC result.
+        agent_result = AgentResult(
+            status=result.status,
+            final_message=result.final_message,
+            turns=[
+                AgentTurn(
+                    turn_num=i + 1,
+                    tool_name="ipc_subagent",
+                    tool_args={"agent_id": agent_id},
+                    tool_result=result.final_message if i == 0 else "",
+                )
+                for i in range(result.turns)
+            ]
+            if result.turns > 0
+            else [],
+            applied_patches=list(result.applied_patches),
+            error=result.error if result.status == "error" else None,
+        )
+        # Track the latest IPC result's out-of-scope changes (B5) so the
+        # completion event can surface a scope violation to the review UI /
+        # downstream consumers. AgentResult itself has no such field (it is a
+        # shared type); the IPC SubagentResult carries it.
+        _ipc_unassigned: list[dict] = list(getattr(result, "unassigned_changes", []) or [])
+
+        # Per-subagent git-diff memo shared between the review loop and the
+        # diff cross-verification below — parity with the in-process path
+        # (_run_subagent). Without it the review computed ``git diff`` from
+        # scratch on every iteration AND again at cross-verification (3
+        # subprocess spawns vs 1-2).  Cleared before each retry (see below):
+        # the worker re-runs after a revert, mutating the worktree, so a stale
+        # entry keyed by assigned_files would serve the OLD diff to the next
+        # review (a correctness regression, not just a perf loss).
+        _ipc_diff_cache: dict = {}
+        # ── Orchestrator review loop (reuses the in-process review helper).
+        retry_count = 0
+        while (
+            self.review_enabled
+            and agent_result.status in ("success", "already_satisfied")
+            and retry_count < self.review_max_retries
+        ):
+            approved, feedback = self._review_subagent_result(
+                agent_id=agent_id,
+                subtask=subtask,
+                repo_root=repo_root,
+                diff_cache=_ipc_diff_cache,
+            )
+            if approved:
+                break
+            retry_count += 1
+            logger.info(
+                "SubAgent %s (IPC) review: not approved (%d/%d). Feedback: %s",
+                agent_id,
+                retry_count,
+                self.review_max_retries,
+                feedback[:200],
+            )
+            # Restore the pre-run snapshot so the external sub-agent retries
+            # from a clean baseline (same semantics as the in-process path),
+            # rather than layering a revision on top of its own rejected edits.
+            reverted = _restore_assigned_snapshots(repo_root, _revert_snapshots)
+            if reverted:
+                logger.info("SubAgent %s (IPC) restored %s before retry", agent_id, reverted)
+            # policy=revert: also roll back genuine out-of-scope writes so the
+            # retry starts from a clean baseline rather than layering on top of
+            # the rejected attempt's strays.
+            if self.orch_config.scope_violation_policy == "revert":
+                _retry_genuine = self._detect_genuine_violations(
+                    repo_root,
+                    subtask.assigned_files,
+                    raw_unassigned=_ipc_unassigned,
+                )
+                _retry_rv = self._revert_unassigned_changes(repo_root, _retry_genuine)
+                if _retry_rv:
+                    reverted = list(reverted) + _retry_rv
+                    logger.info(
+                        "SubAgent %s (IPC) reverted %d out-of-scope file(s) before retry: %s",
+                        agent_id,
+                        len(_retry_rv),
+                        _retry_rv,
+                    )
+            # The revert + upcoming re-dispatch mutate the worktree, so any
+            # diff cached this attempt is now stale — drop it before the worker
+            # re-runs (same invariant as _run_subagent's in-process retry).
+            _ipc_diff_cache.clear()
+            self._event_dispatcher.emit(
+                agent_id,
+                "subagent_retry",
+                {
+                    "task_id": subtask.task_id,
+                    "retry": retry_count,
+                    "max_retries": self.review_max_retries,
+                    "feedback": feedback,
+                    "reverted_files": reverted,
+                    "mode": "ipc",
+                },
+            )
+            ipc_task.description = (
+                f"[REVISION REQUESTED — attempt {retry_count}/{self.review_max_retries}]\n"
+                f"The previous attempt was reverted. Start fresh and apply the correct change.\n"
+                f"Reviewer feedback: {feedback}\n\n"
+                f"Original task: {subtask.description}"
+            )
+            ipc_task.max_turns = _base_max_turns
+            # write_task now mints a FRESH epoch nonce on every dispatch
+            # (see subagent_ipc.write_task — always-mint policy), so a
+            # re-dispatched task object automatically gets a distinct
+            # epoch and the epoch check can distinguish a stale
+            # (attempt-1) result.json from the current attempt's.  No
+            # caller-side `ipc_task.epoch = 0` reset is needed anymore;
+            # the explicit reset below was removed when the always-mint
+            # policy landed.
+            clear_result(repo_root, agent_id)
+            # Reuse mode: the worker polls ITS OWN directory (_worker_id,
+            # which differs from agent_id), not agent_id's dir. The initial
+            # dispatch above passed worker_id correctly; this review-retry
+            # must too, or the reused worker never sees the revision task and
+            # idles until ipc_timeout_s (the original omission — a silent
+            # hang on every retry under worker reuse + review). Safe in the
+            # non-reuse branch too: there _worker_id == agent_id == task_id,
+            # so the destination directory is unchanged.
+            write_task(repo_root, ipc_task, worker_id=_worker_id)
+            self._event_dispatcher.emit(
+                agent_id,
+                "subagent_waiting_ipc",
+                {
+                    "agent_id": agent_id,
+                    "elapsed_s": 0.0,
+                },
+            )
+            result2 = wait_for_result(
                 repo_root,
                 agent_id,
                 timeout_s=self.orch_config.ipc_timeout_s,
@@ -2252,278 +2490,152 @@ class OrchestratorAgent:
                 cancel_event=self.orch_config.cancel_event,
                 on_poll=_on_poll,
             )
-
-            if result is None:
-                logger.warning("SubAgent %s (IPC) did not return a result", agent_id)
-                # If we bailed because the orchestrator was cancelled (Ctrl-C),
-                # tell the worker to abort its IN-FLIGHT task: it has no PID
-                # handle for an osascript-launched terminal, so a cancel.json
-                # sentinel is the only signal that reaches a mid-task worker.
-                # Without this the worker keeps burning tokens until its task
-                # finishes or max_turns elapses.
+            if result2 is None:
+                # Cancelled (or timed out) during the review-retry wait.
+                # The tree was already reverted to the pre-run snapshot above
+                # (so it is clean), but ``agent_result`` still holds the FIRST
+                # attempt's success — the review rejected it and we reverted
+                # it, yet leaving it would report a stale "success" that masks
+                # both the failure and the rollback. Mirror the initial-
+                # timeout path (above): abandon the worker and return an
+                # explicit error so the consumer never sees the stale result.
                 _reusable = self._abandon_ipc_worker(
-                    repo_root, _worker_id, _revert_snapshots, task_id=agent_id,
+                    repo_root,
+                    _worker_id,
+                    _revert_snapshots,
+                    task_id=agent_id,
                 )
-                # Only a worker that soft-quiesced (alive & idle, B6) is reusable.
-                # One that failed to quiesce was terminated (tracked Popen) or is
-                # hung (Terminal-launched, no PID handle — invisible to the claim's
-                # liveness check). Returning a hung slot re-dispatches a dead
-                # worker that then burns the full ipc_timeout_s on the next claim.
-                # A hard cancel ends the run, so the pool is cleared regardless.
                 if _reusable:
                     self._return_worker_to_pool(_worker_id)
                 return AgentResult(
                     status="error",
-                    final_message=f"Sub-agent '{agent_id}' timed out or was cancelled.",
+                    final_message=f"Sub-agent '{agent_id}' review-retry timed out or was cancelled.",
                     turns=[],
-                    error="no result from sub-agent",
+                    error="no result from sub-agent review-retry",
                 )
-
-            # Reconstruct an AgentResult from the IPC result.
             agent_result = AgentResult(
-                status=result.status,
-                final_message=result.final_message,
-                turns=[AgentTurn(
-                    turn_num=i + 1,
-                    tool_name="ipc_subagent",
-                    tool_args={"agent_id": agent_id},
-                    tool_result=result.final_message if i == 0 else "",
-                ) for i in range(result.turns)] if result.turns > 0 else [],
-                applied_patches=result.applied_patches,
-                error=result.error if result.status == "error" else None,
-            )
-            # Track the latest IPC result's out-of-scope changes (B5) so the
-            # completion event can surface a scope violation to the review UI /
-            # downstream consumers. AgentResult itself has no such field (it is a
-            # shared type); the IPC SubagentResult carries it.
-            _ipc_unassigned: list[dict] = list(getattr(result, "unassigned_changes", []) or [])
-
-            # Per-subagent git-diff memo shared between the review loop and the
-            # diff cross-verification below — parity with the in-process path
-            # (_run_subagent). Without it the review computed ``git diff`` from
-            # scratch on every iteration AND again at cross-verification (3
-            # subprocess spawns vs 1-2).  Cleared before each retry (see below):
-            # the worker re-runs after a revert, mutating the worktree, so a stale
-            # entry keyed by assigned_files would serve the OLD diff to the next
-            # review (a correctness regression, not just a perf loss).
-            _ipc_diff_cache: dict = {}
-            # ── Orchestrator review loop (reuses the in-process review helper).
-            retry_count = 0
-            while (
-                self.review_enabled
-                and agent_result.status in ("success", "already_satisfied")
-                and retry_count < self.review_max_retries
-            ):
-                approved, feedback = self._review_subagent_result(
-                    agent_id=agent_id,
-                    subtask=subtask,
-                    repo_root=repo_root,
-                    diff_cache=_ipc_diff_cache,
-                )
-                if approved:
-                    break
-                retry_count += 1
-                logger.info(
-                    "SubAgent %s (IPC) review: not approved (%d/%d). Feedback: %s",
-                    agent_id, retry_count, self.review_max_retries,
-                    feedback[:200],
-                )
-                # Restore the pre-run snapshot so the external sub-agent retries
-                # from a clean baseline (same semantics as the in-process path),
-                # rather than layering a revision on top of its own rejected edits.
-                reverted = _restore_assigned_snapshots(repo_root, _revert_snapshots)
-                if reverted:
-                    logger.info("SubAgent %s (IPC) restored %s before retry", agent_id, reverted)
-                # policy=revert: also roll back genuine out-of-scope writes so the
-                # retry starts from a clean baseline rather than layering on top of
-                # the rejected attempt's strays.
-                if self.orch_config.scope_violation_policy == "revert":
-                    _retry_genuine = self._detect_genuine_violations(
-                        repo_root, subtask.assigned_files,
-                        raw_unassigned=_ipc_unassigned,
-                    )
-                    _retry_rv = self._revert_unassigned_changes(repo_root, _retry_genuine)
-                    if _retry_rv:
-                        reverted = list(reverted) + _retry_rv
-                        logger.info(
-                            "SubAgent %s (IPC) reverted %d out-of-scope file(s) before retry: %s",
-                            agent_id, len(_retry_rv), _retry_rv,
-                        )
-                # The revert + upcoming re-dispatch mutate the worktree, so any
-                # diff cached this attempt is now stale — drop it before the worker
-                # re-runs (same invariant as _run_subagent's in-process retry).
-                _ipc_diff_cache.clear()
-                self._event_dispatcher.emit(agent_id, "subagent_retry", {
-                    "task_id": subtask.task_id,
-                    "retry": retry_count,
-                    "max_retries": self.review_max_retries,
-                    "feedback": feedback,
-                    "reverted_files": reverted,
-                    "mode": "ipc",
-                })
-                ipc_task.description = (
-                    f"[REVISION REQUESTED — attempt {retry_count}/{self.review_max_retries}]\n"
-                    f"The previous attempt was reverted. Start fresh and apply the correct change.\n"
-                    f"Reviewer feedback: {feedback}\n\n"
-                    f"Original task: {subtask.description}"
-                )
-                ipc_task.max_turns = _base_max_turns
-                # write_task now mints a FRESH epoch nonce on every dispatch
-                # (see subagent_ipc.write_task — always-mint policy), so a
-                # re-dispatched task object automatically gets a distinct
-                # epoch and the epoch check can distinguish a stale
-                # (attempt-1) result.json from the current attempt's.  No
-                # caller-side `ipc_task.epoch = 0` reset is needed anymore;
-                # the explicit reset below was removed when the always-mint
-                # policy landed.
-                clear_result(repo_root, agent_id)
-                # Reuse mode: the worker polls ITS OWN directory (_worker_id,
-                # which differs from agent_id), not agent_id's dir. The initial
-                # dispatch above passed worker_id correctly; this review-retry
-                # must too, or the reused worker never sees the revision task and
-                # idles until ipc_timeout_s (the original omission — a silent
-                # hang on every retry under worker reuse + review). Safe in the
-                # non-reuse branch too: there _worker_id == agent_id == task_id,
-                # so the destination directory is unchanged.
-                write_task(repo_root, ipc_task, worker_id=_worker_id)
-                self._event_dispatcher.emit(agent_id, "subagent_waiting_ipc", {
-                    "agent_id": agent_id,
-                    "elapsed_s": 0.0,
-                })
-                result2 = wait_for_result(
-                    repo_root, agent_id,
-                    timeout_s=self.orch_config.ipc_timeout_s,
-                    startup_timeout_s=self.orch_config.ipc_startup_timeout_s,
-                max_timeout_s=self.orch_config.ipc_max_timeout_s,
-                heartbeat_stale_s=self.orch_config.ipc_heartbeat_stale_s,
-                    cancel_event=self.orch_config.cancel_event,
-                    on_poll=_on_poll,
-                )
-                if result2 is None:
-                    # Cancelled (or timed out) during the review-retry wait.
-                    # The tree was already reverted to the pre-run snapshot above
-                    # (so it is clean), but ``agent_result`` still holds the FIRST
-                    # attempt's success — the review rejected it and we reverted
-                    # it, yet leaving it would report a stale "success" that masks
-                    # both the failure and the rollback. Mirror the initial-
-                    # timeout path (above): abandon the worker and return an
-                    # explicit error so the consumer never sees the stale result.
-                    _reusable = self._abandon_ipc_worker(
-                        repo_root, _worker_id, _revert_snapshots, task_id=agent_id,
-                    )
-                    if _reusable:
-                        self._return_worker_to_pool(_worker_id)
-                    return AgentResult(
-                        status="error",
-                        final_message=f"Sub-agent '{agent_id}' review-retry timed out or was cancelled.",
-                        turns=[],
-                        error="no result from sub-agent review-retry",
-                    )
-                agent_result = AgentResult(
-                    status=result2.status,
-                    final_message=result2.final_message,
-                    turns=[AgentTurn(
+                status=result2.status,
+                final_message=result2.final_message,
+                turns=[
+                    AgentTurn(
                         turn_num=i + 1,
                         tool_name="ipc_subagent",
                         tool_args={"agent_id": agent_id},
                         tool_result=result2.final_message if i == 0 else "",
-                    ) for i in range(result2.turns)] if result2.turns > 0 else [],
-                    applied_patches=result2.applied_patches,
-                    error=result2.error if result2.status == "error" else None,
-                )
-                # Reflect the retry attempt's out-of-scope changes (B5).
-                _ipc_unassigned = list(getattr(result2, "unassigned_changes", []) or [])
-
-            # ── Cancelled/error-by-worker revert ────────────────────────────────
-            # The orchestrator-level cancel (cancel_event set) makes
-            # wait_for_result return None → _abandon_ipc_worker reverts. But the
-            # WORKER can ALSO cancel mid-task (Ctrl-C in its terminal, or a
-            # late-arriving cancel.json it honors at the next turn boundary) and
-            # still write a status="cancelled" result.json. Likewise a task that
-            # raises mid-run writes status="error" with whatever it had already
-            # written to disk. Either way the review loop above (success-only)
-            # never reverts, so the aborted/crashed task's partial edits would
-            # linger in the working tree. Revert to the pre-run snapshot so
-            # neither leaves half-applied edits behind, mirroring the
-            # timeout/abandon path. The result still carries what the worker
-            # reported (applied_patches / unassigned_changes) for the completion
-            # event below.
-            _worker_confirmed_exited = False
-            if agent_result.status in ("cancelled", "error"):
-                _cancelled_revert = _restore_assigned_snapshots(
-                    repo_root, _revert_snapshots,
-                )
-                if _cancelled_revert:
-                    logger.info(
-                        "SubAgent %s (IPC) %s; reverted partial edits: %s",
-                        agent_id, agent_result.status, _cancelled_revert,
                     )
-            if agent_result.status == "cancelled":
-                # A "cancelled" result is ambiguous: a pure task-scope cancel.json
-                # (B6) leaves the worker alive and reusable, but a Ctrl-C in the
-                # worker's own terminal sets BOTH the task-scope cancel_event
-                # (this result) AND the process-scope shutdown_event — the worker
-                # exits its poll loop right after writing this result. Give it a
-                # brief grace window to land its "exited" idle-heartbeat marker
-                # before deciding the slot is safe to return to the pool;
-                # otherwise a dead worker gets reused and the next dispatch burns
-                # the full ipc_timeout_s.
-                from .subagent_ipc import read_worker_idle_heartbeat_state
-                _grace_deadline = time.monotonic() + 2.0
-                while time.monotonic() < _grace_deadline:
-                    try:
-                        if read_worker_idle_heartbeat_state(repo_root, _worker_id) == "exited":
-                            _worker_confirmed_exited = True
-                            break
-                    except Exception:
-                        logger.debug("idle-heartbeat read failed for %s", _worker_id)
-                        break
-                    time.sleep(0.2)
+                    for i in range(result2.turns)
+                ]
+                if result2.turns > 0
+                else [],
+                applied_patches=list(result2.applied_patches),
+                error=result2.error if result2.status == "error" else None,
+            )
+            # Reflect the retry attempt's out-of-scope changes (B5).
+            _ipc_unassigned = list(getattr(result2, "unassigned_changes", []) or [])
 
-            # Diff cross-verification (shared with the in-process path).
-            # IPC is the DEFAULT mode on macOS (the terminal auto-launch
-            # target), so without this the parallel poll loop would never see a
-            # verdict here.  IPC applied_patches are clean {"file": ...} dicts,
-            # so patch-file extraction is exact (no diff-text parsing needed).
-            # Reuses _ipc_diff_cache threaded through the review loop above: on
-            # the common success path the reviewed file set equals the reported
-            # patch set, so the cross-verification diff is a cache hit (no new
-            # ``git diff`` subprocess).
-            _diff_verdict = self._compute_diff_verdict(
-                agent_id=agent_id, result=agent_result,
-                repo_root=repo_root, diff_cache=_ipc_diff_cache,
+        # ── Cancelled/error-by-worker revert ────────────────────────────────
+        # The orchestrator-level cancel (cancel_event set) makes
+        # wait_for_result return None → _abandon_ipc_worker reverts. But the
+        # WORKER can ALSO cancel mid-task (Ctrl-C in its terminal, or a
+        # late-arriving cancel.json it honors at the next turn boundary) and
+        # still write a status="cancelled" result.json. Likewise a task that
+        # raises mid-run writes status="error" with whatever it had already
+        # written to disk. Either way the review loop above (success-only)
+        # never reverts, so the aborted/crashed task's partial edits would
+        # linger in the working tree. Revert to the pre-run snapshot so
+        # neither leaves half-applied edits behind, mirroring the
+        # timeout/abandon path. The result still carries what the worker
+        # reported (applied_patches / unassigned_changes) for the completion
+        # event below.
+        _worker_confirmed_exited = False
+        if agent_result.status in ("cancelled", "error"):
+            _cancelled_revert = _restore_assigned_snapshots(
+                repo_root,
+                _revert_snapshots,
             )
-            # B5 signal hygiene (findings 2+3): the worker's raw ``_ipc_unassigned``
-            # is a GLOBAL ``git status`` view, so subtract pre-run baseline dirt,
-            # parallel peers' in-flight edits (global assignment union), and
-            # framework-artifact paths (``.asicode/``, ``logs/``). What remains is
-            # the worker's genuine NEW out-of-scope writes — the real signal.
-            _ipc_unassigned = self._filter_unassigned_changes(
-                _ipc_unassigned, subtask.assigned_files,
-            )
-            # Apply scope_violation_policy (warn / revert / fail) to the genuine
-            # out-of-scope strays BEFORE the completion event, so the event reports
-            # the post-policy state (reverted list / promoted error status).
-            _ipc_scope_reverted = self._apply_scope_violation_policy(
-                repo_root, _ipc_unassigned, agent_result,
-                agent_id=agent_id, mode="ipc",
-            )
-            # Attach the filtered out-of-scope signal onto the result (same
-            # mutation pattern as _orch_diff_verdict above) so poll_subagent —
-            # the orchestrator LLM's only window into a sub-agent in tool-loop
-            # mode — can SEE the scope violation at decision time and roll back /
-            # re-direct, instead of the signal reaching only the event log.
-            try:
-                agent_result._orch_unassigned = _ipc_unassigned
-            except (AttributeError, TypeError):
-                logger.debug("cannot attach _orch_unassigned to result")
-            self._event_dispatcher.emit(agent_id, "subagent_complete", {
+            if _cancelled_revert:
+                logger.info(
+                    "SubAgent %s (IPC) %s; reverted partial edits: %s",
+                    agent_id,
+                    agent_result.status,
+                    _cancelled_revert,
+                )
+        if agent_result.status == "cancelled":
+            # A "cancelled" result is ambiguous: a pure task-scope cancel.json
+            # (B6) leaves the worker alive and reusable, but a Ctrl-C in the
+            # worker's own terminal sets BOTH the task-scope cancel_event
+            # (this result) AND the process-scope shutdown_event — the worker
+            # exits its poll loop right after writing this result. Give it a
+            # brief grace window to land its "exited" idle-heartbeat marker
+            # before deciding the slot is safe to return to the pool;
+            # otherwise a dead worker gets reused and the next dispatch burns
+            # the full ipc_timeout_s.
+            from .subagent_ipc import read_worker_idle_heartbeat_state
+
+            _grace_deadline = time.monotonic() + 2.0
+            while time.monotonic() < _grace_deadline:
+                try:
+                    if read_worker_idle_heartbeat_state(repo_root, _worker_id) == "exited":
+                        _worker_confirmed_exited = True
+                        break
+                except Exception:
+                    logger.debug("idle-heartbeat read failed for %s", _worker_id)
+                    break
+                time.sleep(0.2)
+
+        # Diff cross-verification (shared with the in-process path).
+        # IPC is the DEFAULT mode on macOS (the terminal auto-launch
+        # target), so without this the parallel poll loop would never see a
+        # verdict here.  IPC applied_patches are clean {"file": ...} dicts,
+        # so patch-file extraction is exact (no diff-text parsing needed).
+        # Reuses _ipc_diff_cache threaded through the review loop above: on
+        # the common success path the reviewed file set equals the reported
+        # patch set, so the cross-verification diff is a cache hit (no new
+        # ``git diff`` subprocess).
+        _diff_verdict = self._compute_diff_verdict(
+            agent_id=agent_id,
+            result=agent_result,
+            repo_root=repo_root,
+            diff_cache=_ipc_diff_cache,
+        )
+        # B5 signal hygiene (findings 2+3): the worker's raw ``_ipc_unassigned``
+        # is a GLOBAL ``git status`` view, so subtract pre-run baseline dirt,
+        # parallel peers' in-flight edits (global assignment union), and
+        # framework-artifact paths (``.asicode/``, ``logs/``). What remains is
+        # the worker's genuine NEW out-of-scope writes — the real signal.
+        _ipc_unassigned = self._filter_unassigned_changes(
+            _ipc_unassigned,
+            subtask.assigned_files,
+        )
+        # Apply scope_violation_policy (warn / revert / fail) to the genuine
+        # out-of-scope strays BEFORE the completion event, so the event reports
+        # the post-policy state (reverted list / promoted error status).
+        _ipc_scope_reverted = self._apply_scope_violation_policy(
+            repo_root,
+            _ipc_unassigned,
+            agent_result,
+            agent_id=agent_id,
+            mode="ipc",
+        )
+        # Attach the filtered out-of-scope signal onto the result (same
+        # mutation pattern as _orch_diff_verdict above) so poll_subagent —
+        # the orchestrator LLM's only window into a sub-agent in tool-loop
+        # mode — can SEE the scope violation at decision time and roll back /
+        # re-direct, instead of the signal reaching only the event log.
+        try:
+            agent_result._orch_unassigned = _ipc_unassigned
+        except (AttributeError, TypeError):
+            logger.debug("cannot attach _orch_unassigned to result")
+        self._event_dispatcher.emit(
+            agent_id,
+            "subagent_complete",
+            {
                 "task_id": subtask.task_id,
                 "status": agent_result.status,
                 "final_message": (agent_result.final_message or "")[:300],
                 "max_turns_reached": agent_result.status == "max_turns",
-                "turns": len(agent_result.turns) if hasattr(agent_result, 'turns') else 0,
-                "applied_patches": agent_result.applied_patches if hasattr(agent_result, 'applied_patches') else [],
+                "turns": len(agent_result.turns) if hasattr(agent_result, "turns") else 0,
+                "applied_patches": agent_result.applied_patches if hasattr(agent_result, "applied_patches") else [],
                 # Out-of-scope writes the worker made (B5), after filtering. Non-empty
                 # ⇒ a genuine scope violation: the review/diff cross-verification was
                 # previously blind to these. Surface them so the UI/consumer can flag
@@ -2532,27 +2644,31 @@ class OrchestratorAgent:
                 "reverted_out_of_scope": _ipc_scope_reverted,
                 "diff_verdict": _diff_verdict,
                 "mode": "ipc",
-            })
-            # (The OUT-OF-SCOPE warning is emitted by _apply_scope_violation_policy
-            #  above in ALL policies, so no separate log block is needed here.)
+            },
+        )
+        # (The OUT-OF-SCOPE warning is emitted by _apply_scope_violation_policy
+        #  above in ALL policies, so no separate log block is needed here.)
+        logger.info(
+            "SubAgent %s (IPC) done: status=%s diff_verdict=%s",
+            agent_id,
+            agent_result.status,
+            _diff_verdict,
+        )
+        # The worker finished its task (initial + any review retries) and is
+        # now idle — return it to the pool so a subsequent subtask reuses it
+        # instead of spawning a fresh worker (P3). Skip this for a cancelled
+        # result confirmed exited above (Ctrl-C in the worker's terminal):
+        # the process is gone, so returning it would let a later claim
+        # re-dispatch to a dead worker.
+        if not _worker_confirmed_exited:
+            self._return_worker_to_pool(_worker_id)
+        else:
             logger.info(
-                "SubAgent %s (IPC) done: status=%s diff_verdict=%s",
-                agent_id, agent_result.status, _diff_verdict,
+                "SubAgent %s (IPC) worker %s exited after cancel; not returning to reuse pool.",
+                agent_id,
+                _worker_id,
             )
-            # The worker finished its task (initial + any review retries) and is
-            # now idle — return it to the pool so a subsequent subtask reuses it
-            # instead of spawning a fresh worker (P3). Skip this for a cancelled
-            # result confirmed exited above (Ctrl-C in the worker's terminal):
-            # the process is gone, so returning it would let a later claim
-            # re-dispatch to a dead worker.
-            if not _worker_confirmed_exited:
-                self._return_worker_to_pool(_worker_id)
-            else:
-                logger.info(
-                    "SubAgent %s (IPC) worker %s exited after cancel; not "
-                    "returning to reuse pool.", agent_id, _worker_id,
-                )
-            return agent_result
+        return agent_result
 
     def _launch_ipc_worker_terminal_macos(self, agent_id: str, worker_id: str) -> bool:
         """Open a VISIBLE Terminal.app window running the sub-agent worker (macOS).
@@ -2565,12 +2681,7 @@ class OrchestratorAgent:
         if not _shell_cmd:
             return False
         _as_escaped = _shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
-        _osa = (
-            'tell application "Terminal"\n'
-            f'    do script "{_as_escaped}"\n'
-            "    activate\n"
-            "end tell"
-        )
+        _osa = f'tell application "Terminal"\n    do script "{_as_escaped}"\n    activate\nend tell'
         try:
             subprocess.Popen(
                 ["osascript", "-e", _osa],
@@ -2579,18 +2690,25 @@ class OrchestratorAgent:
             )
             logger.info(
                 "Auto-launched Terminal.app for sub-agent %s (worker %s)",
-                agent_id, worker_id,
+                agent_id,
+                worker_id,
             )
         except Exception as e:
             logger.warning(
-                "Failed to auto-launch terminal for sub-agent %s: %s", agent_id, e,
+                "Failed to auto-launch terminal for sub-agent %s: %s",
+                agent_id,
+                e,
             )
             return False
         else:
             return True
 
     def _spawn_ipc_worker_background(
-        self, repo_root: str, worker_id: str, provider: str, model: str,
+        self,
+        repo_root: str,
+        worker_id: str,
+        provider: str,
+        model: str,
     ) -> bool:
         """Launch the sub-agent worker as a HEADLESS background subprocess.
 
@@ -2609,7 +2727,10 @@ class OrchestratorAgent:
         # LIST, so there is no shlex round-trip to mangle Windows backslashes).
         argv = [
             *asr_subagent_argv(repo_root),
-            "--subagent-id", worker_id, "--orch-pid", str(os.getpid()),
+            "--subagent-id",
+            worker_id,
+            "--orch-pid",
+            str(os.getpid()),
         ]
         if provider:
             argv += ["--provider", provider]
@@ -2652,9 +2773,8 @@ class OrchestratorAgent:
         if sys.platform == "win32":
             # New process group + no console window: Ctrl-C in the REPL must not
             # propagate to the worker, and no terminal should flash.
-            _kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            _kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+                subprocess, "CREATE_NO_WINDOW", 0
             )
         else:
             # Own session so the worker leaves the orchestrator's process group
@@ -2665,7 +2785,9 @@ class OrchestratorAgent:
             _proc = subprocess.Popen(argv, **_kwargs)
         except Exception as e:
             logger.warning(
-                "Failed to background-spawn sub-agent worker %s: %s", worker_id, e,
+                "Failed to background-spawn sub-agent worker %s: %s",
+                worker_id,
+                e,
             )
             return False
         finally:
@@ -2679,7 +2801,9 @@ class OrchestratorAgent:
         with self._bg_lock:
             self._ipc_worker_procs[worker_id] = _proc
         logger.info(
-            "Background-spawned sub-agent worker %s (pid=%s)", worker_id, _proc.pid,
+            "Background-spawned sub-agent worker %s (pid=%s)",
+            worker_id,
+            _proc.pid,
         )
         return True
 
@@ -2687,7 +2811,7 @@ class OrchestratorAgent:
         self,
         subtask: SubTaskSpec,
         extra_turns: int = 0,
-        task_text: Optional[str] = None,
+        task_text: str | None = None,
         original_request: str = "",
     ) -> Any:
         """Instantiate and run one AgentLoop for a single subtask.
@@ -2710,14 +2834,18 @@ class OrchestratorAgent:
         logger.info("SubAgent %s starting: %s", agent_id, subtask.title)
 
         # emit start event (order guaranteed)
-        self._event_dispatcher.emit(agent_id, "subagent_start", {
-            "task_id": subtask.task_id,
-            "title": subtask.title,
-            "description": subtask.description,
-            "assigned_files": list(subtask.assigned_files),
-            "dependencies": list(subtask.dependencies),
-            "priority": subtask.priority,
-        })
+        self._event_dispatcher.emit(
+            agent_id,
+            "subagent_start",
+            {
+                "task_id": subtask.task_id,
+                "title": subtask.title,
+                "description": subtask.description,
+                "assigned_files": list(subtask.assigned_files),
+                "dependencies": list(subtask.dependencies),
+                "priority": subtask.priority,
+            },
+        )
 
         # Build per-subagent config (copy base config, override relevant fields)
         base: AgentConfig = self.orch_config.agent_config or AgentConfig()
@@ -2750,7 +2878,7 @@ class OrchestratorAgent:
             stream_callback=_sub_cb,
             agent_id=agent_id,
             file_lock_manager=self._file_lock_mgr,
-            is_subagent=True,              # skip small-model complexity gating
+            is_subagent=True,  # skip small-model complexity gating
             rag_enabled=sub_rag,
             context_window_size=base.context_window_size,
         )
@@ -2760,9 +2888,10 @@ class OrchestratorAgent:
         # from the webapp already carries a route_decision, but callers that pass a
         # bare AgentConfig() (e.g. /orchestrate REPL) leave it None — which makes
         # AgentLoop.run() hit the unhandled-lane guard and return partial_success.
-        if getattr(sub_config, 'route_decision', None) is None:
+        if getattr(sub_config, "route_decision", None) is None:
             from .enums import Complexity, Scope
             from .task_router import Lane, RouteDecision, TaskKind
+
             sub_config.route_decision = RouteDecision(
                 task_kind=TaskKind.SINGLE_FILE_EDIT,
                 complexity=Complexity.MEDIUM,
@@ -2780,6 +2909,7 @@ class OrchestratorAgent:
         sub_model = self.model
         if _sub_provider and _sub_model:
             from ..client import create_llm_client
+
             try:
                 sub_llm_client = create_llm_client(
                     provider=_sub_provider,
@@ -2813,7 +2943,7 @@ class OrchestratorAgent:
         # PlannerAgent uses real symbol names instead of hallucinating them.
         # (Previously this was only done for dedicated small-model sub-agents.)
         hint_lines = []
-        for fpath in (subtask.assigned_files or []):
+        for fpath in subtask.assigned_files or []:
             try:
                 abs_path = os.path.join(repo_root, fpath) if repo_root else fpath
                 # Bound the read like _capture_assigned_snapshots (5 MiB/file):
@@ -2849,7 +2979,8 @@ class OrchestratorAgent:
         # __exit__ in finally avoids re-indenting the run/review block.
         _model_ctx_scope = (
             self._run_store.model_context_scope(sub_model or "", sub_model or "")
-            if self._run_store is not None else None
+            if self._run_store is not None
+            else None
         )
         if _model_ctx_scope is not None:
             _model_ctx_scope.__enter__()
@@ -2880,8 +3011,13 @@ class OrchestratorAgent:
                     break
                 # Rejected — revert assigned files, then re-run with feedback
                 retry_count += 1
-                logger.info("SubAgent %s review rejected (retry %d/%d): %s",
-                            agent_id, retry_count, self.review_max_retries, feedback[:120])
+                logger.info(
+                    "SubAgent %s review rejected (retry %d/%d): %s",
+                    agent_id,
+                    retry_count,
+                    self.review_max_retries,
+                    feedback[:120],
+                )
 
                 # Restore the pre-run snapshot so the retry starts from a clean
                 # baseline WITHOUT destroying uncommitted work. (Snapshot was
@@ -2893,26 +3029,32 @@ class OrchestratorAgent:
                 # retry starts from a clean baseline.
                 if self.orch_config.scope_violation_policy == "revert":
                     _retry_genuine = self._detect_genuine_violations(
-                        repo_root, subtask.assigned_files,
+                        repo_root,
+                        subtask.assigned_files,
                     )
                     _retry_rv = self._revert_unassigned_changes(repo_root, _retry_genuine)
                     if _retry_rv:
                         logger.info(
                             "Reverted %d out-of-scope file(s) before retry: %s",
-                            len(_retry_rv), _retry_rv,
+                            len(_retry_rv),
+                            _retry_rv,
                         )
 
                 # The revert + upcoming re-run mutate the worktree, so any diff
                 # cached this attempt is now stale — drop it before re-running.
                 _diff_cache.clear()
 
-                self._event_dispatcher.emit(agent_id, "subagent_retry", {
-                    "task_id": subtask.task_id,
-                    "retry": retry_count,
-                    "max_retries": self.review_max_retries,
-                    "feedback": feedback,
-                    "reverted_files": reverted,
-                })
+                self._event_dispatcher.emit(
+                    agent_id,
+                    "subagent_retry",
+                    {
+                        "task_id": subtask.task_id,
+                        "retry": retry_count,
+                        "max_retries": self.review_max_retries,
+                        "feedback": feedback,
+                        "reverted_files": reverted,
+                    },
+                )
                 retry_text = (
                     f"{task_text}\n\n"
                     f"[REVIEW FEEDBACK — attempt {retry_count}]\n"
@@ -2950,7 +3092,9 @@ class OrchestratorAgent:
                 if _aborted_revert:
                     logger.info(
                         "SubAgent %s (in-process) %s; reverted partial edits: %s",
-                        agent_id, result.status, _aborted_revert,
+                        agent_id,
+                        result.status,
+                        _aborted_revert,
                     )
 
             # ── Diff cross-verification ────────────────────────────────────────
@@ -2961,8 +3105,10 @@ class OrchestratorAgent:
             # file names), scopes `git diff` to them, and attaches the verdict
             # onto `result` so poll_subagent surfaces it at decision time.
             _diff_verdict = self._compute_diff_verdict(
-                agent_id=agent_id, result=result,
-                repo_root=repo_root, diff_cache=_diff_cache,
+                agent_id=agent_id,
+                result=result,
+                repo_root=repo_root,
+                diff_cache=_diff_cache,
             )
 
             # Genuine out-of-scope detection (parity with the IPC path, which
@@ -2970,11 +3116,15 @@ class OrchestratorAgent:
             # has no such report, so derive the raw changed set from a fresh
             # ``git status --porcelain`` and apply the same filtering + policy.
             _proc_unassigned = self._detect_genuine_violations(
-                repo_root, subtask.assigned_files,
+                repo_root,
+                subtask.assigned_files,
             )
             _proc_scope_reverted = self._apply_scope_violation_policy(
-                repo_root, _proc_unassigned, result,
-                agent_id=agent_id, mode="in-process",
+                repo_root,
+                _proc_unassigned,
+                result,
+                agent_id=agent_id,
+                mode="in-process",
             )
 
             # Attach the filtered out-of-scope signal onto the result (same
@@ -2988,28 +3138,38 @@ class OrchestratorAgent:
                 logger.debug("cannot attach _orch_unassigned to result")
 
             # emit complete event (order guaranteed)
-            self._event_dispatcher.emit(agent_id, "subagent_complete", {
-                "task_id": subtask.task_id,
-                "status": result.status,
-                "final_message": (result.final_message or "")[:300],
-                "max_turns_reached": result.status == "max_turns",
-                "turns": len(result.turns) if hasattr(result, 'turns') else 0,
-                "applied_patches": result.applied_patches if hasattr(result, 'applied_patches') else [],
-                "unassigned_changes": _proc_unassigned,
-                "reverted_out_of_scope": _proc_scope_reverted,
-                "diff_verdict": _diff_verdict,
-            })
+            self._event_dispatcher.emit(
+                agent_id,
+                "subagent_complete",
+                {
+                    "task_id": subtask.task_id,
+                    "status": result.status,
+                    "final_message": (result.final_message or "")[:300],
+                    "max_turns_reached": result.status == "max_turns",
+                    "turns": len(result.turns) if hasattr(result, "turns") else 0,
+                    "applied_patches": result.applied_patches if hasattr(result, "applied_patches") else [],
+                    "unassigned_changes": _proc_unassigned,
+                    "reverted_out_of_scope": _proc_scope_reverted,
+                    "diff_verdict": _diff_verdict,
+                },
+            )
             logger.info(
                 "SubAgent %s (in-process) done: status=%s diff_verdict=%s",
-                agent_id, result.status, _diff_verdict,
+                agent_id,
+                result.status,
+                _diff_verdict,
             )
         except Exception as e:
             # emit error event
-            self._event_dispatcher.emit(agent_id, "subagent_error", {
-                "task_id": subtask.task_id,
-                "error": str(e),
-                "traceback": traceback.format_exc(),
-            })
+            self._event_dispatcher.emit(
+                agent_id,
+                "subagent_error",
+                {
+                    "task_id": subtask.task_id,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
             # Crash path (IPC parity): an unexpected exception inside the loop
             # can leave partial edits in the tree — restore the pre-run
             # snapshot before re-raising so the error result the caller wraps
@@ -3019,7 +3179,8 @@ class OrchestratorAgent:
             if _crash_revert:
                 logger.info(
                     "SubAgent %s (in-process) crashed; reverted partial edits: %s",
-                    agent_id, _crash_revert,
+                    agent_id,
+                    _crash_revert,
                 )
             raise
         else:
@@ -3042,6 +3203,7 @@ class OrchestratorAgent:
         scoping first (see ``_review_subagent_result``).
         """
         import subprocess
+
         try:
             cmd = ["git", "diff", "HEAD", "--"] + (paths if paths else [])
             out = subprocess.check_output(cmd, cwd=repo_root, stderr=subprocess.DEVNULL, timeout=10)
@@ -3058,7 +3220,10 @@ class OrchestratorAgent:
             return diff
 
     def _cached_git_diff(
-        self, cache: Optional[dict], repo_root: str, paths: list[str],
+        self,
+        cache: dict | None,
+        repo_root: str,
+        paths: list[str],
     ) -> str:
         """``_get_git_diff`` with an optional per-subagent memo.
 
@@ -3085,7 +3250,7 @@ class OrchestratorAgent:
         return cache[key]
 
     @staticmethod
-    def _patch_files_have_wt_changes(repo_root: Optional[str], patch_files: list[str]) -> bool:
+    def _patch_files_have_wt_changes(repo_root: str | None, patch_files: list[str]) -> bool:
         """Return True if any of *patch_files* has a working-tree change in ``git status``.
 
         Complements :meth:`_get_git_diff`: ``git diff HEAD -- <path>`` is EMPTY for
@@ -3099,11 +3264,14 @@ class OrchestratorAgent:
         """
         if not repo_root or not patch_files:
             return False
+        import subprocess as _sp  # module-level import is lazy; hoist for the except refs
+
         try:
-            import subprocess as _sp
             out = _sp.check_output(
                 ["git", "status", "-z", "--porcelain", "--untracked-files=all", "--", *patch_files],
-                cwd=repo_root, stderr=_sp.DEVNULL, timeout=10,
+                cwd=repo_root,
+                stderr=_sp.DEVNULL,
+                timeout=10,
             )
             return bool(out.strip())
         except (_sp.CalledProcessError, _sp.TimeoutExpired, OSError):  # git best-effort
@@ -3111,7 +3279,9 @@ class OrchestratorAgent:
 
     @staticmethod
     def _synthesize_untracked_diff(
-        repo_root: str, assigned_files: list[str], char_limit: int = 0,
+        repo_root: str,
+        assigned_files: list[str],
+        char_limit: int = 0,
     ) -> str:
         """Build a synthetic unified-diff for untracked (newly-created) files.
 
@@ -3137,13 +3307,16 @@ class OrchestratorAgent:
         that further untracked files were omitted.
         """
         import subprocess as _sp
+
         if not repo_root or not assigned_files:
             return ""
         # Check which assigned files are actually untracked (git reports "??" for them).
         try:
             out = _sp.check_output(
                 ["git", "status", "-z", "--porcelain", "--untracked-files=all", "--", *assigned_files],
-                cwd=repo_root, stderr=_sp.DEVNULL, timeout=10,
+                cwd=repo_root,
+                stderr=_sp.DEVNULL,
+                timeout=10,
             )
         except (_sp.CalledProcessError, _sp.TimeoutExpired, OSError):  # git best-effort
             return ""
@@ -3167,10 +3340,7 @@ class OrchestratorAgent:
             # Use prefix-aware matching: an unexpanded directory assignment (cap-exceeded)
             # won't be in the untracked set, but untracked files UNDER it should still
             # be discovered (B6 / turn 13118).
-            _matching = {
-                u for u in untracked
-                if u == _nf or u.startswith(_nf + _sep)
-            }
+            _matching = {u for u in untracked if u == _nf or u.startswith(_nf + _sep)}
             if not _matching:
                 continue
             for _untracked_file in sorted(_matching):
@@ -3199,10 +3369,7 @@ class OrchestratorAgent:
                 _added.append(f"@@ -0,0 +1,{len(_body_lines)} @@")
                 _added.extend(f"+{_bl}" for _bl in _body_lines)
                 if _body_trunc:
-                    _added.append(
-                        f"+[file content truncated: showing first "
-                        f"{_SYNTH_DIFF_FILE_BYTES} of {_size} bytes]"
-                    )
+                    _added.append(f"+[file content truncated: showing first {_SYNTH_DIFF_FILE_BYTES} of {_size} bytes]")
                 _added.append("")
                 lines.extend(_added)
                 _cum_chars += sum(len(_s) for _s in _added)
@@ -3229,13 +3396,13 @@ class OrchestratorAgent:
         """
         self._baseline_dirty_paths = _snapshot_dirty_path_set(repo_root)
         self._global_assigned_paths = {
-            os.path.normpath(_f)
-            for _st in (subtasks or [])
-            for _f in (getattr(_st, "assigned_files", None) or [])
+            os.path.normpath(_f) for _st in (subtasks or []) for _f in (getattr(_st, "assigned_files", None) or [])
         }
 
     def _filter_unassigned_changes(
-        self, reported: list, own_assigned: Optional[list[str]] = None,
+        self,
+        reported: list,
+        own_assigned: list[str] | None = None,
     ) -> list:
         """Filter a worker's raw out-of-scope report to its genuine NEW violations.
 
@@ -3277,6 +3444,7 @@ class OrchestratorAgent:
         if not reported:
             return []
         from .subagent_ipc import _path_matches_scope
+
         _own = {os.path.normpath(_f) for _f in (own_assigned or [])}
         # _baseline_dirty_paths is captured once at run/loop start and never
         # mutated after, so a bare read is race-free.
@@ -3311,7 +3479,7 @@ class OrchestratorAgent:
             out.append(_e)
         return out
 
-    def _git_status_changed_paths(self, repo_root: Optional[str]) -> list:
+    def _git_status_changed_paths(self, repo_root: str | None) -> list:
         """Return raw changed paths from ``git status -z --porcelain``.
 
         Same shape as the worker's IPC ``unassigned_changes`` report
@@ -3331,6 +3499,7 @@ class OrchestratorAgent:
         if not repo_root:
             return []
         from .subagent_ipc import partition_changed_files
+
         # Empty assignment → all changed paths returned in the in-scope half.
         try:
             return partition_changed_files(repo_root, [])[0]
@@ -3338,8 +3507,11 @@ class OrchestratorAgent:
             return []
 
     def _detect_genuine_violations(
-        self, repo_root: Optional[str], assigned_files: Optional[list[str]],
-        *, raw_unassigned: Optional[list] = None,
+        self,
+        repo_root: str | None,
+        assigned_files: list[str] | None,
+        *,
+        raw_unassigned: list | None = None,
     ) -> list:
         """Return this worker's filtered genuine out-of-scope writes.
 
@@ -3354,7 +3526,9 @@ class OrchestratorAgent:
         return self._filter_unassigned_changes(raw_unassigned, assigned_files)
 
     def _revert_unassigned_changes(
-        self, repo_root: Optional[str], unassigned: list,
+        self,
+        repo_root: str | None,
+        unassigned: list,
     ) -> list[str]:
         """Revert genuine out-of-scope writes to their pre-run state.
 
@@ -3382,13 +3556,14 @@ class OrchestratorAgent:
         """
         import shutil
         import subprocess as _sp
+
         reverted: list[str] = []
 
         # Normalize entries and split file vs directory targets in one pass.
         # Directories are always untracked (git tracks files) → rmtree path.
         file_entries: list[tuple[str, str]] = []  # (rel_path, abs_path)
         dir_entries: list[tuple[str, str]] = []
-        for _e in (unassigned or []):
+        for _e in unassigned or []:
             _raw = (_e.get("file") if isinstance(_e, dict) else _e) or ""
             _f = os.path.normpath(_raw)
             # ``os.path.normpath("")`` returns ".", NOT "" — an empty/None
@@ -3408,7 +3583,9 @@ class OrchestratorAgent:
             try:
                 _ck = _sp.run(
                     ["git", "checkout", "HEAD", "--", rel],
-                    cwd=repo_root, capture_output=True, timeout=10,
+                    cwd=repo_root,
+                    capture_output=True,
+                    timeout=10,
                     check=False,
                 )
                 if _ck.returncode == 0:
@@ -3416,7 +3593,8 @@ class OrchestratorAgent:
                 else:
                     logger.warning(
                         "scope_violation revert: git checkout failed for %r: %s",
-                        rel, _ck.stderr.decode("utf-8", "replace").strip(),
+                        rel,
+                        _ck.stderr.decode("utf-8", "replace").strip(),
                     )
             except Exception as _err:
                 logger.warning("scope_violation revert: failed for %r: %s", rel, _err)
@@ -3432,24 +3610,24 @@ class OrchestratorAgent:
 
         # Batch tracked determination: one `git ls-files -z -- <files>` prints
         # exactly the tracked subset. `-z` is REQUIRED — without it git C-quotes
- # non-ASCII paths ("\355\225\234..." for Korean characters), which then fail the
+        # non-ASCII paths ("\355\225\234..." for Korean characters), which then fail the
         # `in tracked` membership test and get misclassified as untracked →
         # deleted by unlink instead of restored by checkout (data loss + a
         # falsely-"reverted" report). `-z` emits NUL-separated raw bytes with no
         # quoting at all, so every entry matches its unnormalized rel-path.
         # None means the batch call failed → per-file fallback below.
-        tracked: Optional[set[str]] = None
+        tracked: set[str] | None = None
         if file_entries:
             try:
                 _r = _sp.run(
                     ["git", "ls-files", "-z", "--"] + [_f for _f, _ in file_entries],
-                    cwd=repo_root, capture_output=True, timeout=20,
+                    cwd=repo_root,
+                    capture_output=True,
+                    timeout=20,
                     check=False,
                 )
                 if _r.returncode == 0:
-                    tracked = {
-                        _p for _p in _r.stdout.decode("utf-8", "replace").split("\0") if _p
-                    }
+                    tracked = {_p for _p in _r.stdout.decode("utf-8", "replace").split("\0") if _p}
             except Exception:
                 tracked = None
 
@@ -3462,7 +3640,9 @@ class OrchestratorAgent:
                 try:
                     _ck = _sp.run(
                         ["git", "checkout", "HEAD", "--", *_tracked_files],
-                        cwd=repo_root, capture_output=True, timeout=30,
+                        cwd=repo_root,
+                        capture_output=True,
+                        timeout=30,
                         check=False,
                     )
                     if _ck.returncode == 0:
@@ -3475,7 +3655,8 @@ class OrchestratorAgent:
                         )
                 except Exception as _err:
                     logger.warning(
-                        "scope_violation revert: batched git checkout failed: %s", _err,
+                        "scope_violation revert: batched git checkout failed: %s",
+                        _err,
                     )
                 if not _batch_ok:
                     for _f, _ in file_entries:
@@ -3494,10 +3675,12 @@ class OrchestratorAgent:
                 try:
                     _tr = _sp.run(
                         ["git", "ls-files", "--error-unmatch", "--", _f],
-                        cwd=repo_root, capture_output=True, timeout=10,
+                        cwd=repo_root,
+                        capture_output=True,
+                        timeout=10,
                         check=False,
                     )
-                    _is_tracked = (_tr.returncode == 0)
+                    _is_tracked = _tr.returncode == 0
                 except Exception:
                     _is_tracked = False
                 if _is_tracked:
@@ -3516,8 +3699,13 @@ class OrchestratorAgent:
         return reverted
 
     def _apply_scope_violation_policy(
-        self, repo_root: Optional[str], genuine: list, result: Any,
-        *, agent_id: str, mode: str,
+        self,
+        repo_root: str | None,
+        genuine: list,
+        result: Any,
+        *,
+        agent_id: str,
+        mode: str,
     ) -> list[str]:
         """Apply ``scope_violation_policy`` to genuine out-of-scope writes.
 
@@ -3536,21 +3724,24 @@ class OrchestratorAgent:
         """
         if not genuine:
             return []
-        _policy = (getattr(self.orch_config, "scope_violation_policy", "warn")
-                   or "warn")
-        _files = [
-            (_e.get("file") if isinstance(_e, dict) else _e) for _e in genuine
-        ]
+        _policy = getattr(self.orch_config, "scope_violation_policy", "warn") or "warn"
+        _files = [(_e.get("file") if isinstance(_e, dict) else _e) for _e in genuine]
         logger.warning(
             "SubAgent %s (%s) made OUT-OF-SCOPE changes (policy=%s): %s",
-            agent_id, mode, _policy, _files,
+            agent_id,
+            mode,
+            _policy,
+            _files,
         )
         if _policy == "revert":
             _rv = self._revert_unassigned_changes(repo_root, genuine)
             if _rv:
                 logger.info(
                     "SubAgent %s (%s) reverted %d out-of-scope file(s): %s",
-                    agent_id, mode, len(_rv), _rv,
+                    agent_id,
+                    mode,
+                    len(_rv),
+                    _rv,
                 )
             return _rv
         if _policy == "fail":
@@ -3559,18 +3750,22 @@ class OrchestratorAgent:
                 result.status = "error"
             if hasattr(result, "final_message"):
                 _prev = (result.final_message or "").strip()
-                result.final_message = (f"{_prev}\n{_stamp}".strip()
-                                        if _prev else _stamp)
+                result.final_message = f"{_prev}\n{_stamp}".strip() if _prev else _stamp
             logger.warning(
                 "SubAgent %s (%s) scope_violation_policy=fail: promoted to error",
-                agent_id, mode,
+                agent_id,
+                mode,
             )
         # "warn" (or any unknown value): log only, already emitted above.
         return []
 
     def _compute_diff_verdict(
-        self, *, agent_id: str, result: Any,
-        repo_root: Optional[str], diff_cache: Optional[dict],
+        self,
+        *,
+        agent_id: str,
+        result: Any,
+        repo_root: str | None,
+        diff_cache: dict | None,
     ) -> str:
         """Cross-verify a sub-agent's reported edits against ``git diff`` and
         attach the verdict (``_orch_diff_verdict``) onto ``result``.
@@ -3592,7 +3787,8 @@ class OrchestratorAgent:
         Returns the verdict string; ``result`` is mutated in place.
         """
         from ._shared_utils import extract_files_from_patch
-        _raw_patches = getattr(result, 'applied_patches', None) or []
+
+        _raw_patches = getattr(result, "applied_patches", None) or []
         _patch_files: list[str] = []
         for _p in _raw_patches:
             if isinstance(_p, dict):
@@ -3631,15 +3827,18 @@ class OrchestratorAgent:
             # NO_CHANGES the diff-only check produced before.
             _diff_verdict = "VERIFIED"
             logger.debug(
-                "[DIFF_VERIFY] %s VERIFIED via new/untracked file (git status), "
-                "diff HEAD empty (patches=%s)", agent_id, _patch_files,
+                "[DIFF_VERIFY] %s VERIFIED via new/untracked file (git status), diff HEAD empty (patches=%s)",
+                agent_id,
+                _patch_files,
             )
         elif _claims_changes and _can_attribute:
             _diff_verdict = "NO_CHANGES"
             logger.warning(
                 "[DIFF_VERIFY] %s status=%s but git diff AND git status are empty "
                 "— final_message may be inaccurate (patches=%s)",
-                agent_id, result.status, _patch_files or "none",
+                agent_id,
+                result.status,
+                _patch_files or "none",
             )
         else:
             _diff_verdict = "UNVERIFIABLE"
@@ -3672,7 +3871,7 @@ class OrchestratorAgent:
             line_no = _symbol_def_line("".join(lines), rel_path, symbol)
             if line_no:
                 # Definition line + up to 5 following lines as context.
-                snippet = "".join(lines[line_no - 1: line_no + 5])
+                snippet = "".join(lines[line_no - 1 : line_no + 5])
                 results.append(
                     f"Found `{symbol}` in {rel_path} at line {line_no}:\n"
                     f"```\n{snippet}```\n"
@@ -3703,10 +3902,10 @@ Approve if the change correctly implements what was asked without breaking exist
     def _review_subagent_result(
         self,
         agent_id: str,
-        subtask: "SubTaskSpec",
+        subtask: SubTaskSpec,
         repo_root: str,
         *,
-        diff_cache: Optional[dict] = None,
+        diff_cache: dict | None = None,
     ) -> tuple[bool, str]:
         """Call orchestrator LLM to review the subagent's diff. Returns (approved, feedback).
 
@@ -3724,23 +3923,30 @@ Approve if the change correctly implements what was asked without breaking exist
         # other agents' changes.  Skip review (assume approved) instead of
         # acting on a misleading diff.
         if not subtask.assigned_files:
-            _why = ("parallel siblings" if self.orch_config.parallel
-                    else "no assigned_files to scope the diff")
+            _why = "parallel siblings" if self.orch_config.parallel else "no assigned_files to scope the diff"
             logger.info(
                 "SubAgent %s review skipped — %s; cannot attribute diff",
-                agent_id, _why,
+                agent_id,
+                _why,
             )
-            self._event_dispatcher.emit(agent_id, "review_skipped", {
-                "task_id": subtask.task_id,
-                "reason": "no_assigned_files" if not self.orch_config.parallel
-                          else "no_assigned_files_parallel",
-            })
+            self._event_dispatcher.emit(
+                agent_id,
+                "review_skipped",
+                {
+                    "task_id": subtask.task_id,
+                    "reason": "no_assigned_files" if not self.orch_config.parallel else "no_assigned_files_parallel",
+                },
+            )
             return True, ""  # unverifiable → do not block on a misleading diff
 
-        self._event_dispatcher.emit(agent_id, "review_start", {
-            "task_id": subtask.task_id,
-            "title": subtask.title,
-        })
+        self._event_dispatcher.emit(
+            agent_id,
+            "review_start",
+            {
+                "task_id": subtask.task_id,
+                "title": subtask.title,
+            },
+        )
 
         diff = self._cached_git_diff(diff_cache, repo_root, subtask.assigned_files)
         if not diff:
@@ -3754,7 +3960,9 @@ Approve if the change correctly implements what was asked without breaking exist
                 # dozens of new files (64 KiB read each) are processed only to be
                 # truncated back down to _cap below.
                 _untracked_diff = self._synthesize_untracked_diff(
-                    repo_root, subtask.assigned_files, char_limit=_cap,
+                    repo_root,
+                    subtask.assigned_files,
+                    char_limit=_cap,
                 )
                 if _untracked_diff:
                     # Apply the SAME overall cap as _get_git_diff: without it a
@@ -3762,22 +3970,23 @@ Approve if the change correctly implements what was asked without breaking exist
                     # prompt (the git-diff path is capped, this one was not).
                     if len(_untracked_diff) > _cap:
                         _untracked_diff = (
-                            f"{_untracked_diff[:_cap]}\n[diff truncated: "
-                            f"{_cap}/{len(_untracked_diff)} chars]\n"
+                            f"{_untracked_diff[:_cap]}\n[diff truncated: {_cap}/{len(_untracked_diff)} chars]\n"
                         )
                     diff = _untracked_diff
             if not diff:
                 # Genuinely no changes — reject
-                self._event_dispatcher.emit(agent_id, "review_rejected", {
-                    "task_id": subtask.task_id,
-                    "feedback": "No changes detected (git diff is empty). The subagent must modify the assigned files.",
-                })
+                self._event_dispatcher.emit(
+                    agent_id,
+                    "review_rejected",
+                    {
+                        "task_id": subtask.task_id,
+                        "feedback": "No changes detected (git diff is empty). The subagent must modify the assigned files.",
+                    },
+                )
                 return False, "No changes detected in git diff. The subagent must modify the assigned files."
 
         user_content = (
-            f"Subtask: {subtask.title}\n"
-            f"Description: {subtask.description}\n\n"
-            f"Git diff:\n```diff\n{diff}\n```"
+            f"Subtask: {subtask.title}\nDescription: {subtask.description}\n\nGit diff:\n```diff\n{diff}\n```"
         )
         messages = [
             LLMMessage(role="system", content=self._REVIEW_SYSTEM),
@@ -3789,10 +3998,17 @@ Approve if the change correctly implements what was asked without breaking exist
 
         if not parsed:
             # Parse failure → assume approved to avoid blocking
-            logger.warning("Review parse failed for %s, assuming approved. Raw (%d chars): %s", agent_id, len(raw), raw[:2000])
-            self._event_dispatcher.emit(agent_id, "review_approved", {
-                "task_id": subtask.task_id, "note": "parse_failed_assumed_ok",
-            })
+            logger.warning(
+                "Review parse failed for %s, assuming approved. Raw (%d chars): %s", agent_id, len(raw), raw[:2000]
+            )
+            self._event_dispatcher.emit(
+                agent_id,
+                "review_approved",
+                {
+                    "task_id": subtask.task_id,
+                    "note": "parse_failed_assumed_ok",
+                },
+            )
             return True, ""
 
         approved = bool(parsed.get("approved", True))
@@ -3806,12 +4022,16 @@ Approve if the change correctly implements what was asked without breaking exist
                 feedback = f"{feedback}\n\n[LOCATION HINT]\n{location_hint}"
 
         event = "review_approved" if approved else "review_rejected"
-        self._event_dispatcher.emit(agent_id, event, {
-            "task_id": subtask.task_id,
-            "approved": approved,
-            "feedback": feedback,
-            "target_symbol": target_symbol,
-        })
+        self._event_dispatcher.emit(
+            agent_id,
+            event,
+            {
+                "task_id": subtask.task_id,
+                "approved": approved,
+                "feedback": feedback,
+                "target_symbol": target_symbol,
+            },
+        )
         return approved, feedback
 
     # ── Result synthesis (legacy — used by run() for backward compat) ──────
@@ -3829,9 +4049,7 @@ Approve if the change correctly implements what was asked without breaking exist
             if res is None:
                 continue
             parts.append(
-                f"[{st.task_id}] {st.title}\n"
-                f"  Status: {res.status}\n"
-                f"  Summary: {(res.final_message or '')[:200]}\n"
+                f"[{st.task_id}] {st.title}\n  Status: {res.status}\n  Summary: {(res.final_message or '')[:200]}\n"
             )
         user_content = "\n".join(parts)
 
@@ -3839,7 +4057,9 @@ Approve if the change correctly implements what was asked without breaking exist
             LLMMessage(role="system", content=_SYNTHESISE_SYSTEM),
             LLMMessage(role="user", content=user_content),
         ]
-        return simple_llm_call(self.llm_client, self.model, messages, thinking_mode=False) or "Multi-agent task completed."
+        return (
+            simple_llm_call(self.llm_client, self.model, messages, thinking_mode=False) or "Multi-agent task completed."
+        )
 
     def _paired_subtask_results(self) -> list[tuple[SubTaskSpec, Any]]:
         """Build (subtask, result) pairs keyed by agent_id from _bg_subagents.
@@ -3852,11 +4072,7 @@ Approve if the change correctly implements what was asked without breaking exist
         result" so the gap is visible rather than silently truncated.
         """
         with self._bg_lock:
-            return [
-                (e["subtask"], e.get("result"))
-                for e in self._bg_subagents.values()
-                if e.get("subtask")
-            ]
+            return [(e["subtask"], e.get("result")) for e in self._bg_subagents.values() if e.get("subtask")]
 
     def _synthesize_from_subtasks(
         self,
@@ -3880,7 +4096,9 @@ Approve if the change correctly implements what was asked without breaking exist
             if res is None:
                 lines.append(f"- [{st.task_id}] {st.title}: no result")
                 continue
-            icon = "✅" if res.status in ("success", "already_satisfied") else ("⚠️" if res.status == "max_turns" else "❌")
+            icon = (
+                "✅" if res.status in ("success", "already_satisfied") else ("⚠️" if res.status == "max_turns" else "❌")
+            )
             msg = (res.final_message or "")[:120]
             lines.append(f"- {icon} [{st.task_id}] {st.title} ({res.status}): {msg}")
         return "Multi-agent task results:\n" + "\n".join(lines) if lines else "Multi-agent task completed."
@@ -3941,6 +4159,7 @@ Approve if the change correctly implements what was asked without breaking exist
         "earlier just because a sub-agent finished.\n"
         "7. Respond in the SAME LANGUAGE as the user's request.\n"
     )
+
     def _native_orchestrator_schemas(self) -> list[dict[str, Any]]:
         """The 3 orchestrator-native tool schemas (spawn/poll/list_subagent).
 
@@ -3999,7 +4218,7 @@ Approve if the change correctly implements what was asked without breaking exist
                         "agent_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "List of agent_ids to wait for. Returns when ANY ONE completes (\"wait-any\"). Mutually exclusive with agent_id.",
+                            "description": 'List of agent_ids to wait for. Returns when ANY ONE completes ("wait-any"). Mutually exclusive with agent_id.',
                         },
                         "timeout_s": {
                             "type": "number",
@@ -4035,37 +4254,45 @@ Approve if the change correctly implements what was asked without breaking exist
         if name == "list_subagents":
             return self._tool_list_subagents()
         raise _NativeToolError(f"unknown orchestrator tool '{name}'.")
+
     # ── Background sub-agent runner ────────────────────────────────────────
     def _ensure_bg_executor(self) -> ThreadPoolExecutor:
         """Lazily create the background sub-agent thread pool."""
         if self._bg_executor is None:
             _n = max(1, self.orch_config.max_subagents)
             self._bg_executor = ThreadPoolExecutor(
-                max_workers=_n, thread_name_prefix="orch-bg",
+                max_workers=_n,
+                thread_name_prefix="orch-bg",
             )
         return self._bg_executor
+
     def _run_subagent_background(
         self,
         subtask: SubTaskSpec,
-        task_text: Optional[str] = None,
+        task_text: str | None = None,
         original_request: str = "",
     ) -> str:
         """Launch a sub-agent in the background; return its agent_id immediately."""
         pool = self._ensure_bg_executor()
         agent_id = subtask.task_id
+
         def _bg_job() -> Any:
             try:
                 return self._run_subagent(
-                    subtask, task_text=task_text, original_request=original_request,
+                    subtask,
+                    task_text=task_text,
+                    original_request=original_request,
                 )
             except Exception as exc:
                 logger.exception("Background SubAgent %s failed", agent_id)
                 from .agent_loop import AgentResult
+
                 return AgentResult(
                     status="error",
                     final_message=f"Sub-agent crashed: {exc}",
                     error=str(exc),
                 )
+
         future = pool.submit(_bg_job)
         # NOTE: "queued vs running" is NOT stored here — a flag captured at
         # submit time goes stale the moment a slot frees up and the task starts
@@ -4083,6 +4310,7 @@ Approve if the change correctly implements what was asked without breaking exist
         # or _run_subagent_ipc() emits it from inside the background thread.
         # Emitting here too would double-count in the spinner progress UI.
         return agent_id
+
     @staticmethod
     def _future_is_queued(entry: dict) -> bool:
         """Live check: is this sub-agent still waiting for a thread-pool slot?
@@ -4098,7 +4326,9 @@ Approve if the change correctly implements what was asked without breaking exist
         return not _fut.running() and not _fut.done()
 
     def _check_bg_subagent(
-        self, agent_id: str, timeout_s: float = 0.0,
+        self,
+        agent_id: str,
+        timeout_s: float = 0.0,
     ) -> tuple[str, Any]:
         """Check a background sub-agent; return (status, result_or_None).
 
@@ -4142,13 +4372,13 @@ Approve if the change correctly implements what was asked without breaking exist
             except Exception as exc:
                 logger.exception("Background SubAgent %s raised", agent_id)
                 from .agent_loop import AgentResult
+
                 result = AgentResult(
                     status="error",
                     final_message=f"Sub-agent failed: {exc}",
                     error=str(exc),
                 )
-            status = ("error" if not result or result.status == "error"
-                      else getattr(result, "status", "completed"))
+            status = "error" if not result or result.status == "error" else getattr(result, "status", "completed")
             with self._bg_lock:
                 # Re-check inside the lock: the unlocked fast-path guard above is a
                 # fast path, but two callers can both observe result is None,
@@ -4168,6 +4398,7 @@ Approve if the change correctly implements what was asked without breaking exist
             # Re-emitting would double-increment the spinner's done-counter.
             return status, result
         return "running", None
+
     # ── Orchestrator-native tool handlers ──────────────────────────────────
     def _tool_spawn_subagent(self, args: dict[str, Any], original_request: str) -> str:
         """spawn_subagent tool handler.
@@ -4183,7 +4414,8 @@ Approve if the change correctly implements what was asked without breaking exist
         if isinstance(_files, str):
             _files = [_files]
         _files = _expand_directory_assignments(
-            getattr(self._registry_proto, "repo_root", None), list(_files),
+            getattr(self._registry_proto, "repo_root", None),
+            list(_files),
         )
         try:
             _priority = int(args.get("priority", 1))
@@ -4218,24 +4450,25 @@ Approve if the change correctly implements what was asked without breaking exist
                     if _entry.get("result") is not None:
                         continue  # finished — no longer concurrent
                     _their = {
-                        _norm_assigned_file(f)
-                        for f in getattr(_entry.get("subtask"), "assigned_files", []) or []
-                        if f
+                        _norm_assigned_file(f) for f in getattr(_entry.get("subtask"), "assigned_files", []) or [] if f
                     }
                     if _their & _new_files:
                         _conflict_ids.append(_aid)
             if _conflict_ids:
-                self._cb("orchestrator_warning", {
-                    "type": "tool_loop_file_conflict",
-                    "agent_id": agent_id,
-                    "conflicting_agents": _conflict_ids,
-                    "files": sorted(_new_files),
-                    "message": (
-                        f"Sub-agent '{agent_id}' shares files with still-running "
-                        f"sub-agent(s) {_conflict_ids}; sequence via dependencies "
-                        f"to avoid a lost update."
-                    ),
-                })
+                self._cb(
+                    "orchestrator_warning",
+                    {
+                        "type": "tool_loop_file_conflict",
+                        "agent_id": agent_id,
+                        "conflicting_agents": _conflict_ids,
+                        "files": sorted(_new_files),
+                        "message": (
+                            f"Sub-agent '{agent_id}' shares files with still-running "
+                            f"sub-agent(s) {_conflict_ids}; sequence via dependencies "
+                            f"to avoid a lost update."
+                        ),
+                    },
+                )
                 _conflict_note = (
                     f"\n⚠ File overlap with running sub-agent(s) "
                     f"{', '.join(_conflict_ids)} — to avoid one overwriting the "
@@ -4265,10 +4498,11 @@ Approve if the change correctly implements what was asked without breaking exist
         with self._bg_lock:
             _entry = self._bg_subagents.get(agent_id, {})
         if self._future_is_queued(_entry):
-            _queued_note = "\n⚠ Queued (waiting for a free worker slot). It will start automatically when one becomes available."
+            _queued_note = (
+                "\n⚠ Queued (waiting for a free worker slot). It will start automatically when one becomes available."
+            )
         _mode_hint = (
-            "A new Terminal window will open shortly for this sub-agent — you "
-            "can watch it work there."
+            "A new Terminal window will open shortly for this sub-agent — you can watch it work there."
             if self.orch_config.subagent_mode == "ipc" and self.auto_launch_terminal
             else "It runs in the background."
         )
@@ -4276,9 +4510,10 @@ Approve if the change correctly implements what was asked without breaking exist
             f"Sub-agent '{agent_id}' spawned: {_title}\n"
             f"Files: {', '.join(_files) if _files else '(none specified)'}\n"
             f"{_mode_hint}{_conflict_note}{_queued_note}\n"
-            f"Use poll_subagent(agent_id=\"{agent_id}\") to collect its result. "
+            f'Use poll_subagent(agent_id="{agent_id}") to collect its result. '
             f"Non-blocking — spawn more sub-agents or inspect the repo meanwhile."
         )
+
     @staticmethod
     def _format_poll_patches(patches: list) -> str:
         """Render applied patches for the poll_subagent tool output.
@@ -4343,15 +4578,17 @@ Approve if the change correctly implements what was asked without breaking exist
 
         if agent_id:
             return self._poll_single_agent(agent_id, timeout_s)
-        return self._poll_any_agent(list(agent_ids_raw), timeout_s)
+        # The arg-validity guards above guarantee agent_ids_raw is non-empty
+        # here (both-None and both-set are rejected), but pyright cannot see it
+        # through the Any-typed args dict — narrow explicitly.
+        _ids = agent_ids_raw or []
+        return self._poll_any_agent(list(_ids), timeout_s)
 
     def _poll_single_agent(self, agent_id: str, timeout_s: float) -> str:
         """Poll a single sub-agent and return a status/result string."""
         status, result = self._check_bg_subagent(agent_id, timeout_s=timeout_s)
         if status == "unknown":
-            raise _NativeToolError(
-                f"no sub-agent with id '{agent_id}'. Use list_subagents to see active ids."
-            )
+            raise _NativeToolError(f"no sub-agent with id '{agent_id}'. Use list_subagents to see active ids.")
         if status == "running":
             with self._bg_lock:
                 entry = self._bg_subagents.get(agent_id, {})
@@ -4366,10 +4603,7 @@ Approve if the change correctly implements what was asked without breaking exist
                     f"Sub-agent '{agent_id}' is queued (waiting for a free slot, "
                     f"{_el:.0f}s since submit). Poll again later."
                 )
-            return (
-                f"Sub-agent '{agent_id}' is still running ({_el:.0f}s elapsed). "
-                f"Poll again later."
-            )
+            return f"Sub-agent '{agent_id}' is still running ({_el:.0f}s elapsed). Poll again later."
         return self._format_agent_result(agent_id, status, result)
 
     def _gather_done_futures(
@@ -4445,9 +4679,7 @@ Approve if the change correctly implements what was asked without breaking exist
             with self._bg_lock:
                 _entry = self._bg_subagents.get(_aid)
             if _entry is None:
-                raise _NativeToolError(
-                    f"no sub-agent with id '{_aid}'. Use list_subagents to see active ids."
-                )
+                raise _NativeToolError(f"no sub-agent with id '{_aid}'. Use list_subagents to see active ids.")
             if _entry["result"] is not None:
                 done.append((_aid, _entry["status"], _entry["result"]))
             else:
@@ -4466,7 +4698,9 @@ Approve if the change correctly implements what was asked without breaking exist
         # non-empty here, so if `done` is empty `known_futures` cannot be.)
         if done:
             return self._format_poll_any_results(
-                agent_ids, done, pending=still_running,
+                agent_ids,
+                done,
+                pending=still_running,
             )
 
         # Nothing has finished yet.
@@ -4493,16 +4727,15 @@ Approve if the change correctly implements what was asked without breaking exist
         _futures = [f for _, f in known_futures]
         while True:
             if _ce is not None and _ce.is_set():
-                return (
-                    f"Wait on {len(agent_ids)} sub-agents interrupted by "
-                    f"cancellation; none collected."
-                )
+                return f"Wait on {len(agent_ids)} sub-agents interrupted by cancellation; none collected."
             _left = _deadline - time.monotonic()
             if _left <= 0:
                 break
             _slice = min(2.0, _left)
             _done_set, _ = _cf.wait(
-                _futures, timeout=_slice, return_when=_cf.FIRST_COMPLETED,
+                _futures,
+                timeout=_slice,
+                return_when=_cf.FIRST_COMPLETED,
             )
             if _done_set:
                 break
@@ -4523,7 +4756,9 @@ Approve if the change correctly implements what was asked without breaking exist
             )
 
         return self._format_poll_any_results(
-            agent_ids, completed, pending=_still_pending,
+            agent_ids,
+            completed,
+            pending=_still_pending,
         )
 
     def _format_poll_any_results(
@@ -4545,10 +4780,7 @@ Approve if the change correctly implements what was asked without breaking exist
         if len(completed) == 1 and not pending:
             _aid, _status, _result = completed[0]
             return self._format_agent_result(_aid, _status, _result)
-        parts = [
-            self._format_agent_result(_aid, _status, _result)
-            for _aid, _status, _result in completed
-        ]
+        parts = [self._format_agent_result(_aid, _status, _result) for _aid, _status, _result in completed]
         _head = f"{len(completed)} of {_total} sub-agents completed"
         if pending:
             _head += f", {len(pending)} still running"
@@ -4580,13 +4812,11 @@ Approve if the change correctly implements what was asked without breaking exist
             f"Sub-agent '{agent_id}' finished — status: {_st}.\n"
             f"Result:\n{_msg}{_patch_note}{_verdict_note}{_scope_note}"
         )
+
     def _tool_list_subagents(self) -> str:
         """list_subagents tool handler."""
         with self._bg_lock:
-            items = [
-                (aid, e.get("status", "?"), e.get("subtask"))
-                for aid, e in self._bg_subagents.items()
-            ]
+            items = [(aid, e.get("status", "?"), e.get("subtask")) for aid, e in self._bg_subagents.items()]
         if not items:
             return "No sub-agents spawned yet."
         lines = []
@@ -4594,6 +4824,7 @@ Approve if the change correctly implements what was asked without breaking exist
             _title = getattr(st, "title", "") if st else ""
             lines.append(f"- {aid} [{status}]: {_title}")
         return "Sub-agents:\n" + "\n".join(lines)
+
     # ── Main tool loop ─────────────────────────────────────────────────────
     def _run_tool_loop(self, request: str) -> OrchestratorResult:
         """Drive a real ``DesignChatLoop`` AS the orchestrator.
@@ -4658,7 +4889,9 @@ Approve if the change correctly implements what was asked without breaking exist
         if getattr(wrapped_registry.config, "file_lock_manager", None) is None:
             wrapped_registry.config.file_lock_manager = self._file_lock_mgr
         loop = DesignChatLoop(
-            self.llm_client, wrapped_registry, self.model,
+            self.llm_client,
+            wrapped_registry,
+            self.model,
             run_store=self._run_store,
         )
         # ── Session context inheritance ──────────────────────────────────────
@@ -4684,7 +4917,9 @@ Approve if the change correctly implements what was asked without breaking exist
         if _session_mgr is not None and _session_id:
             try:
                 _ds = _session_mgr.get_or_create(_session_id)
-                _ctx = _session_mgr.build_context_messages(_ds, current_model=self.model or "", skip_core_prompt=True, mode="code")
+                _ctx = _session_mgr.build_context_messages(
+                    _ds, current_model=self.model or "", skip_core_prompt=True, mode="code"
+                )
                 # Filter out empty system dividers that add no value; keep the rest
                 # (repo / project / insights / summary / turns, incl. the request).
                 for _m in _ctx:
@@ -4735,9 +4970,14 @@ Approve if the change correctly implements what was asked without breaking exist
 
         if _cancelled:
             _sum = self._synthesize_from_subtasks(self._paired_subtask_results())
-            self._cb("orchestrator_done", {
-                "status": "cancelled", "summary": _sum, "total_turns": 0,
-            })
+            self._cb(
+                "orchestrator_done",
+                {
+                    "status": "cancelled",
+                    "summary": _sum,
+                    "total_turns": 0,
+                },
+            )
             return OrchestratorResult(
                 status="cancelled",
                 # Mirror the synthesised summary emitted in the event above (it
@@ -4752,16 +4992,11 @@ Approve if the change correctly implements what was asked without breaking exist
 
         results = list(self._bg_results)
         subtasks = [
-            self._bg_subagents[a]["subtask"]
-            for a in self._bg_subagents
-            if self._bg_subagents[a].get("subtask")
+            self._bg_subagents[a]["subtask"] for a in self._bg_subagents if self._bg_subagents[a].get("subtask")
         ]
-        total_turns = sum(
-            len(getattr(r, "turns", []) or []) for r in results if r is not None
-        )
+        total_turns = sum(len(getattr(r, "turns", []) or []) for r in results if r is not None)
         any_ok = any(
-            getattr(r, "status", "") in ("success", "already_satisfied", "max_turns")
-            for r in results if r is not None
+            getattr(r, "status", "") in ("success", "already_satisfied", "max_turns") for r in results if r is not None
         )
         _dc_content = (getattr(dc_result, "content", "") or "").strip() if dc_result else ""
         _dc_is_error = bool(getattr(dc_result, "is_error", False)) if dc_result else False
@@ -4780,14 +5015,22 @@ Approve if the change correctly implements what was asked without breaking exist
         else:
             status = "error"
         summary = _dc_content or self._synthesize_from_subtasks(self._paired_subtask_results())
-        self._cb("orchestrator_done", {
-            "status": status, "summary": summary, "total_turns": total_turns,
-        })
+        self._cb(
+            "orchestrator_done",
+            {
+                "status": status,
+                "summary": summary,
+                "total_turns": total_turns,
+            },
+        )
         return OrchestratorResult(
-            status=status, summary=summary, subtask_results=results,
+            status=status,
+            summary=summary,
+            subtask_results=results,
             total_turns=total_turns,
             metadata={"mode": "tool_loop", "subagents": len(subtasks)},
         )
+
     def _drain_background_subagents(self, per_agent_timeout: float = 600.0) -> None:
         """Block until every background sub-agent resolves (or its timeout).
 
@@ -4822,6 +5065,7 @@ Approve if the change correctly implements what was asked without breaking exist
                 _remaining[aid] -= _step
                 if _status != "running":
                     _remaining[aid] = 0  # resolved — stop polling this agent
+
     def _shutdown_bg_executor(self) -> None:
         """Tear down the background sub-agent thread pool."""
         ex = self._bg_executor
@@ -4832,6 +5076,7 @@ Approve if the change correctly implements what was asked without breaking exist
             ex.shutdown(wait=False)
         except Exception:
             logger.debug("bg executor shutdown failed", exc_info=True)
+
     def _cleanup_ipc_workers(self) -> None:
         """Write cancel + shutdown sentinels for all IPC workers spawned this run.
 
@@ -4853,6 +5098,7 @@ Approve if the change correctly implements what was asked without breaking exist
         if self.orch_config.subagent_mode != "ipc":
             return
         from .subagent_ipc import write_cancel_all, write_shutdown_all
+
         worker_ids = list(self._ipc_worker_ids)
         if worker_ids:
             repo_root = getattr(self._registry_proto, "repo_root", None) or "."
@@ -4882,7 +5128,7 @@ Approve if the change correctly implements what was asked without breaking exist
         # dead worker whose Popen handle was just dropped above.
         self._reusable_worker_ids.clear()
 
-    def _claim_reusable_worker(self, repo_root: str) -> Optional[str]:
+    def _claim_reusable_worker(self, repo_root: str) -> str | None:
         """Atomically claim an idle, alive worker from the reuse pool (P3).
 
         Returns the worker_id, or ``None`` if no reusable worker is available.
@@ -4906,6 +5152,7 @@ Approve if the change correctly implements what was asked without breaking exist
             read_worker_idle_heartbeat_age,
             read_worker_idle_heartbeat_state,
         )
+
         # Clamp the effective staleness threshold to at least 2x the idle
         # heartbeat write interval. An idle worker writes a fresh heartbeat
         # every _IDLE_HEARTBEAT_INTERVAL_S (30s); if ipc_heartbeat_stale_s is
@@ -4913,13 +5160,18 @@ Approve if the change correctly implements what was asked without breaking exist
         # it is between writes, and the pool churns/drops workers that are
         # perfectly alive.
         _effective_stale_s = max(
-            self.orch_config.ipc_heartbeat_stale_s, 2 * _IDLE_HEARTBEAT_INTERVAL_S,
+            self.orch_config.ipc_heartbeat_stale_s,
+            2 * _IDLE_HEARTBEAT_INTERVAL_S,
         )
         with self._bg_lock:
             candidates = list(self._reusable_worker_ids)
         for wid in candidates:
             _task_path = os.path.join(
-                repo_root, ".asicode", "subagents", wid, "task.json",
+                repo_root,
+                ".asicode",
+                "subagents",
+                wid,
+                "task.json",
             )
             if os.path.exists(_task_path):
                 continue  # still busy (task.json present)
@@ -4954,7 +5206,8 @@ Approve if the change correctly implements what was asked without breaking exist
                     self._reusable_worker_ids.discard(wid)
                 logger.warning(
                     "Reusable worker %s exited (pid=%s); dropping from pool.",
-                    wid, _proc.pid,
+                    wid,
+                    _proc.pid,
                 )
                 continue
             # Heartbeat liveness for Terminal-launched workers (no PID handle):
@@ -4972,9 +5225,10 @@ Approve if the change correctly implements what was asked without breaking exist
                     with self._bg_lock:
                         self._reusable_worker_ids.discard(wid)
                     logger.warning(
-                        "Reusable worker %s idle heartbeat stale (%.0fs > "
-                        "%.0fs); dropping (hung Terminal worker).",
-                        wid, _hb_age, _effective_stale_s,
+                        "Reusable worker %s idle heartbeat stale (%.0fs > %.0fs); dropping (hung Terminal worker).",
+                        wid,
+                        _hb_age,
+                        _effective_stale_s,
                     )
                     continue
             # Alive (or terminal-launched with no PID handle) → claim under lock.
@@ -4998,8 +5252,12 @@ Approve if the change correctly implements what was asked without breaking exist
             self._reusable_worker_ids.add(worker_id)
 
     def _abandon_ipc_worker(
-        self, repo_root: str, worker_id: str,
-        revert_snapshots: Optional[dict] = None, *, grace_s: float = 12.0,
+        self,
+        repo_root: str,
+        worker_id: str,
+        revert_snapshots: dict | None = None,
+        *,
+        grace_s: float = 12.0,
         task_id: str = "",
     ) -> bool:
         """Stop an IPC worker we have given up on (timeout OR cancel) and revert
@@ -5056,6 +5314,7 @@ Approve if the change correctly implements what was asked without breaking exist
         # _cleanup_ipc_workers on a real Ctrl-C; the essential fix on a timeout.
         try:
             from .subagent_ipc import write_cancel_sentinel
+
             write_cancel_sentinel(repo_root, worker_id)
         except Exception as e:
             logger.warning("IPC: failed to signal cancel for worker %s: %s", worker_id, e)
@@ -5063,9 +5322,7 @@ Approve if the change correctly implements what was asked without breaking exist
         # Hard vs soft: an orchestrator-level cancel (cancel_event set) ends the
         # whole run → terminate. A pure timeout (cancel_event clear) → quiesce and
         # keep the worker alive for reuse (B6).
-        _hard = bool(
-            self.orch_config.cancel_event and self.orch_config.cancel_event.is_set()
-        )
+        _hard = bool(self.orch_config.cancel_event and self.orch_config.cancel_event.is_set())
         _proc = None
         with self._bg_lock:
             _proc = self._ipc_worker_procs.get(worker_id)
@@ -5080,7 +5337,11 @@ Approve if the change correctly implements what was asked without breaking exist
         if not _hard:
             _result_dir_id = task_id or worker_id
             _result_path = os.path.join(
-                repo_root, ".asicode", "subagents", _result_dir_id, "result.json",
+                repo_root,
+                ".asicode",
+                "subagents",
+                _result_dir_id,
+                "result.json",
             )
             _quiesce_deadline = time.monotonic() + grace_s
             _quiesced = False
@@ -5092,10 +5353,15 @@ Approve if the change correctly implements what was asked without breaking exist
             # is safe and correct.
             _already_dead = _proc is not None and _proc.poll() is not None
             if _already_dead:
+                # Narrow for pyright: the conjunction guarantees _proc is a live
+                # Popen with a completed poll here (None was excluded first).
+                assert _proc is not None
                 logger.info(
                     "IPC: worker %s already exited (code %s) — skipping %.0fs "
                     "result.json quiesce poll (a dead worker never writes it).",
-                    worker_id, _proc.returncode, grace_s,
+                    worker_id,
+                    _proc.returncode,
+                    grace_s,
                 )
             else:
                 while time.monotonic() < _quiesce_deadline:
@@ -5106,14 +5372,16 @@ Approve if the change correctly implements what was asked without breaking exist
                 if _quiesced:
                     logger.info(
                         "IPC: worker %s quiesced (result.json appeared) after soft "
-                        "timeout — keeping it alive for reuse.", worker_id,
+                        "timeout — keeping it alive for reuse.",
+                        worker_id,
                     )
                     _reusable = True
                 else:
                     # Worker did not honor the sentinel within grace — terminate.
                     logger.warning(
-                        "IPC: worker %s did not quiesce within %.0fs after cancel; "
-                        "terminating (hung worker).", worker_id, grace_s,
+                        "IPC: worker %s did not quiesce within %.0fs after cancel; terminating (hung worker).",
+                        worker_id,
+                        grace_s,
                     )
                     if _proc is not None:
                         try:
@@ -5137,9 +5405,12 @@ Approve if the change correctly implements what was asked without breaking exist
             if reverted:
                 logger.info(
                     "SubAgent IPC worker %s abandoned (%s); restored %s",
-                    worker_id, "cancel" if _hard else "timeout", reverted,
+                    worker_id,
+                    "cancel" if _hard else "timeout",
+                    reverted,
                 )
         return _reusable
+
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _has_dependencies(self, subtasks: list[SubTaskSpec]) -> bool:
@@ -5225,7 +5496,7 @@ Approve if the change correctly implements what was asked without breaking exist
 
         return order, cycles
 
-    def _break_cycles(self, subtasks: list[SubTaskSpec], cycles: list[list[str]]) -> Optional[list[SubTaskSpec]]:
+    def _break_cycles(self, subtasks: list[SubTaskSpec], cycles: list[list[str]]) -> list[SubTaskSpec] | None:
         """
         Attempt to break cycles by removing minimal dependencies.
 
@@ -5246,14 +5517,17 @@ Approve if the change correctly implements what was asked without breaking exist
             return None
 
         # Create a copy of dependencies for modification
-        modified_tasks = [SubTaskSpec(
+        modified_tasks = [
+            SubTaskSpec(
                 task_id=st.task_id,
                 title=st.title,
                 description=st.description,
                 assigned_files=list(st.assigned_files),
                 dependencies=list(st.dependencies),
-                priority=st.priority
-            ) for st in subtasks]
+                priority=st.priority,
+            )
+            for st in subtasks
+        ]
 
         modified_map = {st.task_id: st for st in modified_tasks}
 
@@ -5264,7 +5538,7 @@ Approve if the change correctly implements what was asked without breaking exist
 
             # Find the weakest dependency in the cycle
             weakest = None
-            weakest_score = float('inf')
+            weakest_score = float("inf")
 
             for i, tid in enumerate(cycle):
                 next_tid = cycle[(i + 1) % len(cycle)]
@@ -5291,9 +5565,8 @@ Approve if the change correctly implements what was asked without breaking exist
                     # reproducible (same input → same edges removed). Without
                     # it, a tied cycle removes whichever minimum edge happened
                     # to be enumerated first — process-dependent.
-                    if (
-                        score < weakest_score
-                        or (score == weakest_score and weakest is not None and (tid, next_tid) < weakest)
+                    if score < weakest_score or (
+                        score == weakest_score and weakest is not None and (tid, next_tid) < weakest
                     ):
                         weakest_score = score
                         weakest = (tid, next_tid)
@@ -5306,8 +5579,7 @@ Approve if the change correctly implements what was asked without breaking exist
                 if source_tid in modified_map[target_tid].dependencies:
                     modified_map[target_tid].dependencies.remove(source_tid)
                     logger.info(
-                        "Broke cycle by removing dependency %s → %s (score: %s)",
-                        target_tid, source_tid, weakest_score
+                        "Broke cycle by removing dependency %s → %s (score: %s)", target_tid, source_tid, weakest_score
                     )
 
         # Verify acyclicity (the order itself is discarded — the caller
@@ -5335,7 +5607,9 @@ Approve if the change correctly implements what was asked without breaking exist
             if _removed:
                 logger.info(
                     "Force-removed %d intra-cycle deps on %s to break cycle %s",
-                    _removed, _break_node, cycle,
+                    _removed,
+                    _break_node,
+                    cycle,
                 )
         # Check again
         _order2, new_cycles2 = self._detect_cycles_kahn(modified_map)

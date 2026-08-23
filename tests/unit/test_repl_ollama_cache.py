@@ -12,6 +12,7 @@ Pins the TTL-cache semantics fixed in the repl_impl deep audit:
 - ``_list_provider_model_choices`` reuses the shared cached fetcher for its
   ollama section (single parse + shared TTL — no duplicate subprocess).
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -33,9 +34,7 @@ def _isolate_ollama_cache():
 
 
 def _fake_ollama_list(stdout: str, returncode: int = 0):
-    return subprocess.CompletedProcess(
-        args=["ollama", "list"], returncode=returncode, stdout=stdout, stderr=""
-    )
+    return subprocess.CompletedProcess(args=["ollama", "list"], returncode=returncode, stdout=stdout, stderr="")
 
 
 _LLAMA_OUT = "NAME\tID\tSIZE\nqwen2.5-coder:3b\tabc\t1.9GB\n"
@@ -88,9 +87,7 @@ def test_failure_cached_empty_then_retried_after_ttl(monkeypatch):
 
 def test_provider_choices_reuse_shared_fetcher(monkeypatch):
     """_list_provider_model_choices appends ollama via the cached fetcher."""
-    monkeypatch.setattr(
-        repl_impl, "_get_ollama_models", lambda timeout=5: ["qwen2.5-coder:3b"]
-    )
+    monkeypatch.setattr(repl_impl, "_get_ollama_models", lambda timeout=5: ["qwen2.5-coder:3b"])
     choices = repl_impl._list_provider_model_choices()
     assert ("ollama", "qwen2.5-coder:3b") in choices
     assert any(prov != "ollama" for prov, _ in choices)  # known models kept

@@ -15,6 +15,7 @@ instruction "copy the EXACT text from this block".
 `edit_text::search_string_mismatch` is the most frequent real failure in this
 repo's persistent failure store, which is what makes the routing worth pinning.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -40,11 +41,11 @@ def repo(tool_registry, tmp_path):
 
 
 def _plan(before: str):
-    return {"ops": [{"op": "edit_blocks", "path": "widget.py",
-                     "blocks": [{"before": before, "after": "pass"}]}]}
+    return {"ops": [{"op": "edit_blocks", "path": "widget.py", "blocks": [{"before": before, "after": "pass"}]}]}
 
 
 # ── the near-miss block the model is told to copy from ────────────────────
+
 
 def test_closest_match_block_carries_the_indent_gutter(repo):
     """This block is followed by "Copy the EXACT text from this block", so it
@@ -63,6 +64,7 @@ def test_closest_match_block_explains_the_gutter(repo):
 
 
 # ── the no-near-miss fallback preview ─────────────────────────────────────
+
 
 def test_fallback_preview_carries_the_indent_gutter(repo):
     hint = repo._enrich_plan_error(_plan("zzz totally absent zzz"), "before not found")
@@ -88,19 +90,19 @@ def test_the_reason_for_read_file_is_stated(repo):
 # These build their advice deep inside a turn/tool loop that a unit test cannot
 # reach without a full LLM round-trip, so the string itself is the contract.
 
+
 @pytest.mark.parametrize(
     "path,anchor",
     [
         ("external_llm/agent/agent_loop.py", "BLOCK NOT FOUND:"),
-        ("external_llm/agent/agent_turn_pipeline.py",
-         "Do NOT call write_plan with the same arguments again."),
+        ("external_llm/agent/agent_turn_pipeline.py", "Do NOT call write_plan with the same arguments again."),
     ],
 )
 def test_recovery_advice_names_read_file(path, anchor):
     text = Path(path).read_text(encoding="utf-8")
     idx = text.find(anchor)
     assert idx != -1, f"anchor text moved in {path}"
-    window = text[idx: idx + 600]
+    window = text[idx : idx + 600]
     assert "read_file" in window, f"{path}: recovery advice no longer names read_file"
     assert "bash (cat)" not in window, f"{path}: recovery advice steers to bash cat again"
 

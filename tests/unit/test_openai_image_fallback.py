@@ -7,6 +7,7 @@ Images therefore convert to OCR/placeholder text before the request for known
 text-only models (model_registry.TEXT_ONLY_MODEL_PREFIXES), with a one-shot
 strip-and-retry net in _request_with_retry for models not yet in the registry.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -21,10 +22,7 @@ from external_llm.openai_client import (
 )
 
 # 1x1 red PNG (67 bytes) — valid image data so the OCR path can actually run
-TINY_PNG = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQ"
-    "DwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-)
+TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 
 def _img_msg(text: str = "what is this?") -> LLMMessage:
@@ -42,27 +40,41 @@ def _fresh_learned_set(monkeypatch):
 
 # ── Registry classification ──────────────────────────────────────────────────
 
-@pytest.mark.parametrize("model", [
-    "deepseek-v4-flash",
-    "deepseek-chat",
-    "deepseek-reasoner",
-    "deepseek/deepseek-v4-flash",
-    "openrouter/deepseek/deepseek-v4-flash",
-    "DeepSeek-V4-Flash",
-])
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "deepseek-v4-flash",
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "deepseek/deepseek-v4-flash",
+        "openrouter/deepseek/deepseek-v4-flash",
+        "DeepSeek-V4-Flash",
+    ],
+)
 def test_deepseek_family_is_text_only(model):
     assert text_only_model(model)
 
 
-@pytest.mark.parametrize("model", [
-    "gpt-4o", "gpt-5", "gemini-2.5-pro", "claude-sonnet-5", "kimi-k3",
-    "deepseek-vl", "deepseek-vl2", "deepseek-ocr",
-])
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-4o",
+        "gpt-5",
+        "gemini-2.5-pro",
+        "claude-sonnet-5",
+        "kimi-k3",
+        "deepseek-vl",
+        "deepseek-vl2",
+        "deepseek-ocr",
+    ],
+)
 def test_other_models_not_classified_text_only(model):
     assert not text_only_model(model)
 
 
 # ── Content building gate ────────────────────────────────────────────────────
+
 
 def test_text_only_model_gets_text_fallback():
     content = _openai_content(_img_msg("설명해줘"), "deepseek-v4-flash")
@@ -97,6 +109,7 @@ def test_learned_rejection_is_route_scoped():
 
 # ── _strip_image_parts ───────────────────────────────────────────────────────
 
+
 def test_strip_returns_none_without_images():
     payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
     assert _strip_image_parts(payload) is None
@@ -107,11 +120,13 @@ def test_strip_replaces_image_parts_with_text():
         "model": "m",
         "messages": [
             {"role": "system", "content": "sys"},
-            {"role": "user", "content": [
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{TINY_PNG}"}},
-                {"type": "text", "text": "look"},
-            ]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TINY_PNG}"}},
+                    {"type": "text", "text": "look"},
+                ],
+            },
         ],
     }
     stripped = _strip_image_parts(payload)
@@ -125,6 +140,7 @@ def test_strip_replaces_image_parts_with_text():
 
 
 # ── 400 strip-and-retry net ──────────────────────────────────────────────────
+
 
 class _Resp:
     def __init__(self, status: int):
@@ -187,9 +203,7 @@ def test_400_with_images_retry_fails_does_not_poison_model(monkeypatch):
 
 
 def test_learned_model_skips_images_on_next_call(monkeypatch):
-    oc._IMAGE_REJECTING_MODELS.add(
-        (oc._norm_base(OpenAIClient.DEFAULT_BASE_URL), "mystery-model")
-    )
+    oc._IMAGE_REJECTING_MODELS.add((oc._norm_base(OpenAIClient.DEFAULT_BASE_URL), "mystery-model"))
     client, calls = _capture_client(monkeypatch, [_Resp(200)])
     resp = client.chat([_img_msg()], model="mystery-model")
     assert resp.content == "ok"

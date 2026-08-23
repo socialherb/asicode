@@ -8,6 +8,7 @@ before ``os._exit`` (bypassing atexit), so ``coverage combine`` merges it.
 Exit contract: 0 on a clean ``exit``/Ctrl+C session end, 1 with a printed
 ``CHILD-CRASH`` marker on any exception (the parent surfaces the pty tail).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,28 +26,45 @@ def _main() -> int:
     p.add_argument("--model", default="claude-sonnet-4-6")
     p.add_argument("--collab-sdk", default="installed", choices=("installed", "missing"))
     p.add_argument("--collab-orch", default="none", choices=("none", "raise", "keyboard"))
-    p.add_argument("--collab-result-error", action="store_true",
-                   help="collab run returns a result whose .error is truthy")
+    p.add_argument(
+        "--collab-result-error", action="store_true", help="collab run returns a result whose .error is truthy"
+    )
     p.add_argument("--collab-handoff-raise", action="store_true")
     p.add_argument("--collab-verdict-raise", action="store_true")
-    p.add_argument("--collab-install", default="ok", choices=("ok", "fail", "kb"),
-                   help="_pip_install outcome when SDK is missing and user says y")
-    p.add_argument("--next-suggest-off", action="store_true",
-                   help="simulate display.NEXT_SUGGEST disabled (ASICODE_NEXT_SUGGEST=0)")
-    p.add_argument("--auto-suggest-text", default="",
-                   help="make the next-suggestion LLM reply this text (non-NONE)")
-    p.add_argument("--error-turn", action="store_true",
-                   help="DesignChatLoop fail_mode=error -> chat_result.is_error")
-    p.add_argument("--checkpoint-fail", action="store_true",
-                   help="_newest_checkpoint_id raises on the TURN-END call -> change-summary except")
-    p.add_argument("--checkpoint-seq", action="store_true",
-                   help="_newest_checkpoint_id returns cp0 at turn start, cp1 at turn end + changed files")
-    p.add_argument("--suggest-kick-fail", action="store_true",
-                   help="_kick_next_prompt_suggestion raises -> next-suggestion kick except branch")
-    p.add_argument("--clipboard-image", action="store_true",
-                   help="_check_clipboard_image returns an image -> clip path")
-    p.add_argument("--force-underline", action="store_true",
-                   help="_input_underline stays True -> auto-submit countdown can fire")
+    p.add_argument(
+        "--collab-install",
+        default="ok",
+        choices=("ok", "fail", "kb"),
+        help="_pip_install outcome when SDK is missing and user says y",
+    )
+    p.add_argument(
+        "--next-suggest-off",
+        action="store_true",
+        help="simulate display.NEXT_SUGGEST disabled (ASICODE_NEXT_SUGGEST=0)",
+    )
+    p.add_argument("--auto-suggest-text", default="", help="make the next-suggestion LLM reply this text (non-NONE)")
+    p.add_argument("--error-turn", action="store_true", help="DesignChatLoop fail_mode=error -> chat_result.is_error")
+    p.add_argument(
+        "--checkpoint-fail",
+        action="store_true",
+        help="_newest_checkpoint_id raises on the TURN-END call -> change-summary except",
+    )
+    p.add_argument(
+        "--checkpoint-seq",
+        action="store_true",
+        help="_newest_checkpoint_id returns cp0 at turn start, cp1 at turn end + changed files",
+    )
+    p.add_argument(
+        "--suggest-kick-fail",
+        action="store_true",
+        help="_kick_next_prompt_suggestion raises -> next-suggestion kick except branch",
+    )
+    p.add_argument(
+        "--clipboard-image", action="store_true", help="_check_clipboard_image returns an image -> clip path"
+    )
+    p.add_argument(
+        "--force-underline", action="store_true", help="_input_underline stays True -> auto-submit countdown can fire"
+    )
     ns = p.parse_args()
 
     import tempfile
@@ -60,8 +78,7 @@ def _main() -> int:
     # malformed (observed: "database disk image is malformed" for the child's
     # suffixed file, which then fails to combine). Reuse the active instance
     # when present; only start our own otherwise.
-    data_file = os.environ.get("COVERAGE_FILE") or os.path.join(
-        tempfile.gettempdir(), f"covstage2-{os.getpid()}")
+    data_file = os.environ.get("COVERAGE_FILE") or os.path.join(tempfile.gettempdir(), f"covstage2-{os.getpid()}")
     cov = coverage.Coverage.current()
     if cov is None:
         cov = coverage.Coverage(data_file=data_file)
@@ -98,6 +115,7 @@ def _main() -> int:
         # keystroke) — a startup-timing race. With no overlay, background
         # writes just interleave into the pty stream (drained by the parent).
         import contextlib
+
         asi.patch_stdout = contextlib.nullcontext
 
         # No-op gates that would otherwise hit the network / embedding model.
@@ -106,8 +124,7 @@ def _main() -> int:
         repl_impl._get_ollama_models = lambda timeout=5: []
         repl_impl._copy_to_clipboard = lambda text: "pbcopy"  # no real clipboard
         if ns.clipboard_image:
-            repl_impl._check_clipboard_image = lambda: [
-                {"media_type": "image/png", "data": "aGVsbG8="}]
+            repl_impl._check_clipboard_image = lambda: [{"media_type": "image/png", "data": "aGVsbG8="}]
         else:
             repl_impl._check_clipboard_image = lambda: []
 
@@ -119,8 +136,8 @@ def _main() -> int:
             FakeCollabModule,
             FakeStreamingDisplayModule,
         )
-        _collab_state = FakeCollabInstallState(
-            sdk_installed=(ns.collab_sdk == "installed"))
+
+        _collab_state = FakeCollabInstallState(sdk_installed=(ns.collab_sdk == "installed"))
         _collab_mod = FakeCollabModule(
             _collab_state,
             orch_fail_mode=ns.collab_orch,
@@ -132,31 +149,37 @@ def _main() -> int:
 
         _collab_holder = _types.ModuleType("external_llm.repl.collaborate")
         for _attr in (
-            "is_claude_sdk_installed", "build_collaborate_install_spec",
-            "build_session_handoff", "format_verdict_for_session",
-            "CollaborationOrchestratorConfig", "CollaborationOrchestrator",
+            "is_claude_sdk_installed",
+            "build_collaborate_install_spec",
+            "build_session_handoff",
+            "format_verdict_for_session",
+            "CollaborationOrchestratorConfig",
+            "CollaborationOrchestrator",
         ):
             setattr(_collab_holder, _attr, getattr(_collab_mod, _attr))
         _collab_holder.DEFAULT_COLLAB_MODEL = _collab_mod.DEFAULT_COLLAB_MODEL
         sys.modules["external_llm.repl.collaborate"] = _collab_holder
 
-        _disp_holder = _types.ModuleType(
-            "external_llm.repl.collaborate.streaming_display")
+        _disp_holder = _types.ModuleType("external_llm.repl.collaborate.streaming_display")
         _disp_holder.StreamingDisplay = _display_mod.StreamingDisplay
         sys.modules["external_llm.repl.collaborate.streaming_display"] = _disp_holder
 
         # _pip_install must never touch the real environment in tests.
         if ns.collab_install == "kb":
+
             def _pip_kb(spec, label=None):
                 raise KeyboardInterrupt()
+
             repl_impl._pip_install = _pip_kb
         elif ns.collab_install == "fail":
             repl_impl._pip_install = lambda spec, label=None: False
         else:
+
             def _pip_ok(spec, label=None):
                 # Successful install flips the SDK availability gate.
                 _collab_state.sdk_installed = True
                 return True
+
             repl_impl._pip_install = _pip_ok
 
         if ns.next_suggest_off:
@@ -171,8 +194,7 @@ def _main() -> int:
             # request needs a Hangul suggestion. Return the flag text.
             _sug_text = ns.auto_suggest_text
 
-            def _fake_suggestion(llm_client, model, user_request, final_message,
-                                 digest, auto_mode=False):
+            def _fake_suggestion(llm_client, model, user_request, final_message, digest, auto_mode=False):
                 # Deliver on a slight delay so the next prompt is live when the
                 # suggestion lands (matches the real background-thread timing) —
                 # _deliver_next_suggestion only arms the countdown while the app
@@ -182,14 +204,17 @@ def _main() -> int:
 
                 def _deliver():
                     _tm.sleep(0.6)
-                    repl_impl._deliver_next_suggestion(
-                        _sug_text, repl_impl._next_suggestion_gen)
+                    repl_impl._deliver_next_suggestion(_sug_text, repl_impl._next_suggestion_gen)
+
                 _th.Thread(target=_deliver, daemon=True).start()
+
             repl_impl._kick_next_prompt_suggestion = _fake_suggestion
 
         if ns.suggest_kick_fail:
+
             def _kick_fail(*a, **k):
                 raise RuntimeError("fake suggestion kick crash")
+
             repl_impl._kick_next_prompt_suggestion = _kick_fail
 
         if ns.checkpoint_seq:
@@ -198,9 +223,9 @@ def _main() -> int:
             def _cp_seq(repo_root):
                 _cp_calls["n"] += 1
                 return "cp0" if _cp_calls["n"] == 1 else "cp1"
+
             repl_impl._newest_checkpoint_id = _cp_seq
-            repl_impl._checkpoint_changed_files = (
-                lambda repo_root, checkpoint_id: ["a.txt", "b.txt"])
+            repl_impl._checkpoint_changed_files = lambda repo_root, checkpoint_id: ["a.txt", "b.txt"]
 
         if ns.checkpoint_fail:
             _cpf_calls = {"n": 0}
@@ -212,6 +237,7 @@ def _main() -> int:
                 if _cpf_calls["n"] == 1:
                     return "cp0"
                 raise OSError("fake checkpoint read failure")
+
             repl_impl._newest_checkpoint_id = _cp_fail
 
         if ns.force_underline:
@@ -223,6 +249,7 @@ def _main() -> int:
 
             def _collect_input_underline(prompt, bottom_toolbar=False):
                 return _orig_collect_input(prompt, bottom_toolbar=True)
+
             repl_impl._collect_input = _collect_input_underline
 
         # Disable the slash-command completer: with complete_while_typing the
@@ -252,17 +279,17 @@ def _main() -> int:
 
         repl_impl._retry_create_svc_with_api_key_prompt = _make_svc
         isvc_mod.create_intelligent_service_from_env = _make_svc
-        repl_impl._resolve_model_interactive = (
-            lambda arg, usage_hint="": (ns.provider, arg.split("/")[-1]))
+        repl_impl._resolve_model_interactive = lambda arg, usage_hint="": (ns.provider, arg.split("/")[-1])
 
         # Structural deps: registry/session/loops all faked (no RAG/embedding).
         tool_registry_mod.ToolRegistry = FakeToolRegistry
         tool_registry_mod.AgentConfig = FakeAgentConfig
         design_session_mod.DesignSessionManager = FakeDSM
-        dcl_mod.DesignChatLoop = (
-            lambda client, registry, model: FakeDesignChatLoop(
-                client, registry, model, fail_mode="error_result")
-            if ns.error_turn else FakeDesignChatLoop(client, registry, model))
+        dcl_mod.DesignChatLoop = lambda client, registry, model: (
+            FakeDesignChatLoop(client, registry, model, fail_mode="error_result")
+            if ns.error_turn
+            else FakeDesignChatLoop(client, registry, model)
+        )
         orch_mod.OrchestratorAgent = FakeOrchAgent
         client_mod.create_llm_client = lambda *a, **k: FakeClient()
 
@@ -284,14 +311,19 @@ def _main() -> int:
         _dc_mod.replace = _replace_fallback
 
         args = argparse.Namespace(
-            repo=ns.repo, provider=ns.provider, model=ns.model,
-            api_key=None, no_deps_check=True, verbose=False,
+            repo=ns.repo,
+            provider=ns.provider,
+            model=ns.model,
+            api_key=None,
+            no_deps_check=True,
+            verbose=False,
         )
         repl_impl._run_repl_impl(args)
     except SystemExit as e:
         rc = int(getattr(e, "code", 0) or 0)
     except BaseException:
         import traceback
+
         traceback.print_exc()
         sys.stdout.write("\nCHILD-CRASH\n")
         sys.stdout.flush()
@@ -305,6 +337,7 @@ def _main() -> int:
             cov.save()
         except BaseException:
             import traceback as _tb
+
             sys.stderr.write("\nCOV-SAVE-FAIL\n")
             _tb.print_exc()
             sys.stderr.flush()

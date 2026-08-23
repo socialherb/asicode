@@ -9,6 +9,7 @@ _handle_loop_error records the failed turn on the agent_result channel
 (instance + global collectors), so loops that die with ``status="error"``
 do not vanish from ``failure_rate`` / the recent-outcome window.
 """
+
 from unittest.mock import MagicMock, patch
 
 from external_llm.client import (

@@ -17,6 +17,7 @@ The integration tests stretch ``DRAIN_INTERVAL`` to 10s: any pickup within the
 few-second test budget is only possible if the wake works (the old poll-only
 loop would sleep 10s and the assertions would time out).
 """
+
 from __future__ import annotations
 
 import time
@@ -30,9 +31,7 @@ NOTIFICATION = "proactive_notification"
 
 
 def _ev(source_file="A.py"):
-    return TriggerEvent(
-        kind=TriggerKind.FILE_MODIFIED, repo_root=".", source_file=source_file
-    )
+    return TriggerEvent(kind=TriggerKind.FILE_MODIFIED, repo_root=".", source_file=source_file)
 
 
 def _dec(priority, kind=ActionKind.NOTIFY):
@@ -131,8 +130,7 @@ class TestDrainWakeIntegration:
             # task_done wakes the drain thread. Old poll-only loop: 3rd
             # broadcast ~10s late → this 3s budget would fail.
             assert _wait_for(lambda: push.notification_count() >= 3), (
-                "pending task must start as soon as a concurrency slot frees "
-                "(task_done must wake the drain thread)"
+                "pending task must start as soon as a concurrency slot frees (task_done must wake the drain thread)"
             )
         finally:
             self._teardown_runner(runner)
@@ -146,9 +144,6 @@ class TestDrainWakeIntegration:
         assert runner._drain_thread is not None
         runner._drain_thread.join(timeout=1.0)
         assert not runner._drain_thread.is_alive(), (
-            "drain thread must exit promptly after stop() — stop must wake it "
-            "instead of waiting out the poll interval"
+            "drain thread must exit promptly after stop() — stop must wake it instead of waiting out the poll interval"
         )
-        assert elapsed < 1.0, (
-            f"stop() must not block on the poll interval (took {elapsed:.2f}s)"
-        )
+        assert elapsed < 1.0, f"stop() must not block on the poll interval (took {elapsed:.2f}s)"

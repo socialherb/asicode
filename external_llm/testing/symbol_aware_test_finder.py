@@ -7,11 +7,12 @@ just filename patterns.
 
 Deterministic, rule-based. Falls back to filename heuristic if graph unavailable.
 """
+
 import logging
 import os
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from ..languages import LanguageId
 
@@ -37,6 +38,7 @@ SCOPE_LIMITS = {
 @dataclass
 class SymbolAwareTestTarget:
     """A test target with match reasoning and priority."""
+
     test_path: str
     priority_score: float = 0.0
     reason_codes: list[str] = field(default_factory=list)
@@ -71,15 +73,15 @@ class SymbolAwareTestFinder:
 
     def __init__(self, repo_root: str):
         self._repo_root = repo_root
-        self._test_files_cache: Optional[list[str]] = None
+        self._test_files_cache: list[str] | None = None
         self._content_cache: dict[str, str] = {}
 
     def discover_test_targets(
         self,
-        target_symbols: Optional[list[str]] = None,
-        target_files: Optional[list[str]] = None,
-        impact_files: Optional[list[str]] = None,
-        graph_context: Optional[dict] = None,
+        target_symbols: list[str] | None = None,
+        target_files: list[str] | None = None,
+        impact_files: list[str] | None = None,
+        graph_context: dict | None = None,
         scope_level: str = "standard",
     ) -> list[SymbolAwareTestTarget]:
         """
@@ -102,7 +104,9 @@ class SymbolAwareTestFinder:
             # Extract from graph_context if available
             if graph_context:
                 if not symbols:
-                    symbols = [s.get("name", "") for s in graph_context.get("resolved_symbols", []) if isinstance(s, dict)]
+                    symbols = [
+                        s.get("name", "") for s in graph_context.get("resolved_symbols", []) if isinstance(s, dict)
+                    ]
                 if not impacts:
                     impacts = graph_context.get("impact_files", [])
                 if not files:
@@ -215,8 +219,8 @@ class SymbolAwareTestFinder:
 
     def find_tests_for_symbol(
         self,
-        symbol: Optional[str] = None,
-        file_path: Optional[str] = None,
+        symbol: str | None = None,
+        file_path: str | None = None,
     ) -> list[str]:
         """
         Convenience wrapper around discover_test_targets().
@@ -250,7 +254,9 @@ class SymbolAwareTestFinder:
         test_files = []
         with suppress(OSError):  # walk on permission-restricted dirs
             for dirpath, dirnames, filenames in os.walk(self._repo_root):
-                dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in {'__pycache__', 'node_modules'}]
+                dirnames[:] = [
+                    d for d in dirnames if not d.startswith(".") and d not in {"__pycache__", "node_modules"}
+                ]
                 for fname in filenames:
                     if self._is_test_filename(fname):
                         rel = os.path.relpath(os.path.join(dirpath, fname), self._repo_root)
@@ -265,11 +271,11 @@ class SymbolAwareTestFinder:
         if LanguageId.from_path(filename) is LanguageId.PYTHON:
             return filename.startswith("test_") or filename.endswith("_test.py")
         # TS/JS: foo.test.ts / foo.spec.tsx / test_foo.ts
-        if filename.endswith(('.ts', '.tsx', '.js', '.jsx')):
+        if filename.endswith((".ts", ".tsx", ".js", ".jsx")):
             base, _ = os.path.splitext(filename)
-            if base.endswith(('.test', '.spec')):
+            if base.endswith((".test", ".spec")):
                 return True
-            return filename.startswith('test_')
+            return filename.startswith("test_")
         # Go: foo_test.go
         return bool(filename.endswith("_test.go"))
 
@@ -297,7 +303,7 @@ class SymbolAwareTestFinder:
             if not os.path.isfile(abs_path):
                 content = ""
             else:
-                with open(abs_path, errors='replace', encoding="utf-8") as f:
+                with open(abs_path, errors="replace", encoding="utf-8") as f:
                     content = f.read()
         except OSError:
             content = ""
@@ -313,8 +319,10 @@ class SymbolAwareTestFinder:
             # Look for symbol as whole word
             idx = content.find(symbol)
             while idx != -1:
-                before = idx == 0 or not (content[idx-1].isalnum() or content[idx-1] == '_')
-                after = idx + len(symbol) >= len(content) or not (content[idx+len(symbol)].isalnum() or content[idx+len(symbol)] == '_')
+                before = idx == 0 or not (content[idx - 1].isalnum() or content[idx - 1] == "_")
+                after = idx + len(symbol) >= len(content) or not (
+                    content[idx + len(symbol)].isalnum() or content[idx + len(symbol)] == "_"
+                )
                 if before and after:
                     return True
                 idx = content.find(symbol, idx + 1)
@@ -344,7 +352,7 @@ class SymbolAwareTestFinder:
         for f in file_paths:
             if LanguageId.from_path(f) is LanguageId.PYTHON:
                 # Convert path to module: external_llm/agent/foo.py → external_llm.agent.foo
-                mod = f[:-3].replace('/', '.').replace('\\', '.')
+                mod = f[:-3].replace("/", ".").replace("\\", ".")
                 modules.append(mod)
                 # Also add just the filename stem
                 stem = os.path.splitext(os.path.basename(f))[0]
@@ -352,7 +360,7 @@ class SymbolAwareTestFinder:
                     modules.append(stem)
         return modules
 
-    def _find_corresponding_test(self, source_file: str, test_files: list[str]) -> Optional[str]:
+    def _find_corresponding_test(self, source_file: str, test_files: list[str]) -> str | None:
         """Find test file corresponding to source file by naming convention (Python, TS/JS, Go)."""
         base = os.path.splitext(os.path.basename(source_file))[0]
         candidates = [

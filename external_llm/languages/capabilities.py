@@ -39,5 +39,6 @@ def is_supported(file_path: str, capability: AnalysisCapability) -> bool:
             continue
     """
     return capability in _LANGUAGE_CAPABILITIES.get(
-        LanguageId.from_path(file_path), set(),
+        LanguageId.from_path(file_path),
+        set(),
     )

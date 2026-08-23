@@ -48,7 +48,7 @@ class FakeWriteToolsMixin:
         #    Look for the first '{' and then try to complete it.
         start = raw.find("{")
         if start == -1:
-            return {}   # no JSON object at all
+            return {}  # no JSON object at all
 
         candidate = raw[start:]
         # Attempt to parse candidate with appended closing braces
@@ -64,8 +64,9 @@ class FakeWriteToolsMixin:
 
         # 3. If still failing, try to find any complete JSON object via regex
         import re
+
         # simple non-recursive regex for a JSON object
-        pattern = r'\{[^{}]*\}'
+        pattern = r"\{[^{}]*\}"
         matches = re.findall(pattern, candidate)
         for m in matches:
             try:
@@ -81,23 +82,37 @@ class FakeWriteToolsMixin:
     # ------------------------------------------------------------------
     # Tool methods - each uses _recover_args_from_raw
     # ------------------------------------------------------------------
-    def _tool_edit_file(self, file_path: str, old_string: str, new_string: str,
-                        raw: str = "", **kwargs):
-        return self._generic_tool("edit_file", file_path, raw, required_keys=["old_string", "new_string"],
-                                  extra={"file_path": file_path, "old_string": old_string, "new_string": new_string})
+    def _tool_edit_file(self, file_path: str, old_string: str, new_string: str, raw: str = "", **kwargs):
+        return self._generic_tool(
+            "edit_file",
+            file_path,
+            raw,
+            required_keys=["old_string", "new_string"],
+            extra={"file_path": file_path, "old_string": old_string, "new_string": new_string},
+        )
 
     def _tool_create_file(self, file_path: str, file_content: str, raw: str = "", **kwargs):
-        return self._generic_tool("create_file", file_path, raw, required_keys=["file_content"],
-                                  extra={"file_path": file_path, "file_content": file_content})
+        return self._generic_tool(
+            "create_file",
+            file_path,
+            raw,
+            required_keys=["file_content"],
+            extra={"file_path": file_path, "file_content": file_content},
+        )
 
     def _tool_apply_patch(self, file_path: str, patch: str, raw: str = "", **kwargs):
-        return self._generic_tool("apply_patch", file_path, raw, required_keys=["patch"],
-                                  extra={"file_path": file_path, "patch": patch})
+        return self._generic_tool(
+            "apply_patch", file_path, raw, required_keys=["patch"], extra={"file_path": file_path, "patch": patch}
+        )
 
-    def _tool_edit_ast(self, file_path: str, old_string: str, new_string: str,
-                       raw: str = "", **kwargs):
-        return self._generic_tool("edit_ast", file_path, raw, required_keys=["old_string", "new_string"],
-                                  extra={"file_path": file_path, "old_string": old_string, "new_string": new_string})
+    def _tool_edit_ast(self, file_path: str, old_string: str, new_string: str, raw: str = "", **kwargs):
+        return self._generic_tool(
+            "edit_ast",
+            file_path,
+            raw,
+            required_keys=["old_string", "new_string"],
+            extra={"file_path": file_path, "old_string": old_string, "new_string": new_string},
+        )
 
     def _tool_write_plan(self, plan: str, raw: str = "", **kwargs):
         # write_plan uses direct JSON parse and _repair_plan_json fallback
@@ -130,8 +145,7 @@ class FakeWriteToolsMixin:
     # ------------------------------------------------------------------
     # Generic tool handler
     # ------------------------------------------------------------------
-    def _generic_tool(self, tool_name: str, file_path: str, raw: str,
-                        required_keys: list, extra: dict) -> dict:
+    def _generic_tool(self, tool_name: str, file_path: str, raw: str, required_keys: list, extra: dict) -> dict:
         raw = raw or ""
         args = self._recover_args_from_raw(raw)
 
@@ -207,7 +221,7 @@ class TestRecoverArgsFromRaw:
         raw = '{"file_path": "test\x00.py", "old_string": "a"}'
         out = handler._recover_args_from_raw(raw)
         assert out.get("file_path") == "test.py"  # null stripped
-                # __raw_arguments has null bytes stripped (same as parsed keys)
+        # __raw_arguments has null bytes stripped (same as parsed keys)
         assert out.get("__raw_arguments") == raw.replace("\x00", "")
 
     def test_invalid_json_random_text(self, handler):

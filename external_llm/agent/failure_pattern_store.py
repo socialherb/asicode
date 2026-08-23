@@ -28,6 +28,7 @@ This store is the failure-side analogue of ``insights_manager`` (design
 lessons) and ``learned_policy`` (strategy Q-values): a per-repo memory the
 agent accumulates automatically.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -41,16 +42,17 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 from ..common.file_lock import cross_process_flock
 
 logger = logging.getLogger(__name__)
 
 _STORE_RELPATH = ".asicode/failure_patterns.json"
-_MAX_PATTERNS = 200          # bound on distinct (tool, reason) keys
+_MAX_PATTERNS = 200  # bound on distinct (tool, reason) keys
 _DECAY_HALF_LIFE_SEC = 7 * 24 * 3600  # ~1 week → weight halves
-_PRUNE_BELOW_COUNT = 2       # drop stale low-count patterns on save
-_RECALL_MIN_COUNT = 3        # a pattern must recur this often before recall fires
+_PRUNE_BELOW_COUNT = 2  # drop stale low-count patterns on save
+_RECALL_MIN_COUNT = 3  # a pattern must recur this often before recall fires
 # Reasons that are too broad to produce meaningful recall.  "generic failure"
 # and "transient failure" are fallback classifications from FailureClassifier
 # that conflate unrelated errors — including them would fire "a retry is likely
@@ -58,13 +60,13 @@ _RECALL_MIN_COUNT = 3        # a pattern must recur this often before recall fir
 # the same coarse reason string.  See failure_classifier.py for the full list
 # of possible reason values.
 _NON_RECALLABLE_REASONS = frozenset({"generic failure", "transient failure"})
-_FLUSH_INTERVAL = 5          # batch disk writes: flush every N records
+_FLUSH_INTERVAL = 5  # batch disk writes: flush every N records
 _READ_REFRESH_TTL: float = 2.0  # seconds between disk re-reads in recall_for
 # Per-repo-path locks (same pattern as FileLockManager): the JSON file is shared
 # across concurrent sub-agents / sessions in a shared checkout.  LRU eviction
 # parallels _stores so both registries stay bounded together.
 _MAX_LOCKS = 100
-_locks: "OrderedDict[str, threading.Lock]" = OrderedDict()
+_locks: OrderedDict[str, threading.Lock] = OrderedDict()
 _locks_guard = threading.Lock()
 
 
@@ -84,6 +86,7 @@ def _get_lock(store_path: str) -> threading.Lock:
 def _decay_weight(last_seen_ts: float, now: float) -> float:
     """Exponential decay in [0,1]; ~0.5 after one half-life."""
     import math
+
     age = max(0.0, now - last_seen_ts)
     return math.pow(0.5, age / _DECAY_HALF_LIFE_SEC)
 
@@ -104,9 +107,7 @@ _ACTION_ADVICE_BY_NAME = {
     "ABORT": "stop — this is a permission/environment issue that won't resolve by retrying",
     "FIX_ARGS": "re-issue the call with the missing argument(s) supplied",
 }
-_RECALL_ADVICE_GENERIC = (
-    "change approach (different tool, read the target first, or re-fetch fresh context)"
-)
+_RECALL_ADVICE_GENERIC = "change approach (different tool, read the target first, or re-fetch fresh context)"
 
 # Candidate arg keys that carry a tool call's target path.  We accumulate a
 # bounded per-path breakdown under the (tool, reason) key so the recall hint can
@@ -162,7 +163,7 @@ def _merge_paths(a, b) -> dict:
     return out
 
 
-def _format_path_breakdown(paths: dict) -> str:
+def _format_path_breakdown(paths: dict[str, Any]) -> str:
     """Render the per-path breakdown as a compact suffix for the recall hint."""
     if not isinstance(paths, dict) or not paths:
         return ""
@@ -172,10 +173,7 @@ def _format_path_breakdown(paths: dict) -> str:
     if len(ranked) <= 1 or not total:
         return f" This is concentrated on `{top_label}`."
     share = (top_count / total) if total else 0.0
-    return (
-        f" Mostly on `{top_label}` "
-        f"({round(share * 100)}% of {len(ranked)} affected paths)."
-    )
+    return f" Mostly on `{top_label}` ({round(share * 100)}% of {len(ranked)} affected paths)."
 
 
 class FailurePatternStore:
@@ -290,7 +288,9 @@ class FailurePatternStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
             {"patterns": merged, "version": 1, "updated": time.time()},
-            ensure_ascii=False, indent=2, allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
         )
         # Atomic write: temp file in same dir + rename.
         try:
@@ -362,9 +362,7 @@ class FailurePatternStore:
                     # Bound: keep the top-N paths by count so a repo with many
                     # distinct files can't grow the entry unbounded.
                     if len(paths) > _MAX_PATHS:
-                        paths = dict(
-                            sorted(paths.items(), key=lambda kv: kv[1], reverse=True)[:_MAX_PATHS]
-                        )
+                        paths = dict(sorted(paths.items(), key=lambda kv: kv[1], reverse=True)[:_MAX_PATHS])
                     entry["paths"] = paths
             data[key] = entry
             self._cache = data
@@ -412,8 +410,12 @@ class FailurePatternStore:
             return round(self._effective_unsafe(entry, now))
 
     def recall_for(
-        self, tool_name: str, reason: str, *,
-        action=None, min_count: int = _RECALL_MIN_COUNT,
+        self,
+        tool_name: str,
+        reason: str,
+        *,
+        action=None,
+        min_count: int = _RECALL_MIN_COUNT,
     ) -> str:
         """Return a compact recall hint if this failure is recurrent, else "".
 
@@ -471,12 +473,12 @@ class FailurePatternStore:
                 return ""
             now = time.time()
             n = round(self._effective_unsafe(entry, now))
-            paths = entry.get("paths") if isinstance(entry.get("paths"), dict) else {}
+            paths: Any = entry.get("paths") if isinstance(entry.get("paths"), dict) else {}
         if n < min_count:
             return ""
         advice = _advice_for_action(action)
         hint = (
-            f"[RECALL] `{tool_name}` failing with \"{reason}\" has recurred "
+            f'[RECALL] `{tool_name}` failing with "{reason}" has recurred '
             f"{n}× in this repo. A retry is likely to fail the same way — {advice}."
         )
         hint += _format_path_breakdown(paths)
@@ -606,8 +608,9 @@ class FailurePatternStore:
         return entry.get("count", 0) * _decay_weight(entry.get("last_seen", now), now)
 
     @staticmethod
-    def _merge_max(disk_data: dict[str, dict], memory_data: dict[str, dict],
-                   baseline: dict[str, int] | None = None) -> dict[str, dict]:
+    def _merge_max(
+        disk_data: dict[str, dict], memory_data: dict[str, dict], baseline: dict[str, int] | None = None
+    ) -> dict[str, dict]:
         """Merge two dicts, taking max(count), max(last_seen), min(first_seen) per key.
 
         The default ``{**disk_data, **memory_data}`` merge lets a stale in-memory
@@ -689,14 +692,16 @@ class FailurePatternStore:
             scored = []
             for key, eff in ranked:
                 entry = data[key]
-                scored.append({
-                    "key": key,
-                    "tool": entry.get("tool", ""),
-                    "reason": entry.get("reason", ""),
-                    "count": entry.get("count", 0),
-                    "effective": round(eff, 2),
-                    "last_seen": entry.get("last_seen", 0.0),
-                })
+                scored.append(
+                    {
+                        "key": key,
+                        "tool": entry.get("tool", ""),
+                        "reason": entry.get("reason", ""),
+                        "count": entry.get("count", 0),
+                        "effective": round(eff, 2),
+                        "last_seen": entry.get("last_seen", 0.0),
+                    }
+                )
             return scored[:limit]
 
 
@@ -704,7 +709,7 @@ class FailurePatternStore:
 # re-reading the JSON file on every failure in a long session).  LRU eviction
 # keeps multi-repo long-running processes bounded.
 _MAX_STORES = 100
-_stores: "OrderedDict[str, FailurePatternStore]" = OrderedDict()
+_stores: OrderedDict[str, FailurePatternStore] = OrderedDict()
 _stores_guard = threading.Lock()
 _atexit_registered = False
 
@@ -776,8 +781,8 @@ def get_store(repo_root: str | Path, *, enabled: bool = True) -> FailurePatternS
 # most once per process and then be silenced forever (even for new
 # conversations that need it most); the bounded FIFO below keeps memory in
 # check while preserving per-run scoping.
-_CLASSIFIER: "object | None" = None  # FailureClassifier, lazily imported
-_RECORDED_SESSION_KEYS: "OrderedDict[tuple[str, str, str, str], None]" = OrderedDict()
+_CLASSIFIER: Any | None = None  # FailureClassifier, lazily imported
+_RECORDED_SESSION_KEYS: OrderedDict[tuple[str, str, str, str], None] = OrderedDict()
 _RECORDED_SESSION_KEYS_LIMIT = 4096
 
 # Per-run/turn session identity.  MUST be generated fresh per run — the old
@@ -833,7 +838,7 @@ def reset_recall_session() -> None:
 # process-lifetime (not persisted) — same scope as rg-fallback counters.
 _recall_lock = threading.Lock()
 _recall_counts: dict[str, int] = {"fired": 0, "helped": 0, "ignored": 0}
-_pending_recall: "OrderedDict[str, None]" = OrderedDict()
+_pending_recall: OrderedDict[str, None] = OrderedDict()
 _PENDING_RECALL_LIMIT = 4096
 
 
@@ -923,6 +928,7 @@ def recall_on_failure(
         global _CLASSIFIER
         if _CLASSIFIER is None:
             from .failure_classifier import FailureClassifier
+
             _CLASSIFIER = FailureClassifier()
         # Adapt a raised exception into a result-shaped namespace so the
         # classifier's exception-type / errno hierarchy covers dispatch
@@ -931,9 +937,11 @@ def recall_on_failure(
             src = result
         elif exc is not None:
             import types as _types
+
             src = _types.SimpleNamespace(error=exc, ok=False)
         else:
             return ""
+        assert _CLASSIFIER is not None  # lazily imported above when _CLASSIFIER was None
         classification = _CLASSIFIER.classify(tool_name, src)
         reason = getattr(classification, "reason", "") or ""
         action = getattr(classification, "action", None)

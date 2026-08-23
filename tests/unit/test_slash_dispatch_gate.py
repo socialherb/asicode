@@ -102,9 +102,7 @@ def extract_slash_commands(source: str) -> list[tuple[str, tuple[str, ...]]]:
     """[(canonical, aliases)] parsed from the ``_SLASH_COMMANDS`` list literal."""
     tree = ast.parse(source)
     for node in tree.body:
-        if any(
-            isinstance(t, ast.Name) and t.id == "_SLASH_COMMANDS" for t in _assign_targets(node)
-        ):
+        if any(isinstance(t, ast.Name) and t.id == "_SLASH_COMMANDS" for t in _assign_targets(node)):
             value = node.value
             if not isinstance(value, ast.List):
                 raise AssertionError("_SLASH_COMMANDS must be a list literal for static extraction")
@@ -123,11 +121,7 @@ def extract_slash_commands(source: str) -> list[tuple[str, tuple[str, ...]]]:
 
 def _find_def(tree: ast.Module, name: str) -> ast.FunctionDef | None:
     return next(
-        (
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
-        ),
+        (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name),
         None,
     )
 
@@ -184,11 +178,7 @@ def _classify(node: ast.Constant, parents: dict[ast.AST, ast.AST]) -> str | None
     if isinstance(parent, ast.Call):
         if _is_startswith_call(parent):
             return "raw_cond"
-        if (
-            isinstance(parent.func, ast.Name)
-            and parent.func.id == "len"
-            and isinstance(parents.get(parent), ast.Slice)
-        ):
+        if isinstance(parent.func, ast.Name) and parent.func.id == "len" and isinstance(parents.get(parent), ast.Slice):
             return "raw_cond"
     return None
 
@@ -331,9 +321,7 @@ def check_dispatch(commands: list[tuple[str, tuple[str, ...]]], refs: dict[str, 
         for a in als:
             if a.startswith("/"):
                 if a not in handlers and c not in equals:
-                    violations.append(
-                        f"alias {a} of {c} not dispatched (canonical {c} raw-only or absent)"
-                    )
+                    violations.append(f"alias {a} of {c} not dispatched (canonical {c} raw-only or absent)")
             elif a not in refs["non_slash"]:  # type: ignore[operator]
                 violations.append(f"non-slash alias {a!r} of {c} not handled")
     unknown = (equals | refs["tuple"]) - set(canon) - set(aliases)  # type: ignore[operator]
@@ -350,7 +338,11 @@ def check_alias_build_loop(source: str) -> list[str]:
             for stmt in ast.walk(node):
                 if isinstance(stmt, ast.Assign):
                     for t in stmt.targets:
-                        if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == "_SLASH_ALIASES":
+                        if (
+                            isinstance(t, ast.Subscript)
+                            and isinstance(t.value, ast.Name)
+                            and t.value.id == "_SLASH_ALIASES"
+                        ):
                             return []
     return ["no for-loop over _SLASH_COMMANDS building _SLASH_ALIASES found"]
 
@@ -388,9 +380,7 @@ def test_alias_build_loop_present() -> None:
 @pytest.mark.parametrize("cmd", [c for c, _ in COMMANDS], ids=[c for c, _ in COMMANDS])
 def test_canonical_command_dispatched(cmd: str) -> None:
     handlers = REFS["equals"] | REFS["raw_cond"]  # type: ignore[operator]
-    assert cmd in handlers, (
-        f"{cmd} is defined in _SLASH_COMMANDS but has no dispatch branch in _dispatch_command"
-    )
+    assert cmd in handlers, f"{cmd} is defined in _SLASH_COMMANDS but has no dispatch branch in _dispatch_command"
 
 
 @pytest.mark.parametrize("alias,canonical", ALIAS_ITEMS, ids=[a for a, _ in ALIAS_ITEMS])
@@ -413,7 +403,7 @@ def test_no_unknown_refs_and_gate_consistency() -> None:
 
 # ─────────────── layer 2: detector self-tests (synthetic) ───────────────
 
-_COMPLIANT_ASI = '''
+_COMPLIANT_ASI = """
 _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
     ("/quit",        (":q", "/exit"), "", "end"),
     ("/help",        ("/?",),         "", "help"),
@@ -426,9 +416,9 @@ for _name, _aliases, _arg, _desc in _SLASH_COMMANDS:
     _SLASH_ALIASES[_name] = _name
     for _al in _aliases:
         _SLASH_ALIASES[_al] = _name
-'''
+"""
 
-_COMPLIANT_REPL = '''
+_COMPLIANT_REPL = """
 def _run_repl_impl():
     def _dispatch_command(user_input: str):
         _cmd_tok = user_input.strip().split(None, 1)
@@ -450,7 +440,7 @@ def _run_repl_impl():
             _orch_inline = _stripped[len(_tok0):].lstrip() if _tok0 in ("/orchestrate", "/orch") else ""
             user_input = _orch_inline
         return ("chat", user_input)
-'''
+"""
 
 
 def _v_asi(replacer: str, replacement: str) -> str:
@@ -477,7 +467,7 @@ _SELF_TEST_CASES = [
             '        if _stripped.startswith("/code ") or _stripped == "/code":\n'
             '            _print("  switched to Code Chat")\n'
             '            user_input = _stripped[len("/code"):].lstrip()\n',
-            '        if False:  # /code removed\n            pass\n',
+            "        if False:  # /code removed\n            pass\n",
         ),
         "has no dispatch branch",
     ),
@@ -526,7 +516,7 @@ _SELF_TEST_CASES = [
     (
         "alias_build_loop_replaced",
         _v_asi(
-            'for _name, _aliases, _arg, _desc in _SLASH_COMMANDS:\n    _SLASH_ALIASES[_name] = _name\n    for _al in _aliases:\n        _SLASH_ALIASES[_al] = _name\n',
+            "for _name, _aliases, _arg, _desc in _SLASH_COMMANDS:\n    _SLASH_ALIASES[_name] = _name\n    for _al in _aliases:\n        _SLASH_ALIASES[_al] = _name\n",
             '_SLASH_ALIASES = {"/help": "/help"}  # stale\n',
         ),
         _COMPLIANT_REPL,
@@ -537,7 +527,8 @@ _SELF_TEST_CASES = [
 
 @pytest.mark.parametrize(
     "label,asi_src,repl_src,expected",
-    list(_SELF_TEST_CASES),    ids=[c[0] for c in _SELF_TEST_CASES],
+    list(_SELF_TEST_CASES),
+    ids=[c[0] for c in _SELF_TEST_CASES],
 )
 def test_detector_self_tests(label: str, asi_src: str, repl_src: str, expected: str | None) -> None:
     violations = run_gate(asi_src, repl_src)
@@ -584,7 +575,7 @@ def test_mutation_standalone_handler_removed() -> None:
 
 
 def test_mutation_new_command_undispatched() -> None:
-    needle = '    ("/quit",    (":q", "/exit"), "",       "end the session"),\n'
+    needle = '    ("/quit", (":q", "/exit"), "", "end the session"),\n'
     assert ASI_SRC.count(needle) == 1, "anchor — registry tail changed?"
     mutated = ASI_SRC.replace(needle, needle + '    ("/bogus-x", (), "", "gate self-test"),\n')
     commands = extract_slash_commands(mutated)
@@ -595,8 +586,7 @@ def test_mutation_new_command_undispatched() -> None:
 def test_mutation_alias_lost_from_raw_dispatch() -> None:
     """/orch removed from the raw dispatch conditions; internal _tok0 ref remains."""
     needle = (
-        '        elif _stripped.startswith(("/orchestrate ", "/orch ")) '
-        'or _stripped in {"/orchestrate", "/orch"}:\n'
+        '        elif _stripped.startswith(("/orchestrate ", "/orch ")) or _stripped in {"/orchestrate", "/orch"}:\n'
     )
     assert REPL_SRC.count(needle) == 1, "anchor — orchestrator block changed?"
     mutated = REPL_SRC.replace(needle, '        elif _stripped.startswith("/orchestrate "):\n')
@@ -637,8 +627,8 @@ def test_mutation_alias_build_loop_replaced() -> None:
 
 
 def test_mutation_duplicate_alias() -> None:
-    needle = '    ("/diff",    (),              "",       "re-show the last run\'s file changes"),\n'
+    needle = '    ("/diff", (), "", "re-show the last run\'s file changes"),\n'
     assert ASI_SRC.count(needle) == 1, "anchor — /diff entry changed?"
-    mutated = ASI_SRC.replace(needle, '    ("/diff",    ("/cls",),        "",       "re-show the last run\'s file changes"),\n')
+    mutated = ASI_SRC.replace(needle, '    ("/diff", ("/cls",), "", "re-show the last run\'s file changes"),\n')
     violations = check_registry(extract_slash_commands(mutated))
     assert any("/cls" in v for v in violations), violations

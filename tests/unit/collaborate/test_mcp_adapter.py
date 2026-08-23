@@ -10,6 +10,7 @@ These tests verify:
 
 Note: Full MCP server integration requires claude-agent-sdk.
 """
+
 from __future__ import annotations
 
 import time
@@ -46,6 +47,7 @@ class TestMissingSdkGuidance:
 
     def test_build_mcp_server_message_names_install_command(self, monkeypatch):
         import sys
+
         monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
         registry = ToolRegistry(repo_root=".", config=AgentConfig())
         with pytest.raises(ImportError) as exc_info:
@@ -180,7 +182,7 @@ class TestCollaborateInstallGate:
         spec = build_collaborate_install_spec()
         assert spec == ["-e", "/src/asicode[collaborate]"]
         # the full command wraps the spec unchanged
-        assert build_collaborate_install_command()[-len(spec):] == spec
+        assert build_collaborate_install_command()[-len(spec) :] == spec
 
     def test_install_spec_non_editable_is_bare_name(self, monkeypatch):
         import importlib.metadata as md
@@ -351,6 +353,7 @@ class TestMcpServerBuilding:
 
     def test_mcp_tools_list(self):
         from external_llm.editor.agent.mcp import list_mcp_tools
+
         tools = list_mcp_tools()
         assert len(tools) >= 18  # Most tools should be exposed
         tool_names = {t["name"] for t in tools}
@@ -375,6 +378,7 @@ class TestMcpServerBuilding:
 
     def test_each_tool_has_description(self):
         from external_llm.editor.agent.mcp import list_mcp_tools
+
         tools = list_mcp_tools()
         for t in tools:
             assert t.get("description"), f"Tool {t['name']} missing description"
@@ -444,9 +448,7 @@ class TestTimeoutOrdering:
         """job has no recovery re-run, so its ceiling must not be inflated 2x."""
         from external_llm.repl.collaborate import asi_mcp_adapter as mod
 
-        assert _resolve_mcp_timeout("job", {"wait_timeout": 120}) == (
-            120 + mod._MCP_TIMEOUT_GRACE
-        )
+        assert _resolve_mcp_timeout("job", {"wait_timeout": 120}) == (120 + mod._MCP_TIMEOUT_GRACE)
 
     @pytest.mark.parametrize("bad", [None, 0, "", "abc", -5, 3.7, [], {"nested": 1}])
     def test_malformed_timeout_arg_never_raises(self, bad):
@@ -465,13 +467,12 @@ class TestTimeoutOrdering:
             assert _resolve_mcp_timeout(tool, {}) == expected
         # A tool with no override falls through to the global default.
         from external_llm.repl.collaborate import asi_mcp_adapter as mod
+
         assert _resolve_mcp_timeout("apply_patch", {}) == mod.CLAUDE_MCP_TOOL_TIMEOUT
 
     def test_a_timeout_arg_is_ignored_for_tools_that_do_not_police_their_own(self):
         """An unrelated tool carrying a `timeout` key must not inflate its ceiling."""
-        assert _resolve_mcp_timeout("read_file", {"timeout": 9999}) == (
-            _TOOL_SPECIFIC_TIMEOUTS["read_file"]
-        )
+        assert _resolve_mcp_timeout("read_file", {"timeout": 9999}) == (_TOOL_SPECIFIC_TIMEOUTS["read_file"])
 
     def test_zero_env_disables_the_ceiling_and_is_not_resurrected(self, monkeypatch):
         """CLAUDE_MCP_TOOL_TIMEOUT=0 means "no ceiling" (config allows zero).
@@ -533,9 +534,7 @@ class TestCooperativeCancellationOnTimeout:
 
         done: dict = {}
         monkeypatch.setattr(mod, "_resolve_mcp_timeout", lambda tool, args: 0.3)
-        handler = mod._make_async_handler(
-            self._slow_scope_aware_registry(done), "run_structural_scan"
-        )
+        handler = mod._make_async_handler(self._slow_scope_aware_registry(done), "run_structural_scan")
 
         t0 = time.monotonic()
         out = asyncio.run(handler({}))
@@ -548,9 +547,7 @@ class TestCooperativeCancellationOnTimeout:
             f"worker never exited within {time.monotonic() - t0:.1f}s — "
             "the scope event was never set (orphaned worker, pool slot pinned)"
         )
-        assert done.get("observed") is True, (
-            "worker exited without OBSERVING the cancellation — wrong exit path"
-        )
+        assert done.get("observed") is True, "worker exited without OBSERVING the cancellation — wrong exit path"
         assert done["t"] - t0 < self.FULL, "worker ran to completion — no cooperation"
 
     def test_timeout_while_queued_does_not_pin_the_pool(self, monkeypatch):

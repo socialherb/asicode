@@ -11,6 +11,7 @@ Design:
   - Configurable max concurrent jobs to limit resource usage
   - Integrates with _tool_shell_exec via a simple transition at timeout
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -21,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 
 from ..client import interruptible_sleep
 from ..common.bounded_capture import _BoundedCapture
@@ -61,7 +62,7 @@ def _tail_preview(buf: str) -> str:
     return buf[-200:] if len(buf) > 200 else buf
 
 
-def _close_job_pipes(job: "BackgroundJob") -> None:
+def _close_job_pipes(job: BackgroundJob) -> None:
     """Close a job's pipe read ends — final resource reclaim for a dropped job.
 
     Used when a stale victim is evicted from ``_stale_jobs`` without waiting
@@ -76,9 +77,7 @@ def _close_job_pipes(job: "BackgroundJob") -> None:
             except Exception:
                 # A concurrently-closed fd (reaper drain) is the normal cause;
                 # the eviction already gave up on this job either way.
-                logger.debug(
-                    "Pipe close failed for dropped job %s", job.job_id, exc_info=True
-                )
+                logger.debug("Pipe close failed for dropped job %s", job.job_id, exc_info=True)
 
 
 def strip_malloc_noise(text: str) -> str:
@@ -97,10 +96,7 @@ def strip_malloc_noise(text: str) -> str:
     """
     if not text or _MALLOC_NOISE_TOKEN not in text:
         return text
-    return "".join(
-        line for line in text.splitlines(keepends=True)
-        if _MALLOC_NOISE_TOKEN not in line
-    )
+    return "".join(line for line in text.splitlines(keepends=True) if _MALLOC_NOISE_TOKEN not in line)
 
 
 # NOTE: the partial-output hand-over used to be excavated from CPython's private
@@ -114,9 +110,18 @@ def strip_malloc_noise(text: str) -> str:
 class BackgroundJobInfo:
     """Immutable snapshot of a background job's state."""
 
-    def __init__(self, job_id: str, command: str, pid: Optional[int],
-                 status: str, elapsed: float, stdout: str, stderr: str,
-                 stdout_total: int = 0, stderr_total: int = 0):
+    def __init__(
+        self,
+        job_id: str,
+        command: str,
+        pid: int | None,
+        status: str,
+        elapsed: float,
+        stdout: str,
+        stderr: str,
+        stdout_total: int = 0,
+        stderr_total: int = 0,
+    ):
         self.job_id = job_id
         self.command = command
         self.pid = pid
@@ -143,8 +148,7 @@ class BackgroundJobInfo:
 class BackgroundJob:
     """Internal mutable job state (not exposed to callers directly)."""
 
-    def __init__(self, job_id: str, command: str, proc: subprocess.Popen,
-                 start_time: float):
+    def __init__(self, job_id: str, command: str, proc: subprocess.Popen, start_time: float):
         self.job_id = job_id
         self.command = command
         self.proc = proc
@@ -212,10 +216,10 @@ class BackgroundJob:
             recovered_stderr = getattr(self.proc, "_recovered_stderr", "")
             if recovered_stdout:
                 stdout += recovered_stdout
-                self.proc._recovered_stdout = ""
+                self.proc._recovered_stdout = ""  # type: ignore[attr-defined]  # dynamic Popen attr
             if recovered_stderr:
                 stderr += recovered_stderr
-                self.proc._recovered_stderr = ""
+                self.proc._recovered_stderr = ""  # type: ignore[attr-defined]  # dynamic Popen attr
 
             if self.proc.stdout:
                 with contextlib.suppress(UnicodeDecodeError, OSError):  # binary output / closed pipe
@@ -231,6 +235,7 @@ class BackgroundJob:
     def _read_fd(fd) -> str:
         """Read all available data from a file descriptor (non-blocking)."""
         import fcntl
+
         old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
         try:
@@ -297,8 +302,7 @@ class BackgroundJob:
         try:
             ret = self.proc.poll()
         except Exception:
-            logger.warning("poll() failed while settling status for job %s",
-                           self.job_id, exc_info=True)
+            logger.warning("poll() failed while settling status for job %s", self.job_id, exc_info=True)
             return  # keep the current status — the next reap tick retries
         if ret is None:
             self.status = "running"
@@ -332,6 +336,7 @@ class BackgroundJob:
                 # getpgid() here fails once the leader exited and was reaped,
                 # silently skipping the kill and orphaning the grandchildren.
                 import signal
+
                 os.killpg(self._pgid, signal.SIGTERM)
                 # Give it a moment, then SIGKILL
                 try:
@@ -342,7 +347,8 @@ class BackgroundJob:
                         self.proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         logger.warning(
-                            "Job %s did not die after SIGKILL — process still alive", self.job_id,
+                            "Job %s did not die after SIGKILL — process still alive",
+                            self.job_id,
                         )
                         # Don't claim "killed" for a live process — and never
                         # leave the transient "killing" marker (eviction
@@ -407,7 +413,7 @@ class BackgroundJobManager:
         # the job is removed from _jobs by cleanup() or _evict_over_capacity.
         # Maps job_id -> BackgroundJobInfo.  Bounded at _REAPED_RESULTS_MAX
         # (oldest entries evicted first via popitem(last=False)).
-        self._reaped_results: "OrderedDict[str, BackgroundJobInfo]" = OrderedDict()
+        self._reaped_results: OrderedDict[str, BackgroundJobInfo] = OrderedDict()
         # Eviction victims whose kill could not finish (process still alive,
         # e.g. D-state after SIGKILL).  They are out of _jobs — the slot was
         # freed — but not dead, so the reaper tracks them here and converges
@@ -417,11 +423,11 @@ class BackgroundJobManager:
         self._stale_jobs: dict[str, BackgroundJob] = {}
         self._lock = threading.Lock()
         self._last_reap: float = 0.0
-        self._reaper_timer: Optional[threading.Timer] = None
+        self._reaper_timer: threading.Timer | None = None
         self._reaper_active: bool = False
 
     @staticmethod
-    def _reaped_tail(buf: Optional[str]) -> str:
+    def _reaped_tail(buf: str | None) -> str:
         """Keep the LAST ``_REAPED_OUTPUT_CAP`` chars of *buf*, marking elision.
 
         Tail, never head: a job is backgrounded precisely because it is long,
@@ -497,7 +503,9 @@ class BackgroundJobManager:
             kill_victims = self._evict_over_capacity_locked(job_id)
             logger.info(
                 "Background job started: id=%s cmd=%.200s pid=%d",
-                job_id, command, proc.pid,
+                job_id,
+                command,
+                proc.pid,
             )
 
         # Kill outside the lock — may block up to ~6 s.
@@ -511,9 +519,7 @@ class BackgroundJobManager:
                 # already buffered. Logged because a failure here is the
                 # difference between a retrievable result and a silently
                 # empty one.
-                logger.debug(
-                    "Final drain failed for evicted job %s", victim_id, exc_info=True
-                )
+                logger.debug("Final drain failed for evicted job %s", victim_id, exc_info=True)
             # Overwrite the "killing" placeholder (pre-snapshotted under the
             # lock in _evict_over_capacity_locked) with the true outcome after
             # the kill: the final state, or — when the kill could not finish
@@ -537,20 +543,24 @@ class BackgroundJobManager:
                         _close_job_pipes(_oldest_job)
                         logger.warning(
                             "Dropped oldest stale job %s (cap %d): still alive after SIGKILL",
-                            _oldest_id, self.max_jobs,
+                            _oldest_id,
+                            self.max_jobs,
                         )
                     logger.warning(
                         "Evicted job %s still alive after kill — re-tracking for reap: cmd=%.200s",
-                        victim_id, victim_cmd,
+                        victim_id,
+                        victim_cmd,
                     )
             logger.warning(
                 "Killed oldest job to enforce max_jobs=%d: id=%s cmd=%.200s",
-                self.max_jobs, victim_id, victim_cmd,
+                self.max_jobs,
+                victim_id,
+                victim_cmd,
             )
 
         return job_id
 
-    def get_info(self, job_id: str) -> Optional[BackgroundJobInfo]:
+    def get_info(self, job_id: str) -> BackgroundJobInfo | None:
         """Get a snapshot of job state, or None if not found.
 
         Fallback: if the job has been reaped (removed from ``_jobs`` by
@@ -599,9 +609,9 @@ class BackgroundJobManager:
             stderr_total=job._stderr_buf.total,
         )
 
-    def wait_for_completion(self, job_id: str, timeout: float = 120.0,
-                                poll_interval: float = 1.0,
-                                cancel_event: Optional[Any] = None) -> Optional[BackgroundJobInfo]:
+    def wait_for_completion(
+        self, job_id: str, timeout: float = 120.0, poll_interval: float = 1.0, cancel_event: Any | None = None
+    ) -> BackgroundJobInfo | None:
         """Wait for a background job to finish (completed/failed/killed).
 
         Polls at *poll_interval* seconds until the job terminates or
@@ -626,7 +636,7 @@ class BackgroundJobManager:
         the deadline arrives returns ``None`` at the deadline.
         """
         deadline = time.monotonic() + timeout
-        none_since: Optional[float] = None
+        none_since: float | None = None
         while True:
             info = self.get_info(job_id)
             if info is None:
@@ -674,10 +684,7 @@ class BackgroundJobManager:
         self._maybe_reap()
         with self._lock:
             # Snapshot immutable fields under the lock
-            snapshots = [
-                (job_id, job, job.command, job.proc.pid)
-                for job_id, job in list(self._jobs.items())
-            ]
+            snapshots = [(job_id, job, job.command, job.proc.pid) for job_id, job in list(self._jobs.items())]
             reaped = list(self._reaped_results.values())
 
         # ── I/O outside the lock ──
@@ -691,17 +698,19 @@ class BackgroundJobManager:
             job.read_output()
             stdout = job._stdout_buf.text()
             stderr = strip_malloc_noise(job._stderr_buf.text())
-            infos.append(BackgroundJobInfo(
-                job_id=job_id,
-                command=command,
-                pid=pid,
-                status=status,
-                elapsed=job.elapsed,
-                stdout=_tail_preview(stdout or ""),
-                stderr=_tail_preview(stderr or ""),
-                stdout_total=job._stdout_buf.total,
-                stderr_total=job._stderr_buf.total,
-            ))
+            infos.append(
+                BackgroundJobInfo(
+                    job_id=job_id,
+                    command=command,
+                    pid=pid,
+                    status=status,
+                    elapsed=job.elapsed,
+                    stdout=_tail_preview(stdout or ""),
+                    stderr=_tail_preview(stderr or ""),
+                    stdout_total=job._stdout_buf.total,
+                    stderr_total=job._stderr_buf.total,
+                )
+            )
 
         # ── Reaped-results ring (already-snapshotted; no I/O needed) ──
         # Terminal entries respect include_completed; the transient
@@ -714,13 +723,11 @@ class BackgroundJobManager:
             infos.extend(r for r in reaped if r.job_id not in active_ids)
         else:
             infos.extend(
-                r for r in reaped
-                if r.status not in ("completed", "failed", "killed")
-                and r.job_id not in active_ids
+                r for r in reaped if r.status not in ("completed", "failed", "killed") and r.job_id not in active_ids
             )
         return infos
 
-    def kill(self, job_id: str) -> Optional[str]:
+    def kill(self, job_id: str) -> str | None:
         """Kill a specific job. Returns the final status string, or None if not found.
 
         ``job.kill()`` may block up to 6 seconds (SIGTERM wait + SIGKILL fallback),
@@ -778,10 +785,7 @@ class BackgroundJobManager:
                 if j.poll_status() != "running":
                     info = self._snapshot_job_locked(jid, j)
                     self._store_reaped_locked(jid, info)
-            self._jobs = OrderedDict(
-                (jid, j) for jid, j in self._jobs.items()
-                if j.poll_status() == "running"
-            )
+            self._jobs = OrderedDict((jid, j) for jid, j in self._jobs.items() if j.poll_status() == "running")
             removed = before - len(self._jobs)
             if removed:
                 logger.debug("Cleaned up %d background job(s)", removed)
@@ -970,7 +974,7 @@ class BackgroundJobManager:
 
 
 # Module-level singleton for shared use across tool instances
-_global_bg_manager: Optional[BackgroundJobManager] = None
+_global_bg_manager: BackgroundJobManager | None = None
 _global_bg_manager_lock = threading.Lock()
 
 
@@ -991,8 +995,8 @@ def get_global_background_job_manager(max_jobs: int = 5) -> BackgroundJobManager
                 _global_bg_manager = BackgroundJobManager(max_jobs=max_jobs)
     elif max_jobs != _global_bg_manager.max_jobs:
         logger.warning(
-            "get_global_background_job_manager(max_jobs=%d) ignored: singleton "
-            "already created with max_jobs=%d",
-            max_jobs, _global_bg_manager.max_jobs,
+            "get_global_background_job_manager(max_jobs=%d) ignored: singleton already created with max_jobs=%d",
+            max_jobs,
+            _global_bg_manager.max_jobs,
         )
     return _global_bg_manager

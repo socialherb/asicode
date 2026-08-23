@@ -9,6 +9,7 @@ re-parse the whole repo.  These tests pin the two contracts:
 * reuse happens exactly when (and only when) the manifest stamp matches the
   current stat — stale/missing/corrupt entries fail open to extract_file.
 """
+
 import json
 import os
 import shutil
@@ -67,9 +68,18 @@ def _graph_snapshot(graph):
     symbols = {}
     for uid, s in sorted(graph.symbols.items()):
         symbols[uid] = (
-            s.name, s.qualname, s.module, s.file_path, s.kind,
-            s.start_line, s.end_line, s.language, s.signature_hash,
-            s.docstring, s.signature, tuple(s.bases or ()),
+            s.name,
+            s.qualname,
+            s.module,
+            s.file_path,
+            s.kind,
+            s.start_line,
+            s.end_line,
+            s.language,
+            s.signature_hash,
+            s.docstring,
+            s.signature,
+            tuple(s.bases or ()),
         )
     edges = [(e.caller, e.callee, e.file_path, e.line) for e in graph.call_edges]
     imports = [(e.importer, e.imported, e.import_type) for e in graph.import_edges]
@@ -96,6 +106,7 @@ _SRC = {
 
 
 # ── Warm first build ─────────────────────────────────────────────────────────
+
 
 def test_first_build_serves_unchanged_files_from_gate_cache(monkeypatch):
     repo = _make_repo(_SRC)
@@ -141,10 +152,12 @@ def test_disk_warm_build_populates_process_cache(monkeypatch):
 
 
 def test_nested_rel_keys_served_from_disk(monkeypatch):
-    repo = _make_repo({
-        "pkg/__init__.py": "",
-        "pkg/mod.py": "def helper(x):\n    return x\n",
-    })
+    repo = _make_repo(
+        {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": "def helper(x):\n    return x\n",
+        }
+    )
     try:
         _write_gate_cache(repo)
         calls = _count_extract_calls(monkeypatch)
@@ -157,6 +170,7 @@ def test_nested_rel_keys_served_from_disk(monkeypatch):
 
 
 # ── Staleness: reuse exactly on (and only on) stamp match ────────────────────
+
 
 def test_stale_stamp_reextracts(monkeypatch):
     repo = _make_repo(_SRC)
@@ -210,6 +224,7 @@ def test_corrupt_payload_falls_back_to_parse(monkeypatch):
 
 
 # ── Fail-open: any cache problem degrades to a full build ────────────────────
+
 
 def test_corrupt_json_falls_back_to_full_parse(monkeypatch):
     repo = _make_repo(_SRC)
@@ -272,6 +287,7 @@ def test_no_cache_file_falls_back_to_full_parse(monkeypatch):
 
 # ── Reload on gate rewrite ───────────────────────────────────────────────────
 
+
 def test_reload_after_gate_rewrite_serves_fresh_payload(monkeypatch):
     repo = _make_repo(_SRC)
     try:
@@ -296,6 +312,7 @@ def test_reload_after_gate_rewrite_serves_fresh_payload(monkeypatch):
 
 # ── Nested roots / cwd independence ─────────────────────────────────────────
 
+
 def test_nested_roots_do_not_share_extract_cache_payloads():
     """Regression: _extract_cache was keyed by abs path alone, but payloads
     carry root-relative fields (SymbolNode.file_path / .module, CallEdge
@@ -303,10 +320,12 @@ def test_nested_roots_do_not_share_extract_cache_payloads():
     pkg/m.py — file_path "pkg/m.py" instead of "m.py", module "pkg.m"
     instead of "m" — and handed back the very SAME SymbolNode objects for
     graphs that must disagree on them."""
-    repo = _make_repo({
-        "pkg/__init__.py": "",
-        "pkg/m.py": "def helper(x):\n    return x\n",
-    })
+    repo = _make_repo(
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": "def helper(x):\n    return x\n",
+        }
+    )
     try:
         g1 = RepositoryGraph(repo)
         g1.build()
@@ -318,12 +337,8 @@ def test_nested_roots_do_not_share_extract_cache_payloads():
         g2 = RepositoryGraph(os.path.join(repo, "pkg"))
         g2.build()
         sym2 = g2.symbols["m.py:helper"]
-        assert sym2.file_path == "m.py", (
-            f"nested root must get pkg-relative file_path, got {sym2.file_path!r}"
-        )
-        assert sym2.module == "m", (
-            f"nested root must get pkg-relative module, got {sym2.module!r}"
-        )
+        assert sym2.file_path == "m.py", f"nested root must get pkg-relative file_path, got {sym2.file_path!r}"
+        assert sym2.module == "m", f"nested root must get pkg-relative module, got {sym2.module!r}"
         # Distinct objects — no cross-root aliasing through the shared cache.
         assert sym2 is not sym1
     finally:
@@ -336,10 +351,12 @@ def test_module_names_independent_of_cwd(monkeypatch, tmp_path):
     module names like "....var.folders...pkg.m" (and, mixed with disk-cache
     payloads written from the repo root, a per-file module convention that
     disagreed within one graph)."""
-    repo = _make_repo({
-        "pkg/__init__.py": "",
-        "pkg/m.py": "def helper(x):\n    return x\n",
-    })
+    repo = _make_repo(
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": "def helper(x):\n    return x\n",
+        }
+    )
     try:
         monkeypatch.chdir(tmp_path)  # cwd is NOT the repo root
         g = RepositoryGraph(repo)

@@ -8,6 +8,7 @@ Covers the logic added to _try_ast_rewrite_fallback that:
   3. On unrecoverable syntax error: returns None without writing (forces strategy
      ladder to choose a different approach instead of quality-gate rollback)
 """
+
 import ast
 import textwrap
 
@@ -16,6 +17,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helper: reproduce the normalization logic from _try_ast_rewrite_fallback
 # ---------------------------------------------------------------------------
+
 
 def _normalize_fb_code_via_unparse(fb_code: str, orig_indent: str) -> str | None:
     """Mirror of the normalization path in _try_ast_rewrite_fallback."""
@@ -28,10 +30,7 @@ def _normalize_fb_code_via_unparse(fb_code: str, orig_indent: str) -> str | None
                 (len(_item_) - len(_item_.lstrip()) for _item_ in fn_lines if _item_.strip()),
                 default=0,
             )
-            norm_raw = "\n".join(
-                (orig_indent + _item_[fn_min:]) if _item_.strip() else ""
-                for _item_ in fn_lines
-            )
+            norm_raw = "\n".join((orig_indent + _item_[fn_min:]) if _item_.strip() else "" for _item_ in fn_lines)
     except SyntaxError:
         return None
     else:
@@ -41,6 +40,7 @@ def _normalize_fb_code_via_unparse(fb_code: str, orig_indent: str) -> str | None
 # ---------------------------------------------------------------------------
 # Tests: normalization helper
 # ---------------------------------------------------------------------------
+
 
 class TestNormalizeViaUnparse:
     """Unit tests for the ast.parse + ast.unparse normalization helper."""
@@ -79,7 +79,7 @@ class TestNormalizeViaUnparse:
             "def foo(x):\n"
             "    if x:\n"
             "        return x\n"
-            "       return None\n"   # ← 7 spaces instead of 8 or 4
+            "       return None\n"  # ← 7 spaces instead of 8 or 4
         )
         result = _normalize_fb_code_via_unparse(broken, "")
         assert result is None
@@ -118,6 +118,7 @@ class TestNormalizeViaUnparse:
 # ---------------------------------------------------------------------------
 # Tests: pre-write validation gate behaviour
 # ---------------------------------------------------------------------------
+
 
 class TestPreWriteValidationGate:
     """Behaviour tests for the pre-write validation gate in _try_ast_rewrite_fallback.
@@ -172,11 +173,11 @@ class TestPreWriteValidationGate:
         # Simulate a file where the function was spliced with wrong outer indent
         broken_file = (
             "class Foo:\n"
-            "  def foo(self):\n"     # 2-space (non-standard)
+            "  def foo(self):\n"  # 2-space (non-standard)
             "      for x in items:\n"  # 6-space
-            "          if not x:\n"    # 10-space
-            "            continue\n"   # 12-space
-            "          process(x)\n"   # 10-space
+            "          if not x:\n"  # 10-space
+            "            continue\n"  # 12-space
+            "          process(x)\n"  # 10-space
         )
         action, _ = self._simulate_validation_gate(broken_file, fb_code)
         # fb_code itself parses fine → normalization should succeed
@@ -188,11 +189,12 @@ class TestPreWriteValidationGate:
         broken_fb = (
             "def foo():\n"
             "    for x in items:\n"
-            "        do_something()\n"   # 8-space
-            "       continue\n"          # 7-space — inconsistent with 8-space block
+            "        do_something()\n"  # 8-space
+            "       continue\n"  # 7-space — inconsistent with 8-space block
         )
         # Verify the test input is actually broken Python
         import ast as _ast_check
+
         with pytest.raises(IndentationError):
             _ast_check.parse(broken_fb)
         broken_file = "class C:\n" + broken_fb
@@ -220,7 +222,7 @@ class TestPreWriteValidationGate:
             "class RepairEngine:\n"
             "     def _check_f821_and_auto_repair(self, errors):\n"  # 5-space indent bug
             "         for name in errors:\n"
-            "           if not name:\n"     # 11-space instead of 12
+            "           if not name:\n"  # 11-space instead of 12
             "                 continue\n"  # 17-space — mismatch
         )
         action, write_text = self._simulate_validation_gate(broken_file, fb_code)

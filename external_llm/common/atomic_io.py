@@ -26,6 +26,7 @@ processes; callers needing that should additionally hold
 alone already prevents the crash-corruption (truncation) class of bugs that
 motivated this module.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -35,7 +36,7 @@ import os
 import tempfile
 import time
 from collections.abc import Callable
-from typing import Any, Optional, TextIO
+from typing import Any, TextIO
 
 from .repo_files import invalidate_for_written_path
 
@@ -85,7 +86,9 @@ def sweep_stale_temp_files(base_dir: str, max_age_s: float = _STALE_TMP_AGE_S) -
                     removed += 1
                     logger.info(
                         "Reclaimed stale atomic-write leftover: %s (%.1f MB, age %.1f h)",
-                        entry.path, st.st_size / 1e6, (now - st.st_mtime) / 3600.0,
+                        entry.path,
+                        st.st_size / 1e6,
+                        (now - st.st_mtime) / 3600.0,
                     )
                 except OSError as exc:
                     # Raced with another sweeper, or not ours to remove.
@@ -107,9 +110,9 @@ def _sweep_once(base_dir: str) -> None:
 def _atomic_replace(
     path: Any,
     suffix: str,
-    write_body: Callable[[TextIO], None],
+    write_body: Callable[[Any], None],
     *,
-    finalize: Optional[Callable[[str, str], None]] = None,
+    finalize: Callable[[str, str], None] | None = None,
     binary: bool = False,
 ) -> None:
     """Shared crash-safe write pipeline behind every public atomic writer.
@@ -155,11 +158,13 @@ def _atomic_replace(
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
 def atomic_write_json(
     path: Any,
     data: Any,
     *,
-    indent: int = 2,
+    indent: int | None = 2,
     ensure_ascii: bool = False,
     default: Any = None,
 ) -> None:
@@ -181,6 +186,7 @@ def atomic_write_json(
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
+
     # NOTE: intentional near-duplicate of atomic_write_text's wrapper below
     # (structural scanner: sim 0.85 shared-prefix -- both are the 3-line
     # "def _write_body + _atomic_replace(path, .tmp, ...)" skeleton). Merging
@@ -217,11 +223,10 @@ def atomic_write_jsonl(
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
+
     def _write_body(fh: TextIO) -> None:
         for rec in records:
-            fh.write(
-                json.dumps(rec, ensure_ascii=ensure_ascii, default=default) + "\n"
-            )
+            fh.write(json.dumps(rec, ensure_ascii=ensure_ascii, default=default) + "\n")
 
     _atomic_replace(path, ".jsonl", _write_body)
 
@@ -264,6 +269,7 @@ def atomic_write_text(path: Any, content: str, *, mode: Any = None) -> None:
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
+
     # Same intentional wrapper skeleton as atomic_write_json's (see the note
     # there): identical structure, different body (plain write vs json.dump).
     def _write_body(fh: TextIO) -> None:
@@ -316,6 +322,7 @@ def atomic_write_bytes(path: Any, data: bytes, *, mode: Any = None) -> None:
     Raises:
         OSError/IOError: on write or rename failure (temp file is cleaned up).
     """
+
     # Same intentional wrapper skeleton as atomic_write_text's (see the note
     # there): identical structure, different body (raw bytes vs text).
     def _write_body(fh) -> None:
@@ -376,6 +383,9 @@ def write_namespace_json(
             data = loaded
     data[namespace] = value
     atomic_write_json(
-        file_path, data, indent=indent, ensure_ascii=ensure_ascii, default=default,
+        file_path,
+        data,
+        indent=indent,
+        ensure_ascii=ensure_ascii,
+        default=default,
     )
-

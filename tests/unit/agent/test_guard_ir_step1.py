@@ -16,31 +16,31 @@ from external_llm.agent.guard_ir import parse_guard
 # (description, raw_guard_string, expected_condition_op, expected_control)
 # expected_condition_op=None / expected_control="" → parse failure or no control flow
 GUARD_CASES = [
-    ("simple not + continue",    "if not x: continue",                    "Not",     "continue"),
-    ("not name continue",        "if not name: continue",                  "Not",     "continue"),
-    ("attribute access continue","if not error.name: continue",            "Not",     "continue"),
-    ("param guard raise",        "if not value: raise ValueError('missing')", "Not",  "raise"),
-    ("param guard return",       "if not value: return",                   "Not",     "return"),
-    ("param guard return None",  "if not value: return None",              "Not",     "return"),
-    ("break guard",              "if done: break",                         "Name",    "break"),
-    ("and condition continue",   "if not a and not b: continue",           "And",     "continue"),
-    ("compare eq guard",         "if x == 0: return",                     "Eq",      "return"),
-    ("compare notin guard",      "if item not in seen: continue",          "NotIn",   "continue"),
-    ("is None guard",            "if x is None: return None",             "Is",      "return"),
-    ("self attr guard",          "if not self.enabled: return",            "Not",     "return"),
-    ("nested attribute",         "if not obj.sub.attr: continue",          "Not",     "continue"),
-    ("raise valueerror",         "if x < 0: raise ValueError(x)",         "Lt",      "raise"),
+    ("simple not + continue", "if not x: continue", "Not", "continue"),
+    ("not name continue", "if not name: continue", "Not", "continue"),
+    ("attribute access continue", "if not error.name: continue", "Not", "continue"),
+    ("param guard raise", "if not value: raise ValueError('missing')", "Not", "raise"),
+    ("param guard return", "if not value: return", "Not", "return"),
+    ("param guard return None", "if not value: return None", "Not", "return"),
+    ("break guard", "if done: break", "Name", "break"),
+    ("and condition continue", "if not a and not b: continue", "And", "continue"),
+    ("compare eq guard", "if x == 0: return", "Eq", "return"),
+    ("compare notin guard", "if item not in seen: continue", "NotIn", "continue"),
+    ("is None guard", "if x is None: return None", "Is", "return"),
+    ("self attr guard", "if not self.enabled: return", "Not", "return"),
+    ("nested attribute", "if not obj.sub.attr: continue", "Not", "continue"),
+    ("raise valueerror", "if x < 0: raise ValueError(x)", "Lt", "raise"),
     # Block form → same semantics as inline
-    ("block form continue",      "if not x:\n    continue",               "Not",     "continue"),
-    ("block form return",        "if not y:\n    return None",            "Not",     "return"),
+    ("block form continue", "if not x:\n    continue", "Not", "continue"),
+    ("block form return", "if not y:\n    return None", "Not", "return"),
     # Edge: bare if without control flow
-    ("no control flow",          "if x: pass",                            None,      ""),
+    ("no control flow", "if x: pass", None, ""),
     # Edge: syntax error
-    ("syntax error",             "if not :",                              None,      ""),
+    ("syntax error", "if not :", None, ""),
 ]
 
 NULL_CASES = [
-    ("empty string",    ""),
+    ("empty string", ""),
     ("whitespace only", "   "),
 ]
 
@@ -56,12 +56,8 @@ def test_parse_guard_condition_and_control(desc: str, raw: str, exp_op, exp_ctrl
         assert ir.control == exp_ctrl, f"[{desc}] expected control={exp_ctrl!r}, got {ir.control!r}"
     else:
         assert ir.condition is not None, f"[{desc}] expected condition with op={exp_op!r}, got None"
-        assert ir.condition.op_class == exp_op, (
-            f"[{desc}] op_class: expected {exp_op!r}, got {ir.condition.op_class!r}"
-        )
-        assert ir.control == exp_ctrl, (
-            f"[{desc}] control: expected {exp_ctrl!r}, got {ir.control!r}"
-        )
+        assert ir.condition.op_class == exp_op, f"[{desc}] op_class: expected {exp_op!r}, got {ir.condition.op_class!r}"
+        assert ir.control == exp_ctrl, f"[{desc}] control: expected {exp_ctrl!r}, got {ir.control!r}"
 
 
 @pytest.mark.parametrize("desc,raw", NULL_CASES)
@@ -72,6 +68,7 @@ def test_parse_guard_empty_returns_none(desc: str, raw: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Basic GuardIR field invariants
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestGuardIRFields:
     def test_canonical_not_empty_for_valid_guard(self) -> None:
@@ -98,8 +95,8 @@ class TestGuardIRFields:
     def test_control_field_correct(self) -> None:
         cases = [
             ("if not x: continue", "continue"),
-            ("if not x: break",    "break"),
-            ("if not x: return",   "return"),
+            ("if not x: break", "break"),
+            ("if not x: return", "return"),
             ("if not x: raise ValueError()", "raise"),
         ]
         for raw, expected_ctrl in cases:
@@ -138,9 +135,10 @@ class TestGuardIRFields:
 # canonical / compact form verification
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestCanonicalCompact:
     def test_block_and_inline_give_same_canonical(self) -> None:
-        ir_block  = parse_guard("if not x:\n    continue")
+        ir_block = parse_guard("if not x:\n    continue")
         ir_inline = parse_guard("if not x: continue")
         assert ir_block is not None and ir_inline is not None
         assert ir_block.canonical == ir_inline.canonical

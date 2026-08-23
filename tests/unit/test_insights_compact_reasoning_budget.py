@@ -18,6 +18,7 @@ The fix has two parts, both pinned here:
 Source-contract tests (inspect.getsource) — importing asi has heavy
 import-time side effects, so we parse the source text instead.
 """
+
 from __future__ import annotations
 
 import re
@@ -36,7 +37,9 @@ def _get_compact_insights_source() -> str:
             start = i
             break
     if start is None:
-        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
+        pytest.fail(
+            "_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression"
+        )
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]
@@ -71,9 +74,7 @@ class TestInsightsCompactReasoningBudget:
         than a multiplier that under-sizes for large files."""
         src = _get_compact_insights_source()
         # The expansion must be gated on the reasoning-model check.
-        assert "_ci_is_reasoning" in src, (
-            "reasoning budget expansion must be gated on _is_reasoning_model"
-        )
+        assert "_ci_is_reasoning" in src, "reasoning budget expansion must be gated on _is_reasoning_model"
         # Must set a floor large enough for reasoning traces on OpenCode
         # (which shares the max_tokens budget between reasoning + content).
         assert re.search(r"32000|_ci_in_tokens\s*\*\s*[4-9]", src), (
@@ -87,6 +88,5 @@ class TestInsightsCompactReasoningBudget:
         DeepSeek) skip reasoning entirely and the whole budget goes to content."""
         src = _get_compact_insights_source()
         assert "thinking_mode=False" in src, (
-            "compact call must pass thinking_mode=False (deterministic curation, "
-            "not a reasoning task)"
+            "compact call must pass thinking_mode=False (deterministic curation, not a reasoning task)"
         )

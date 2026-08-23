@@ -62,6 +62,6 @@ def test_general_cycle_fires_once_per_fill():
     # Climb toward the limit.
     assert _general_should_compress(60_000, budget, occ) is False
     assert _general_should_compress(90_000, budget, occ) is False
-    assert _general_should_compress(103_000, budget, occ) is True   # compress fires
+    assert _general_should_compress(103_000, budget, occ) is True  # compress fires
     # Post-compress the verbatim window shrinks to ~4 recent turns.
-    assert _general_should_compress(20_000, budget, occ) is False    # stays quiet
+    assert _general_should_compress(20_000, budget, occ) is False  # stays quiet

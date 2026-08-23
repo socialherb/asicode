@@ -10,6 +10,7 @@ The payload sites are the two emission points in the turn pipeline:
   - ``_build_and_filter_prepared_calls``  → ``tool_call_preview``
   - ``_process_tool_results`` (normal + read-only early-finish) → ``tool_call``
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -25,7 +26,7 @@ def _make_loop(agent_id: str = "main"):
     loop._cb = lambda name, data=None: events.append((name, data or {}))
     loop.config = mock.MagicMock()
     loop.config.stream_callback = True
-    loop.config.cancel_event = None          # MagicMock truthiness would cancel
+    loop.config.cancel_event = None  # MagicMock truthiness would cancel
     loop.config.agent_id = agent_id
     loop.config.scoped_verification = False  # skip test-impact index invalidation
     loop.registry = mock.MagicMock()
@@ -44,12 +45,16 @@ def _make_loop(agent_id: str = "main"):
 # tool_call_preview
 # ---------------------------------------------------------------------------
 
+
 def test_preview_payload_carries_main_agent_id():
     loop, events = _make_loop("main")
     loop._build_and_filter_prepared_calls(
         tool_calls=[{"id": "c1", "name": "grep", "args": {"pattern": "x"}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=False, turn_num=2,
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=False,
+        turn_num=2,
     )
     previews = [d for n, d in events if n == "tool_call_preview"]
     assert previews, "tool_call_preview must be emitted"
@@ -61,8 +66,11 @@ def test_preview_payload_carries_subagent_id():
     loop, events = _make_loop("sub_3")
     loop._build_and_filter_prepared_calls(
         tool_calls=[{"id": "c1", "name": "grep", "args": {"pattern": "x"}}],
-        turns=[], plan_subtasks=[], plan_current_index=0,
-        read_only_request=False, turn_num=1,
+        turns=[],
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=False,
+        turn_num=1,
     )
     previews = [d for n, d in events if n == "tool_call_preview"]
     assert previews and previews[0]["agent_id"] == "sub_3"
@@ -72,14 +80,24 @@ def test_preview_payload_carries_subagent_id():
 # tool_call (normal path)
 # ---------------------------------------------------------------------------
 
+
 def _run_process_tool_results(loop):
     return loop._process_tool_results(
         results=[ToolResult(ok=True, content="hit", error="")],
         prepared_calls=[{"tool": "grep", "args": {"pattern": "x"}, "call_id": "c1"}],
-        new_messages=[], write_tool_used=False, reads_since_last_edit=0,
-        fail_streak={}, fail_streak_threshold=3, session_key="sk",
-        write_tools=set(), read_only_request=False, request="r",
-        session_id="s", git_state=None, turn_num=2, turns=[],
+        new_messages=[],
+        write_tool_used=False,
+        reads_since_last_edit=0,
+        fail_streak={},
+        fail_streak_threshold=3,
+        session_key="sk",
+        write_tools=set(),
+        read_only_request=False,
+        request="r",
+        session_id="s",
+        git_state=None,
+        turn_num=2,
+        turns=[],
     )
 
 

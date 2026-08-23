@@ -1,4 +1,5 @@
 """Unit tests for RAGSearcher._walk_files directory pruning."""
+
 from pathlib import Path
 
 from external_llm.agent.rag_searcher import RAGSearcher
@@ -19,10 +20,8 @@ def test_walk_files_prunes_vendor_dirs(tmp_path: Path):
     rel_files = [str(f.relative_to(tmp_path)) for f in files]
 
     assert "src/main.py" in rel_files
-    assert not any("node_modules" in f for f in rel_files), \
-        "node_modules should be pruned"
-    assert not any(".git" in f for f in rel_files), \
-        ".git should be pruned"
+    assert not any("node_modules" in f for f in rel_files), "node_modules should be pruned"
+    assert not any(".git" in f for f in rel_files), ".git should be pruned"
 
 
 def test_walk_files_is_source_prioritized_and_deterministic(tmp_path: Path):
@@ -42,6 +41,7 @@ def test_walk_files_is_source_prioritized_and_deterministic(tmp_path: Path):
     searcher = RAGSearcher(str(tmp_path))
     # Patch the cap down to 4 so the prioritization is observable; restore after.
     import external_llm.agent.rag_searcher as rs
+
     orig = rs._MAX_FILES
     rs._MAX_FILES = 4
     try:
@@ -117,9 +117,7 @@ def test_prepare_files_matches_walk_admission(tmp_path: Path):
         p.write_text("x = 1\n", encoding="utf-8")
 
     searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
-    prepared, fp_map = searcher._prepare_files(
-        ["vendor/dep.py", "lib.min.js", "app.min.css"]
-    )
+    prepared, fp_map = searcher._prepare_files(["vendor/dep.py", "lib.min.js", "app.min.css"])
     assert prepared == {}
     assert fp_map == {}
 
@@ -156,9 +154,7 @@ def test_invalidate_files_mixed_batch_keeps_arrays_aligned(tmp_path: Path):
     in descending index order, so a snapshot-based path→idx lookup stays valid
     for the whole loop and the mirror matches the arrays afterwards."""
     for i in range(4):
-        (tmp_path / f"f{i}.py").write_text(
-            f"def f{i}():\n    return {i}\n", encoding="utf-8"
-        )
+        (tmp_path / f"f{i}.py").write_text(f"def f{i}():\n    return {i}\n", encoding="utf-8")
     searcher = RAGSearcher(str(tmp_path), vector_cache_enabled=False)
     searcher._ensure_index()
     assert searcher._rel_paths == ["f0.py", "f1.py", "f2.py", "f3.py"]

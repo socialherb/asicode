@@ -22,17 +22,13 @@ _spec.loader.exec_module(g)  # type: ignore[union-attr]
     ("body", "expected"),
     [
         # plain unused params (both x and y unused)
-        ("    a = 1\n    b = 2\n    c = 3\n    return a + b + c",
-         ["m.py::f::x", "m.py::f::y"]),
+        ("    a = 1\n    b = 2\n    c = 3\n    return a + b + c", ["m.py::f::x", "m.py::f::y"]),
         # unused param next to a used one
-        ("    a = 1\n    b = 2\n    c = 3\n    return x + a + b + c",
-         ["m.py::f::y"]),
+        ("    a = 1\n    b = 2\n    c = 3\n    return x + a + b + c", ["m.py::f::y"]),
         # param used only in a nested closure (closure use counts)
-        ("    a = 1\n    b = 2\n    def inner():\n        return x\n    return inner",
-         ["m.py::f::y"]),
+        ("    a = 1\n    b = 2\n    def inner():\n        return x\n    return inner", ["m.py::f::y"]),
         # shadowed nested param: inner(x) shadows — outer x genuinely unused
-        ("    a = 1\n    b = 2\n    def inner(x):\n        return x\n    return inner",
-         ["m.py::f::x", "m.py::f::y"]),
+        ("    a = 1\n    b = 2\n    def inner(x):\n        return x\n    return inner", ["m.py::f::x", "m.py::f::y"]),
     ],
     ids=["plain", "mixed", "closure-use", "shadowed"],
 )
@@ -43,14 +39,7 @@ def test_scan_flags_unused_params(body, expected):
 
 
 def test_scan_flags_method_of_base_less_class():
-    src = (
-        "class C:\n"
-        "    def m(self, x):\n"
-        "        a = 1\n"
-        "        b = 2\n"
-        "        c = 3\n"
-        "        return a + b + c\n"
-    )
+    src = "class C:\n    def m(self, x):\n        a = 1\n        b = 2\n        c = 3\n        return a + b + c\n"
     assert g._scan_source(src, "m.py") == ["m.py::C.m::x"]
 
 
@@ -72,7 +61,10 @@ def test_async_function_flagged():
         # decorated functions (routes/callbacks) may be signature-inspected
         ("@router.get('/x')\ndef f(x):\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n", "decorated"),
         # classes with bases are override surfaces
-        ("class C(Base):\n    def m(self, x):\n        a = 1\n        b = 2\n        c = 3\n        return a + b + c\n", "class-with-base"),
+        (
+            "class C(Base):\n    def m(self, x):\n        a = 1\n        b = 2\n        c = 3\n        return a + b + c\n",
+            "class-with-base",
+        ),
         # tiny wrapper bodies (< 4 lines) are callback shims
         ("def f(x):\n    return 1\n", "tiny-body"),
         # self is conventionally unlisted

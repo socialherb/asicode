@@ -5,6 +5,7 @@ Validates that the LanguageRegistry, RepositoryGraph, TaskRouter,
 SymbolSearcher, LintRunner, and validation pipeline all work correctly
 with Python, TypeScript, and JavaScript files together.
 """
+
 from __future__ import annotations
 
 import shutil
@@ -43,6 +44,7 @@ def _make_router(repo_root: str | None = None) -> TaskRouter:
     client.chat.return_value = response
     client.chat_with_tools.return_value = response
     return TaskRouter(llm_client=client, model="test-model")
+
 
 # ── Fixture: multi-language project ──────────────────────────────────────────
 
@@ -215,11 +217,10 @@ def multilang_project():
     tmpdir = tempfile.mkdtemp(prefix="multilang-e2e-")
     try:
         import subprocess
+
         subprocess.run(["git", "init"], cwd=tmpdir, capture_output=True, check=False)
-        subprocess.run(["git", "config", "user.email", "test@test.com"],
-                       cwd=tmpdir, capture_output=True, check=False)
-        subprocess.run(["git", "config", "user.name", "Test"],
-                       cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmpdir, capture_output=True, check=False)
 
         # Python
         svc_dir = Path(tmpdir) / "service"
@@ -257,8 +258,7 @@ def multilang_project():
         (Path(tmpdir) / "styles.css").write_text("body { margin: 0; }")
 
         subprocess.run(["git", "add", "."], cwd=tmpdir, capture_output=True, check=False)
-        subprocess.run(["git", "commit", "-m", "init multilang"],
-                       cwd=tmpdir, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "init multilang"], cwd=tmpdir, capture_output=True, check=False)
 
         yield tmpdir
     finally:
@@ -280,6 +280,7 @@ def facade(multilang_project):
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. LanguageRegistry
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestLanguageRegistry:
     """Verify that the registry correctly identifies languages and capabilities."""
@@ -326,6 +327,7 @@ class TestLanguageRegistry:
 
     def test_file_pattern_regex(self):
         import re
+
         pat = LanguageRegistry.instance().get_file_pattern()
         assert re.search(pat, "service/user_service.py")
         assert re.search(pat, "api/user.ts")
@@ -348,6 +350,7 @@ class TestLanguageRegistry:
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Syntax Validation
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestSyntaxValidation:
     """Verify that each provider validates syntax correctly."""
@@ -378,11 +381,10 @@ class TestSyntaxValidation:
         assert result.language == LanguageId.JAVASCRIPT
 
 
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Symbol Detection (Provider Patterns)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestSymbolDetection:
     """Verify that providers find symbols in source code."""
@@ -452,6 +454,7 @@ class TestSymbolDetection:
 # 4. Repository Graph (GSG) — Multi-Language Indexing
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestRepositoryGraph:
     """Verify that the GSG indexes symbols from all languages."""
 
@@ -459,10 +462,7 @@ class TestRepositoryGraph:
         assert len(graph.symbols) > 0
 
     def test_python_symbols_indexed(self, graph):
-        py_symbols = [
-            s for s in graph.symbols.values()
-            if s.file_path.endswith(".py") and s.name != "__init__"
-        ]
+        py_symbols = [s for s in graph.symbols.values() if s.file_path.endswith(".py") and s.name != "__init__"]
         assert len(py_symbols) >= 2  # UserService, get_user, update_user, ...
         names = {s.name for s in py_symbols}
         assert "UserService" in names
@@ -518,6 +518,7 @@ class TestRepositoryGraph:
 # 5. Task Router — Language-Aware Routing
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestTaskRouter:
     """Verify that edit requests route to MAIN_AGENT for every language.
 
@@ -532,39 +533,27 @@ class TestTaskRouter:
         self.router = _make_router()
 
     def test_python_edit_to_main_agent(self):
-        decision = self.router.route(
-            "add a docstring to the get_user function in user_service.py"
-        )
+        decision = self.router.route("add a docstring to the get_user function in user_service.py")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_typescript_edit_to_main_agent(self):
-        decision = self.router.route(
-            "add a findAll method to the UserRepository class in api/user.ts"
-        )
+        decision = self.router.route("add a findAll method to the UserRepository class in api/user.ts")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_javascript_edit_to_main_agent(self):
-        decision = self.router.route(
-            "modify the formatDate function in utils/helpers.js to accept a locale parameter"
-        )
+        decision = self.router.route("modify the formatDate function in utils/helpers.js to accept a locale parameter")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_tsx_edit_to_main_agent(self):
-        decision = self.router.route(
-            "add a size prop to the Button component in ui/Button.tsx"
-        )
+        decision = self.router.route("add a size prop to the Button component in ui/Button.tsx")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_css_edit_to_main_agent(self):
-        decision = self.router.route(
-            "change the background-color of body in styles.css"
-        )
+        decision = self.router.route("change the background-color of body in styles.css")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_json_edit_to_main_agent(self):
-        decision = self.router.route(
-            "change the version value to 2.0 in config.json"
-        )
+        decision = self.router.route("change the version value to 2.0 in config.json")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_mixed_ts_js_to_main_agent(self):
@@ -577,6 +566,7 @@ class TestTaskRouter:
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. Symbol Search — Multi-Language
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestSymbolSearch:
     """Verify that SymbolSearcher finds symbols across languages."""
@@ -614,10 +604,7 @@ class TestSymbolSearch:
     # tree-sitter AST index (_index_via_treesitter), the single source of
     # truth. These tests pin that CSS symbols are reliably findable.
     def test_find_css_class(self, tmp_path):
-        (tmp_path / "style.css").write_text(
-            ".btn-primary {\n  color: blue;\n}\n"
-            ".card { padding: 8px; }\n"
-        )
+        (tmp_path / "style.css").write_text(".btn-primary {\n  color: blue;\n}\n.card { padding: 8px; }\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("btn-primary", kind="any")
         assert len(results) == 1
@@ -625,9 +612,7 @@ class TestSymbolSearch:
         assert results[0].file.endswith("style.css")
 
     def test_find_css_id(self, tmp_path):
-        (tmp_path / "style.css").write_text(
-            "#main-header {\n  width: 100%;\n}\n"
-        )
+        (tmp_path / "style.css").write_text("#main-header {\n  width: 100%;\n}\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("main-header", kind="any")
         assert len(results) == 1
@@ -636,18 +621,14 @@ class TestSymbolSearch:
     def test_find_css_class_with_kind_class(self, tmp_path):
         # kind="class" must also reach the CSS class pattern (only 5 patterns,
         # all of which were previously dropped by [:3]).
-        (tmp_path / "style.css").write_text(
-            ".hero-banner { display: flex; }\n"
-        )
+        (tmp_path / "style.css").write_text(".hero-banner { display: flex; }\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("hero-banner", kind="class")
         assert len(results) == 1
         assert results[0].kind == "css_class"
 
     def test_find_css_variable(self, tmp_path):
-        (tmp_path / "theme.css").write_text(
-            ":root {\n  --primary-color: #333;\n}\n"
-        )
+        (tmp_path / "theme.css").write_text(":root {\n  --primary-color: #333;\n}\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("primary-color", kind="any")
         assert len(results) == 1
@@ -747,9 +728,7 @@ class TestSymbolSearch:
         """An ordinary CSS property like 'color' inside a declaration must NOT
         be indexed — only '--'-prefixed custom properties are symbols. This
         distinguishes the AST's declaration filtering from a naive regex."""
-        (tmp_path / "s.css").write_text(
-            ".x { color: red; background: blue; --real-var: 1; }\n"
-        )
+        (tmp_path / "s.css").write_text(".x { color: red; background: blue; --real-var: 1; }\n")
         ss = SymbolSearcher(tmp_path)
         # 'color' and 'background' are ordinary properties, not symbols.
         assert ss.find_symbol("color", kind="any") == []
@@ -763,9 +742,7 @@ class TestSymbolSearch:
         """Selectors nested inside @media / @supports blocks are still indexed —
         the AST walk descends into nested rule_sets, which a line-anchored rg
         regex handles only by accident."""
-        (tmp_path / "s.css").write_text(
-            "@media (max-width: 600px) {\n  .responsive { display: none; }\n}\n"
-        )
+        (tmp_path / "s.css").write_text("@media (max-width: 600px) {\n  .responsive { display: none; }\n}\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("responsive", kind="any")
         assert len(results) == 1
@@ -793,14 +770,13 @@ class TestSymbolSearch:
 # path — previously they were only reachable through the removed fallback.
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestNonPySymbolSearch:
     """Verify SymbolSearcher finds symbols in Rust/C#/Ruby/PHP/Swift via the
     provider registry → tree-sitter AST index (no rg+regex fallback)."""
 
     def test_rust_function_found(self, tmp_path):
-        (tmp_path / "a.rs").write_text(
-            "fn process_data(input: &[u8]) -> Vec<u8> { vec![] }\n"
-        )
+        (tmp_path / "a.rs").write_text("fn process_data(input: &[u8]) -> Vec<u8> { vec![] }\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("process_data", kind="any")
         assert len(results) == 1
@@ -825,9 +801,7 @@ class TestNonPySymbolSearch:
         # A generic return type (Task<User>) was missed by the legacy rg
         # regex; the AST path captures it correctly.
         (tmp_path / "b.cs").write_text(
-            "public class Svc {\n"
-            "  public Task<User> GetByIdAsync(int id) { return null; }\n"
-            "}\n"
+            "public class Svc {\n  public Task<User> GetByIdAsync(int id) { return null; }\n}\n"
         )
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("GetByIdAsync", kind="function")
@@ -851,18 +825,14 @@ class TestNonPySymbolSearch:
         assert results[0].file.endswith(".rb")
 
     def test_php_class_found(self, tmp_path):
-        (tmp_path / "d.php").write_text(
-            "<?php\nclass UserRepository { }\n?>\n"
-        )
+        (tmp_path / "d.php").write_text("<?php\nclass UserRepository { }\n?>\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("UserRepository", kind="any")
         assert len(results) == 1
         assert results[0].file.endswith(".php")
 
     def test_php_method_found(self, tmp_path):
-        (tmp_path / "d.php").write_text(
-            "<?php\nclass Svc {\n  public function getById($id) {}\n}\n?>\n"
-        )
+        (tmp_path / "d.php").write_text("<?php\nclass Svc {\n  public function getById($id) {}\n}\n?>\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("getById", kind="function")
         assert len(results) == 1
@@ -886,17 +856,13 @@ class TestNonPySymbolSearch:
         """_find_in_other_langs must no longer exist on SymbolSearcher — it
         was pure redundancy once every non-Python language had a provider."""
         from external_llm.agent.symbol_search import SymbolSearcher
+
         ss = SymbolSearcher(Path("/"))
         assert not hasattr(ss, "_find_in_other_langs")
 
     def test_bash_function_posix_form_found(self, tmp_path):
         # POSIX form: name() { ... } — the common case.
-        (tmp_path / "deploy.sh").write_text(
-            "#!/usr/bin/env bash\n"
-            "build_app() {\n"
-            "    make all\n"
-            "}\n"
-        )
+        (tmp_path / "deploy.sh").write_text("#!/usr/bin/env bash\nbuild_app() {\n    make all\n}\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("build_app", kind="any")
         assert len(results) == 1
@@ -905,11 +871,7 @@ class TestNonPySymbolSearch:
 
     def test_bash_function_keyword_form_found(self, tmp_path):
         # C-style / keyword form: function name { ... }
-        (tmp_path / "test.sh").write_text(
-            "function test_suite {\n"
-            "    pytest\n"
-            "}\n"
-        )
+        (tmp_path / "test.sh").write_text("function test_suite {\n    pytest\n}\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("test_suite", kind="any")
         assert len(results) == 1
@@ -919,10 +881,7 @@ class TestNonPySymbolSearch:
     def test_bash_call_not_mistaken_for_definition(self, tmp_path):
         # A bare function call must NOT be indexed as a definition — the
         # POSIX pattern requires the trailing "()" which a call lacks.
-        (tmp_path / "run.sh").write_text(
-            "#!/usr/bin/env bash\n"
-            "deploy_production   # just a call, no definition\n"
-        )
+        (tmp_path / "run.sh").write_text("#!/usr/bin/env bash\ndeploy_production   # just a call, no definition\n")
         ss = SymbolSearcher(tmp_path)
         results = ss.find_symbol("deploy_production", kind="any")
         assert len(results) == 0
@@ -930,13 +889,7 @@ class TestNonPySymbolSearch:
     def test_bash_two_forms_in_one_file(self, tmp_path):
         # Both POSIX and keyword forms in the same file are found.
         (tmp_path / "ci.sh").write_text(
-            "lint() {\n"
-            "    flake8 .\n"
-            "}\n"
-            "function deploy {\n"
-            "    lint\n"
-            "    kubectl apply\n"
-            "}\n"
+            "lint() {\n    flake8 .\n}\nfunction deploy {\n    lint\n    kubectl apply\n}\n"
         )
         ss = SymbolSearcher(tmp_path)
         names = {r.name for r in ss.find_symbol("lint", kind="any")}
@@ -947,6 +900,7 @@ class TestNonPySymbolSearch:
 # ══════════════════════════════════════════════════════════════════════════════
 # 8. Lint Runner — Language Dispatch
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestLintRunner:
     """Verify that LintRunner dispatches to the correct linter."""
@@ -982,6 +936,7 @@ class TestLintRunner:
 # ══════════════════════════════════════════════════════════════════════════════
 # 9. Go Provider
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestGoProvider:
     """Verify Go language support end-to-end."""
@@ -1033,9 +988,7 @@ class TestGoProvider:
         assert "UserService" in names or "NewUserService" in names or "FormatUser" in names
 
     def test_go_router_routes_main_agent(self):
-        decision = _make_router().route(
-            "modify the GetUser function in server/main.go"
-        )
+        decision = _make_router().route("modify the GetUser function in server/main.go")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_go_lint_dispatch(self, multilang_project):
@@ -1063,6 +1016,7 @@ class TestGoProvider:
 # ══════════════════════════════════════════════════════════════════════════════
 # 10. Java Provider
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestJavaProvider:
     """Verify Java language support end-to-end."""
@@ -1114,9 +1068,7 @@ class TestJavaProvider:
         assert "UserRepository" in names or "findById" in names
 
     def test_java_router_routes_main_agent(self):
-        decision = _make_router().route(
-            "modify the delete method in src/UserRepository.java"
-        )
+        decision = _make_router().route("modify the delete method in src/UserRepository.java")
         assert decision.lane == Lane.MAIN_AGENT
 
     def test_java_lint_dispatch(self, multilang_project):
@@ -1149,16 +1101,19 @@ class TestJavaProvider:
 # 11. Tree-sitter Integration
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestTreeSitter:
     """Verify tree-sitter integration when available."""
 
     def test_is_available_returns_bool(self):
         from external_llm.languages.tree_sitter_utils import is_available
+
         assert isinstance(is_available(), bool)
 
     def test_find_symbol_range_without_tree_sitter(self):
         """Verify graceful None return when tree-sitter is not installed."""
         from external_llm.languages.tree_sitter_utils import _HAS_TREE_SITTER, find_symbol_range
+
         if _HAS_TREE_SITTER:
             pytest.skip("tree-sitter is installed; testing fallback path only")
         result = find_symbol_range("function foo() {}", "foo", "javascript")
@@ -1166,6 +1121,7 @@ class TestTreeSitter:
 
     def test_find_all_symbols_without_tree_sitter(self):
         from external_llm.languages.tree_sitter_utils import _HAS_TREE_SITTER, find_all_symbols
+
         if _HAS_TREE_SITTER:
             pytest.skip("tree-sitter is installed; testing fallback path only")
         result = find_all_symbols("function foo() {}", "javascript")
@@ -1183,6 +1139,7 @@ class TestTreeSitter:
 _ts_available = False
 try:
     from external_llm.languages.tree_sitter_utils import is_available
+
     _ts_available = is_available()
 except ImportError:
     pass
@@ -1195,6 +1152,7 @@ class TestTreeSitterEdgeCases:
     def test_ts_template_literal_braces(self):
         """Template literal with braces should not confuse tree-sitter."""
         from external_llm.languages.tree_sitter_utils import find_symbol_range
+
         src = """\
 export function greet(name: string): string {
   return `Hello, ${name}! You have ${count} items in your ${"cart"}`;
@@ -1213,6 +1171,7 @@ export function farewell(name: string): string {
     def test_jsx_braces(self):
         """JSX expressions with braces should be handled correctly."""
         from external_llm.languages.tree_sitter_utils import find_symbol_range
+
         src = """\
 export function Card({ title, children }) {
   return (
@@ -1240,6 +1199,7 @@ export function Badge({ count }) {
     def test_comment_braces(self):
         """Braces inside comments should be ignored."""
         from external_llm.languages.tree_sitter_utils import find_symbol_range
+
         src = """\
 // This function handles { edge cases }
 export function processData(data: any): any {
@@ -1262,6 +1222,7 @@ export function nextFunction(): void {
 
     def test_go_symbol_range(self):
         from external_llm.languages.tree_sitter_utils import find_symbol_range
+
         result = find_symbol_range(GO_SRC, "NewUserService", "go")
         assert result is not None
         start, end = result
@@ -1270,6 +1231,7 @@ export function nextFunction(): void {
 
     def test_java_symbol_range(self):
         from external_llm.languages.tree_sitter_utils import find_symbol_range
+
         result = find_symbol_range(JAVA_SRC, "UserRepository", "java")
         assert result is not None
         start, end = result
@@ -1278,6 +1240,7 @@ export function nextFunction(): void {
 
     def test_find_all_symbols_ts(self):
         from external_llm.languages.tree_sitter_utils import find_all_symbols
+
         symbols = find_all_symbols(TYPESCRIPT_SRC, "typescript")
         assert len(symbols) >= 2
         names = {s[0] for s in symbols}
@@ -1285,6 +1248,7 @@ export function nextFunction(): void {
 
     def test_find_all_symbols_go(self):
         from external_llm.languages.tree_sitter_utils import find_all_symbols
+
         symbols = find_all_symbols(GO_SRC, "go")
         assert len(symbols) >= 2
         names = {s[0] for s in symbols}

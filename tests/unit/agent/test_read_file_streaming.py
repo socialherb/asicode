@@ -13,6 +13,7 @@ alone would silently renumber any file containing ``\\v \\f \\x1c \\x1d \\x1e
 answered twice — once through the bulk path, once through the streaming path —
 and the two answers must be identical.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -52,10 +53,7 @@ def _peak_alloc_mb(out: list):
 
 
 def _tricky_text(rng: random.Random, tokens: int) -> str:
-    return "".join(
-        rng.choice(_BREAKS) if rng.random() < 0.35 else rng.choice(_ALPHA)
-        for _ in range(tokens)
-    )
+    return "".join(rng.choice(_BREAKS) if rng.random() < 0.35 else rng.choice(_ALPHA) for _ in range(tokens))
 
 
 class TestSplitterParity:
@@ -208,7 +206,7 @@ class TestToolParity:
             {"start_line": 3, "end_line": 9},
             {"start_line": 1, "end_line": 1},
             {"end_line": 4},
-            {"start_line": 900},              # past the end
+            {"start_line": 900},  # past the end
             {"start_line": 9, "end_line": 2},  # inverted
             {"start_line": 1, "end_line": 0},  # malformed
         ],
@@ -216,13 +214,12 @@ class TestToolParity:
     )
     def test_every_range_shape_agrees(self, tool_registry, temp_repo_root, monkeypatch, args):
         name = _write(
-            temp_repo_root, "sample.py",
+            temp_repo_root,
+            "sample.py",
             "".join(f"def f{i}():\n    return {i}\n" for i in range(20)),
         )
         bulk, streamed = self._both(tool_registry, monkeypatch, {"path": name, **args})
-        assert (bulk.ok, bulk.content, bulk.error) == (
-            streamed.ok, streamed.content, streamed.error
-        )
+        assert (bulk.ok, bulk.content, bulk.error) == (streamed.ok, streamed.content, streamed.error)
         assert bulk.metadata == streamed.metadata
 
     def test_a_file_of_exotic_line_breaks_agrees(self, tool_registry, temp_repo_root, monkeypatch):
@@ -235,7 +232,8 @@ class TestToolParity:
 
     def test_the_over_cap_refusal_agrees(self, tool_registry, temp_repo_root, monkeypatch):
         name = _write(
-            temp_repo_root, "long.py",
+            temp_repo_root,
+            "long.py",
             "".join(f"x = {i}\n" for i in range(rt._cfg.lines.READ_FILE_FULL_LINES + 50)),
         )
         bulk, streamed = self._both(tool_registry, monkeypatch, {"path": name})
@@ -244,7 +242,10 @@ class TestToolParity:
         assert bulk.metadata == streamed.metadata
 
     def test_a_line_wider_than_the_retention_window_agrees(
-        self, tool_registry, temp_repo_root, monkeypatch,
+        self,
+        tool_registry,
+        temp_repo_root,
+        monkeypatch,
     ):
         """One line wider than the streaming window — a minified bundle.
 
@@ -266,18 +267,24 @@ class TestToolParity:
     def test_the_char_budget_cut_agrees(self, tool_registry, temp_repo_root, monkeypatch):
         """A range far past the output budget must truncate at the same line."""
         name = _write(
-            temp_repo_root, "wide.txt",
+            temp_repo_root,
+            "wide.txt",
             "".join(("y" * 200 + "\n") for _ in range(4000)),
         )
         bulk, streamed = self._both(
-            tool_registry, monkeypatch, {"path": name, "start_line": 1, "end_line": 4000},
+            tool_registry,
+            monkeypatch,
+            {"path": name, "start_line": 1, "end_line": 4000},
         )
         assert (bulk.metadata or {}).get("truncated") is True
         assert bulk.metadata == streamed.metadata, "resume_line drifted between paths"
         assert bulk.content == streamed.content
 
     def test_a_binary_file_is_still_refused_before_any_body_read(
-        self, tool_registry, temp_repo_root, streaming,
+        self,
+        tool_registry,
+        temp_repo_root,
+        streaming,
     ):
         with open(f"{temp_repo_root}/blob.bin", "wb") as fh:
             fh.write(b"\x00\x01\x02" * 5000)
@@ -303,7 +310,10 @@ class TestMemory:
     # the code, was what kept the number small.
     @pytest.mark.parametrize("ext", ["log", "py", "js"])
     def test_the_over_cap_refusal_does_not_materialise_the_file(
-        self, tool_registry, temp_repo_root, ext,
+        self,
+        tool_registry,
+        temp_repo_root,
+        ext,
     ):
         name = self._big(temp_repo_root, ext)
         peak: list = []
@@ -317,7 +327,9 @@ class TestMemory:
         )
 
     def test_a_ranged_read_does_not_materialise_the_file(
-        self, tool_registry, temp_repo_root,
+        self,
+        tool_registry,
+        temp_repo_root,
     ):
         """The call the refusal tells the model to make next.
 
@@ -328,7 +340,8 @@ class TestMemory:
         peak: list = []
         with _peak_alloc_mb(peak):
             result = tool_registry.dispatch(
-                "read_file", {"path": name, "start_line": 100, "end_line": 120},
+                "read_file",
+                {"path": name, "start_line": 100, "end_line": 120},
             )
         assert result.ok
         assert "2026-07-30 INFO" in result.content

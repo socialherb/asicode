@@ -24,6 +24,7 @@ through, reporting success.
     "full"                        → full-repo snapshot, taken once
     anything else                 → scoped snapshot of touched files
 """
+
 from __future__ import annotations
 
 import logging
@@ -31,7 +32,6 @@ import os
 import threading
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ MODE_SCOPED = "scoped"
 _DISABLED_VALUES = frozenset({"0", "off", "false", "no"})
 
 
-def resolve_checkpoint_mode(raw: Optional[str]) -> str:
+def resolve_checkpoint_mode(raw: str | None) -> str:
     """Map ``ASICODE_CHECKPOINT_ON_WRITE`` to one of the three MODE_* values."""
     value = (raw or MODE_SCOPED).strip().lower() or MODE_SCOPED
     if value in _DISABLED_VALUES:
@@ -83,12 +83,10 @@ class RunCheckpointGate:
     under ``_lock`` because subagents write concurrently.
     """
 
-    def __init__(self, repo_root: str, mode: Optional[str] = None) -> None:
+    def __init__(self, repo_root: str, mode: str | None = None) -> None:
         self.repo_root = repo_root
-        self.mode = resolve_checkpoint_mode(
-            mode if mode is not None else os.environ.get("ASICODE_CHECKPOINT_ON_WRITE")
-        )
-        self.checkpoint_id: Optional[str] = None
+        self.mode = resolve_checkpoint_mode(mode if mode is not None else os.environ.get("ASICODE_CHECKPOINT_ON_WRITE"))
+        self.checkpoint_id: str | None = None
         self._store = None
         self._lock = threading.Lock()
         # Paths seen absent by before_write and NOT yet written to the store as
@@ -111,10 +109,11 @@ class RunCheckpointGate:
     def _get_store(self):
         if self._store is None:
             from external_llm.agent.checkpoint_store import CheckpointStore
+
             self._store = CheckpointStore(self.repo_root)
         return self._store
 
-    def before_write(self, paths: Optional[Iterable[str]]) -> Optional[str]:
+    def before_write(self, paths: Iterable[str] | None) -> str | None:
         """Capture pre-write state for ``paths``; returns the checkpoint id.
 
         Called on the write path, so it must never raise: a checkpoint is a
@@ -126,9 +125,7 @@ class RunCheckpointGate:
             with self._lock:
                 if self.mode == MODE_FULL:
                     if self.checkpoint_id is None:
-                        self.checkpoint_id = self._get_store().create(
-                            "Pre-run snapshot (full repo)"
-                        )
+                        self.checkpoint_id = self._get_store().create("Pre-run snapshot (full repo)")
                     return self.checkpoint_id
 
                 in_repo = resolve_in_repo_paths(paths or (), self.repo_root)
@@ -148,9 +145,7 @@ class RunCheckpointGate:
 
                 store = self._get_store()
                 if self.checkpoint_id is None:
-                    self.checkpoint_id = store.create(
-                        "Pre-run snapshot (scoped)", files=existing
-                    )
+                    self.checkpoint_id = store.create("Pre-run snapshot (scoped)", files=existing)
                 else:
                     store.extend(self.checkpoint_id, existing)
                 return self.checkpoint_id
@@ -160,7 +155,7 @@ class RunCheckpointGate:
             logger.warning("run checkpoint gate failed", exc_info=True)
             return self.checkpoint_id
 
-    def confirm_writes(self, paths: Optional[Iterable[str]]) -> Optional[str]:
+    def confirm_writes(self, paths: Iterable[str] | None) -> str | None:
         """Tombstone the pending absences that *this* successful write created.
 
         Called after a write tool succeeded, with the same targets the matching
@@ -191,18 +186,14 @@ class RunCheckpointGate:
                 if not self._pending_absent:
                     return self.checkpoint_id
                 targets = set(resolve_in_repo_paths(paths or (), self.repo_root))
-                created = sorted(
-                    p for p in self._pending_absent & targets if Path(p).exists()
-                )
+                created = sorted(p for p in self._pending_absent & targets if Path(p).exists())
                 if not created:
                     return self.checkpoint_id
                 self._pending_absent.difference_update(created)
 
                 store = self._get_store()
                 if self.checkpoint_id is None:
-                    self.checkpoint_id = store.create(
-                        "Pre-run snapshot (scoped)", files=[], absent=created
-                    )
+                    self.checkpoint_id = store.create("Pre-run snapshot (scoped)", files=[], absent=created)
                 else:
                     store.extend(self.checkpoint_id, [], absent=created)
                 return self.checkpoint_id

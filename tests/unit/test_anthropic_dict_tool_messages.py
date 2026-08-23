@@ -15,6 +15,7 @@ openai_client.py fails fast on dicts (direct attribute access); providers.py
 assumes objects. Only anthropic_client half-supports the dict form — these
 tests pin the consistent behavior: dict messages keep their tool metadata.
 """
+
 from __future__ import annotations
 
 import json
@@ -45,11 +46,13 @@ class _FakeJsonResponse:
         return self.data
 
 
-_OK = _FakeJsonResponse({
-    "content": [{"type": "text", "text": "done"}],
-    "stop_reason": "end_turn",
-    "usage": {"input_tokens": 1, "output_tokens": 1},
-})
+_OK = _FakeJsonResponse(
+    {
+        "content": [{"type": "text", "text": "done"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+)
 
 _TOOLS = [{"name": "grep", "description": "search", "parameters": {"type": "object", "properties": {}}}]
 
@@ -71,8 +74,11 @@ def test_dict_assistant_tool_calls_become_tool_use_blocks(monkeypatch):
     client.chat_with_tools(
         [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "",
-             "tool_calls": [{"id": "tc_1", "function": {"name": "grep", "arguments": json.dumps({"q": "x"})}}]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_1", "function": {"name": "grep", "arguments": json.dumps({"q": "x"})}}],
+            },
             {"role": "tool", "tool_call_id": "tc_1", "content": "match found"},
         ],
         _TOOLS,
@@ -93,8 +99,11 @@ def test_dict_tool_result_keeps_tool_use_id(monkeypatch):
     client.chat_with_tools(
         [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "",
-             "tool_calls": [{"id": "tc_42", "function": {"name": "grep", "arguments": "{}"}}]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc_42", "function": {"name": "grep", "arguments": "{}"}}],
+            },
             {"role": "tool", "tool_call_id": "tc_42", "content": "ok"},
         ],
         _TOOLS,
@@ -121,10 +130,13 @@ def test_dict_raw_content_preferred(monkeypatch):
 def test_dict_images_become_image_blocks(monkeypatch):
     client, cap = _client_with_capture(monkeypatch)
     client.chat_with_tools(
-        [{
-            "role": "user", "content": "look",
-            "images": [{"media_type": "image/png", "data": "aGk="}],
-        }],
+        [
+            {
+                "role": "user",
+                "content": "look",
+                "images": [{"media_type": "image/png", "data": "aGk="}],
+            }
+        ],
         _TOOLS,
     )
     msgs = _api_msgs(cap)
@@ -141,8 +153,11 @@ def test_object_messages_still_work(monkeypatch):
     client.chat_with_tools(
         [
             LLMMessage(role="user", content="hi"),
-            LLMMessage(role="assistant", content="",
-                       tool_calls=[{"id": "tc_9", "function": {"name": "grep", "arguments": "{}"}}]),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": "tc_9", "function": {"name": "grep", "arguments": "{}"}}],
+            ),
             LLMMessage(role="tool", content="ok", tool_call_id="tc_9"),
         ],
         _TOOLS,

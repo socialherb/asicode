@@ -11,6 +11,7 @@ hard to pin down. These tests target each helper directly.
 
 Run: pytest tests/unit/test_diff_apply_pure.py -v
 """
+
 from __future__ import annotations
 
 import sys
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import diff_apply
 
 # ── _clean_diff_lines ────────────────────────────────────────────────────────
+
 
 class TestCleanDiffLines:
     def test_empty_input_returns_empty(self):
@@ -113,6 +115,7 @@ class TestCleanDiffLines:
 
 # ── _parse_hunk_header ───────────────────────────────────────────────────────
 
+
 class TestParseHunkHeader:
     def test_full_form(self):
         assert diff_apply._parse_hunk_header("@@ -10,5 +12,7 @@") == (10, 5, 12, 7)
@@ -131,10 +134,11 @@ class TestParseHunkHeader:
 
 # ── _recount_hunks ───────────────────────────────────────────────────────────
 
+
 class TestRecountHunks:
     def test_recomputes_counts_from_body(self):
         lines = [
-            "@@ -1,99 +1,99 @@",   # bogus counts
+            "@@ -1,99 +1,99 @@",  # bogus counts
             " ctx",
             "-old",
             "+new",
@@ -173,7 +177,7 @@ class TestRecountHunks:
         # not be mistaken for the '+++ ' file header.
         lines = [
             "@@ -1,99 +1,99 @@",
-            "+++b/c",   # no space — code addition
+            "+++b/c",  # no space — code addition
         ]
         out = diff_apply._recount_hunks(lines)
         assert out[0] == "@@ -1,0 +1,1 @@"
@@ -185,6 +189,7 @@ class TestRecountHunks:
 
 
 # ── _rewrite_patch_paths ─────────────────────────────────────────────────────
+
 
 class TestRewritePatchPaths:
     def test_no_target_returns_unchanged(self):
@@ -206,6 +211,7 @@ class TestRewritePatchPaths:
 
 
 # ── _upgrade_hunk_fragment ───────────────────────────────────────────────────
+
 
 class TestUpgradeHunkFragment:
     def test_wraps_naked_hunk_into_full_diff(self):
@@ -231,6 +237,7 @@ class TestUpgradeHunkFragment:
 
 # ── _clean_diff (integration of the above) ───────────────────────────────────
 
+
 class TestCleanDiff:
     def test_empty_returns_empty(self):
         assert diff_apply._clean_diff("", "/repo", "x.py") == ""
@@ -246,20 +253,24 @@ class TestCleanDiff:
 
 # ── _classify_git_apply_output ───────────────────────────────────────────────
 
+
 class TestClassifyGitApplyOutput:
-    @pytest.mark.parametrize("msg,expected", [
-        ("error: corrupt patch at line 3", diff_apply.REASON_PATCH_MALFORMED),
-        ("fatal: patch fragment without header", diff_apply.REASON_PATCH_MALFORMED),
-        ("error: malformed patch", diff_apply.REASON_PATCH_MALFORMED),
-        ("repository lacks the necessary blob", diff_apply.REASON_PATCH_MALFORMED),
-        ("can't find file to patch", diff_apply.REASON_PATH_INVALID),
-        ("No such file or directory", diff_apply.REASON_PATH_INVALID),
-        ("error: patch failed: x.py:42", diff_apply.REASON_CONFLICT),
-        ("hunk failed at 10", diff_apply.REASON_CONFLICT),
-        ("Patch does not apply", diff_apply.REASON_CONFLICT),
-        ("some unrecognized message", diff_apply.REASON_UNKNOWN),
-        ("", diff_apply.REASON_UNKNOWN),
-    ])
+    @pytest.mark.parametrize(
+        "msg,expected",
+        [
+            ("error: corrupt patch at line 3", diff_apply.REASON_PATCH_MALFORMED),
+            ("fatal: patch fragment without header", diff_apply.REASON_PATCH_MALFORMED),
+            ("error: malformed patch", diff_apply.REASON_PATCH_MALFORMED),
+            ("repository lacks the necessary blob", diff_apply.REASON_PATCH_MALFORMED),
+            ("can't find file to patch", diff_apply.REASON_PATH_INVALID),
+            ("No such file or directory", diff_apply.REASON_PATH_INVALID),
+            ("error: patch failed: x.py:42", diff_apply.REASON_CONFLICT),
+            ("hunk failed at 10", diff_apply.REASON_CONFLICT),
+            ("Patch does not apply", diff_apply.REASON_CONFLICT),
+            ("some unrecognized message", diff_apply.REASON_UNKNOWN),
+            ("", diff_apply.REASON_UNKNOWN),
+        ],
+    )
     def test_classification(self, msg, expected):
         assert diff_apply._classify_git_apply_output(msg) == expected
 
@@ -268,6 +279,7 @@ class TestClassifyGitApplyOutput:
 
 
 # ── _extract_files_from_git_apply_output ─────────────────────────────────────
+
 
 class TestExtractFilesFromGitApplyOutput:
     def test_empty_returns_empty(self):
@@ -298,6 +310,7 @@ class TestExtractFilesFromGitApplyOutput:
 
 # ── _is_probably_binary_file ─────────────────────────────────────────────────
 
+
 class TestIsProbablyBinaryFile:
     def test_text_file_not_binary(self, tmp_path):
         p = tmp_path / "t.txt"
@@ -315,6 +328,7 @@ class TestIsProbablyBinaryFile:
 
 
 # ── _has_conflict_markers ────────────────────────────────────────────────────
+
 
 class TestHasConflictMarkers:
     def _write(self, tmp_path, text):
@@ -372,8 +386,7 @@ class TestHasConflictMarkers:
     def test_multiple_conflict_blocks_detected(self, tmp_path):
         p = self._write(
             tmp_path,
-            "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> branch\n"
-            "<<<<<<< HEAD\nc\n=======\nd\n>>>>>>> branch\n",
+            "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> branch\n<<<<<<< HEAD\nc\n=======\nd\n>>>>>>> branch\n",
         )
         assert diff_apply._has_conflict_markers(p, 0) is True
 
@@ -382,6 +395,7 @@ class TestHasConflictMarkers:
 
 
 # ── _resolve_inside_repo_path ────────────────────────────────────────────────
+
 
 class TestResolveInsideRepoPath:
     def test_resolves_inside(self, tmp_path):
@@ -393,11 +407,23 @@ class TestResolveInsideRepoPath:
     def test_rejects_path_traversal(self, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()
-        with pytest.raises(ValueError, match="path_outside_repo"):
+        # SSOT (path_security.resolve_inside_repo) rejects traversal during
+        # normalize_rel_path — earlier and stricter than the old local copy,
+        # which only caught it at resolve time.
+        with pytest.raises(ValueError, match="path_invalid"):
             diff_apply._resolve_inside_repo_path(repo, "../../etc/passwd")
+
+    def test_rejects_absolute_path(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # Absolute input is normalized to a repo-relative path by the SSOT
+        # (leading slash stripped) — never an escape.
+        p = diff_apply._resolve_inside_repo_path(repo, "/etc/passwd")
+        assert p == (repo / "etc" / "passwd").resolve()
 
 
 # ── _rollback (report + mixed tracked/new pathspec regression) ──────────────
+
 
 class TestRollbackReport:
     """Regression tests for the _rollback report dict (Design 10).
@@ -417,7 +443,9 @@ class TestRollbackReport:
         def git(*args):
             subprocess.run(
                 ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
-                cwd=str(repo), check=True, capture_output=True,
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
             )
 
         git("init", "-q")
@@ -461,6 +489,7 @@ class TestRollbackReport:
 
 # ── _count_hunk_body: empty line counting (Bug 1 regression test) ────────────
 
+
 class TestCountHunkBodyEmptyLines:
     """Bug 1: _count_hunk_body must count empty lines as context (like git apply)."""
 
@@ -470,7 +499,7 @@ class TestCountHunkBodyEmptyLines:
         lines = [
             "@@ -1,2 +1,3 @@",
             " a",
-            "",       # blank context line — MUST be counted
+            "",  # blank context line — MUST be counted
             "+new",
             " b",
         ]
@@ -485,7 +514,7 @@ class TestCountHunkBodyEmptyLines:
     def test_whitespace_only_line_counted_as_context(self):
         lines = [
             "@@ -1,1 +1,2 @@",
-            "   ",     # whitespace-only — valid context
+            "   ",  # whitespace-only — valid context
             "+new",
         ]
         result = diff_apply._count_hunk_body(lines, 0)
@@ -511,6 +540,7 @@ class TestCountHunkBodyEmptyLines:
 
 # ── _count_hunk_body: early-stop fix (Bug 2 regression test) ─────────────────
 
+
 class TestCountHunkBodyEarlyStop:
     """Bug 2: _count_hunk_body must NOT truncate valid trailing context when
     claimed counts are exhausted. LLM claimed counts are unreliable — the
@@ -522,8 +552,8 @@ class TestCountHunkBodyEarlyStop:
         lines = [
             "@@ -1,1 +1,1 @@",
             " ctx1",
-            " ctx2",   # trailing context — must not be truncated
-            " ctx3",   # more trailing context
+            " ctx2",  # trailing context — must not be truncated
+            " ctx3",  # more trailing context
         ]
         result = diff_apply._count_hunk_body(lines, 0)
         assert result is not None
@@ -539,10 +569,10 @@ class TestCountHunkBodyEarlyStop:
         # After claimed counts are met, only context lines (" "-prefix, "\ ",
         # blank) are absorbed.  "+"/"-" lines are a hunk boundary stop.
         lines = [
-            "@@ -1,1 +1,1 @@",    # 0
-            " ctx1",               # 1 — consumed, meets claimed (1,1)
-            "+extra",              # 2 — "+" after claimed → stop (not context)
-            "more context",        # 3 — would be context but already stopped
+            "@@ -1,1 +1,1 @@",  # 0
+            " ctx1",  # 1 — consumed, meets claimed (1,1)
+            "+extra",  # 2 — "+" after claimed → stop (not context)
+            "more context",  # 3 — would be context but already stopped
         ]
         result = diff_apply._count_hunk_body(lines, 0)
         assert result is not None
@@ -550,57 +580,60 @@ class TestCountHunkBodyEarlyStop:
         assert end == 2  # body consumed lines[1:2] = [" ctx1"]
         assert actual_old == 1  # ctx1 only
         assert actual_new == 1  # ctx1 only
-    def test_multifile_bare_header_not_absorbed_by_prior_hunk(self):
-            # Bug 3+2 interaction regression: bare "--- f2.py" / "+++ f2.py"
-            # headers after a hunk must NOT be absorbed as deletion/addition lines
-            # by the prior hunk's _count_hunk_body.
-            lines = [
-                "@@ -1,2 +1,2 @@",    # 0 — hunk 1 header
-                " a",                   # 1
-                " b",                   # 2
-                "--- f2.py",            # 3 — bare header, must NOT be consumed as -
-                "+++ f2.py",            # 4 — bare header, must NOT be consumed as +
-                "@@ -1,1 +1,1 @@",     # 5 — hunk 2 header
-                "-old",                 # 6
-                "+new",                 # 7
-            ]
-            result = diff_apply._count_hunk_body(lines, 0)
-            assert result is not None
-            end, actual_old, actual_new, claimed_old, claimed_new = result
-            assert claimed_old == 2
-            assert claimed_new == 2
-            assert end == 3  # consumed lines[1:3] = [" a", " b"]; "--- f2.py" is boundary
-            assert actual_old == 2
-            assert actual_new == 2
 
-            # Hunk 2 must also parse correctly (boundary check uses bare pair detection)
-            result2 = diff_apply._count_hunk_body(lines, 5)
-            assert result2 is not None
-            end2, _, _, _, _ = result2
-            assert end2 == 8  # consumed lines[6:8] = ["-old", "+new"]
+    def test_multifile_bare_header_not_absorbed_by_prior_hunk(self):
+        # Bug 3+2 interaction regression: bare "--- f2.py" / "+++ f2.py"
+        # headers after a hunk must NOT be absorbed as deletion/addition lines
+        # by the prior hunk's _count_hunk_body.
+        lines = [
+            "@@ -1,2 +1,2 @@",  # 0 — hunk 1 header
+            " a",  # 1
+            " b",  # 2
+            "--- f2.py",  # 3 — bare header, must NOT be consumed as -
+            "+++ f2.py",  # 4 — bare header, must NOT be consumed as +
+            "@@ -1,1 +1,1 @@",  # 5 — hunk 2 header
+            "-old",  # 6
+            "+new",  # 7
+        ]
+        result = diff_apply._count_hunk_body(lines, 0)
+        assert result is not None
+        end, actual_old, actual_new, claimed_old, claimed_new = result
+        assert claimed_old == 2
+        assert claimed_new == 2
+        assert end == 3  # consumed lines[1:3] = [" a", " b"]; "--- f2.py" is boundary
+        assert actual_old == 2
+        assert actual_new == 2
+
+        # Hunk 2 must also parse correctly (boundary check uses bare pair detection)
+        result2 = diff_apply._count_hunk_body(lines, 5)
+        assert result2 is not None
+        end2, _, _, _, _ = result2
+        assert end2 == 8  # consumed lines[6:8] = ["-old", "+new"]
+
     def test_multifile_bare_header_before_claimed_counts_met(self):
-            # Bare header pair appears BEFORE claimed counts are met (inflated
-            # claimed count scenario). Must still be recognized as boundary via
-            # the ---/+++ pair check, not consumed as deletion/addition lines.
-            lines = [
-                "@@ -1,50 +1,50 @@",    # 0 — inflated claimed (50 old, 50 new)
-                " a",                   # 1
-                " b",                   # 2
-                "--- f2.py",            # 3 — bare header, must be boundary
-                "+++ f2.py",            # 4
-                "@@ -1,1 +1,1 @@",     # 5 — hunk 2 header
-                "-old",
-                "+new",
-            ]
-            result = diff_apply._count_hunk_body(lines, 0)
-            assert result is not None
-            end, actual_old, actual_new, _, _ = result
-            assert end == 3  # consumed lines[1:3] only; "--- f2.py" is boundary
-            assert actual_old == 2
-            assert actual_new == 2
+        # Bare header pair appears BEFORE claimed counts are met (inflated
+        # claimed count scenario). Must still be recognized as boundary via
+        # the ---/+++ pair check, not consumed as deletion/addition lines.
+        lines = [
+            "@@ -1,50 +1,50 @@",  # 0 — inflated claimed (50 old, 50 new)
+            " a",  # 1
+            " b",  # 2
+            "--- f2.py",  # 3 — bare header, must be boundary
+            "+++ f2.py",  # 4
+            "@@ -1,1 +1,1 @@",  # 5 — hunk 2 header
+            "-old",
+            "+new",
+        ]
+        result = diff_apply._count_hunk_body(lines, 0)
+        assert result is not None
+        end, actual_old, actual_new, _, _ = result
+        assert end == 3  # consumed lines[1:3] only; "--- f2.py" is boundary
+        assert actual_old == 2
+        assert actual_new == 2
 
 
 # ── _clean_diff_lines: ---/+++ pair without a/b/ prefix (Bug 3 regression) ──
+
 
 class TestCleanDiffLinesBareHeaders:
     """Bug 3: LLM often emits ``--- f.py`` / ``+++ f.py`` without the a/ or b/

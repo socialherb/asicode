@@ -14,6 +14,7 @@ system message. Two things had rotted:
 The machine is advisory: nothing is blocked on the phase. These tests therefore
 assert on reachability and on the advice text, which is all it produces.
 """
+
 from __future__ import annotations
 
 import types
@@ -52,9 +53,16 @@ def test_the_full_path_reaches_finish():
 
 @pytest.mark.parametrize(
     "command",
-    ["pytest tests/unit", "python3 -m pytest -q", "ruff check .",
-     "npm run test", "go test ./...", "cargo clippy", "make lint",
-     "cd build\npytest"],
+    [
+        "pytest tests/unit",
+        "python3 -m pytest -q",
+        "ruff check .",
+        "npm run test",
+        "go test ./...",
+        "cargo clippy",
+        "make lint",
+        "cd build\npytest",
+    ],
 )
 def test_any_verification_runner_advances_verify(command):
     assert _Phase("VERIFY").advance("bash", command=command) == "FINISH"
@@ -62,8 +70,7 @@ def test_any_verification_runner_advances_verify(command):
 
 @pytest.mark.parametrize(
     "command",
-    ["ls -la", "cat notes.md", "pip install pytest", "grep -rn pytest .",
-     "git commit -m 'add pytest'"],
+    ["ls -la", "cat notes.md", "pip install pytest", "grep -rn pytest .", "git commit -m 'add pytest'"],
 )
 def test_ordinary_bash_does_not_advance_verify(command):
     """`bash` is the general-purpose tool; only an actual verification run
@@ -202,9 +209,7 @@ def test_record_tool_success_carries_tool_name_into_hint():
     host._tool_fail_memory = {}
     host._tool_key = AgentLoop._tool_key
     host._record_tool_usage = types.MethodType(AgentLoop._record_tool_usage, host)
-    host._shared_run_store = type(
-        "S", (), {"record_tool_usage": staticmethod(lambda *a, **k: None)}
-    )()
+    host._shared_run_store = type("S", (), {"record_tool_usage": staticmethod(lambda *a, **k: None)})()
 
     AgentLoop._record_tool_success(host, "read_file", {"path": "a.py"})
     AgentLoop._record_tool_success(host, "read_file", {"path": "a.py"})
@@ -228,9 +233,7 @@ def _make_tool_memory_host():
     host._tool_fail_memory = {}
     host._tool_key = AgentLoop._tool_key
     host._record_tool_usage = types.MethodType(AgentLoop._record_tool_usage, host)
-    host._shared_run_store = type(
-        "S", (), {"record_tool_usage": staticmethod(lambda *a, **k: None)}
-    )()
+    host._shared_run_store = type("S", (), {"record_tool_usage": staticmethod(lambda *a, **k: None)})()
     return host
 
 
@@ -440,10 +443,7 @@ def test_record_tool_usage_routes_by_ok_and_clears_fail_on_success():
 
     seen = []
     host = _make_tool_memory_host()
-    host._shared_run_store = type(
-        "S", (), {"record_tool_usage": staticmethod(
-            lambda *a, **k: seen.append(a))}
-    )()
+    host._shared_run_store = type("S", (), {"record_tool_usage": staticmethod(lambda *a, **k: seen.append(a))})()
 
     key = make_tool_signature("apply_patch", {"patch": "x"})
     AgentLoop._record_tool_usage(host, "apply_patch", {"patch": "x"}, False)
@@ -451,8 +451,7 @@ def test_record_tool_usage_routes_by_ok_and_clears_fail_on_success():
 
     assert key not in host._tool_fail_memory  # success dropped the fail entry
     assert host._tool_success_memory[key] == ("apply_patch", 1)
-    assert seen == [("MAIN_AGENT", "apply_patch", False, ""),
-                    ("MAIN_AGENT", "apply_patch", True, "")]
+    assert seen == [("MAIN_AGENT", "apply_patch", False, ""), ("MAIN_AGENT", "apply_patch", True, "")]
 
 
 def test_record_tool_usage_failure_leaves_success_memory_untouched():

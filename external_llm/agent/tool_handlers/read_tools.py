@@ -1,4 +1,5 @@
 """Read-only tool handlers for ToolRegistry."""
+
 from __future__ import annotations
 
 import codecs
@@ -69,12 +70,25 @@ def _outline_extent(sym: Any) -> str:
 # Extracted to a module-level constant so the hot path (read_file, the most
 # frequently called tool) does not allocate a fresh dict literal on every call.
 _EXT_LANG_MAP = {
-    "py": "python", "js": "javascript", "ts": "typescript",
-    "go": "go", "java": "java", "kt": "kotlin", "rs": "rust",
-    "md": "markdown", "yaml": "yaml", "yml": "yaml",
-    "json": "json", "css": "css", "html": "html",
-    "sh": "bash", "bash": "bash", "zsh": "bash",
-    "sql": "sql", "xml": "xml", "svg": "xml",
+    "py": "python",
+    "js": "javascript",
+    "ts": "typescript",
+    "go": "go",
+    "java": "java",
+    "kt": "kotlin",
+    "rs": "rust",
+    "md": "markdown",
+    "yaml": "yaml",
+    "yml": "yaml",
+    "json": "json",
+    "css": "css",
+    "html": "html",
+    "sh": "bash",
+    "bash": "bash",
+    "zsh": "bash",
+    "sql": "sql",
+    "xml": "xml",
+    "svg": "xml",
 }
 
 
@@ -95,8 +109,8 @@ _BINARY_SNIFF_BYTES = 8192
 _TEXTUAL_BYTES = bytes(
     sorted(
         {0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1B}  # BS TAB LF VT FF CR ESC
-        | set(range(0x20, 0x7F))                     # printable ASCII
-        | set(range(0x80, 0x100))                    # UTF-8 lead/continuation
+        | set(range(0x20, 0x7F))  # printable ASCII
+        | set(range(0x80, 0x100))  # UTF-8 lead/continuation
     )
 )
 
@@ -220,8 +234,14 @@ def _unsupported_flag(stderr: str) -> str | None:
 
 
 def _stream_split_window(
-    fh, prefix: bytes, first: int, last: int, retain_chars: int, *,
-    stop_after_last: bool = False, cut_overflow_line: bool = False,
+    fh,
+    prefix: bytes,
+    first: int,
+    last: int,
+    retain_chars: int,
+    *,
+    stop_after_last: bool = False,
+    cut_overflow_line: bool = False,
 ):
     """``(total_lines, lines[first-1:last])`` without holding the whole file.
 
@@ -540,7 +560,7 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
     while i < n:
         c = pattern[i]
         if pattern.startswith("**/", i):
-            out.append("(?:.*/)?")       # `**/x` must also match a bare `x`
+            out.append("(?:.*/)?")  # `**/x` must also match a bare `x`
             i += 3
         elif pattern.startswith("**", i):
             out.append(".*")
@@ -559,11 +579,11 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
                 j += 1
             while j < n and pattern[j] != "]":
                 j += 1
-            if j >= n:                    # unterminated class → literal '['
+            if j >= n:  # unterminated class → literal '['
                 out.append(re.escape(c))
                 i += 1
             else:
-                body = pattern[i + 1:j]
+                body = pattern[i + 1 : j]
                 negated = body.startswith(("!", "^"))
                 if negated:
                     body = body[1:]
@@ -583,8 +603,7 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
                     re.compile(f"[{cls}]")
                 except re.error as exc:
                     raise ValueError(
-                        f"invalid glob pattern {pattern!r}: bad character class "
-                        f"[{pattern[i + 1:j]}] ({exc.msg})"
+                        f"invalid glob pattern {pattern!r}: bad character class [{pattern[i + 1 : j]}] ({exc.msg})"
                     ) from exc
                 out.append(f"[{cls}]")
                 i = j + 1
@@ -597,10 +616,24 @@ def _glob_to_regex(pattern: str) -> re.Pattern:
 class ReadToolsMixin:
     """Mixin providing read-only tool implementations for ToolRegistry."""
 
+    # Host contracts provided by the composition target ToolRegistry
+    # (tool_registry.py: class ToolRegistry(ReadToolsMixin, WriteToolsMixin,
+    # ...)). Pure typing scaffolding — the registry's __init__ owns the
+    # runtime values, so nothing here is assigned.
+    repo_root: str
+    _make_result: Any
+    # Registry exposes _effective_repo_root as a @property; Any (not str)
+    # avoids reportIncompatibleVariableOverride (same call as P29).
+    _effective_repo_root: Any
+    _correct_bias_path: Any
+    _secure_path: Any
+    _symbol_searcher: Any
+    _rag_searcher: Any
+
     # Above this many matches the mtime sort is skipped (it stats every hit).
     _GLOB_MTIME_SORT_LIMIT = 2000
 
-    def _tool_glob(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_glob(self, args: dict[str, Any]) -> ToolResult:
         """List repository files matching a glob pattern, newest first.
 
         Fills the gap that made ``bash ls``/``find`` the only way to answer
@@ -625,14 +658,16 @@ class ReadToolsMixin:
             scoped = self._secure_path(scope, confine=True)
             if scoped is None:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=f"path {scope!r} is outside the repository",
                 )
             try:
                 prefix = scoped.resolve().relative_to(root.resolve()).as_posix()
             except ValueError:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=f"path {scope!r} is outside the repository",
                 )
             prefix = "" if prefix == "." else prefix.rstrip("/") + "/"
@@ -642,6 +677,7 @@ class ReadToolsMixin:
         # Reuse the TTL-cached repo index the write tools already maintain,
         # so a glob costs a dict lookup rather than another `git ls-files`.
         from .write_tools import _repo_file_index
+
         paths = _repo_file_index(str(root))
 
         # A pattern with no separator matches the BASENAME anywhere ("*.py"
@@ -682,6 +718,7 @@ class ReadToolsMixin:
                     return (root / rel).stat().st_mtime
                 except OSError:
                     return 0.0
+
             matches.sort(key=_mtime, reverse=True)
         # else: already path-sorted by _repo_file_index — deterministic, and
         # stat()ing thousands of files to order a list nobody will read whole
@@ -708,7 +745,7 @@ class ReadToolsMixin:
                 lines.append(f"  {rel}")
         return self._make_result(ok=True, content="\n".join(lines))
 
-    def _tool_read_file(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_read_file(self, args: dict[str, Any]) -> ToolResult:
         """Read a file by path with optional line range.
 
         Output prefixes each line with its 1-based number AND an indent gutter
@@ -767,7 +804,11 @@ class ReadToolsMixin:
                     # Identical output, and no slower — the file is read once
                     # either way, and the decoded copy is what cost the time.
                     _total, lines = _stream_split_window(
-                        fh, head, _first, _last, _retain,
+                        fh,
+                        head,
+                        _first,
+                        _last,
+                        _retain,
                         # _apply_char_budget below cuts and reports
                         # partial_line, so a line wider than _retain must
                         # arrive as a prefix, not as nothing — that is what
@@ -775,11 +816,16 @@ class ReadToolsMixin:
                         cut_overflow_line=True,
                     )
                 else:
-                    lines = (head + fh.read()).decode(
-                        "utf-8", errors="replace",
-                    ).splitlines()
+                    lines = (
+                        (head + fh.read())
+                        .decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+                        .splitlines()
+                    )
                     _total = len(lines)
-                    lines = lines[_first - 1:_last]
+                    lines = lines[_first - 1 : _last]
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to read {path!r}: {e}")
 
@@ -811,7 +857,8 @@ class ReadToolsMixin:
             # gives start_line=0, equally wrong). Line numbers are 1-based.
             if end_line is not None and _requested_end < 1:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=(
                         f"end_line must be 1 or greater (got {_requested_end}); "
                         f"line numbers are 1-based. Omit end_line to read to the "
@@ -825,19 +872,17 @@ class ReadToolsMixin:
             # inverted range).
             if end_line is not None and s > _requested_end:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=(
-                        f"start_line {s} is after end_line {_requested_end} "
-                        f"in {path!r} ({_total} lines). Swap them."
+                        f"start_line {s} is after end_line {_requested_end} in {path!r} ({_total} lines). Swap them."
                     ),
                 )
             if s > _total:
                 return self._make_result(
-                    ok=False, content="",
-                    error=(
-                        f"start_line {s} is past the end of {path!r}, which has "
-                        f"{_total} lines."
-                    ),
+                    ok=False,
+                    content="",
+                    error=(f"start_line {s} is past the end of {path!r}, which has {_total} lines."),
                 )
 
         numbered_lines = [_format_numbered_line(i, ln) for i, ln in enumerate(lines[: e - s + 1], start=s)]
@@ -849,9 +894,7 @@ class ReadToolsMixin:
         budget = _cfg.lines.READ_FILE_MAX_CHARS
         # partial_line: emitted as a prefix only (mid-line truncation) — the
         # caller must be told its tail is unrecoverable, see _apply_char_budget.
-        numbered_lines, truncated_at, partial_line = _apply_char_budget(
-            numbered_lines, s, budget
-        )
+        numbered_lines, truncated_at, partial_line = _apply_char_budget(numbered_lines, s, budget)
         if truncated_at is not None:
             e = truncated_at - 1
         content = "\n".join(numbered_lines)
@@ -900,10 +943,7 @@ class ReadToolsMixin:
         outline is empty (unsupported language, parse failure) so this path can
         never be worse than what it replaces.
         """
-        head = (
-            f"`{path}` has {line_count} lines — too long to return whole "
-            f"(cap {_cfg.lines.READ_FILE_FULL_LINES})."
-        )
+        head = f"`{path}` has {line_count} lines — too long to return whole (cap {_cfg.lines.READ_FILE_FULL_LINES})."
         try:
             symbols = self._symbol_searcher.get_file_outline(path)
         except Exception:
@@ -946,12 +986,11 @@ class ReadToolsMixin:
             + "\n\nOutline — each range is exact; pass it as start_line/end_line:\n"
             + "\n".join(rows)
             + "\n\nNext: read_symbol with a name above (exact, no range needed), "
-              "or read_file with start_line/end_line."
+            "or read_file with start_line/end_line."
         )
 
     @staticmethod
-    def _run_search_bounded(cmd, cwd, timeout, retain_lines, cancelled=None,
-                            max_line_chars=None):
+    def _run_search_bounded(cmd, cwd, timeout, retain_lines, cancelled=None, max_line_chars=None):
         """Run a line-oriented search, keeping at most *retain_lines* of stdout.
 
         Returns ``(returncode, lines, total_lines, stderr)`` where *lines* is a
@@ -1004,11 +1043,19 @@ class ReadToolsMixin:
         import threading
         import time
 
-        _STDERR_CAP = 64 * 1024
+        _stderr_cap = 64 * 1024
         try:
-            proc = subprocess.Popen(
-                cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
+            # Popen[str]: text=True selects the str-typed channel variant.
+            # Without the type argument pyright inferred Popen[bytes] and the
+            # text-mode handles as None-typed optionals.
+            proc: subprocess.Popen[str] = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
                 start_new_session=True,
             )
         except OSError as exc:
@@ -1016,12 +1063,22 @@ class ReadToolsMixin:
             # rather than left to the caller's generic handler, which would
             # report "grep failed: [Errno 2]" without saying what was missing.
             raise RuntimeError(f"could not start {cmd[0]!r}: {exc}") from exc
+        # Captured before the closures: pyright cannot narrow an attribute
+        # (proc.stdout) inside a nested function — it re-reads the declared
+        # union and falls back to the None arm. Binding to locals with asserts
+        # gives the drain threads and the teardown the narrowed channel types
+        # (IO[str]) they actually hold. Runtime shape unchanged: Popen with
+        # stdout/stderr=PIPE always returns open handles here.
+        _out = proc.stdout
+        _err = proc.stderr
+        assert _out is not None
+        assert _err is not None
         err_chunks: list[str] = []
 
         def _drain_err():
             try:
-                for chunk in iter(lambda: proc.stderr.read(8192), ""):
-                    if sum(map(len, err_chunks)) < _STDERR_CAP:
+                for chunk in iter(lambda: _err.read(8192), ""):
+                    if sum(map(len, err_chunks)) < _stderr_cap:
                         err_chunks.append(chunk)
             except (OSError, ValueError) as exc:
                 # The pipe closed under us (kill path) — stdout is the result
@@ -1037,7 +1094,7 @@ class ReadToolsMixin:
 
         def _drain_out():
             try:
-                for line in proc.stdout:
+                for line in _out:
                     counted[0] += 1
                     if len(lines) < retain_lines:
                         _kept = line.rstrip("\n")
@@ -1096,7 +1153,7 @@ class ReadToolsMixin:
             # ValueError the drains only tolerate as a degradation.
             out_thread.join(timeout=2)
             err_thread.join(timeout=2)
-            for _stream in (proc.stdout, proc.stderr):
+            for _stream in (_out, _err):
                 try:
                     _stream.close()
                 except (OSError, ValueError) as exc:
@@ -1119,7 +1176,7 @@ class ReadToolsMixin:
         _scope = current_cancel_event()
         return _scope is not None and _scope.is_set()
 
-    def _tool_grep(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_grep(self, args: dict[str, Any]) -> ToolResult:
         """Search for a pattern across files using grep (or ripgrep if available)."""
         import shutil
         import subprocess
@@ -1127,11 +1184,12 @@ class ReadToolsMixin:
         # Safety limit: ~33k tokens max per result (prevent token explosion from context+N on long lines)
         # Match bash tool's BASH_OUTPUT_MAX_CHARS threshold for consistency.
         from ..config.thresholds import config as _thresholds
-        _MAX_RESULT_CHARS = _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
+
+        _max_result_chars = _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
         # Width companion to the cap above. Without it the cap bounded only how
         # many lines were emitted, and one match in a minified file returned
         # 34,000,257 chars against this 60,000-char "hard limit".
-        _MAX_LINE_CHARS = _thresholds.lines.SEARCH_MAX_LINE_CHARS
+        _max_line_chars = _thresholds.lines.SEARCH_MAX_LINE_CHARS
 
         pattern = args.get("pattern", "").strip()
         if not pattern:
@@ -1179,13 +1237,23 @@ class ReadToolsMixin:
         # retry (unsupported flag, uncompilable pattern) and they can both fire
         # on the same call. Each one flips a latch that cannot flip back, so the
         # loop still terminates well inside the bound.
+        # Pre-bound for pyright: the loop below is guaranteed to run at least
+        # once (range(3)), but the analyzer cannot see that, so the post-loop
+        # reads of these four (plus `total` via `_total`) flagged as possibly
+        # unbound. Pre-binding costs nothing and matches the runtime contract.
+        _rc, _lines, _total, _stderr = 2, [], 0, ""
         for _attempt in range(3):
             if use_rg:
-                cmd = [_rg, "-n", "--no-heading",
-                       # Truncate wide lines in the CHILD, so a match inside a
-                       # minified bundle never crosses the pipe at all. The
-                       # match COUNT is unaffected — rg still counts the line.
-                       "--max-columns", str(_MAX_LINE_CHARS)]
+                cmd = [
+                    _rg,
+                    "-n",
+                    "--no-heading",
+                    # Truncate wide lines in the CHILD, so a match inside a
+                    # minified bundle never crosses the pipe at all. The
+                    # match COUNT is unaffected — rg still counts the line.
+                    "--max-columns",
+                    str(_max_line_chars),
+                ]
                 if _rg_preview:
                     # The preview form keeps the head of the line; the plain
                     # flag replaces it with a bare "omitted" marker, which
@@ -1229,19 +1297,25 @@ class ReadToolsMixin:
             _retain = max(max_results * 20, 5000)
             try:
                 _rc, _lines, _total, _stderr = self._run_search_bounded(
-                    cmd, self.repo_root, 120, _retain,
+                    cmd,
+                    self.repo_root,
+                    120,
+                    _retain,
                     cancelled=self._search_cancel_requested,
                     # Redundant for rg (already clamped in the child by
                     # --max-columns) and load-bearing for the system-grep
                     # fallback, which has no equivalent flag.
-                    max_line_chars=_MAX_LINE_CHARS,
+                    max_line_chars=_max_line_chars,
                 )
             except SearchCancelled:
                 # ok=False, mirroring the bash cancel: the user withdrew the
                 # request, so this is not an answer.
                 return self._make_result(
-                    ok=False, content="", error="Operation cancelled",
-                    retryable=False, metadata={"cancelled": True},
+                    ok=False,
+                    content="",
+                    error="Operation cancelled",
+                    retryable=False,
+                    metadata={"cancelled": True},
                 )
             except subprocess.TimeoutExpired:
                 return self._make_result(ok=True, content=f"grep timed out (pattern={pattern!r})")
@@ -1275,11 +1349,10 @@ class ReadToolsMixin:
         _skipped_note = ""
         if _rc == 2 and (_lines or _search_ran_despite_errors(_stderr)):
             _first_err = next(
-                (ln.strip() for ln in (_stderr or "").splitlines() if ln.strip()), "",
+                (ln.strip() for ln in (_stderr or "").splitlines() if ln.strip()),
+                "",
             )
-            _skipped_note = (
-                f"\n(note: some files could not be read and were skipped — {_first_err[:200]})"
-            )
+            _skipped_note = f"\n(note: some files could not be read and were skipped — {_first_err[:200]})"
             _rc = 0 if _lines else 1
 
         if _rc == 0 or (_rc == 1 and _lines):
@@ -1339,7 +1412,7 @@ class ReadToolsMixin:
             display_lines = []
             for _item_ in lines[:max_results]:
                 display_chars += len(_item_) + 1  # +1 for newline
-                if display_chars > _MAX_RESULT_CHARS:
+                if display_chars > _max_result_chars:
                     # Include this line but stop. It is CUT to what the budget
                     # had left: appending it whole made this "hard char limit"
                     # a limit plus one line of unbounded width, and a single
@@ -1348,12 +1421,12 @@ class ReadToolsMixin:
                     # clamps upstream (rg --max-columns, the retention clamp)
                     # keep a normal line intact here; this is the backstop for
                     # the one line that still straddles the budget.
-                    _left = _MAX_RESULT_CHARS - (display_chars - len(_item_) - 1)
+                    _left = _max_result_chars - (display_chars - len(_item_) - 1)
                     display_lines.append(_item_[:_left] if _left > 0 else "")
                     break
                 display_lines.append(_item_)
             display = "\n".join(display_lines)
-            char_truncated = display_chars > _MAX_RESULT_CHARS
+            char_truncated = display_chars > _max_result_chars
 
             tool_name = "rg" if use_rg else "grep"
             result = f"{tool_name}: {pattern!r} in {search_path} ({total} match{'es' if total != 1 else ''})"
@@ -1361,13 +1434,14 @@ class ReadToolsMixin:
                 result += f" ({context} context lines)"
             result += f"\n{display}"
             if char_truncated:
-                result += f"\n... (truncated at {_MAX_RESULT_CHARS:,} characters — {len(display_lines)} of {total} matches shown). For log files, use `bash grep -n 'pattern' file` then `read_file` with exact line range — drastically reduces tokens."
+                result += f"\n... (truncated at {_max_result_chars:,} characters — {len(display_lines)} of {total} matches shown). For log files, use `bash grep -n 'pattern' file` then `read_file` with exact line range — drastically reduces tokens."
             elif truncated:
                 result += f"\n... (truncated to {max_results} of {total} matches — refine your pattern)"
             result += _skipped_note
 
             return self._make_result(
-                ok=True, content=result,
+                ok=True,
+                content=result,
                 metadata={"files_skipped": True} if _skipped_note else {},
             )
         if _rc == 1:
@@ -1379,11 +1453,12 @@ class ReadToolsMixin:
             )
         stderr = (_stderr or "").strip()[:500]
         return self._make_result(
-            ok=False, content="",
+            ok=False,
+            content="",
             error=f"grep failed (exit={_rc}): {stderr}",
         )
 
-    def _tool_read_symbol(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_read_symbol(self, args: dict[str, Any]) -> ToolResult:
         """Read a symbol definition (function, class, or variable) by name.
 
         When SymbolDef.end_line is available (AST end_lineno), read the full
@@ -1396,7 +1471,9 @@ class ReadToolsMixin:
             # answer. Reported as success it reads to the model as "asked and
             # answered", so the retry it needs never happens.
             return self._make_result(
-                ok=False, content="", error="'name' is required (the symbol to read).",
+                ok=False,
+                content="",
+                error="'name' is required (the symbol to read).",
             )
         file_path = args.get("file_path") or None
         context_lines = int(args.get("context_lines", 10))
@@ -1441,10 +1518,7 @@ class ReadToolsMixin:
         window = _read_symbol_window(abs_path, start, count)
         actual_end = start + len(window)
 
-        numbered_lines = [
-            _format_numbered_line(i, ln)
-            for i, ln in enumerate(window, start=start + 1)
-        ]
+        numbered_lines = [_format_numbered_line(i, ln) for i, ln in enumerate(window, start=start + 1)]
 
         lang = sym.file.split(".")[-1] if "." in sym.file else ""
         lang_label = _EXT_LANG_MAP.get(lang, lang)
@@ -1465,15 +1539,14 @@ class ReadToolsMixin:
         # 0-based index, so the origin handed over is `start + 1`, matching the
         # 1-based numbering above.
         budget = _cfg.lines.READ_FILE_MAX_CHARS
-        kept, truncated_at, partial_line = _apply_char_budget(
-            numbered_lines, start + 1, budget
-        )
+        kept, truncated_at, partial_line = _apply_char_budget(numbered_lines, start + 1, budget)
         context = "\n".join(kept)
 
         content = multi_header + (
             f"**{sym.kind}** `{name}` defined in `{loc}`"
             f" — `│N│` = leading-indent column count\n"
-            f"```{lang_label}\n{context}\n```")
+            f"```{lang_label}\n{context}\n```"
+        )
         if truncated_at is not None:
             if partial_line is not None:
                 content += (
@@ -1505,7 +1578,7 @@ class ReadToolsMixin:
                 meta["partial_line"] = partial_line
         return self._make_result(ok=True, content=content, metadata=meta)
 
-    def _tool_find_symbol(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_find_symbol(self, args: dict[str, Any]) -> ToolResult:
         name = args.get("name", "").strip()
         if not name:
             return self._make_result(ok=False, content="", error="'name' is required")
@@ -1528,9 +1601,7 @@ class ReadToolsMixin:
                     "symbol may exist in an un-indexed file — try grep/bash, "
                     "narrow search_path, or the cap may need raising."
                 )
-            return self._make_result(
-                ok=True, content=f"No definitions found for '{name}'.{_note}"
-            )
+            return self._make_result(ok=True, content=f"No definitions found for '{name}'.{_note}")
 
         lines: list[str] = [f"Found {len(defs)} definition(s) for '{name}':\n"]
         for d in defs:
@@ -1543,7 +1614,7 @@ class ReadToolsMixin:
                 lines.append(f"    bases     : {', '.join(d.bases)}")
             if d.methods:
                 methods_str = ", ".join(d.methods[:10])
-                suffix = f" (+{len(d.methods)-10} more)" if len(d.methods) > 10 else ""
+                suffix = f" (+{len(d.methods) - 10} more)" if len(d.methods) > 10 else ""
                 lines.append(f"    methods   : {methods_str}{suffix}")
             if d.decorators:
                 lines.append(f"    decorators: {', '.join(d.decorators)}")
@@ -1551,9 +1622,7 @@ class ReadToolsMixin:
 
         # include_inheritance: enrich first result with subclasses + references
         if include_inheritance and defs:
-            info = self._symbol_searcher.get_symbol_info(
-                name, file_path=search_path, kind=kind, defs=defs
-            )
+            info = self._symbol_searcher.get_symbol_info(name, file_path=search_path, kind=kind, defs=defs)
             if info:
                 if "subclasses" in info:
                     lines.append(f"Subclasses : {', '.join(info['subclasses'])}")
@@ -1562,14 +1631,16 @@ class ReadToolsMixin:
                     lines.append(f"Used in    : {', '.join(info['referenced_in'])}")
                 if "sample_references" in info:
                     lines.append("\nSample references:")
-                    lines.extend(f"  {sr['file']}:{sr['line']}  {sr['context'][:80]}" for sr in info["sample_references"])
+                    lines.extend(
+                        f"  {sr['file']}:{sr['line']}  {sr['context'][:80]}" for sr in info["sample_references"]
+                    )
                 if "other_definitions" in info:
                     lines.append("\nOther definitions:")
                     lines.extend(f"  [{od['kind']}] {od['file']}:{od['line']}" for od in info["other_definitions"])
 
         return self._make_result(ok=True, content="\n".join(lines))
 
-    def _tool_find_references(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_find_references(self, args: dict[str, Any]) -> ToolResult:
         name = (args.get("name") or args.get("symbol") or "").strip()
         if not name:
             return self._make_result(ok=False, content="", error="'name' (or 'symbol') is required")
@@ -1587,7 +1658,7 @@ class ReadToolsMixin:
 
         return self._make_result(ok=True, content="\n".join(lines))
 
-    def _tool_get_file_outline(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_get_file_outline(self, args: dict[str, Any]) -> ToolResult:
         path = args.get("path", "").strip()
         if not path:
             return self._make_result(ok=False, content="", error="'path' is required")
@@ -1598,7 +1669,9 @@ class ReadToolsMixin:
 
         symbols = self._symbol_searcher.get_file_outline(path)
         if not symbols:
-            return self._make_result(ok=True, content=f"No symbols found in '{path}' (file may be empty or unsupported language).")
+            return self._make_result(
+                ok=True, content=f"No symbols found in '{path}' (file may be empty or unsupported language)."
+            )
 
         lines: list[str] = [f"File outline: {path} ({len(symbols)} symbols)\n"]
         for s in symbols:
@@ -1615,7 +1688,7 @@ class ReadToolsMixin:
                 lines.append(f"{prefix} {loc}{detail}")
                 if s.methods:
                     m_str = ", ".join(s.methods[:15])
-                    suffix = f" (+{len(s.methods)-15} more)" if len(s.methods) > 15 else ""
+                    suffix = f" (+{len(s.methods) - 15} more)" if len(s.methods) > 15 else ""
                     lines.append(f"    methods: {m_str}{suffix}")
             elif s.kind in ("function", "async_function"):
                 sig = f"({s.signature})" if s.signature else ""
@@ -1634,11 +1707,12 @@ class ReadToolsMixin:
         # repo's own safety net.
         lines.append("\nUse read_symbol to pull one of these by name, or read_file with start_line/end_line.")
         return self._make_result(
-            ok=True, content="\n".join(lines),
+            ok=True,
+            content="\n".join(lines),
             metadata={"path": path, "symbol_count": len(symbols)},
         )
 
-    def _tool_find_relevant_files(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_find_relevant_files(self, args: dict[str, Any]) -> ToolResult:
         query = args.get("query", "").strip()
         if not query:
             return self._make_result(ok=False, content="", error="'query' is required")
@@ -1668,7 +1742,8 @@ class ReadToolsMixin:
             else:
                 content = "No relevant files found for the given query."
             return self._make_result(
-                ok=True, content=content,
+                ok=True,
+                content=content,
                 metadata={"files_found": [], "result_count": 0, "index_truncated": index_truncated},
             )
 
@@ -1685,7 +1760,8 @@ class ReadToolsMixin:
                 "the full repository."
             )
         return self._make_result(
-            ok=True, content="\n".join(lines),
+            ok=True,
+            content="\n".join(lines),
             metadata={
                 "files_found": [r.file for r in results],
                 "result_count": len(results),
@@ -1693,7 +1769,7 @@ class ReadToolsMixin:
             },
         )
 
-    def _tool_read_image(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_read_image(self, args: dict[str, Any]) -> ToolResult:
         """Read text from an image file using OCR."""
         path = args.get("path", "").strip()
         if not path:
@@ -1707,6 +1783,7 @@ class ReadToolsMixin:
 
         try:
             import base64 as _b64
+
             data = _b64.b64encode(abs_path.read_bytes()).decode("utf-8")
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to read image file {path!r}: {e}")
@@ -1715,6 +1792,7 @@ class ReadToolsMixin:
         # _try_ocr_base64 degrades internally when OCR deps are missing —
         # the old except ImportError fallback was dead code.
         from external_llm.providers import _try_ocr_base64 as _ocr_fn
+
         ocr_text = _ocr_fn(data)
 
         if ocr_text:
@@ -1725,6 +1803,5 @@ class ReadToolsMixin:
         return self._make_result(
             ok=True,
             content=f"[Image OCR — {abs_path.name}] No text detected in the image. "
-                    "The image may contain only graphics without text, or OCR could not read it.",
+            "The image may contain only graphics without text, or OCR could not read it.",
         )
-

@@ -7,6 +7,7 @@ re-ranked EVERY line independently by BM25 score. That destroyed the grouping
 and separators floated to meaningless spots. The fix gates BM25 to context==0
 (flat match-lines only).
 """
+
 import pathlib
 import re
 
@@ -33,7 +34,7 @@ def _svc_py(root: pathlib.Path) -> pathlib.Path:
     (root / "svc.py").write_text(
         "def setup(self):\n"
         "    x = 1\n"
-        "    connect_database()\n"          # L3 — match
+        "    connect_database()\n"  # L3 — match
         "    return x\n"
         "    pass\n"
         "    pass\n"
@@ -48,7 +49,7 @@ def _svc_py(root: pathlib.Path) -> pathlib.Path:
         "    pass\n"
         "    pass\n"
         "def more():\n"
-        "    connect_database()\n"          # L18 — match
+        "    connect_database()\n"  # L18 — match
     )
     return root / "svc.py"
 
@@ -60,14 +61,11 @@ def test_grep_context_does_not_scramble_groups(tool_registry):
     """
     root = pathlib.Path(tool_registry.repo_root)
     _svc_py(root)
-    res = tool_registry.dispatch(
-        "grep", {"pattern": "connect_database", "context": 2, "path": "svc.py"}
-    )
+    res = tool_registry.dispatch("grep", {"pattern": "connect_database", "context": 2, "path": "svc.py"})
     assert res.ok, res.error
     nums = _line_numbers(res.content)
     assert nums, f"no line numbers parsed from output:\n{res.content}"
-    assert nums == sorted(nums), (
-        f"context>0 output scrambled (non-ascending line numbers): {nums}")
+    assert nums == sorted(nums), f"context>0 output scrambled (non-ascending line numbers): {nums}"
     # both matches present with their context
     assert 3 in nums and 18 in nums
 
@@ -78,16 +76,14 @@ def test_grep_context_match_keeps_neighbors(tool_registry):
     """
     root = pathlib.Path(tool_registry.repo_root)
     _svc_py(root)
-    res = tool_registry.dispatch(
-        "grep", {"pattern": "connect_database", "context": 1, "path": "svc.py"}
-    )
+    res = tool_registry.dispatch("grep", {"pattern": "connect_database", "context": 1, "path": "svc.py"})
     assert res.ok, res.error
     out_lines = res.content.splitlines()[1:]  # skip header
     # first match line is L3; its trailing context (L4) must be the very next line
     match_idx = next(i for i, ln in enumerate(out_lines) if re.match(r"^3:", ln))
     assert re.match(r"^4[-:]", out_lines[match_idx + 1]), (
-        f"trailing context L4 not adjacent to match L3: "
-        f"{out_lines[match_idx:match_idx + 3]}")
+        f"trailing context L4 not adjacent to match L3: {out_lines[match_idx : match_idx + 3]}"
+    )
 
 
 def test_grep_flat_no_ranking_when_results_fit(tool_registry):
@@ -115,19 +111,13 @@ def test_grep_flat_no_ranking_when_results_fit(tool_registry):
     #
     # The bait: the LATER line scores higher under BM25 (three occurrences vs
     # one), so a lost _top.sort() pulls it to the front.
-    (root / "alpha.py").write_text(
-        "# mytoken once\n"
-        "filler = 1\n"
-        "# mytoken mytoken mytoken\n"
-    )
-    res = tool_registry.dispatch(
-        "grep", {"pattern": "mytoken", "context": 0, "path": "."}
-    )
+    (root / "alpha.py").write_text("# mytoken once\nfiller = 1\n# mytoken mytoken mytoken\n")
+    res = tool_registry.dispatch("grep", {"pattern": "mytoken", "context": 0, "path": "."})
     assert res.ok, res.error
     assert "mytoken" in res.content
     assert res.content.index("alpha.py:1:") < res.content.index("alpha.py:3:"), (
-        f"native line order not preserved (line 1 must precede line 3) — "
-        f"_top.sort() lost?\n{res.content}")
+        f"native line order not preserved (line 1 must precede line 3) — _top.sort() lost?\n{res.content}"
+    )
 
 
 def test_grep_reports_true_match_count_when_ranking_runs(tool_registry):
@@ -146,15 +136,13 @@ def test_grep_reports_true_match_count_when_ranking_runs(tool_registry):
         # 100 matches each => 400 total, far above the max_results=5 below.
         (root / f"bulk{f}.py").write_text("".join(f"mytoken_{i}\n" for i in range(100)))
 
-    res = tool_registry.dispatch(
-        "grep", {"pattern": "mytoken", "context": 0, "path": ".", "max_results": 5}
-    )
+    res = tool_registry.dispatch("grep", {"pattern": "mytoken", "context": 0, "path": ".", "max_results": 5})
     assert res.ok, res.error
     header = res.content.splitlines()[0]
-    assert "(400 matches)" in header, (
-        f"header must report the true match count, not the displayed count.\n{header}")
+    assert "(400 matches)" in header, f"header must report the true match count, not the displayed count.\n{header}"
     assert "of 400 matches" in res.content, (
-        f"truncation notice missing — agent cannot tell results were dropped.\n{res.content}")
+        f"truncation notice missing — agent cannot tell results were dropped.\n{res.content}"
+    )
 
 
 def test_grep_ranked_survivors_are_in_file_line_order(tool_registry):
@@ -163,11 +151,8 @@ def test_grep_ranked_survivors_are_in_file_line_order(tool_registry):
     root = pathlib.Path(tool_registry.repo_root)
     (root / "bulk.py").write_text("".join(f"mytoken_{i}\n" for i in range(300)))
 
-    res = tool_registry.dispatch(
-        "grep", {"pattern": "mytoken", "context": 0, "path": ".", "max_results": 10}
-    )
+    res = tool_registry.dispatch("grep", {"pattern": "mytoken", "context": 0, "path": ".", "max_results": 10})
     assert res.ok, res.error
     nums = _line_numbers(res.content)
     assert nums, res.content
-    assert nums == sorted(nums), (
-        f"ranked survivors must be re-sorted into file/line order: {nums}")
+    assert nums == sorted(nums), f"ranked survivors must be re-sorted into file/line order: {nums}"

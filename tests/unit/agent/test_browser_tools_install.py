@@ -13,6 +13,7 @@ decision itself is covered by tests/unit/test_pip_env.py.
 These tests do NOT require Playwright or Chromium to be installed; every
 external dependency (subprocess, importlib) is mocked away.
 """
+
 import sys
 
 from external_llm.agent.tool_handlers import browser_tools
@@ -53,7 +54,8 @@ def test_user_declines(monkeypatch):
     monkeypatch.setattr(browser_tools, "HAS_PLAYWRIGHT", False)
     host = _InstallHost()
     monkeypatch.setattr(
-        host, "_tool_ask_user",
+        host,
+        "_tool_ask_user",
         lambda args: ToolResult(ok=True, metadata={"answer": "no"}),
         raising=False,
     )
@@ -76,7 +78,8 @@ def test_user_consents(monkeypatch):
     monkeypatch.setattr(browser_tools, "HAS_PLAYWRIGHT", False)
     host = _InstallHost()
     monkeypatch.setattr(
-        host, "_tool_ask_user",
+        host,
+        "_tool_ask_user",
         lambda args: ToolResult(ok=True, metadata={"answer": "yes"}),
         raising=False,
     )
@@ -90,7 +93,9 @@ def test_ask_user_raises(monkeypatch):
     """ask_user raises → return False, _install_playwright not called."""
     monkeypatch.setattr(browser_tools, "HAS_PLAYWRIGHT", False)
     host = _InstallHost()
-    monkeypatch.setattr(host, "_tool_ask_user", lambda args: (_ for _ in ()).throw(RuntimeError("prompt down")), raising=False)
+    monkeypatch.setattr(
+        host, "_tool_ask_user", lambda args: (_ for _ in ()).throw(RuntimeError("prompt down")), raising=False
+    )
 
     install_called = False
 
@@ -137,18 +142,22 @@ def test_frozen_env(monkeypatch):
 # by tests/unit/test_pip_env.py. Here we only assert browser wiring: that
 # _install_playwright threads whatever flags the (shared) helper returns.
 
+
 def test_install_uses_flags(monkeypatch):
     """_install_playwright threads the env flags into the pip invocation."""
     monkeypatch.setattr(
-        BrowserActionToolsMixin, "_pip_install_flags",
+        BrowserActionToolsMixin,
+        "_pip_install_flags",
         staticmethod(lambda: ["--user", "--break-system-packages"]),
     )
     calls = []
 
     def _fake_run(cmd, **kwargs):
         calls.append(cmd)
+
         class _R:  # minimal CompletedProcess stand-in
             returncode = 0
+
         return _R()
 
     monkeypatch.setattr(browser_tools.subprocess, "run", _fake_run)

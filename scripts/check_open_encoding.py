@@ -56,8 +56,19 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 # Directories that never reach a user's machine, plus caches.
-SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".mypy_cache",
-             ".pytest_cache", "build", "dist", ".asicode", "tests"}
+SKIP_DIRS = {
+    "__pycache__",
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+    "build",
+    "dist",
+    ".asicode",
+    "tests",
+}
 
 
 def _resolve_scan_paths(args: list[str]) -> list[str] | None:
@@ -126,7 +137,8 @@ def _violations_in(source: str) -> list[int]:
                 continue
             out.append(node.lineno)
         elif isinstance(node.func, ast.Attribute) and node.func.attr in (
-            "read_text", "write_text",
+            "read_text",
+            "write_text",
         ):
             # encoding may also arrive positionally: read_text(encoding, ...)
             # is positional arg 0, write_text(data, encoding, ...) arg 1.
@@ -148,8 +160,10 @@ def main() -> int:
         findings += [f"{rel}:{line}" for line in _violations_in(source)]
 
     if not findings:
-        print("✅ Every open()/read_text()/write_text() outside tests/ passes encoding= "
-              "(0 tolerated — this gate has no baseline)")
+        print(
+            "✅ Every open()/read_text()/write_text() outside tests/ passes encoding= "
+            "(0 tolerated — this gate has no baseline)"
+        )
         return 0
 
     print(f"❌ {len(findings)} locale-decoding call(s) (open/read_text/write_text) without encoding=:\n")
@@ -159,8 +173,8 @@ def main() -> int:
         "\ntext-mode open() decodes with the process locale, not UTF-8, so these"
         "\nraise UnicodeDecodeError on any non-ASCII byte under a C/POSIX locale"
         "\n(containers without C.UTF-8, PYTHONCOERCECLOCALE=0)."
-        "\n\nAdd encoding=\"utf-8\". If the file is user source whose encoding we do"
-        "\nnot control, add errors=\"replace\" as well so behaviour stays lenient."
+        '\n\nAdd encoding="utf-8". If the file is user source whose encoding we do'
+        '\nnot control, add errors="replace" as well so behaviour stays lenient.'
         "\nDo NOT add a baseline for this."
     )
     return 1

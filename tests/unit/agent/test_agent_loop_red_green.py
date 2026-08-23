@@ -20,6 +20,7 @@ Covers the remaining untested surface of AgentLoop:
 - _append_native_tool_messages per provider (openai reasoning+filter, ollama, generic)
 - _hunk_to_before_after
 """
+
 from __future__ import annotations
 
 import json
@@ -46,6 +47,7 @@ from external_llm.client import (
 # ---------------------------------------------------------------------------
 # Harness — AgentLoop via __new__ (no __init__ side effects) with mocked deps
 # ---------------------------------------------------------------------------
+
 
 def _harness(**cfg_over):
     """Minimal AgentLoop host with the attributes the covered methods read."""
@@ -99,6 +101,7 @@ class _FastEvent(threading.Event):
 # _collect_git_info / _rollback_patches
 # ---------------------------------------------------------------------------
 
+
 def test_collect_git_info_no_repo_root():
     loop = _harness()
     loop.registry.repo_root = None
@@ -107,9 +110,7 @@ def test_collect_git_info_no_repo_root():
 
 def test_collect_git_info_snapshot_exception():
     loop = _harness()
-    with mock.patch(
-        "external_llm.agent.agent_loop.get_git_snapshot", side_effect=RuntimeError("git boom")
-    ):
+    with mock.patch("external_llm.agent.agent_loop.get_git_snapshot", side_effect=RuntimeError("git boom")):
         assert loop._collect_git_info() == {}
 
 
@@ -146,6 +147,7 @@ def test_rollback_patches_exception(tmp_path):
 # ---------------------------------------------------------------------------
 # __init__ branches
 # ---------------------------------------------------------------------------
+
 
 def _real_loop(**cfg_over):
     """Construct a REAL AgentLoop (exercises __init__ branches)."""
@@ -186,6 +188,7 @@ def test_init_helper_init_failure_sets_none():
 # Small pure helpers
 # ---------------------------------------------------------------------------
 
+
 def test_resolve_routing_intent_design_chat():
     loop = _harness(design_chat_mode=True)
     assert loop._resolve_routing_intent(None) == "read_only"
@@ -212,6 +215,7 @@ def test_try_parse_json_delegates():
 # ---------------------------------------------------------------------------
 # _try_readonly_early_finish
 # ---------------------------------------------------------------------------
+
 
 def _ro_result(ok=True, content="", tool="find_symbol"):
     return ToolResult(ok=ok, content=content, error=None if ok else "boom")
@@ -260,6 +264,7 @@ def test_readonly_early_finish_long_preview_truncated():
 # _strip_thinking_text
 # ---------------------------------------------------------------------------
 
+
 def test_strip_thinking_empty():
     loop = _harness()
     assert loop._strip_thinking_text("") == ""
@@ -296,6 +301,7 @@ def test_strip_thinking_clean_text():
 # ---------------------------------------------------------------------------
 # _extract_known_file_path / _extract_target_keywords
 # ---------------------------------------------------------------------------
+
 
 def test_extract_known_file_empty_request():
     loop = _harness()
@@ -334,6 +340,7 @@ def test_extract_target_keywords_quoted_cap_three():
 # run() branches (real AgentLoop in a tmp git repo)
 # ---------------------------------------------------------------------------
 
+
 def _run(cmd, cwd, **kw):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, **kw, check=False)
 
@@ -360,8 +367,12 @@ def _make_run_loop(tmp_path) -> tuple[AgentLoop, Path]:
 
 def _main_route(**over):
     route = {
-        "lane": Lane.MAIN_AGENT, "confidence": 0.9, "task_kind": "general",
-        "reasoning": "", "complexity": "low", "target_specificity_score": 0.5,
+        "lane": Lane.MAIN_AGENT,
+        "confidence": 0.9,
+        "task_kind": "general",
+        "reasoning": "",
+        "complexity": "low",
+        "target_specificity_score": 0.5,
     }
     route.update(over)
     return SimpleNamespace(**route)
@@ -414,9 +425,7 @@ def test_run_stamps_checkpoint_id(tmp_path):
     loop._run_llm_loop = lambda ctx: AgentResult(
         status="success", final_message="ok", turns=[], applied_patches=[], metadata=None
     )
-    with mock.patch.object(
-        ToolRegistry, "run_checkpoint_id", new_callable=mock.PropertyMock, return_value="cp-1"
-    ):
+    with mock.patch.object(ToolRegistry, "run_checkpoint_id", new_callable=mock.PropertyMock, return_value="cp-1"):
         result = loop.run("change alpha to 2")
     assert result.metadata["checkpoint_id"] == "cp-1"
 
@@ -424,6 +433,7 @@ def test_run_stamps_checkpoint_id(tmp_path):
 # ---------------------------------------------------------------------------
 # _save_session_log / _cb
 # ---------------------------------------------------------------------------
+
 
 def _session_result():
     turn = AgentTurn(0, "read_file", {}, ToolResult(ok=True, content="c", metadata={"touched_files": ["a.py"]}))
@@ -491,6 +501,7 @@ def test_cb_callback_exception_swallowed():
 # _check_native_tool_support
 # ---------------------------------------------------------------------------
 
+
 def test_native_support_non_native_provider():
     loop = _harness()
     loop.llm_client.get_provider_name.return_value = "custom"
@@ -516,6 +527,7 @@ def test_native_support_ollama_unknown_assumes_supported():
 # ---------------------------------------------------------------------------
 # _llm_call_with_tools
 # ---------------------------------------------------------------------------
+
 
 def _llm_response(**over):
     resp = mock.MagicMock()
@@ -547,9 +559,7 @@ def test_llm_call_repair_drop_notifies():
         "external_llm.agent.context_budget.repair_tool_message_sequence",
         side_effect=lambda msgs: msgs[:-1],
     ):
-        out = loop._llm_call_with_tools(
-            [LLMMessage(role="user", content="a"), LLMMessage(role="user", content="b")]
-        )
+        out = loop._llm_call_with_tools([LLMMessage(role="user", content="a"), LLMMessage(role="user", content="b")])
     assert out["content"] == "ok"
     loop._cb.assert_called_once()
     assert loop._cb.call_args.args[0] == "agent_working"
@@ -568,6 +578,7 @@ def test_llm_call_normalizes_dict_tool_calls():
 # ---------------------------------------------------------------------------
 # _retry_on_rate_limit
 # ---------------------------------------------------------------------------
+
 
 def test_retry_none_result_returns_empty():
     loop = _harness()
@@ -679,9 +690,7 @@ def test_retry_nan_token_values_tolerated():
 
 def test_retry_reasoning_tokens_logged():
     loop = _harness()
-    out = loop._retry_on_rate_limit(
-        lambda: {"prompt_tokens": 100, "completion_tokens": 50, "reasoning_tokens": 20}
-    )
+    out = loop._retry_on_rate_limit(lambda: {"prompt_tokens": 100, "completion_tokens": 50, "reasoning_tokens": 20})
     assert out["prompt_tokens"] == 100
     assert out["completion_tokens"] == 50
 
@@ -689,6 +698,7 @@ def test_retry_reasoning_tokens_logged():
 # ---------------------------------------------------------------------------
 # _auto_repair_apply_patch_args
 # ---------------------------------------------------------------------------
+
 
 def test_auto_repair_non_string_patch():
     loop = _harness()
@@ -710,7 +720,9 @@ def test_auto_repair_hunk_only_wraps_headers():
     loop = _harness()
     out = loop._auto_repair_apply_patch_args({"patch": "@@ -1 +1 @@\n+x\n", "path": "src/a.py"})
     assert out is not None
-    assert out["patch"].startswith("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n+x\n")
+    assert out["patch"].startswith(
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n+x\n"
+    )
 
 
 def test_auto_repair_missing_diffgit_header_added():
@@ -743,6 +755,7 @@ def test_auto_repair_nothing_applicable():
 # ---------------------------------------------------------------------------
 # Guidance appenders
 # ---------------------------------------------------------------------------
+
 
 def test_write_plan_guidance_ok_result_unchanged():
     loop = _harness()
@@ -796,8 +809,11 @@ def test_edit_warnings_guidance_tip():
 def test_edit_warnings_guidance_syntax_check():
     loop = _harness()
     res = ToolResult(
-        ok=False, error="e",
-        metadata={"syntax_check": {"ok": False, "skipped": False, "errors": [{"line": 3, "col": 4, "message": "bad indent"}]}},
+        ok=False,
+        error="e",
+        metadata={
+            "syntax_check": {"ok": False, "skipped": False, "errors": [{"line": 3, "col": 4, "message": "bad indent"}]}
+        },
     )
     content = loop._append_edit_warnings_guidance("base", "edit_text", res)
     assert "[SYNTAX WARNING]" in content
@@ -813,8 +829,15 @@ def test_edit_warnings_guidance_empty_metadata_unchanged():
 def test_semantic_diagnostics_syntax_path():
     loop = _harness()
     res = ToolResult(
-        ok=False, error="e",
-        metadata={"syntax_check": {"semantic_diagnostics": [{"file_path": "a.py", "line": 1, "message": "undefined name 'x'", "severity": "error"}]}},
+        ok=False,
+        error="e",
+        metadata={
+            "syntax_check": {
+                "semantic_diagnostics": [
+                    {"file_path": "a.py", "line": 1, "message": "undefined name 'x'", "severity": "error"}
+                ]
+            }
+        },
     )
     content = loop._append_semantic_diagnostics("base", res)
     assert "<file_diagnostics>" in content
@@ -824,8 +847,13 @@ def test_semantic_diagnostics_syntax_path():
 def test_semantic_diagnostics_semantic_report_path():
     loop = _harness()
     res = ToolResult(
-        ok=False, error="e",
-        metadata={"semantic_report": {"diagnostics": [{"file_path": "b.py", "line": 2, "message": "type mismatch", "severity": "warning"}]}},
+        ok=False,
+        error="e",
+        metadata={
+            "semantic_report": {
+                "diagnostics": [{"file_path": "b.py", "line": 2, "message": "type mismatch", "severity": "warning"}]
+            }
+        },
     )
     content = loop._append_semantic_diagnostics("base", res)
     assert "<file_diagnostics>" in content
@@ -841,11 +869,15 @@ def test_semantic_diagnostics_none_returns_unchanged():
 def test_patch_retry_guidance():
     loop = _harness()
     res = ToolResult(
-        ok=False, error="e",
+        ok=False,
+        error="e",
         metadata={
             "retry_guidance": {
-                "failure_type": "ctx", "target_file": "a.py", "hint": "h",
-                "instruction": "i", "exact_existing_snippet": "code = 1",
+                "failure_type": "ctx",
+                "target_file": "a.py",
+                "hint": "h",
+                "instruction": "i",
+                "exact_existing_snippet": "code = 1",
             }
         },
     )
@@ -867,12 +899,20 @@ def test_patch_retry_guidance_ignored_for_success():
 # _append_native_tool_messages
 # ---------------------------------------------------------------------------
 
+
 def test_native_openai_reasoning_content_and_tool_msgs():
     loop = _harness()
     loop.llm_client.get_provider_name.return_value = "openai"
     raw = SimpleNamespace(
         raw_response={
-            "choices": [{"message": {"tool_calls": [{"id": "c1", "function": {"name": "read_file"}}], "reasoning_content": "thinking"}}]
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [{"id": "c1", "function": {"name": "read_file"}}],
+                        "reasoning_content": "thinking",
+                    }
+                }
+            ]
         }
     )
     resp = {"content": "hi", "raw": raw}
@@ -927,6 +967,7 @@ def test_native_generic_fallback_folds_text():
 # ---------------------------------------------------------------------------
 # _hunk_to_before_after
 # ---------------------------------------------------------------------------
+
 
 def test_hunk_to_before_after_splits():
     loop = _harness()

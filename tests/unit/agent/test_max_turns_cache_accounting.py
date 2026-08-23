@@ -8,6 +8,7 @@ cache token consumption. For cache-heavy providers (Anthropic, z.ai) this
 underreported cache_read_tokens and cache_creation_tokens, skewing
 cache_adjusted_cost_usd and cache_hit_ratio in the final metadata.
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -121,7 +122,7 @@ def test_max_turns_accumulates_cache_tokens_with_wrap_up_retry():
     assert ctx.total_cache_read_tokens == 700, "wrap-up retry cache_read_tokens were silently dropped"
     assert ctx.total_cache_creation_tokens == 110, "wrap-up retry cache_creation_tokens were silently dropped"
     assert ctx.total_prompt_tokens == 160  # 80 + 80
-    assert ctx.total_completion_tokens == 40   # 20 + 20
+    assert ctx.total_completion_tokens == 40  # 20 + 20
     tokens_meta = result.metadata["tokens"]
     assert tokens_meta["cache_read_tokens"] == 700
     assert tokens_meta["cache_creation_tokens"] == 110

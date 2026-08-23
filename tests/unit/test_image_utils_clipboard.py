@@ -16,6 +16,7 @@ The script-building and result-parsing helpers are pure functions and are
 tested directly; the ``_check_clipboard_image`` orchestrator is exercised with
 ``platform.system`` / ``subprocess.run`` stubbed so no real osascript runs.
 """
+
 from __future__ import annotations
 
 import base64
@@ -82,9 +83,9 @@ class TestBuildProbeScript:
         # (`use framework`, `set ... to`) under `-l JavaScript`, which JXA
         # cannot parse. The probe must use the JS ObjC-bridge form instead.
         s = _build_clipboard_probe_script(_CLIPBOARD_IMAGE_UTIS)
-        assert "use framework" not in s          # AppleScript ObjC import
-        assert "ObjC.import('AppKit')" in s      # JXA ObjC import
-        assert "$.NSPasteboard" in s             # JXA ObjC access
+        assert "use framework" not in s  # AppleScript ObjC import
+        assert "ObjC.import('AppKit')" in s  # JXA ObjC import
+        assert "$.NSPasteboard" in s  # JXA ObjC access
         assert "base64EncodedStringWithOptions" in s
 
     def test_emits_uti_tab_b64_format(self):
@@ -129,7 +130,8 @@ class TestCheckClipboardImage:
     def test_png_clipboard_attached(self, monkeypatch):
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **k: _run(returncode=0, stdout=f"public.png\t{_VALID_B64}"),
         )
         assert _check_clipboard_image() == [{"media_type": "image/png", "data": _VALID_B64}]
@@ -139,7 +141,8 @@ class TestCheckClipboardImage:
         # of silently dropped, and carries media_type image/tiff.
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **k: _run(returncode=0, stdout=f"public.tiff\t{_VALID_B64}"),
         )
         assert _check_clipboard_image() == [{"media_type": "image/tiff", "data": _VALID_B64}]
@@ -149,7 +152,8 @@ class TestCheckClipboardImage:
         # orchestrator must surface that PNG, not a TIFF.
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **k: _run(returncode=0, stdout=f"public.png\t{_VALID_B64}"),
         )
         result = _check_clipboard_image()
@@ -158,7 +162,8 @@ class TestCheckClipboardImage:
     def test_invalid_base64_returns_empty(self, monkeypatch):
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **k: _run(returncode=0, stdout="public.png\t" + "!" * 120),
         )
         assert _check_clipboard_image() == []
@@ -167,7 +172,8 @@ class TestCheckClipboardImage:
         # <100-char payloads are rejected as implausible image fragments.
         monkeypatch.setattr(platform, "system", lambda: "Darwin")
         monkeypatch.setattr(
-            subprocess, "run",
+            subprocess,
+            "run",
             lambda *a, **k: _run(returncode=0, stdout="public.png\t" + "A" * 50),
         )
         assert _check_clipboard_image() == []

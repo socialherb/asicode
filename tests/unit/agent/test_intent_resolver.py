@@ -41,25 +41,27 @@ from external_llm.client import LLMServerUnavailableError
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-_VALID_JSON = json.dumps({
-    "intent_type": "bugfix",
-    "lane_hint": "planner",
-    "scope_hint": "single_file",
-    "complexity_hint": "normal",
-    "is_test_write": False,
-    "is_style_fix": False,
-    "is_filesystem_op": False,
-    "is_ui_change": False,
-    "is_interface_preserving": False,
-    "modify_symbols": ["ConnectionPool.release"],
-    "new_symbols": [],
-    "reference_symbols": [],
-    "search_terms": ["ConnectionPool", "release"],
-    "confidence": 0.9,
-    "metadata": {"language_detected": "en"},
-    "normalized_query": "fix bug in ConnectionPool.release",
-    "code_concepts": {"data_fields": [], "behavioral_kind": "fix", "scope_phase": "execution"},
-})
+_VALID_JSON = json.dumps(
+    {
+        "intent_type": "bugfix",
+        "lane_hint": "planner",
+        "scope_hint": "single_file",
+        "complexity_hint": "normal",
+        "is_test_write": False,
+        "is_style_fix": False,
+        "is_filesystem_op": False,
+        "is_ui_change": False,
+        "is_interface_preserving": False,
+        "modify_symbols": ["ConnectionPool.release"],
+        "new_symbols": [],
+        "reference_symbols": [],
+        "search_terms": ["ConnectionPool", "release"],
+        "confidence": 0.9,
+        "metadata": {"language_detected": "en"},
+        "normalized_query": "fix bug in ConnectionPool.release",
+        "code_concepts": {"data_fields": [], "behavioral_kind": "fix", "scope_phase": "execution"},
+    }
+)
 
 
 class FakeResponse:
@@ -80,10 +82,14 @@ class FakeClient:
         self.calls = []
 
     def chat(self, messages, model, temperature, max_tokens):
-        self.calls.append({
-            "messages": messages, "model": model,
-            "temperature": temperature, "max_tokens": max_tokens,
-        })
+        self.calls.append(
+            {
+                "messages": messages,
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
         if self.error is not None:
             raise self.error
         if not self.responses:
@@ -115,8 +121,10 @@ class FailingRetryClient(FakeClient):
 
 def make_resolver(client=None, enable_cache=False, **kw) -> IntentResolver:
     cfg = IntentResolutionConfig(
-        llm_client=client, model="test-model",
-        enable_cache=enable_cache, **kw,
+        llm_client=client,
+        model="test-model",
+        enable_cache=enable_cache,
+        **kw,
     )
     return IntentResolver(cfg)
 
@@ -155,7 +163,6 @@ def base_dict(**overrides) -> dict:
 
 
 class TestFactoryAndInit:
-
     def test_create_factory_defaults(self):
         client = FakeClient([])
         r = create_intent_resolver(client, "model-x", enable_cache=True)
@@ -186,7 +193,6 @@ class TestFactoryAndInit:
 
 
 class TestResolveCache:
-
     def test_resolve_empty_request(self):
         client = FakeClient([])
         resolver = make_resolver(client, enable_cache=True)
@@ -222,10 +228,12 @@ class TestResolveCache:
         assert len(client.calls) == 1
 
     def test_cache_ttl_expiry(self, monkeypatch):
-        client = FakeClient([
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-        ])
+        client = FakeClient(
+            [
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+            ]
+        )
         resolver = make_resolver(client, enable_cache=True, cache_ttl_seconds=300)
         now = {"t": 1000.0}
         monkeypatch.setattr(ir_module.time, "monotonic", lambda: now["t"])
@@ -250,10 +258,12 @@ class TestResolveCache:
         assert len(client.calls) == 5
 
     def test_cache_disabled_no_caching(self):
-        client = FakeClient([
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-        ])
+        client = FakeClient(
+            [
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+            ]
+        )
         resolver = make_resolver(client, enable_cache=False)
         resolver.resolve("fix ConnectionPool.release")
         resolver.resolve("fix ConnectionPool.release")
@@ -266,7 +276,6 @@ class TestResolveCache:
 
 
 class TestResolveWithLlm:
-
     def test_no_client_falls_back(self):
         resolver = make_resolver(None)
         r = resolver.resolve("fix the ConnectionPool release bug")
@@ -365,12 +374,15 @@ class TestResolveWithLlm:
         assert r.modify_symbols == ["ConnectionPool.release"]
 
     def test_truncation_retry_doubles_budget(self):
-        truncated = ('{"intent_type": "bugfix", "search_terms": ["ConnectionPool", "release"], '
-                     '"modify_symbols": ["Connection')
-        client = FakeClient([
-            FakeResponse(content=truncated, finish_reason="length"),
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-        ])
+        truncated = (
+            '{"intent_type": "bugfix", "search_terms": ["ConnectionPool", "release"], "modify_symbols": ["Connection'
+        )
+        client = FakeClient(
+            [
+                FakeResponse(content=truncated, finish_reason="length"),
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+            ]
+        )
         resolver = make_resolver(client)
         r = resolver.resolve("fix ConnectionPool.release")
         assert len(client.calls) == 2
@@ -380,20 +392,24 @@ class TestResolveWithLlm:
         assert r.modify_symbols == ["ConnectionPool.release"]
 
     def test_finish_reason_truncated_retries(self):
-        client = FakeClient([
-            FakeResponse(content='{"intent_type": "feature"}', finish_reason="truncated"),
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-        ])
+        client = FakeClient(
+            [
+                FakeResponse(content='{"intent_type": "feature"}', finish_reason="truncated"),
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+            ]
+        )
         resolver = make_resolver(client)
         r = resolver.resolve("fix ConnectionPool.release")
         assert len(client.calls) == 2
         assert r.intent_type == "bugfix"  # retry content wins
 
     def test_json_looks_truncated_retries(self):
-        client = FakeClient([
-            FakeResponse(content='{"intent_type": "feature"', finish_reason="stop"),
-            FakeResponse(content=_VALID_JSON, finish_reason="stop"),
-        ])
+        client = FakeClient(
+            [
+                FakeResponse(content='{"intent_type": "feature"', finish_reason="stop"),
+                FakeResponse(content=_VALID_JSON, finish_reason="stop"),
+            ]
+        )
         resolver = make_resolver(client)
         r = resolver.resolve("fix ConnectionPool.release")
         assert len(client.calls) == 2
@@ -412,10 +428,12 @@ class TestResolveWithLlm:
 
     def test_retry_empty_content_keeps_original(self):
         truncated = '{"intent_type": "feature", "nested": {"x": 1}, "search_terms": ["alpha"]'
-        client = FakeClient([
-            FakeResponse(content=truncated, finish_reason="length"),
-            FakeResponse(content="", finish_reason="stop"),  # empty retry
-        ])
+        client = FakeClient(
+            [
+                FakeResponse(content=truncated, finish_reason="length"),
+                FakeResponse(content="", finish_reason="stop"),  # empty retry
+            ]
+        )
         resolver = make_resolver(client)
         r = resolver.resolve("add alpha support")
         assert len(client.calls) == 2
@@ -424,10 +442,12 @@ class TestResolveWithLlm:
 
     def test_retry_plain_str_response(self):
         truncated = '{"intent_type": "feature", "search_terms": ["alpha"]'
-        client = FakeClient([
-            FakeResponse(content=truncated, finish_reason="length"),
-            _VALID_JSON,  # retry returns a plain string
-        ])
+        client = FakeClient(
+            [
+                FakeResponse(content=truncated, finish_reason="length"),
+                _VALID_JSON,  # retry returns a plain string
+            ]
+        )
         resolver = make_resolver(client)
         r = resolver.resolve("fix ConnectionPool.release")
         assert len(client.calls) == 2
@@ -454,7 +474,6 @@ class TestResolveWithLlm:
 
 
 class TestPrompts:
-
     def test_system_prompt_contains_guides(self):
         p = make_resolver(None)._build_system_prompt()
         assert "intent_type" in p
@@ -474,7 +493,6 @@ class TestPrompts:
 
 
 class TestRecoverTruncatedJson:
-
     def test_not_object_none(self):
         assert make_resolver(None)._recover_truncated_json("[1, 2") is None
 
@@ -531,7 +549,6 @@ class TestRecoverTruncatedJson:
 
 
 class TestParseLlmResponse:
-
     def test_no_brace_fallback(self):
         d = make_resolver(None)._parse_llm_response("no json here", "orig")
         assert d["intent_type"] == "unknown"
@@ -597,8 +614,9 @@ class TestParseLlmResponse:
 
     def test_non_list_list_fields_coerced(self):
         d = make_resolver(None)._parse_llm_response(
-            '{"intent_type": "bugfix", "search_terms": "notalist", '
-            '"modify_symbols": 42, "new_symbols": {"name": "x"}}', "orig")
+            '{"intent_type": "bugfix", "search_terms": "notalist", "modify_symbols": 42, "new_symbols": {"name": "x"}}',
+            "orig",
+        )
         assert d["search_terms"] == []
         assert d["modify_symbols"] == []
         assert d["new_symbols"] == []
@@ -634,7 +652,6 @@ class TestParseLlmResponse:
 
 
 class TestBuildIntentResult:
-
     def test_basic_role_aware_fields(self):
         r = make_resolver(None)._build_intent_result("req", base_dict())
         assert r.intent_type == "bugfix"
@@ -681,10 +698,16 @@ class TestBuildIntentResult:
         assert r.spec_hints == {}
 
     def test_new_symbols_filtered(self):
-        d = base_dict(new_symbols=[
-            {"name": "validate", "kind": "method", "parent": "UserModel"},
-            {"name": ""}, {}, "junk", 42, {"name": "ok"},
-        ])
+        d = base_dict(
+            new_symbols=[
+                {"name": "validate", "kind": "method", "parent": "UserModel"},
+                {"name": ""},
+                {},
+                "junk",
+                42,
+                {"name": "ok"},
+            ]
+        )
         r = make_resolver(None)._build_intent_result("req", d)
         assert [s["name"] for s in r.new_symbols] == ["validate", "ok"]
 
@@ -716,7 +739,7 @@ class TestBuildIntentResult:
         d = base_dict(edit_kind="guard_add", guard_statement="x = 1")
         r = make_resolver(None)._build_intent_result("req", d)
         assert r.guard_statement == "x = 1"  # syntax-valid → kept
-        assert r.guard_spec is None           # but not a guard → no IR
+        assert r.guard_spec is None  # but not a guard → no IR
 
     def test_guard_statement_ignored_unless_guard_add(self):
         d = base_dict(edit_kind="body_only", guard_statement="if x: return")
@@ -725,11 +748,13 @@ class TestBuildIntentResult:
         assert r.guard_spec is None
 
     def test_code_concepts_valid_and_capped(self):
-        d = base_dict(code_concepts={
-            "data_fields": [f"field{i}" for i in range(10)] + ["x", "bad field!"],
-            "behavioral_kind": "enforcement",
-            "scope_phase": "verification",
-        })
+        d = base_dict(
+            code_concepts={
+                "data_fields": [f"field{i}" for i in range(10)] + ["x", "bad field!"],
+                "behavioral_kind": "enforcement",
+                "scope_phase": "verification",
+            }
+        )
         r = make_resolver(None)._build_intent_result("req", d)
         assert r.code_concepts["data_fields"] == [f"field{i}" for i in range(8)]
         assert r.code_concepts["behavioral_kind"] == "enforcement"
@@ -752,39 +777,62 @@ class TestBuildIntentResult:
         assert r.code_concepts == {}
 
     def test_project_wide_clears_scope_phase(self):
-        d = base_dict(scope_hint="project_wide", code_concepts={
-            "data_fields": ["x_field"], "behavioral_kind": "fix", "scope_phase": "planning",
-        })
+        d = base_dict(
+            scope_hint="project_wide",
+            code_concepts={
+                "data_fields": ["x_field"],
+                "behavioral_kind": "fix",
+                "scope_phase": "planning",
+            },
+        )
         r = make_resolver(None)._build_intent_result("req", d)
         assert r.scope_hint == Scope.PROJECT_WIDE
         assert r.code_concepts["scope_phase"] == ""
         assert r.code_concepts["data_fields"] == ["x_field"]
 
     def test_project_wide_clears_scope_phase_keeps_behavioral_kind(self):
-        d = base_dict(scope_hint="project_wide", code_concepts={
-            "data_fields": [], "behavioral_kind": "fix", "scope_phase": "planning",
-        })
+        d = base_dict(
+            scope_hint="project_wide",
+            code_concepts={
+                "data_fields": [],
+                "behavioral_kind": "fix",
+                "scope_phase": "planning",
+            },
+        )
         r = make_resolver(None)._build_intent_result("req", d)
         assert r.code_concepts == {"data_fields": [], "behavioral_kind": "fix", "scope_phase": ""}
 
     def test_project_wide_empties_concepts_without_fields(self):
-        d = base_dict(scope_hint="project_wide", code_concepts={
-            "data_fields": [], "behavioral_kind": "", "scope_phase": "planning",
-        })
+        d = base_dict(
+            scope_hint="project_wide",
+            code_concepts={
+                "data_fields": [],
+                "behavioral_kind": "",
+                "scope_phase": "planning",
+            },
+        )
         r = make_resolver(None)._build_intent_result("req", d)
         assert r.code_concepts == {}
 
     def test_complexity_mapping(self):
         for hint, expected in [
-            ("trivial", Complexity.LOW), ("normal", Complexity.MEDIUM),
-            ("complex", Complexity.HIGH), ("bogus", Complexity.LOW), (None, Complexity.LOW),
+            ("trivial", Complexity.LOW),
+            ("normal", Complexity.MEDIUM),
+            ("complex", Complexity.HIGH),
+            ("bogus", Complexity.LOW),
+            (None, Complexity.LOW),
         ]:
             r = make_resolver(None)._build_intent_result("req", base_dict(complexity_hint=hint))
             assert r.complexity_hint == expected
 
     def test_boolean_flags(self):
-        d = base_dict(is_test_write=True, is_style_fix=True, is_filesystem_op=True,
-                      is_ui_change=True, is_interface_preserving=True)
+        d = base_dict(
+            is_test_write=True,
+            is_style_fix=True,
+            is_filesystem_op=True,
+            is_ui_change=True,
+            is_interface_preserving=True,
+        )
         r = make_resolver(None)._build_intent_result("req", d)
         assert r.is_test_write and r.is_style_fix and r.is_filesystem_op
         assert r.is_ui_change and r.is_interface_preserving
@@ -800,7 +848,6 @@ class TestBuildIntentResult:
 
 
 class TestScopeHintRobustness:  # RED → GREEN (IR-B1)
-
     @pytest.mark.parametrize("bad_scope", ["project-wide", "SINGLE_FILE", "multi", 42])
     def test_resolve_invalid_scope_hint_preserves_llm_result(self, bad_scope):
         payload = json.loads(_VALID_JSON)
@@ -842,9 +889,9 @@ class TestScopeHintRobustness:  # RED → GREEN (IR-B1)
         payload["search_terms"] = [[1, 2], "valid", 42, ""]
         client = FakeClient([FakeResponse(content=json.dumps(payload), finish_reason="stop")])
         r = make_resolver(client).resolve("fix ConnectionPool.release")
-        assert r.intent_type == "bugfix"          # ← currently collapses to "unknown"
+        assert r.intent_type == "bugfix"  # ← currently collapses to "unknown"
         assert r.search_terms == ["valid"]
-        assert r.confidence == 0.9                # ← currently 0.1
+        assert r.confidence == 0.9  # ← currently 0.1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -853,7 +900,6 @@ class TestScopeHintRobustness:  # RED → GREEN (IR-B1)
 
 
 class TestFallbackExtraction:
-
     def test_word_extraction_and_stop_words(self):
         r = make_resolver(None).resolve("please fix the ConnectionPool release bug")
         assert "ConnectionPool" in r.search_terms
@@ -903,7 +949,6 @@ class TestFallbackExtraction:
 
 
 class TestCreateEmptyAndFallback:
-
     def test_empty_result_fields(self):
         r = make_resolver(None)._create_empty_result("")
         assert r.original_request == ""

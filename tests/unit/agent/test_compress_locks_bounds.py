@@ -26,6 +26,7 @@ strong-local-binding is dropped in favor of assign-then-re-read, the identity /
 dedup tests become racy (intermittently creating a fresh Lock and breaking
 dedup).
 """
+
 from __future__ import annotations
 
 import gc
@@ -73,9 +74,7 @@ def test_gc_evicts_idle_session_lock(ctx):
     del lock
     gc.collect()
 
-    assert sid not in _MODULE_COMPRESS_LOCKS, (
-        "idle session lock leaked — registry is not weakly-referenced"
-    )
+    assert sid not in _MODULE_COMPRESS_LOCKS, "idle session lock leaked — registry is not weakly-referenced"
 
 
 def test_strong_ref_keeps_entry_alive_across_return(ctx):

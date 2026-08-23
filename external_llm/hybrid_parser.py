@@ -3,13 +3,13 @@ Hybrid Output Parser
 
 Parses and validates all output modes
 """
+
 from __future__ import annotations
 
 import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .output_modes import OutputMode
 
@@ -21,20 +21,20 @@ class ParseResult:
     """Parse result"""
 
     success: bool
-    mode: Optional[OutputMode] = None
-    error: Optional[str] = None
+    mode: OutputMode | None = None
+    error: str | None = None
     warnings: list[str] = field(default_factory=list)
 
     # Per-mode results
-    blocks: Optional[list[dict]] = None  # ASICODE_BLOCK
-    diff: Optional[str] = None  # UNIFIED_DIFF
-    code: Optional[str] = None  # TARGETED_BLOCK
-    insert_point: Optional[str] = None
-    content: Optional[str] = None  # FULL_FILE
-    file_path: Optional[str] = None
-    plan: Optional[dict] = None  # PLAN_JSON
+    blocks: list[dict] | None = None  # ASICODE_BLOCK
+    diff: str | None = None  # UNIFIED_DIFF
+    code: str | None = None  # TARGETED_BLOCK
+    insert_point: str | None = None
+    content: str | None = None  # FULL_FILE
+    file_path: str | None = None
+    plan: dict | None = None  # PLAN_JSON
 
-    raw_output: Optional[str] = None
+    raw_output: str | None = None
 
 
 class HybridOutputParser:
@@ -45,13 +45,9 @@ class HybridOutputParser:
 
         logger.info("Parsing (expected=%s)", expected_mode.value)
 
-        #NEEDS_DISAMBIGUATION check
+        # NEEDS_DISAMBIGUATION check
         if "NEEDS_DISAMBIGUATION" in llm_output:
-            return ParseResult(
-                success=True,
-                mode=None,
-                raw_output=llm_output
-            )
+            return ParseResult(success=True, mode=None, raw_output=llm_output)
 
         # Parse in expected mode
         parsers = {
@@ -74,15 +70,11 @@ class HybridOutputParser:
                     result.warnings.append(f"Parsed as {mode.value} instead")
                     return result
 
-        return ParseResult(
-            success=False,
-            error="Failed to parse",
-            raw_output=llm_output
-        )
+        return ParseResult(success=False, error="Failed to parse", raw_output=llm_output)
 
     def _parse_asicode(self, text: str) -> ParseResult:
         """Parse ASICODE block"""
-        pattern = r'ASICODE_BEGIN\s*\n(.*?)\nASICODE_END'
+        pattern = r"ASICODE_BEGIN\s*\n(.*?)\nASICODE_END"
         matches = re.findall(pattern, text, re.DOTALL)
 
         if not matches:
@@ -90,28 +82,20 @@ class HybridOutputParser:
 
         blocks = []
         for match in matches:
-            before = re.search(r'BEFORE\s*\n(.*?)\nAFTER', match, re.DOTALL)
-            after = re.search(r'AFTER\s*\n(.*?)$', match, re.DOTALL)
+            before = re.search(r"BEFORE\s*\n(.*?)\nAFTER", match, re.DOTALL)
+            after = re.search(r"AFTER\s*\n(.*?)$", match, re.DOTALL)
 
             if before and after:
-                blocks.append({
-                    "before": before.group(1).strip(),
-                    "after": after.group(1).strip()
-                })
+                blocks.append({"before": before.group(1).strip(), "after": after.group(1).strip()})
 
         if not blocks:
             return ParseResult(success=False, error="ASICODE blocks missing BEFORE/AFTER")
 
-        return ParseResult(
-            success=True,
-            mode=OutputMode.ASICODE_BLOCK,
-            blocks=blocks,
-            raw_output=text
-        )
+        return ParseResult(success=True, mode=OutputMode.ASICODE_BLOCK, blocks=blocks, raw_output=text)
 
     def _parse_diff(self, text: str) -> ParseResult:
         """Parse unified diff (strict validation: header + @@ hunk required)"""
-        pattern = r'```diff\s*\n(.*?)\n```'
+        pattern = r"```diff\s*\n(.*?)\n```"
         matches = re.findall(pattern, text, re.DOTALL)
 
         # A multi-file patch may be split across several ```diff fences (one file per
@@ -125,30 +109,25 @@ class HybridOutputParser:
         # Minimum: must have --- a/ +++ b/ + @@ to qualify as a real diff
         has_git_header = diff.startswith("diff --git ")
         has_file_headers = ("--- a/" in diff) and ("+++ b/" in diff)
-        has_hunk = ("@@ " in diff)
+        has_hunk = "@@ " in diff
 
         # Some models write explanatory text starting with "diff --git ...", so require a hunk too
         if (has_git_header or has_file_headers) and has_hunk:
-            return ParseResult(
-                success=True,
-                mode=OutputMode.UNIFIED_DIFF,
-                diff=diff,
-                raw_output=text
-            )
+            return ParseResult(success=True, mode=OutputMode.UNIFIED_DIFF, diff=diff, raw_output=text)
 
         return ParseResult(success=False, error="No valid unified diff found")
 
     def _parse_targeted(self, text: str) -> ParseResult:
         """Parse TARGETED_BLOCK"""
-        func_match = re.search(r'FUNCTION:\s*(\w+)', text)
+        func_match = re.search(r"FUNCTION:\s*(\w+)", text)
         if not func_match:
             return ParseResult(success=False, error="No FUNCTION marker")
 
-        insert_match = re.search(r'INSERT_AFTER:\s*(.+)', text)
+        insert_match = re.search(r"INSERT_AFTER:\s*(.+)", text)
         if not insert_match:
             return ParseResult(success=False, error="No INSERT_AFTER")
 
-        code_pattern = r'```python\s*\n(.*?)\n```'
+        code_pattern = r"```python\s*\n(.*?)\n```"
         code_matches = re.findall(code_pattern, text, re.DOTALL)
         if not code_matches:
             return ParseResult(success=False, error="No code block")
@@ -158,14 +137,14 @@ class HybridOutputParser:
             mode=OutputMode.TARGETED_BLOCK,
             code=code_matches[0],
             insert_point=insert_match.group(1).strip(),
-            raw_output=text
+            raw_output=text,
         )
 
     def _parse_full_file(self, text: str) -> ParseResult:
         """Parse FULL_FILE - supports fenced or unfenced FILE blocks"""
         # Uses the same rules as EnhancedOutputParser.FILE_BLOCK_RE
         # Allows fenced code or unfenced body after FILE: path
-        pattern = r'(?ims)(?:^|\n)\s*(?:FILE|Path|Target file)\s*:\s*(?P<path>[^\n\r]+?)\s*\r?\n(?:```[^\n\r]*\r?\n(?P<code1>[\s\S]*?)\r?\n```|(?P<code2>(?:(?!^\s*(?:FILE|Path|Target file)\s*:).*\r?\n)*))?'
+        pattern = r"(?ims)(?:^|\n)\s*(?:FILE|Path|Target file)\s*:\s*(?P<path>[^\n\r]+?)\s*\r?\n(?:```[^\n\r]*\r?\n(?P<code1>[\s\S]*?)\r?\n```|(?P<code2>(?:(?!^\s*(?:FILE|Path|Target file)\s*:).*\r?\n)*))?"
 
         match = re.search(pattern, text)
         if not match:
@@ -183,17 +162,11 @@ class HybridOutputParser:
         if not code.strip():
             return ParseResult(success=False, error="No code content")
 
-        return ParseResult(
-            success=True,
-            mode=OutputMode.FULL_FILE,
-            file_path=path,
-            content=code,
-            raw_output=text
-        )
+        return ParseResult(success=True, mode=OutputMode.FULL_FILE, file_path=path, content=code, raw_output=text)
 
     def _parse_plan(self, text: str) -> ParseResult:
         """Parse PLAN_JSON"""
-        json_pattern = r'```json\s*\n(.*?)\n```'
+        json_pattern = r"```json\s*\n(.*?)\n```"
         matches = re.findall(json_pattern, text, re.DOTALL)
 
         if not matches:
@@ -207,9 +180,4 @@ class HybridOutputParser:
         if "operations" not in plan:
             return ParseResult(success=False, error="Missing operations")
 
-        return ParseResult(
-            success=True,
-            mode=OutputMode.PLAN_JSON,
-            plan=plan,
-            raw_output=text
-        )
+        return ParseResult(success=True, mode=OutputMode.PLAN_JSON, plan=plan, raw_output=text)

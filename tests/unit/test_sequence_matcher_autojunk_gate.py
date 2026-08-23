@@ -12,6 +12,7 @@ constructor call whose keywords lack autojunk=False, so the pattern cannot
 regress in new code. Mirrors the AST-gate pattern of
 test_service_internal_call_contract.py.
 """
+
 from __future__ import annotations
 
 import ast
@@ -30,9 +31,7 @@ def _scan_src(src: str, name: str) -> list[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        is_matcher = (
-            isinstance(func, ast.Name) and func.id == "SequenceMatcher"
-        ) or (
+        is_matcher = (isinstance(func, ast.Name) and func.id == "SequenceMatcher") or (
             isinstance(func, ast.Attribute)
             and func.attr == "SequenceMatcher"
             and isinstance(func.value, ast.Name)
@@ -50,9 +49,7 @@ def _production_py_files() -> list[pathlib.Path]:
     files = []
     for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
-        files.extend(
-            pathlib.Path(dirpath) / f for f in filenames if f.endswith(".py")
-        )
+        files.extend(pathlib.Path(dirpath) / f for f in filenames if f.endswith(".py"))
     return files
 
 
@@ -60,14 +57,12 @@ def test_no_sequence_matcher_without_autojunk():
     offenders: list[str] = []
     for path in _production_py_files():
         offenders.extend(
-            f"{path.relative_to(_REPO_ROOT)}::{loc}"
-            for loc in _scan_src(path.read_text(encoding="utf-8"), path.name)
+            f"{path.relative_to(_REPO_ROOT)}::{loc}" for loc in _scan_src(path.read_text(encoding="utf-8"), path.name)
         )
     assert not offenders, (
         "SequenceMatcher calls without autojunk=False: autojunk purges "
         "chars/lines appearing in >1% of a >=200-char sequence, collapsing "
-        "ratio() toward 0 for near-identical text. Offenders:\n"
-        + "\n".join(offenders)
+        "ratio() toward 0 for near-identical text. Offenders:\n" + "\n".join(offenders)
     )
 
 
@@ -93,19 +88,12 @@ def test_passes_autojunk_keyword_without_positional():
 
 
 def test_ignores_comments_and_strings():
-    src = (
-        "# difflib.SequenceMatcher(None) in a comment\n"
-        's = "difflib.SequenceMatcher(None)"\n'
-    )
+    src = '# difflib.SequenceMatcher(None) in a comment\ns = "difflib.SequenceMatcher(None)"\n'
     assert _scan_src(src, "m.py") == []
 
 
 def test_passes_set_seqs_reuse_after_gated_constructor():
     # The P5 optimization reuses one matcher via set_seqs(); the constructor
     # is the single gate point.
-    src = (
-        "import difflib\n"
-        "m = difflib.SequenceMatcher(None, autojunk=False)\n"
-        "m.set_seqs(a, b)\n"
-    )
+    src = "import difflib\nm = difflib.SequenceMatcher(None, autojunk=False)\nm.set_seqs(a, b)\n"
     assert _scan_src(src, "m.py") == []

@@ -3,6 +3,7 @@
 Covers summarize_decl_losses (pure) and its integration into
 WriteSafetyManager.summarize_change ([POST-EDIT DIFF] block).
 """
+
 import pytest
 
 from external_llm.agent.tool_safety import (
@@ -11,7 +12,7 @@ from external_llm.agent.tool_safety import (
     summarize_decl_losses,
 )
 
-BASE = '''\
+BASE = """\
 import os
 from typing import List as TList
 
@@ -27,7 +28,7 @@ class Service:
 
     def method_b(self):
         pass
-'''
+"""
 
 
 class TestPythonDeclSets:
@@ -44,6 +45,7 @@ class TestPythonDeclSets:
         # tree (Phase 3 restore path) instead of forcing a second ast.parse of
         # the same text.
         import ast
+
         calls = []
         orig_parse = ast.parse
 
@@ -100,6 +102,7 @@ class TestSummarizeDeclLosses:
 def _ts_available() -> bool:
     try:
         from external_llm.languages.tree_sitter_utils import get_parser
+
         return get_parser("javascript") is not None
     except ImportError:
         return False

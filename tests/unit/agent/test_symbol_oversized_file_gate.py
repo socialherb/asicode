@@ -16,6 +16,7 @@ The refusal path is the perverse one: the whole cost buys a message that
 returns no file content at all. 0.2.15 capped tree-sitter parse memos to hold
 whole-process peak RSS at 76 MB; one of these calls was 20x that on its own.
 """
+
 from __future__ import annotations
 
 import time

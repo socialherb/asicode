@@ -19,6 +19,7 @@ Both shipped once (the walk cache carried them simultaneously, making its fix
 entirely inert while looking correct), hence the explicit assertions on the
 counter object itself rather than only on end-to-end behaviour.
 """
+
 from __future__ import annotations
 
 import threading
@@ -30,6 +31,7 @@ import external_llm.agent.tool_handlers.write_tools as wt
 
 # ── The counters must be mutable shared objects, not ints ──────────────────
 
+
 def test_walk_generation_counters_are_shared_mutable_boxes():
     """A bare int cannot carry a bump across a ``from ... import``."""
     for gen in (su._PY_WALK_GEN, su._TS_WALK_GEN):
@@ -40,6 +42,7 @@ def test_walk_generation_counters_are_shared_mutable_boxes():
 def test_invalidate_walk_caches_bump_is_visible_to_importers():
     """Mirrors how tool_registry reaches the counters: import, then observe."""
     from external_llm.agent._shared_utils import _PY_WALK_GEN, _TS_WALK_GEN
+
     before = (_PY_WALK_GEN[0], _TS_WALK_GEN[0])
 
     su.invalidate_walk_caches()
@@ -50,6 +53,7 @@ def test_invalidate_walk_caches_bump_is_visible_to_importers():
 
 
 # ── Mid-collection invalidation must not be resurrected ────────────────────
+
 
 def _bump_after(delay: float, fn) -> threading.Thread:
     """Run *fn* (the post-write invalidation) *delay* seconds from now."""
@@ -67,7 +71,7 @@ def test_walk_cache_not_repopulated_when_invalidated_mid_walk(tmp_path, monkeypa
 
     def slow_walk(root, *a, **kw):
         for item in real_walk(root, *a, **kw):
-            time.sleep(0.3)          # the write lands during this window
+            time.sleep(0.3)  # the write lands during this window
             yield item
 
     monkeypatch.setattr(su.os, "walk", slow_walk)
@@ -95,6 +99,7 @@ def test_repo_file_index_not_repopulated_when_invalidated_mid_listing(tmp_path, 
     # re-exports of the same objects, but patching the re-export binding would
     # not reach the real call inside cached_repo_file_list).
     import external_llm.common.repo_files as common_rf
+
     monkeypatch.setattr(common_rf, "git_list_repo_files", slow_listing)
     t = _bump_after(0.1, lambda: wt.invalidate_repo_file_index(str(tmp_path)))
     paths = wt._repo_file_index(str(tmp_path))
@@ -133,12 +138,13 @@ def test_git_snapshot_not_repopulated_when_invalidated_mid_fetch(monkeypatch):
 # before it". Refusing to cache in the second case would disable the cache
 # outright after every write, giving back the walk this exists to avoid.
 
+
 def test_walk_started_after_invalidation_still_caches(tmp_path):
     (tmp_path / "a.py").write_text("x = 1\n")
     key = str(tmp_path)
 
-    su.invalidate_walk_caches()          # write finishes first...
-    su._walk_py_files(tmp_path, 5000)     # ...then the walk starts
+    su.invalidate_walk_caches()  # write finishes first...
+    su._walk_py_files(tmp_path, 5000)  # ...then the walk starts
 
     assert key in su._PY_WALK_CACHE, (
         "a post-write walk refused to cache — the counter is being compared "
@@ -147,6 +153,7 @@ def test_walk_started_after_invalidation_still_caches(tmp_path):
 
 
 # ── Invalidation must reach SCOPED entries, not just the repo root ──────────
+
 
 def test_invalidation_clears_subdirectory_walk_entries(tmp_path):
     """`find_symbol(..., search_path=sub)` caches under the SUBDIRECTORY.
@@ -164,15 +171,13 @@ def test_invalidation_clears_subdirectory_walk_entries(tmp_path):
     (sub / "a.py").write_text("x = 1\n")
 
     su._PY_WALK_CACHE.clear()
-    su._walk_py_files(tmp_path, 5000)   # whole-tree walk
-    su._walk_py_files(sub, 5000)        # scoped walk -> subdirectory key
+    su._walk_py_files(tmp_path, 5000)  # whole-tree walk
+    su._walk_py_files(sub, 5000)  # scoped walk -> subdirectory key
     assert {str(tmp_path), str(sub)} <= set(su._PY_WALK_CACHE)
 
     su.invalidate_walk_caches()
 
-    assert not su._PY_WALK_CACHE, (
-        f"scoped entries survived invalidation: {list(su._PY_WALK_CACHE)}"
-    )
+    assert not su._PY_WALK_CACHE, f"scoped entries survived invalidation: {list(su._PY_WALK_CACHE)}"
 
 
 def test_invalidate_walk_caches_takes_no_root():
@@ -182,10 +187,12 @@ def test_invalidate_walk_caches_takes_no_root():
     neither reliably matched the searcher's own root.
     """
     import inspect
+
     assert list(inspect.signature(su.invalidate_walk_caches).parameters) == []
 
 
 # ── Per-root git snapshot isolation ─────────────────────────────────────────
+
 
 def test_git_snapshot_isolated_per_root(monkeypatch):
     """``get_git_snapshot(repo_root)`` must not leak repo A's snapshot to repo B.
@@ -212,8 +219,7 @@ def test_git_snapshot_isolated_per_root(monkeypatch):
     # Same key would reuse the first snapshot — without per-root isolation
     # snap_b would be identical to snap_a.
     assert snap_a != snap_b, (
-        "get_git_snapshot returned the SAME snapshot for two different roots — "
-        "the cache is NOT keyed by repo_root"
+        "get_git_snapshot returned the SAME snapshot for two different roots — the cache is NOT keyed by repo_root"
     )
 
     # Both entries must survive in the cache independently.
@@ -288,17 +294,14 @@ def test_git_snapshot_cache_capped(tmp_path, monkeypatch):
     for i in range(12):
         acm.get_git_snapshot(f"/repo-{i}")
 
-    assert len(acm._git_cache) == 8, (
-        f"_git_cache grew to {len(acm._git_cache)} (cap=8) — _capped_put not working"
-    )
+    assert len(acm._git_cache) == 8, f"_git_cache grew to {len(acm._git_cache)} (cap=8) — _capped_put not working"
     # The oldest 4 entries (/repo-0..3) must be evicted under FIFO.
     for i in range(4):
-        assert f"/repo-{i}" not in acm._git_cache, (
-            f"/repo-{i} survived FIFO eviction — oldest not evicted first"
-        )
+        assert f"/repo-{i}" not in acm._git_cache, f"/repo-{i} survived FIFO eviction — oldest not evicted first"
 
 
 # ── Invalidation root alignment ──────────────────────────────────────────────
+
 
 def test_invalidation_uses_effective_repo_root_consistently():
     """The unknown-scope full drop must use ``_effective_repo_root``; the
@@ -330,13 +333,11 @@ def test_invalidation_uses_effective_repo_root_consistently():
     src = textwrap.dedent(inspect.getsource(ToolRegistry._invalidate_caches_unknown_scope))
     tree = ast.parse(src)
     _full_drops = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        and n.func.id == "invalidate_repo_file_index"
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "invalidate_repo_file_index"
     ]
-    assert _full_drops, (
-        "_invalidate_caches_unknown_scope lost its wholesale repo file index drop"
-    )
+    assert _full_drops, "_invalidate_caches_unknown_scope lost its wholesale repo file index drop"
     for node in _full_drops:
         arg = ast.get_source_segment(src, node.args[0] if node.args else None)
         assert arg and "self._effective_repo_root" in arg, (
@@ -348,25 +349,23 @@ def test_invalidation_uses_effective_repo_root_consistently():
     src2 = textwrap.dedent(inspect.getsource(ToolRegistry._invalidate_cache_after_write))
     tree2 = ast.parse(src2)
     assert not [
-        n for n in ast.walk(tree2)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        and n.func.id == "invalidate_repo_file_index"
+        n
+        for n in ast.walk(tree2)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "invalidate_repo_file_index"
     ], (
         "_invalidate_cache_after_write must not wholesale-drop the repo file "
         "index — the atomic funnel + per-path invalidate_for_written_path cover it"
     )
     _per_path = [
-        n for n in ast.walk(tree2)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        and n.func.id == "invalidate_for_written_path"
+        n
+        for n in ast.walk(tree2)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "invalidate_for_written_path"
     ]
-    assert _per_path, (
-        "_invalidate_cache_after_write must invalidate the repo file index per "
-        "touched path"
-    )
+    assert _per_path, "_invalidate_cache_after_write must invalidate the repo file index per touched path"
 
 
 # ── The git snapshot must be invalidated by a real write, not only by tests ──
+
 
 def _init_git_repo(root):
     import subprocess
@@ -423,9 +422,7 @@ def test_write_tool_invalidates_the_git_snapshot(tmp_path, monkeypatch):
 
     # Within the TTL: only invalidation can make this non-empty.
     status = acm.get_git_snapshot(str(tmp_path))["status"]
-    assert "app.py" in status, (
-        f"git snapshot still pre-write after a successful edit: {status!r}"
-    )
+    assert "app.py" in status, f"git snapshot still pre-write after a successful edit: {status!r}"
 
 
 def test_mutating_bash_invalidates_the_git_snapshot(tmp_path, monkeypatch):
@@ -453,9 +450,7 @@ def test_mutating_bash_invalidates_the_git_snapshot(tmp_path, monkeypatch):
     assert reg._tool_call_mutates("bash", {"command": "cp app.py copy.py"})
 
     status = acm.get_git_snapshot(str(tmp_path))["status"]
-    assert "copy.py" in status, (
-        f"git snapshot still pre-write after a mutating bash call: {status!r}"
-    )
+    assert "copy.py" in status, f"git snapshot still pre-write after a mutating bash call: {status!r}"
 
 
 # ── P3 coalesced invalidation: dirty-stamp window semantics ──────────────────
@@ -463,6 +458,7 @@ def test_mutating_bash_invalidates_the_git_snapshot(tmp_path, monkeypatch):
 # get_git_snapshot serves the pre-write entry inside the window, rebuilds
 # past it. Window control via _GIT_REBUILD_COALESCE_S monkeypatch (read at
 # call time): 60.0 = "every read is inside the window", 0.0 = "always past".
+
 
 def _tagged_git(monkeypatch, tag: str) -> dict:
     """Fake _run_git_raw returning deterministic per-command values tagged by
@@ -498,12 +494,8 @@ def test_git_snapshot_within_coalesce_window_serves_prewrite_entry(monkeypatch):
     acm._clear_git_cache("/repo-x")  # a write lands
     after = acm.get_git_snapshot("/repo-x")
 
-    assert after == prewrite, (
-        "within-window read must serve the pre-write entry, not rebuild"
-    )
-    assert rebuild_calls["n"] == 0, (
-        "within-window read must not spawn git subprocesses"
-    )
+    assert after == prewrite, "within-window read must serve the pre-write entry, not rebuild"
+    assert rebuild_calls["n"] == 0, "within-window read must not spawn git subprocesses"
     assert acm._git_dirty_since.get("/repo-x") is not None, (
         "the dirty stamp must survive until a past-window read rebuilds"
     )
@@ -523,9 +515,7 @@ def test_git_snapshot_rebuilds_fresh_past_coalesce_window(monkeypatch):
     acm._clear_git_cache("/repo-y")
 
     snap = acm.get_git_snapshot("/repo-y")  # past window -> rebuild
-    assert snap["status"] == "status-post", (
-        "past-window read must rebuild fresh, not serve the pre-write entry"
-    )
+    assert snap["status"] == "status-post", "past-window read must rebuild fresh, not serve the pre-write entry"
     assert post_calls["n"] == 3, "one fresh snapshot = 3 git commands"
     assert "/repo-y" not in acm._git_dirty_since, (
         "the post-write rebuild stores fresh data, so the stamp must be popped"
@@ -534,8 +524,7 @@ def test_git_snapshot_rebuilds_fresh_past_coalesce_window(monkeypatch):
     snap2 = acm.get_git_snapshot("/repo-y")  # must be a hit now
     assert snap2 == snap, "the hit must return the same post-write entry"
     assert post_calls["n"] == 3, (
-        "a clean entry must not rebuild on every read — the popped stamp must "
-        "not leave the root permanently dirty"
+        "a clean entry must not rebuild on every read — the popped stamp must not leave the root permanently dirty"
     )
 
 
@@ -553,9 +542,7 @@ def test_clear_git_cache_root_scoped_stamp(monkeypatch):
     acm._clear_git_cache("/repo-a")  # write to repo A only
     acm.get_git_snapshot("/repo-a")  # rebuild (+3 -> 9)
     acm.get_git_snapshot("/repo-b")  # must HIT — untouched by A's write
-    assert calls["n"] == 9, (
-        "a write to repo A must not force repo B's entry to rebuild"
-    )
+    assert calls["n"] == 9, "a write to repo A must not force repo B's entry to rebuild"
 
 
 def test_clear_git_cache_no_arg_stamps_all_roots(monkeypatch):
@@ -570,9 +557,7 @@ def test_clear_git_cache_no_arg_stamps_all_roots(monkeypatch):
     acm._clear_git_cache()  # caller cannot name a root
     acm.get_git_snapshot("/repo-a")  # rebuild (+3 -> 9)
     acm.get_git_snapshot("/repo-b")  # rebuild (+3 -> 12)
-    assert calls["n"] == 12, (
-        "no-arg clear must stamp every cached root, not leave some serving stale"
-    )
+    assert calls["n"] == 12, "no-arg clear must stamp every cached root, not leave some serving stale"
 
 
 def test_clear_git_cache_stamps_only_cached_roots():
@@ -582,12 +567,11 @@ def test_clear_git_cache_stamps_only_cached_roots():
     acm._git_dirty_since.clear()
 
     acm._clear_git_cache("/never-cached-root")
-    assert not acm._git_dirty_since, (
-        "clearing a root that has no entry must not leave a stamp behind"
-    )
+    assert not acm._git_dirty_since, "clearing a root that has no entry must not leave a stamp behind"
 
 
 # ── Known-scope invalidation: per-path (not wholesale) ───────────────────────
+
 
 class _PostWriteRegistry:
     """Minimal ToolRegistry stand-in for _invalidate_cache_after_write."""
@@ -627,16 +611,12 @@ def test_invalidate_cache_after_write_covers_non_atomic_writer(tmp_path, monkeyp
 
     # Simulate the git-apply write: plain open(), no atomic funnel.
     (tmp_path / "app.py").write_text("x = 2\n", encoding="utf-8")
-    assert key in common_rf._FILE_INDEX_CACHE, (
-        "sanity: a plain write must NOT auto-invalidate (funnel bypassed)"
-    )
+    assert key in common_rf._FILE_INDEX_CACHE, "sanity: a plain write must NOT auto-invalidate (funnel bypassed)"
 
     reg = _PostWriteRegistry(tmp_path)
     ToolRegistry._invalidate_cache_after_write(reg, ["app.py"])
 
-    assert key not in common_rf._FILE_INDEX_CACHE, (
-        "per-path invalidation must cover the non-atomic (git-apply) writer"
-    )
+    assert key not in common_rf._FILE_INDEX_CACHE, "per-path invalidation must cover the non-atomic (git-apply) writer"
 
 
 def test_invalidate_cache_after_write_no_extra_bump_after_atomic_write(tmp_path, monkeypatch):
@@ -671,8 +651,7 @@ def test_invalidate_cache_after_write_no_extra_bump_after_atomic_write(tmp_path,
     reg = _PostWriteRegistry(tmp_path)
     ToolRegistry._invalidate_cache_after_write(reg, ["app.py"])
     assert gen1 == common_rf._FILE_INDEX_GEN, (
-        "per-path invalidation after an atomic write must NOT bump the "
-        "generation again (double invalidation)"
+        "per-path invalidation after an atomic write must NOT bump the generation again (double invalidation)"
     )
 
 
@@ -698,19 +677,14 @@ def test_unknown_scope_invalidation_drops_the_facade_graph():
     tree = ast.parse(src)
 
     facade_drops = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "invalidate"
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "invalidate"
     ]
     assert facade_drops, (
-        "_invalidate_caches_unknown_scope lost its facade graph drop — "
-        "mutating bash left RG-backed queries stale (B1)"
+        "_invalidate_caches_unknown_scope lost its facade graph drop — mutating bash left RG-backed queries stale (B1)"
     )
-    assert any(
-        ast.get_source_segment(src, n.func.value) == "self._call_graph"
-        for n in facade_drops
-    ), (
+    assert any(ast.get_source_segment(src, n.func.value) == "self._call_graph" for n in facade_drops), (
         "_invalidate_caches_unknown_scope must call self._call_graph.invalidate() "
         "— cgi.invalidate() alone leaves the facade's RG graph warm (B1)"
     )

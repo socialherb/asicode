@@ -10,6 +10,7 @@ missing tokens, …).
 
 subprocess.run is mocked so these tests are fast and don't require tsc.
 """
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,8 +26,9 @@ def _fake_proc(returncode, stdout):
 
 def _validate(stdout, returncode=2):
     p = TypeScriptSyntaxProvider()
-    with patch("external_llm.languages.typescript_provider.subprocess.run",
-               return_value=_fake_proc(returncode, stdout)):
+    with patch(
+        "external_llm.languages.typescript_provider.subprocess.run", return_value=_fake_proc(returncode, stdout)
+    ):
         return p.validate_syntax("server.ts", "irrelevant — subprocess mocked")
 
 
@@ -43,10 +45,7 @@ class TestTypeScriptSyntaxOnly:
         assert not r.errors
 
     def test_genuine_syntax_errors_still_fail(self):
-        out = (
-            "bad.ts(1,12): error TS1005: ':' expected.\n"
-            "bad.ts(2,13): error TS1109: Expression expected.\n"
-        )
+        out = "bad.ts(1,12): error TS1005: ':' expected.\nbad.ts(2,13): error TS1109: Expression expected.\n"
         r = _validate(out)
         assert r.ok is False
         assert len(r.errors) == 2
@@ -54,8 +53,8 @@ class TestTypeScriptSyntaxOnly:
 
     def test_mixed_keeps_only_syntax(self):
         out = (
-            "f.ts(1,1): error TS2591: Cannot find name 'process'.\n"   # ignored
-            "f.ts(2,5): error TS1005: ';' expected.\n"                 # kept
+            "f.ts(1,1): error TS2591: Cannot find name 'process'.\n"  # ignored
+            "f.ts(2,5): error TS1005: ';' expected.\n"  # kept
         )
         r = _validate(out)
         assert r.ok is False

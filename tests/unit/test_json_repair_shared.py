@@ -12,7 +12,7 @@ class TestSharedRepairJsonBrackets:
         """String with only opening brackets should close them."""
         assert repair_json_brackets("[") == "[]"
         assert repair_json_brackets("{") == "{}"
-        assert repair_json_brackets("[{") == '[{}]'
+        assert repair_json_brackets("[{") == "[{}]"
 
     def test_nested_unclosed(self):
         """Nested unclosed brackets should be properly closed."""
@@ -38,6 +38,7 @@ class TestSharedRepairJsonBrackets:
         text = '{"a": [1, 2]]}'
         result = repair_json_brackets(text)
         import json
+
         parsed = json.loads(result)
         assert parsed == {"a": [1, 2]}
 
@@ -46,14 +47,15 @@ class TestSharedRepairJsonBrackets:
         text = '{"a": 1}}'
         result = repair_json_brackets(text)
         import json
+
         parsed = json.loads(result)
         assert parsed == {"a": 1}
 
     def test_mismatched_close_brace_in_array(self):
         """Closing brace when stack expects bracket should be dropped."""
-        text = '[1, 2}'
+        text = "[1, 2}"
         result = repair_json_brackets(text)
-        assert result == '[1, 2]'
+        assert result == "[1, 2]"
 
     def test_mismatched_close_bracket_in_object(self):
         """Closing bracket when stack expects brace should be dropped."""
@@ -81,6 +83,7 @@ class TestSharedRepairTruncatedJson:
         assert result is not None
         # After repair, should close the object, array, and outer JSON
         import json
+
         parsed = json.loads(result)
         assert len(parsed["operations"]) == 0
 
@@ -90,6 +93,7 @@ class TestSharedRepairTruncatedJson:
         result = repair_truncated_json(text)
         assert result is not None
         import json
+
         parsed = json.loads(result)
         assert len(parsed["operations"]) == 2
 
@@ -100,7 +104,7 @@ class TestSharedRepairTruncatedJson:
 
     def test_not_operation_json(self):
         """Not an operations JSON at all -> return None."""
-        text = 'plain text, not json'
+        text = "plain text, not json"
         assert repair_truncated_json(text) is None
 
     def test_no_complete_operation_before_truncation(self):
@@ -121,6 +125,7 @@ class TestSharedRepairTruncatedJson:
         result = repair_truncated_json(text)
         assert result is not None
         import json
+
         parsed = json.loads(result)
         assert parsed["operations"] == [{"op": "add"}]
 

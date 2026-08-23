@@ -7,6 +7,7 @@ function was attributed to all functions — including the callee itself
 were fed to the LLM via ``super_context_builder``'s "relationships" block.
 Coverage was 0/62 branches before this file.
 """
+
 from __future__ import annotations
 
 import textwrap
@@ -24,6 +25,7 @@ def _build(src: str, tmp_path: Path):
 
 
 # --- DG-B1: per-function call attribution ---
+
 
 def test_only_actual_caller_gets_callee(tmp_path):
     """Only calls() calls bar(); bar and unrelated must NOT call bar."""
@@ -156,9 +158,13 @@ class TestResolveImport:
     def _layout(root: Path) -> Path:
         """Create the canonical layout and return current_file."""
         for rel in [
-            "pkg/__init__.py", "pkg/util.py",
-            "pkg/sub/__init__.py", "pkg/sub/mod.py", "pkg/sub/local.py",
-            "pkg/pkg2/__init__.py", "pkg/pkg2/deep.py",
+            "pkg/__init__.py",
+            "pkg/util.py",
+            "pkg/sub/__init__.py",
+            "pkg/sub/mod.py",
+            "pkg/sub/local.py",
+            "pkg/pkg2/__init__.py",
+            "pkg/pkg2/deep.py",
             "lib.py",
         ]:
             p = root / rel
@@ -278,6 +284,7 @@ class TestFormatCallGraph:
 def _empty_graph():
     """A DependencyGraph with no pre-existing keys (avoids defaultdict noise)."""
     from external_llm.dependency_graph import DependencyGraph
+
     return DependencyGraph()
 
 
@@ -333,8 +340,8 @@ def test_relative_import_not_misresolved_as_absolute(tmp_path):
     # Plant a DECOY absolute sibling that the buggy path would have matched.
     (tmp_path / "pkg").mkdir(exist_ok=True)
     (tmp_path / "pkg" / "__init__.py").write_text("")
-    (tmp_path / "pkg" / "sibling.py").write_text("VAL = 1\n")     # the real target
-    (tmp_path / "sibling.py").write_text("DECOY = 999\n")          # must NOT match
+    (tmp_path / "pkg" / "sibling.py").write_text("VAL = 1\n")  # the real target
+    (tmp_path / "sibling.py").write_text("DECOY = 999\n")  # must NOT match
     mod = tmp_path / "pkg" / "mod.py"
     mod.write_text("from .sibling import VAL\n")
     b = DependencyGraphBuilder(tmp_path)

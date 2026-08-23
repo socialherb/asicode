@@ -11,6 +11,7 @@ The companion mode _query_transitive_importers records at POP time (after its
 own ``> max_depth`` guard) and was already correct; a parity test pins both to
 the same bound semantics so they cannot drift apart again.
 """
+
 from types import SimpleNamespace
 
 from external_llm.agent.tool_handlers.analysis_tools import AnalysisToolsMixin
@@ -36,8 +37,7 @@ def _make_host(callee_chain=None, importer_chain=None):
     class _FakeGraph:
         def get_callees(self, sym, file_path=None):
             return [
-                SimpleNamespace(callee_symbol=n, callee_file="f.py",
-                                caller_file="f.py", callee_line=1)
+                SimpleNamespace(callee_symbol=n, callee_file="f.py", caller_file="f.py", callee_line=1)
                 for n in _callees.get(sym, [])
             ]
 
@@ -67,8 +67,7 @@ def test_reachable_respects_max_depth_bound():
         res = host._query_reachable("A", "downstream", max_depth=md, limit=50)
         depths = {x["symbol"]: x["depth"] for x in res.metadata["reachable"]}
         assert depths, f"max_depth={md}: nothing reachable"
-        assert max(depths.values()) <= md, (
-            f"max_depth={md} leaked beyond bound: {depths}")
+        assert max(depths.values()) <= md, f"max_depth={md} leaked beyond bound: {depths}"
 
 
 def test_reachable_max_depth_one_stops_at_one_hop():
@@ -83,8 +82,7 @@ def test_reachable_max_depth_zero_yields_nothing():
     """0 hops from the source reaches no other symbol (was leaking B)."""
     host = _make_host(callee_chain=_CHAIN)
     res = host._query_reachable("A", "downstream", max_depth=0, limit=50)
-    assert not res.metadata.get("reachable"), (
-        f"depth 0 should reach nothing, got {res.metadata.get('reachable')}")
+    assert not res.metadata.get("reachable"), f"depth 0 should reach nothing, got {res.metadata.get('reachable')}"
 
 
 def test_reachable_importers_parity_same_bound():
@@ -101,5 +99,5 @@ def test_reachable_importers_parity_same_bound():
         n_reach = len(r_reach.metadata.get("reachable", []))
         n_imp = len(r_imp.metadata.get("importers", []))
         assert n_reach == n_imp == md, (
-            f"max_depth={md}: reachable={n_reach}, importers={n_imp} "
-            f"(both should equal {md})")
+            f"max_depth={md}: reachable={n_reach}, importers={n_imp} (both should equal {md})"
+        )

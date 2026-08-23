@@ -38,6 +38,7 @@ def _asi():
 
     return asi
 
+
 def _resolve_subagent_max_turns(task, args: argparse.Namespace) -> int:
     """Resolve a sub-agent worker's turn budget: task → CLI args → SSOT.
 
@@ -66,18 +67,18 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
     # byte-identical to the original repl_impl source.
     global _REPO_ROOT
     _asi_mod = _asi()
-    _C = _asi_mod._C
+    _colors = _asi_mod._C
     _print = _asi_mod._print
     _REPO_ROOT = _asi_mod._REPO_ROOT
     _resolve_repo_root = _asi_mod._resolve_repo_root
-    _ProgressPrinter = _asi_mod._ProgressPrinter
+    _progress_printer = _asi_mod._ProgressPrinter
 
     repo_root = _resolve_repo_root(args.repo)
     _REPO_ROOT = repo_root
 
     agent_id = args.subagent_id
     if not agent_id:
-        _print("--subagent-id is required with --subagent", _C["red"])
+        _print("--subagent-id is required with --subagent", _colors["red"])
         sys.exit(1)
 
     # Capture the spawning parent PID ONCE at worker start. If the orchestrator
@@ -119,7 +120,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
 
     _print(
         f"Sub-agent worker [{agent_id}] started, watching {repo_root}/.asicode/subagents/{agent_id}/task.json",
-        _C["teal"],
+        _colors["teal"],
     )
 
     cancel_event = threading.Event()  # TASK-scope: abort the current task only
@@ -127,7 +128,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
 
     def _sigint_handler(sig, frame):
         # Ctrl-C is a process-level intent: abort the in-flight task AND exit.
-        _print(f"\nSub-agent [{agent_id}] shutting down…", _C["yellow"])
+        _print(f"\nSub-agent [{agent_id}] shutting down…", _colors["yellow"])
         cancel_event.set()  # abort in-flight task immediately
         shutdown_event.set()  # exit the poll loop after the task unwinds
 
@@ -207,7 +208,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
                     _print(
                         f"\nSub-agent [{agent_id}] cancel signal received "
                         f"— aborting current task at the next turn boundary.",
-                        _C["yellow"],
+                        _colors["yellow"],
                     )
                     try:
                         os.unlink(_cancel_path)  # fire-once
@@ -243,7 +244,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
         # does not leak into the next poll (poll_for_task checks cancel_event and
         # returns None if it is set).
         cancel_event.clear()
-        _print(f"[{agent_id}] Polling for task… (Ctrl-C to exit)", _C["muted"])
+        _print(f"[{agent_id}] Polling for task… (Ctrl-C to exit)", _colors["muted"])
         task = poll_for_task(
             repo_root=repo_root,
             agent_id=agent_id,
@@ -266,10 +267,10 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
             daemon=True,
         ).start()
 
-        _print(f"[{agent_id}] Received task: {task.title}", _C["green"])
-        _print(f"  files: {task.assigned_files}", _C["muted"])
+        _print(f"[{agent_id}] Received task: {task.title}", _colors["green"])
+        _print(f"  files: {task.assigned_files}", _colors["muted"])
         if task.description:
-            _print(f"  description: {task.description[:200]}", _C["muted"])
+            _print(f"  description: {task.description[:200]}", _colors["muted"])
 
         # Task payload can override provider/model/api_key; else use CLI args.
         provider = task.provider or getattr(args, "provider", "") or ""
@@ -277,7 +278,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
         api_key = task.api_key or getattr(args, "api_key", "") or None
         max_turns = _resolve_subagent_max_turns(task, args)
 
-        printer = _ProgressPrinter(verbose=getattr(args, "verbose", False))
+        printer = _progress_printer(verbose=getattr(args, "verbose", False))
         ipc_result = None
 
         # ── Heartbeat: prove liveness so the orchestrator's wait_for_result
@@ -488,7 +489,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
             printer._stop_spinner()
             _print(
                 f"[{agent_id}] Task complete: {status} ({turns} turns, {elapsed:.1f}s)",
-                _C["green"] if status == "success" else _C["yellow"],
+                _colors["green"] if status == "success" else _colors["yellow"],
             )
 
         except AgentCancelled:
@@ -525,7 +526,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
                 printer._stop_spinner()
             except Exception:
                 logging.getLogger(__name__).debug("subagent cancel spinner stop failed", exc_info=True)
-            _print(f"[{agent_id}] Task cancelled (worker staying alive).", _C["yellow"])
+            _print(f"[{agent_id}] Task cancelled (worker staying alive).", _colors["yellow"])
         except Exception as e:
             logging.getLogger(__name__).exception(
                 "Sub-agent %s execution failed",
@@ -557,7 +558,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
                 printer._stop_spinner()
             except Exception:
                 logging.getLogger(__name__).debug("subagent error spinner stop failed", exc_info=True)
-            _print(f"[{agent_id}] Task failed: {e}", _C["red"])
+            _print(f"[{agent_id}] Task failed: {e}", _colors["red"])
 
         # Always write a result so the orchestrator's wait_for_result unblocks.
         # write_result itself can raise (I/O error, serialization failure); if it
@@ -568,7 +569,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
         if ipc_result is not None:
             try:
                 write_result(repo_root, ipc_result)
-                _print(f"[{agent_id}] Result written.", _C["muted"])
+                _print(f"[{agent_id}] Result written.", _colors["muted"])
             except Exception as _wr_exc:
                 logging.getLogger(__name__).exception(
                     "Sub-agent %s: result write failed (%s); retrying with a minimal error result",
@@ -586,7 +587,7 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
                             epoch=ipc_result.epoch,
                         ),
                     )
-                    _print(f"[{agent_id}] Minimal error result written.", _C["muted"])
+                    _print(f"[{agent_id}] Minimal error result written.", _colors["muted"])
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "Sub-agent %s: minimal error-result write also failed; orchestrator will time out.",
@@ -624,4 +625,4 @@ def run_subagent_worker(args: argparse.Namespace) -> None:
     except Exception:
         logging.getLogger(__name__).debug("subagent exited-heartbeat write failed", exc_info=True)
 
-    _print(f"Sub-agent [{agent_id}] stopped.", _C["teal"])
+    _print(f"Sub-agent [{agent_id}] stopped.", _colors["teal"])

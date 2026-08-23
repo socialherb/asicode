@@ -12,12 +12,14 @@ Moved here:
   - System prompt template (_SYSTEM_PROMPT_TEMPLATE)
   - ContextManagerMixin class with all context build/trim/compress methods
 """
+
 from __future__ import annotations
 
 import subprocess
 import threading
 import time
 from contextlib import suppress
+from typing import Any  # f821-protected
 
 from external_llm.common.repo_files import canonical_repo_key
 
@@ -114,7 +116,10 @@ def _run_git_raw(repo_root: str, *args: str) -> str:
         r = subprocess.run(
             ["git", "-c", "core.quotePath=false", *list(args)],
             cwd=repo_root,
-            capture_output=True, text=True, check=False, timeout=8,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
         )
         return r.stdout.strip()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):  # git best-effort
@@ -198,10 +203,8 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
     _fresh: dict[str, str] = {}
     try:
         from ._thread_pool import shared_pool as _pool
-        _futures = {
-            key: _pool.submit(_run_git_raw, repo_root, *args)
-            for key, args in _cmds.items()
-        }
+
+        _futures = {key: _pool.submit(_run_git_raw, repo_root, *args) for key, args in _cmds.items()}
         for key, fut in _futures.items():
             try:
                 _fresh[key] = fut.result(timeout=5)
@@ -252,10 +255,12 @@ def get_git_snapshot(repo_root: str) -> dict[str, str]:
 # ContextTier
 # ---------------------------------------------------------------------------
 
+
 class ContextTier(str):
     """Context injection tier — controls how much startup context is loaded."""
+
     MAIN_AGENT = "main_agent"  # ~2,500 tokens: lean start, tool-driven exploration
-    COMPACT = "compact"      # ~1,000 tokens: small model / subagent
+    COMPACT = "compact"  # ~1,000 tokens: small model / subagent
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +299,10 @@ You operate inside the user's current repository (see "Working directory" below)
 """
 
 
-
 # ---------------------------------------------------------------------------
 # ContextManagerMixin
 # ---------------------------------------------------------------------------
+
 
 class ContextManagerMixin:
     """Context building, trimming, and compression methods for AgentLoop.
@@ -313,6 +318,14 @@ class ContextManagerMixin:
     ``SlidingWindowContext`` instance created by ``_init_context_manager()``.
     """
 
+    # Host-class attributes (provided by AgentLoop, not set here). Pure typing
+    # scaffolding — AgentLoop.__init__ owns the runtime values.
+    config: Any
+    registry: Any
+    llm_client: Any
+    _cb: Any
+    _check_small_model: Any
+
     def _init_context_manager(self) -> None:
         """Create the SlidingWindowContext used for trim/compress/evict.
 
@@ -322,11 +335,7 @@ class ContextManagerMixin:
         from .context_manager import SlidingWindowConfig, SlidingWindowContext
 
         _raw_window = getattr(self.config, "context_window_size", 60)
-        _model_name = (
-            getattr(self, "model", None)
-            or getattr(self.config, "model_name", None)
-            or ""
-        )
+        _model_name = getattr(self, "model", None) or getattr(self.config, "model_name", None) or ""
         # context_window_size is a MESSAGE COUNT (default 60 in config), NOT
         # tokens. max(_, 300) is a FLOOR (not an upper bound): it raises the
         # effective window so the main agent keeps a large prefix (better cache
@@ -341,6 +350,7 @@ class ContextManagerMixin:
             config=_cfg,
             stream_callback=self._cb,
         )
+
     # ------------------------------------------------------------------
     # Context trimming / compression (delegated to SlidingWindowContext)
     # ------------------------------------------------------------------
@@ -379,7 +389,10 @@ class ContextManagerMixin:
             r = subprocess.run(
                 ["git", *list(args)],
                 cwd=self.registry.repo_root,
-                capture_output=True, text=True, check=False, timeout=8,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=8,
             )
             out = r.stdout.strip()
             if max_lines and out:
@@ -390,7 +403,7 @@ class ContextManagerMixin:
         else:
             return out
 
-    def _build_session_context(self, tier: ContextTier = None) -> str:
+    def _build_session_context(self, tier: ContextTier | None = None) -> str:
         """Build rich session context block — injected into system prompt at startup.
 
         Like Claude Code's automatic git-status/branch injection, this forces the
@@ -407,7 +420,7 @@ class ContextManagerMixin:
         """
 
         if tier is None:
-            tier = ContextTier.MAIN_AGENT
+            tier = ContextTier(ContextTier.MAIN_AGENT)
 
         # ── 1-2. Git snapshot (shared TTL cache with _collect_git_info) ─
         # branch + status are fetched once per run and reused by the rollback
@@ -442,7 +455,9 @@ class ContextManagerMixin:
     # ------------------------------------------------------------------
 
     def _build_initial_messages(
-        self, request: str, context: str,
+        self,
+        request: str,
+        context: str,
         tier: str | None = None,
     ) -> list:
         """Build the initial message list for the agent."""
@@ -451,8 +466,9 @@ class ContextManagerMixin:
         if tier is None:
             tier = getattr(self, "_context_tier", ContextTier.MAIN_AGENT)
 
+        _tier = tier if isinstance(tier, ContextTier) else ContextTier(ContextTier.MAIN_AGENT)
         system_content = _SYSTEM_PROMPT_TEMPLATE.format(
-            session_context=self._build_session_context(tier),
+            session_context=self._build_session_context(_tier),
             project_context=context or "",
         )
 
@@ -460,6 +476,7 @@ class ContextManagerMixin:
             LLMMessage(role="system", content=system_content.rstrip()),
             LLMMessage(role="user", content=request),
         ]
+
     def _build_continuation_messages(
         self,
         continuation_data: dict,
@@ -488,16 +505,18 @@ class ContextManagerMixin:
                 messages.append(LLMMessage(role=role, content=content))
 
         # 3. Mode transition marker (system message)
-        messages.append(LLMMessage(
-            role="system",
-            content=(
-                "=== Transition to Implementation Mode ===\n\n"
-                "The design analysis phase is complete. "
-                "You now have the full agent tool set available. "
-                "The design conversation above is preserved for context. "
-                "Proceed with implementing the request below."
-            ),
-        ))
+        messages.append(
+            LLMMessage(
+                role="system",
+                content=(
+                    "=== Transition to Implementation Mode ===\n\n"
+                    "The design analysis phase is complete. "
+                    "You now have the full agent tool set available. "
+                    "The design conversation above is preserved for context. "
+                    "Proceed with implementing the request below."
+                ),
+            )
+        )
 
         # 4. Implementation request (first user turn in agent mode)
         messages.append(LLMMessage(role="user", content=request))

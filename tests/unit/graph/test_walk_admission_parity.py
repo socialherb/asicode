@@ -16,6 +16,7 @@ non-Python language (go/java/...), the shared ts/js walker only ts/js — the
 filter (and the .go/.java fixtures below) is what makes the two sets
 comparable instead of relying on fixture luck.
 """
+
 from pathlib import Path
 
 from external_llm.agent._shared_utils import (
@@ -31,16 +32,16 @@ from external_llm.common.walk_policy import (
 from external_llm.graph.repository_graph import RepositoryGraph
 
 FIXTURE = {
-    "src/main.py": "def main():\n    pass\n",          # include (py)
-    "app.js": "export function app() {}\n",            # include (ts/js)
-    "vendor/dep.py": "def dep():\n    pass\n",         # divergence 1: shared indexes, RG skips
-    "vendor/dep.js": "export function dep() {}\n",     # divergence 1
-    "pkg.egg-info/x.py": "def egg():\n    pass\n",     # divergence 2: RG indexes, shared skips
-    "lib.min.js": "function f() {}\n",                 # divergence 3: shared indexes, RG skips
-    "node_modules/lib/m.py": "def m():\n    pass\n",   # control: both skip
-    ".venv/x.py": "def x():\n    pass\n",              # control: both skip
-    "Main.java": "class Main {}\n",                    # non-py non-ts/js: RG stamps, tsjs walker must not
-    "svc/handler.go": "package svc\n",                 # — locks the _TS_JS_EXTENSIONS filter in _rg_sets
+    "src/main.py": "def main():\n    pass\n",  # include (py)
+    "app.js": "export function app() {}\n",  # include (ts/js)
+    "vendor/dep.py": "def dep():\n    pass\n",  # divergence 1: shared indexes, RG skips
+    "vendor/dep.js": "export function dep() {}\n",  # divergence 1
+    "pkg.egg-info/x.py": "def egg():\n    pass\n",  # divergence 2: RG indexes, shared skips
+    "lib.min.js": "function f() {}\n",  # divergence 3: shared indexes, RG skips
+    "node_modules/lib/m.py": "def m():\n    pass\n",  # control: both skip
+    ".venv/x.py": "def x():\n    pass\n",  # control: both skip
+    "Main.java": "class Main {}\n",  # non-py non-ts/js: RG stamps, tsjs walker must not
+    "svc/handler.go": "package svc\n",  # — locks the _TS_JS_EXTENSIONS filter in _rg_sets
 }
 
 
@@ -103,7 +104,4 @@ def test_rag_walk_admission_parity(tmp_path):
     assert not violations, f"RAG admitted paths the shared policy skips: {violations}"
     # non-vacuous: real source is admitted, divergence fixtures are not
     assert "src/main.py" in rels and "app.js" in rels
-    assert not any(
-        rel.startswith(("vendor/", "node_modules/", ".venv/", "pkg.egg-info/"))
-        for rel in rels
-    )
+    assert not any(rel.startswith(("vendor/", "node_modules/", ".venv/", "pkg.egg-info/")) for rel in rels)

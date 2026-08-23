@@ -7,6 +7,7 @@ shared missing-return path is exercised in test_repair_missing_return.py; here
 we cover every other strategy + the Go-specific helpers (_go_zero_value, type
 mismatch, unused import) + the registry/dispatch surface.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -48,6 +49,7 @@ from external_llm.editor.primitives.models import PrimitiveKind
 
 # ── fixtures & helpers ──────────────────────────────────────────────────────
 
+
 def _cls(symbol=None, ftype=FailureType.UNKNOWN_SYMBOL):
     return Classification(type=ftype, source=EvidenceSource.NONE, symbol=symbol)
 
@@ -72,34 +74,49 @@ def _import(ops):
 
 # ── low-level helpers ───────────────────────────────────────────────────────
 
+
 class TestLowLevelHelpers:
     def test_make_raw_replacement(self):
         ops = _make_raw_replacement("x = 1")
         assert _raw(ops) == "x = 1"
 
-    @pytest.mark.parametrize("line, indent", [
-        ("    x", "    "),
-        ("\tx", "\t"),
-        ("x", ""),
-        ("  \t y", "  \t "),
-    ])
+    @pytest.mark.parametrize(
+        "line, indent",
+        [
+            ("    x", "    "),
+            ("\tx", "\t"),
+            ("x", ""),
+            ("  \t y", "  \t "),
+        ],
+    )
     def test_get_indent(self, line, indent):
         assert _get_indent(line) == indent
 
-    @pytest.mark.parametrize("t, zero", [
-        ("int", "0"), ("int64", "0"), ("uint", "0"), ("uint32", "0"),
-        ("float32", "0.0"), ("float64", "0.0"),
-        ("bool", "false"), ("boolean", "false"),
-        ("string", '""'),
-        ("error", "nil"),
-        ("[]int", "nil"), ("[]string", "nil"),
-        ("map[string]int", "nil"),
-        ("*int", "nil"), ("*Foo", "nil"),
-        ("func()", "nil"),
-        ("chan int", "nil"),
-        ("interface{}", "nil"),
-        ("Foo", "Foo{}"), ("time.Time", "time.Time{}"),
-    ])
+    @pytest.mark.parametrize(
+        "t, zero",
+        [
+            ("int", "0"),
+            ("int64", "0"),
+            ("uint", "0"),
+            ("uint32", "0"),
+            ("float32", "0.0"),
+            ("float64", "0.0"),
+            ("bool", "false"),
+            ("boolean", "false"),
+            ("string", '""'),
+            ("error", "nil"),
+            ("[]int", "nil"),
+            ("[]string", "nil"),
+            ("map[string]int", "nil"),
+            ("*int", "nil"),
+            ("*Foo", "nil"),
+            ("func()", "nil"),
+            ("chan int", "nil"),
+            ("interface{}", "nil"),
+            ("Foo", "Foo{}"),
+            ("time.Time", "time.Time{}"),
+        ],
+    )
     def test_go_zero_value(self, t, zero):
         assert _go_zero_value(t) == zero
 
@@ -122,6 +139,7 @@ class TestLowLevelHelpers:
 
 
 # ── Python ──────────────────────────────────────────────────────────────────
+
 
 class TestPyRepairMissingVariable:
     def test_known_typing_name_from_import(self):
@@ -167,24 +185,24 @@ class TestPyRepairSyntaxError:
 class TestPyRepairArgumentMismatch:
     def test_too_many_args_keeps_first_only(self):
         code = "foo(a, b, c)\n"
-        assert _raw(py_repair_argument_mismatch(
-            code, _err("takes 1 positional argument but 3 were given", 1), None
-        )) == "foo(a)\n"
+        assert (
+            _raw(py_repair_argument_mismatch(code, _err("takes 1 positional argument but 3 were given", 1), None))
+            == "foo(a)\n"
+        )
 
     def test_missing_required_returns_none(self):
-        assert py_repair_argument_mismatch(
-            "foo()\n", _err("missing 1 required positional argument", 1), None
-        ) is None
+        assert py_repair_argument_mismatch("foo()\n", _err("missing 1 required positional argument", 1), None) is None
 
     def test_no_paren_returns_none(self):
-        assert py_repair_argument_mismatch(
-            "foo\n", _err("takes 1 positional argument but 3 were given", 1), None
-        ) is None
+        assert (
+            py_repair_argument_mismatch("foo\n", _err("takes 1 positional argument but 3 were given", 1), None) is None
+        )
 
     def test_empty_args_returns_none(self):
-        assert py_repair_argument_mismatch(
-            "foo()\n", _err("takes 1 positional argument but 3 were given", 1), None
-        ) is None
+        assert (
+            py_repair_argument_mismatch("foo()\n", _err("takes 1 positional argument but 3 were given", 1), None)
+            is None
+        )
 
     def test_no_line_returns_none(self):
         assert py_repair_argument_mismatch("foo(a)\n", _err("x"), None) is None
@@ -193,15 +211,17 @@ class TestPyRepairArgumentMismatch:
 class TestPyRepairDuplicateIdentifier:
     def test_def_gets_dup_suffix(self):
         code = "def foo():\n    pass\n"
-        assert _raw(py_repair_duplicate_identifier(
-            code, _err("name 'foo' redefined", 1), None
-        )) == "def foo_dup():\n    pass\n"
+        assert (
+            _raw(py_repair_duplicate_identifier(code, _err("name 'foo' redefined", 1), None))
+            == "def foo_dup():\n    pass\n"
+        )
 
     def test_class_gets_Dup_suffix(self):
         code = "class Foo:\n    pass\n"
-        assert _raw(py_repair_duplicate_identifier(
-            code, _err("duplicate class Foo", 1), None
-        )) == "class FooDup:\n    pass\n"
+        assert (
+            _raw(py_repair_duplicate_identifier(code, _err("duplicate class Foo", 1), None))
+            == "class FooDup:\n    pass\n"
+        )
 
     def test_no_marker_returns_none(self):
         assert py_repair_duplicate_identifier("def foo():\n", _err("syntax error", 1), None) is None
@@ -211,6 +231,7 @@ class TestPyRepairDuplicateIdentifier:
 
 
 # ── Java ────────────────────────────────────────────────────────────────────
+
 
 class TestJavaRepairUnknownSymbol:
     def test_known_type_adds_import_with_semicolon(self):
@@ -248,21 +269,26 @@ class TestJavaRepairSyntaxError:
 class TestJavaRepairArgumentMismatch:
     def test_too_many_drops_last(self):
         code = "foo(a, b, c);\n"
-        assert _raw(java_repair_argument_mismatch(
-            code, _err("actual and formal argument lists differ in length", 1), None
-        )) == "foo(a, b);\n"
+        assert (
+            _raw(
+                java_repair_argument_mismatch(code, _err("actual and formal argument lists differ in length", 1), None)
+            )
+            == "foo(a, b);\n"
+        )
 
     def test_single_arg_returns_none(self):
         code = "foo(a);\n"
-        assert java_repair_argument_mismatch(
-            code, _err("actual and formal argument lists differ in length", 1), None
-        ) is None
+        assert (
+            java_repair_argument_mismatch(code, _err("actual and formal argument lists differ in length", 1), None)
+            is None
+        )
 
     def test_empty_args_returns_none(self):
         code = "foo();\n"
-        assert java_repair_argument_mismatch(
-            code, _err("actual and formal argument lists differ in length", 1), None
-        ) is None
+        assert (
+            java_repair_argument_mismatch(code, _err("actual and formal argument lists differ in length", 1), None)
+            is None
+        )
 
     def test_no_marker_returns_none(self):
         assert java_repair_argument_mismatch("foo(a, b);\n", _err("type", 1), None) is None
@@ -274,15 +300,16 @@ class TestJavaRepairArgumentMismatch:
 class TestJavaRepairDuplicateIdentifier:
     def test_class_dup_suffix(self):
         code = "class Foo {\n}\n"
-        assert _raw(java_repair_duplicate_identifier(
-            code, _err("duplicate class Foo", 1), None
-        )) == "class FooDup {\n}\n"
+        assert (
+            _raw(java_repair_duplicate_identifier(code, _err("duplicate class Foo", 1), None)) == "class FooDup {\n}\n"
+        )
 
     def test_no_marker_returns_none(self):
         assert java_repair_duplicate_identifier("class Foo {}\n", _err("syntax", 1), None) is None
 
 
 # ── Kotlin ──────────────────────────────────────────────────────────────────
+
 
 class TestKotlinRepairUnknownSymbol:
     def test_known_type_bare_import(self):
@@ -291,8 +318,7 @@ class TestKotlinRepairUnknownSymbol:
 
     def test_no_semicolon(self):
         # Kotlin imports must NOT carry a trailing semicolon.
-        assert not _import(kotlin_repair_unknown_symbol(
-            "val x: List<Int>\n", _err("x", 1), _cls("List"))).endswith(";")
+        assert not _import(kotlin_repair_unknown_symbol("val x: List<Int>\n", _err("x", 1), _cls("List"))).endswith(";")
 
     def test_already_imported_returns_none(self):
         code = "import kotlin.collections.List\nval x: List<Int>\n"
@@ -312,19 +338,13 @@ class TestKotlinRepairMissingReturn:
     def test_typed_function_inserts_return_null(self):
         code = "fun compute(): Int {\n    val x = 1\n}\n"
         assert _raw(kotlin_repair_missing_return(code, _err("missing return", 3), None)) == (
-            "fun compute(): Int {\n"
-            "    val x = 1\n"
-            "        return null\n"
-            "}\n"
+            "fun compute(): Int {\n    val x = 1\n        return null\n}\n"
         )
 
     def test_unit_body_function_inserts_bare_return(self):
         code = "fun compute() {\n    println()\n}\n"
         assert _raw(kotlin_repair_missing_return(code, _err("missing return", 3), None)) == (
-            "fun compute() {\n"
-            "    println()\n"
-            "        return\n"
-            "}\n"
+            "fun compute() {\n    println()\n        return\n}\n"
         )
 
     def test_no_fun_header_returns_none(self):
@@ -337,13 +357,11 @@ class TestKotlinRepairMissingReturn:
 class TestKotlinRepairArgumentMismatch:
     def test_too_many_drops_last(self):
         code = "foo(a, b, c)\n"
-        assert _raw(kotlin_repair_argument_mismatch(
-            code, _err("too many arguments", 1), None)) == "foo(a, b)\n"
+        assert _raw(kotlin_repair_argument_mismatch(code, _err("too many arguments", 1), None)) == "foo(a, b)\n"
 
     def test_required_drops_last(self):
         code = "foo(a, b, c)\n"
-        assert _raw(kotlin_repair_argument_mismatch(
-            code, _err("required: 2, found: 3", 1), None)) == "foo(a, b)\n"
+        assert _raw(kotlin_repair_argument_mismatch(code, _err("required: 2, found: 3", 1), None)) == "foo(a, b)\n"
 
     def test_single_arg_returns_none(self):
         assert kotlin_repair_argument_mismatch("foo(a)\n", _err("too many", 1), None) is None
@@ -358,19 +376,24 @@ class TestKotlinRepairArgumentMismatch:
 class TestKotlinRepairDuplicateIdentifier:
     def test_fun_dup_suffix(self):
         code = "fun foo() {\n}\n"
-        assert _raw(kotlin_repair_duplicate_identifier(
-            code, _err("duplicate declaration", 1), None)) == "fun fooDup() {\n}\n"
+        assert (
+            _raw(kotlin_repair_duplicate_identifier(code, _err("duplicate declaration", 1), None))
+            == "fun fooDup() {\n}\n"
+        )
 
     def test_class_dup_suffix(self):
         code = "class Foo {\n}\n"
-        assert _raw(kotlin_repair_duplicate_identifier(
-            code, _err("duplicate declaration", 1), None)) == "class FooDup {\n}\n"
+        assert (
+            _raw(kotlin_repair_duplicate_identifier(code, _err("duplicate declaration", 1), None))
+            == "class FooDup {\n}\n"
+        )
 
     def test_no_marker_returns_none(self):
         assert kotlin_repair_duplicate_identifier("fun foo() {}\n", _err("syntax", 1), None) is None
 
 
 # ── Go ──────────────────────────────────────────────────────────────────────
+
 
 class TestGoRepairUnknownSymbol:
     def test_known_pkg_adds_import(self):
@@ -449,8 +472,7 @@ class TestGoRepairSyntaxError:
 class TestGoRepairArgumentMismatch:
     def test_too_many_drops_last(self):
         code = "foo(a, b, c)\n"
-        assert _raw(go_repair_argument_mismatch(
-            code, _err("too many arguments", 1), None)) == "foo(a, b)\n"
+        assert _raw(go_repair_argument_mismatch(code, _err("too many arguments", 1), None)) == "foo(a, b)\n"
 
     def test_too_many_single_arg_returns_none(self):
         assert go_repair_argument_mismatch("foo(a)\n", _err("too many arguments", 1), None) is None
@@ -492,19 +514,14 @@ class TestGoRepairMissingReturn:
         # Idiomatic Go: "{" on the header line → ret_type detection disabled → nil.
         code = "func compute() int {\n    x := 1\n}\n"
         assert _raw(go_repair_missing_return(code, _err("missing return at end of function", 3), None)) == (
-            "func compute() int {\n"
-            "    x := 1\n"
-            "        return nil\n"
-            "}\n"
+            "func compute() int {\n    x := 1\n        return nil\n}\n"
         )
 
     def test_typed_function_zero_value(self):
         # Header without inline "{" lets the return type be parsed; body indented.
         code = "func compute() int\n    x := 1\n"
         assert _raw(go_repair_missing_return(code, _err("missing return at end of function", 2), None)) == (
-            "func compute() int\n"
-            "    x := 1\n"
-            "        return 0\n"
+            "func compute() int\n    x := 1\n        return 0\n"
         )
 
     def test_no_missing_return_marker(self):
@@ -527,44 +544,51 @@ class TestGoRepairTypeMismatch:
         # expression itself is "nil". Casing preserved (original-message search),
         # so the qualified type survives verbatim into the zero-value literal.
         code = "x := nil\n"
-        ops = go_repair_type_mismatch(
-            code, _err("cannot use nil as time.Time value in assignment", 1), None)
+        ops = go_repair_type_mismatch(code, _err("cannot use nil as time.Time value in assignment", 1), None)
         assert _raw(ops) == "x := time.Time{}\n"
 
     def test_nil_to_value_type_legacy_format(self):
-        ops = go_repair_type_mismatch(
-            "x := nil\n", _err("cannot use nil as type time.Time in assignment", 1), None)
+        ops = go_repair_type_mismatch("x := nil\n", _err("cannot use nil as type time.Time in assignment", 1), None)
         assert _raw(ops) == "x := time.Time{}\n"
 
     def test_nil_replaces_only_first_nil(self):
         code = "var p *Foo = nil\n"
-        ops = go_repair_type_mismatch(
-            code, _err("cannot use nil as *Foo value in assignment", 1), None)
+        ops = go_repair_type_mismatch(code, _err("cannot use nil as *Foo value in assignment", 1), None)
         # *Foo is a pointer type → zero value is nil, so the line is unchanged.
         assert _raw(ops) == "var p *Foo = nil\n"
 
     def test_numeric_cast_wraps_rhs(self):
         code = "y := x\n"
         ops = go_repair_type_mismatch(
-            code, _err("cannot use x (variable of type int) as float64 value in assignment", 1), None)
+            code, _err("cannot use x (variable of type int) as float64 value in assignment", 1), None
+        )
         assert _raw(ops) == "y := float64(x)\n"
 
     def test_numeric_cast_legacy_format(self):
         ops = go_repair_type_mismatch(
-            "y := x\n", _err("cannot use x (type int) as type float64 in assignment", 1), None)
+            "y := x\n", _err("cannot use x (type int) as type float64 in assignment", 1), None
+        )
         assert _raw(ops) == "y := float64(x)\n"
 
     def test_struct_type_message_matches_but_not_repairable(self):
         # "variable of struct type time.Time" — parsed fine (casing preserved),
         # but time.Time is not a numeric type → no repair.
-        assert go_repair_type_mismatch(
-            "var s string = t\n",
-            _err("cannot use t (variable of struct type time.Time) as string value in assignment", 1),
-            None) is None
+        assert (
+            go_repair_type_mismatch(
+                "var s string = t\n",
+                _err("cannot use t (variable of struct type time.Time) as string value in assignment", 1),
+                None,
+            )
+            is None
+        )
 
     def test_non_numeric_types_returns_none(self):
-        assert go_repair_type_mismatch(
-            "x := a\n", _err("cannot use a (variable of type Foo) as Bar value in assignment", 1), None) is None
+        assert (
+            go_repair_type_mismatch(
+                "x := a\n", _err("cannot use a (variable of type Foo) as Bar value in assignment", 1), None
+            )
+            is None
+        )
 
     def test_no_match_returns_none(self):
         assert go_repair_type_mismatch("x := 1\n", _err("type error", 1), None) is None
@@ -574,6 +598,7 @@ class TestGoRepairTypeMismatch:
 
 
 # ── registry / dispatch ─────────────────────────────────────────────────────
+
 
 class TestRegistry:
     def test_get_strategies_python(self):

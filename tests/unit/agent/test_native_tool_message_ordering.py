@@ -9,6 +9,7 @@ became assistant(tool_calls) -> user(warning) -> tool(result), which:
     followed by tool messages), and
   - repair_tool_message_sequence "fixes" by dropping the entire tool exchange.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -29,8 +30,13 @@ def _response_with_tool_call(call_id: str) -> dict:
     raw = types.SimpleNamespace(
         raw_response={
             "choices": [
-                {"message": {"tool_calls": [{"id": call_id, "type": "function",
-                                             "function": {"name": "apply_patch", "arguments": "{}"}}]}}
+                {
+                    "message": {
+                        "tool_calls": [
+                            {"id": call_id, "type": "function", "function": {"name": "apply_patch", "arguments": "{}"}}
+                        ]
+                    }
+                }
             ]
         }
     )
@@ -42,8 +48,7 @@ def _warn(text: str) -> LLMMessage:
 
 
 def _tool_result(call_id: str) -> LLMMessage:
-    return LLMMessage(role="tool", name="apply_patch", tool_call_id=call_id,
-                      content='{"ok": false}')
+    return LLMMessage(role="tool", name="apply_patch", tool_call_id=call_id, content='{"ok": false}')
 
 
 def test_deepseek_warning_does_not_interleave_assistant_and_tool():
@@ -75,8 +80,12 @@ def _assert_roles_alternate(roles):
 
 def test_anthropic_warning_folded_into_tool_result_turn_no_malformed_block():
     loop = _loop("anthropic")
-    response = {"content": "patching", "raw": types.SimpleNamespace(
-        raw_response={"content": [{"type": "tool_use", "id": "call_9", "name": "apply_patch", "input": {}}]})}
+    response = {
+        "content": "patching",
+        "raw": types.SimpleNamespace(
+            raw_response={"content": [{"type": "tool_use", "id": "call_9", "name": "apply_patch", "input": {}}]}
+        ),
+    }
     tool_result_messages = [_warn("[STRATEGY WARNING] switch approach"), _tool_result("call_9")]
 
     out = loop._append_native_tool_messages([], response, tool_result_messages)
@@ -95,11 +104,18 @@ def test_anthropic_warning_folded_into_tool_result_turn_no_malformed_block():
 
 def test_gemini_warning_folded_keeps_user_turns_alternating():
     loop = _loop("google")
-    response = {"content": "patching", "raw": types.SimpleNamespace(
-        raw_response={"candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "apply_patch", "args": {}}}]}}]})}
-    tool_result_messages = [_warn("[STRATEGY WARNING] switch approach"),
-                            LLMMessage(role="tool", name="apply_patch", tool_call_id="x", content='{"ok": false}')]
+    response = {
+        "content": "patching",
+        "raw": types.SimpleNamespace(
+            raw_response={
+                "candidates": [{"content": {"parts": [{"functionCall": {"name": "apply_patch", "args": {}}}]}}]
+            }
+        ),
+    }
+    tool_result_messages = [
+        _warn("[STRATEGY WARNING] switch approach"),
+        LLMMessage(role="tool", name="apply_patch", tool_call_id="x", content='{"ok": false}'),
+    ]
 
     out = loop._append_native_tool_messages([], response, tool_result_messages)
 

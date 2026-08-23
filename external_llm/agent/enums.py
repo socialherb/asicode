@@ -22,11 +22,12 @@ class Scope(str, Enum):
     MULTI_FILE = "multi_file"
     PROJECT_WIDE = "project_wide"
 
+
 class EstimatedScope(str, Enum):
-    TINY = 'tiny'
-    SMALL = 'small'
-    MEDIUM = 'medium'
-    LARGE = 'large'
+    TINY = "tiny"
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
 
 
 def estimated_scope_to_score(scope: EstimatedScope) -> float:

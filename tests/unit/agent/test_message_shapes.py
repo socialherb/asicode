@@ -6,6 +6,7 @@ supported provider formats — standard (OpenAI/DeepSeek/Ollama), Anthropic-nati
 parts). Regression guard for GAP-3 (Gemini was previously invisible to repair /
 eviction / sliding-window orphan detection).
 """
+
 from external_llm.agent.message_shapes import (
     _has_raw_blocks,
     _has_raw_key,
@@ -23,35 +24,40 @@ def _std_tool_result():
 
 def _std_tool_call():
     return LLMMessage(
-        role="assistant", content="",
+        role="assistant",
+        content="",
         tool_calls=[{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
     )
 
 
 def _anthropic_tool_result():
     return LLMMessage(
-        role="user", content="",
+        role="user",
+        content="",
         raw_content=[{"type": "tool_result", "tool_use_id": "tu_1", "content": "42"}],
     )
 
 
 def _anthropic_tool_call():
     return LLMMessage(
-        role="assistant", content="",
+        role="assistant",
+        content="",
         raw_content=[{"type": "text", "text": "ok"}, {"type": "tool_use", "id": "tu_1", "name": "grep"}],
     )
 
 
 def _gemini_tool_result():
     return LLMMessage(
-        role="user", content="",
+        role="user",
+        content="",
         raw_content=[{"functionResponse": {"name": "read_file", "response": {"content": "42"}}}],
     )
 
 
 def _gemini_tool_call():
     return LLMMessage(
-        role="assistant", content="",
+        role="assistant",
+        content="",
         raw_content=[{"text": "ok"}, {"functionCall": {"name": "grep", "args": {}}}],
     )
 
@@ -98,7 +104,8 @@ def test_raw_content_helpers_ignore_non_dict_items():
     """Non-dict entries in ``raw_content`` must be skipped, never crash —
     pins the shared skeleton behind both raw-content helpers."""
     msg = LLMMessage(
-        role="user", content="",
+        role="user",
+        content="",
         raw_content=["junk", {"type": "tool_result", "content": "42"}, None],
     )
     assert _has_raw_blocks(msg, "user", "tool_result")
@@ -108,7 +115,8 @@ def test_raw_content_helpers_ignore_non_dict_items():
 def test_raw_content_helpers_enforce_role():
     """Role mismatch short-circuits before ``raw_content`` is inspected."""
     wrong_role = LLMMessage(
-        role="assistant", content="",
+        role="assistant",
+        content="",
         raw_content=[{"type": "tool_result", "content": "42"}],
     )
     assert not _has_raw_blocks(wrong_role, "user", "tool_result")

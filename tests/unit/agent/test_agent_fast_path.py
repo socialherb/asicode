@@ -1,7 +1,9 @@
 """Unit tests for agent_fast_path.py — 100% branch coverage."""
+
 from external_llm.agent.agent_fast_path import FastPathMixin, _is_trivial_request
 
 # ── _is_trivial_request ──────────────────────────────────────────────────────
+
 
 class TestIsTrivialRequest:
     """Branch coverage for the standalone triviality check."""
@@ -61,8 +63,10 @@ class TestIsTrivialRequest:
 
 # ── FastPathMixin ────────────────────────────────────────────────────────────
 
+
 class FakeConfig:
     """Minimal config stub for FastPathMixin tests."""
+
     def __init__(self, route_decision=None):
         self.route_decision = route_decision
 
@@ -74,6 +78,7 @@ class FakeRoute:
 
 class _Host(FastPathMixin):
     """Concrete host class with minimal config."""
+
     def __init__(self, config):
         self.config = config
 
@@ -84,12 +89,14 @@ class TestFastPathMixin:
     def test_route_micro_edit(self):
         """Route with MICRO_EDIT → True."""
         from external_llm.agent.task_router import TaskKind
+
         host = _Host(FakeConfig(route_decision=FakeRoute(TaskKind.MICRO_EDIT)))
         assert host._is_trivial_edit_request("any request") is True
 
     def test_route_other_kind(self):
         """Route with non-MICRO_EDIT kind → False."""
         from external_llm.agent.task_router import TaskKind
+
         host = _Host(FakeConfig(route_decision=FakeRoute(TaskKind.SINGLE_FILE_EDIT)))
         assert host._is_trivial_edit_request("any request") is False
 

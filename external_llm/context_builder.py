@@ -14,6 +14,7 @@ Compatibility:
   - ContextBuilder (class alias)
   - enhance_user_request(text, ...) (function)
 """
+
 from __future__ import annotations
 
 import logging
@@ -22,10 +23,8 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
 
-from common import normalize_rel_path_fast
-from path_security import resolve_inside_repo
+from path_security import normalize_rel_path, resolve_inside_repo
 from utils.string_helper import utf8_trailing_incomplete_len
 
 from .agent.agent_context_manager import get_git_snapshot
@@ -67,6 +66,7 @@ def _bounded_file_text(p: Path, max_bytes: int = _FILE_CONTEXT_MAX_BYTES) -> tup
         return raw.decode("utf-8"), True
     except UnicodeDecodeError:
         return raw.decode("latin-1"), True
+
 
 # Process-wide TTL cache for project-structure hints.  Computing this scans
 # every top-level directory recursively via rglob (~95ms on a ~900-file repo)
@@ -130,7 +130,7 @@ class EnhancedContextBuilder:
     def build_context(
         self,
         user_request: str,
-        target_file: Optional[str] = None,
+        target_file: str | None = None,
         include_related_files: bool = True,
         include_git_context: bool = True,
         max_related_files: int = 3,
@@ -267,11 +267,7 @@ class EnhancedContextBuilder:
                 # truncation are different facts, and telling the model "exceeds
                 # 1 MiB" when the file is actually < 1 MiB (just long) is a
                 # false statement about what it is not seeing.
-                cause = (
-                    "file exceeds 1 MiB"
-                    if truncated
-                    else f"showing first {_FILE_CONTEXT_MAX_LINES} lines"
-                )
+                cause = "file exceeds 1 MiB" if truncated else f"showing first {_FILE_CONTEXT_MAX_LINES} lines"
                 out.append(f"**Total lines**: >={total} (head only — {cause})")
             else:
                 out.append(f"**Total lines**: {total}")
@@ -312,10 +308,7 @@ class EnhancedContextBuilder:
                 snippet_lines = content.split("\n")
                 if len(snippet_lines) > _FILE_CONTEXT_MAX_LINES:
                     snippet = "\n".join(snippet_lines[:_FILE_CONTEXT_MAX_LINES])
-                    snippet += (
-                        f"\n...[more lines omitted — "
-                        f"showing first {_FILE_CONTEXT_MAX_LINES}]"
-                    )
+                    snippet += f"\n...[more lines omitted — showing first {_FILE_CONTEXT_MAX_LINES}]"
                 else:
                     snippet = content
                 if truncated:
@@ -342,7 +335,7 @@ class EnhancedContextBuilder:
         # "./pkg/__init__.py" form never matched "pkg/__init__.py", so a
         # target importing its own package leaked into its own Related
         # Files (defect A class, fallback half).
-        rel = normalize_rel_path_fast(target_file)
+        rel = normalize_rel_path(target_file)
         # 1) Preferred: context_collector (shallow)
         try:
             from context_collector import collect_related_files_shallow  # type: ignore
@@ -440,8 +433,17 @@ class EnhancedContextBuilder:
                 if item.is_dir():
                     # Count .py files with directory pruning instead of rglob,
                     # which would descend into node_modules/.git/etc.
-                    _skip = {".git", "__pycache__", "node_modules", ".venv",
-                             "venv", ".mypy_cache", ".pytest_cache", "build", "dist"}
+                    _skip = {
+                        ".git",
+                        "__pycache__",
+                        "node_modules",
+                        ".venv",
+                        "venv",
+                        ".mypy_cache",
+                        ".pytest_cache",
+                        "build",
+                        "dist",
+                    }
                     py_count = 0
                     for _root, _dirs, _files in os.walk(item):
                         _dirs[:] = [d for d in _dirs if d not in _skip]
@@ -487,7 +489,7 @@ class EnhancedContextBuilder:
         }
         return lang_map.get(ext, "")
 
-    def _get_llm_instructions(self, target_file: Optional[str] = None) -> str:
+    def _get_llm_instructions(self, target_file: str | None = None) -> str:
         file_hint = f" for `{target_file}`" if target_file else ""
         return f"""**Your Task**: Generate a unified diff patch{file_hint}
 
@@ -512,8 +514,8 @@ ContextBuilder = EnhancedContextBuilder
 
 def enhance_user_request(
     user_request: str,
-    target_file: Optional[str] = None,
-    extra_hints: Optional[list[str]] = None,
+    target_file: str | None = None,
+    extra_hints: list[str] | None = None,
 ) -> str:
     """
     Small helper expected by some service implementations.

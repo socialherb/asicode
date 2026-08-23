@@ -14,6 +14,7 @@ raise :class:`ContextWindowCollapseError` immediately. preemptive_trim and the
 in-turn re-trim callbacks were REMOVED (2026-08) — a context-length 400 records
 an overflow override and propagates at once, without another attempt.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -65,9 +66,7 @@ def test_apply_context_hard_cap_passthrough_when_window_sufficient():
     """A large window must keep the pre-existing trim/no-op behaviour — the
     guard is collapse-only."""
     msgs = [LLMMessage(role="system", content="sys"), LLMMessage(role="user", content="hi")]
-    with mock.patch(
-        "external_llm.agent.design_chat_loop._resolve_context_limit", return_value=131072
-    ):
+    with mock.patch("external_llm.agent.design_chat_loop._resolve_context_limit", return_value=131072):
         out = _apply_context_hard_cap(msgs, model="big-model", tool_schemas=_big_schema())
     assert out == msgs  # 131072 - 4096 reserve - 8k schemas >> floor → untouched
 
@@ -138,8 +137,6 @@ def test_agent_loop_overflow_propagates_without_retry_cb():
 def test_user_facing_error_explains_collapse():
     """The collapse error must map to an actionable user message (not the
     generic fallback) when design chat surfaces it."""
-    msg = _user_facing_llm_error(
-        ContextWindowCollapseError("context window (4096) is too small")
-    )
+    msg = _user_facing_llm_error(ContextWindowCollapseError("context window (4096) is too small"))
     assert "too small" in msg
     assert "message trimming cannot fix" in msg

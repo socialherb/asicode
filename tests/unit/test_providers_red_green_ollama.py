@@ -1,6 +1,7 @@
 """RED→GREEN: OllamaClient — chat / _num_ctx_for_model / chat_with_tools full
 branch coverage via fake sessions. Runtime capability queries (/api/show) are
 patched out so tests never touch the network."""
+
 from __future__ import annotations
 
 import json
@@ -88,8 +89,10 @@ def test_chat_default_model_and_options() -> None:
 
 def test_chat_status_errors() -> None:
     for status, exc in [
-        (404, LLMAPIError), (401, LLMAuthenticationError),
-        (429, LLMRateLimitError), (500, LLMServerUnavailableError),
+        (404, LLMAPIError),
+        (401, LLMAuthenticationError),
+        (429, LLMRateLimitError),
+        (500, LLMServerUnavailableError),
         (400, LLMAPIError),
     ]:
         c = _client(_resp(status=status, text="e"))
@@ -102,15 +105,19 @@ def test_chat_streaming_full_flow() -> None:
         json.dumps({"message": {"thinking": "think..."}}),
         json.dumps({"message": {"content": "Hel"}}),
         "not json at all",
-        json.dumps({"message": {"content": "lo"}, "done": True, "done_reason": "stop", "prompt_eval_count": 4, "eval_count": 6}),
+        json.dumps(
+            {"message": {"content": "lo"}, "done": True, "done_reason": "stop", "prompt_eval_count": 4, "eval_count": 6}
+        ),
         "",
     ]
     c = _client(_resp(lines=lines))
     got_tok: list[str] = []
     got_reason: list[str] = []
     r = c.chat(
-        [LLMMessage(role="user", content="x")], model="qwen2.5-coder:3b",
-        token_callback=got_tok.append, reasoning_callback=got_reason.append,
+        [LLMMessage(role="user", content="x")],
+        model="qwen2.5-coder:3b",
+        token_callback=got_tok.append,
+        reasoning_callback=got_reason.append,
         thinking_mode=True,
     )
     assert r.content == "Hello"
@@ -220,18 +227,22 @@ def test_chat_with_tools_default_model_and_message_kinds() -> None:
             LLMMessage(role="system", content="S"),
             LLMMessage(role="user", content="u"),
             LLMMessage(role="tool", content="res"),
-            LLMMessage(role="assistant", content="prev", tool_calls=[
-                # format A: OpenAI-style with string args
-                {"type": "function", "function": {"name": "f1", "arguments": '{"a": 1}'}},
-                # format A: dict args
-                {"type": "function", "function": {"name": "f2", "arguments": {"b": 2}}},
-                # format B: agent_loop normalized
-                {"id": "x", "name": "f3", "args": {"c": 3}},
-                # malformed: non-dict entry → skipped
-                "garbage",
-                # no function/name keys → skipped
-                {"id": "y"},
-            ]),
+            LLMMessage(
+                role="assistant",
+                content="prev",
+                tool_calls=[
+                    # format A: OpenAI-style with string args
+                    {"type": "function", "function": {"name": "f1", "arguments": '{"a": 1}'}},
+                    # format A: dict args
+                    {"type": "function", "function": {"name": "f2", "arguments": {"b": 2}}},
+                    # format B: agent_loop normalized
+                    {"id": "x", "name": "f3", "args": {"c": 3}},
+                    # malformed: non-dict entry → skipped
+                    "garbage",
+                    # no function/name keys → skipped
+                    {"id": "y"},
+                ],
+            ),
         ],
         tools=[{"name": "f1", "description": "d", "parameters": {}}],
         model="",
@@ -263,8 +274,10 @@ def test_chat_with_tools_empty_tools_omits_key() -> None:
 
 def test_chat_with_tools_status_errors() -> None:
     for status, exc in [
-        (404, LLMAPIError), (401, LLMAuthenticationError),
-        (429, LLMRateLimitError), (500, LLMServerUnavailableError),
+        (404, LLMAPIError),
+        (401, LLMAuthenticationError),
+        (429, LLMRateLimitError),
+        (500, LLMServerUnavailableError),
         (400, LLMAPIError),
     ]:
         c = _client(_resp(status=status, text="e"))
@@ -282,7 +295,9 @@ def test_chat_with_tools_streaming_flow() -> None:
     c = _client(_resp(lines=lines))
     got: list[str] = []
     r = c.chat_with_tools(
-        [LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b",
+        [LLMMessage(role="user", content="x")],
+        tools=[],
+        model="qwen2.5-coder:3b",
         token_callback=got.append,
     )
     assert r.content == "Hello" and got == ["Hel", "lo"]
@@ -295,24 +310,36 @@ def test_chat_with_tools_streaming_flow() -> None:
 
 def test_chat_with_tools_non_streaming_flow_and_arg_parsing() -> None:
     # string args JSON-parseable
-    c = _client(_resp(json_data=_ok_json(
-        tool_calls=[{"function": {"name": "f", "arguments": '{"k": 1}'}}],
-    )))
+    c = _client(
+        _resp(
+            json_data=_ok_json(
+                tool_calls=[{"function": {"name": "f", "arguments": '{"k": 1}'}}],
+            )
+        )
+    )
     r = c.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b")
     assert r.tool_calls[0].args == {"k": 1}
     assert r.is_final is False
 
     # string args NOT parseable → __raw_arguments
-    c2 = _client(_resp(json_data=_ok_json(
-        tool_calls=[{"function": {"name": "f", "arguments": "{broken"}}],
-    )))
+    c2 = _client(
+        _resp(
+            json_data=_ok_json(
+                tool_calls=[{"function": {"name": "f", "arguments": "{broken"}}],
+            )
+        )
+    )
     r2 = c2.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b")
     assert r2.tool_calls[0].args == {"__raw_arguments": "{broken"}
 
     # non-dict args → __raw_arguments str
-    c3 = _client(_resp(json_data=_ok_json(
-        tool_calls=[{"function": {"name": "f", "arguments": 42}}],
-    )))
+    c3 = _client(
+        _resp(
+            json_data=_ok_json(
+                tool_calls=[{"function": {"name": "f", "arguments": 42}}],
+            )
+        )
+    )
     r3 = c3.chat_with_tools([LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b")
     assert r3.tool_calls[0].args == {"__raw_arguments": "42"}
 
@@ -326,7 +353,9 @@ def test_chat_with_tools_stream_error_line() -> None:
     c = _client(_resp(lines=[json.dumps({"error": "oom"})]))
     with pytest.raises(LLMAPIError, match="oom"):
         c.chat_with_tools(
-            [LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b",
+            [LLMMessage(role="user", content="x")],
+            tools=[],
+            model="qwen2.5-coder:3b",
             token_callback=lambda _c: None,
         )
 
@@ -351,12 +380,16 @@ def test_chat_with_tools_think_and_message_edge_cases() -> None:
     c = _client(_resp(lines=[_tc_line(content="ok", done=True, done_reason="stop")]))
     c.chat_with_tools(
         [
-            LLMMessage(role="assistant", content="prev", tool_calls=[
-                # format A string args that fail JSON parsing → {}
-                {"type": "function", "function": {"name": "f1", "arguments": "{broken"}},
-                # format B with non-dict args → {}
-                {"id": "x", "name": "f2", "args": "not-a-dict"},
-            ]),
+            LLMMessage(
+                role="assistant",
+                content="prev",
+                tool_calls=[
+                    # format A string args that fail JSON parsing → {}
+                    {"type": "function", "function": {"name": "f1", "arguments": "{broken"}},
+                    # format B with non-dict args → {}
+                    {"id": "x", "name": "f2", "args": "not-a-dict"},
+                ],
+            ),
         ],
         tools=[],
         model="qwen2.5-coder:3b",
@@ -378,7 +411,9 @@ def test_chat_with_tools_streaming_skips_non_json_lines() -> None:
     ]
     c = _client(_resp(lines=lines))
     r = c.chat_with_tools(
-        [LLMMessage(role="user", content="x")], tools=[], model="qwen2.5-coder:3b",
+        [LLMMessage(role="user", content="x")],
+        tools=[],
+        model="qwen2.5-coder:3b",
         token_callback=lambda _c: None,
     )
     assert r.content == "ok"

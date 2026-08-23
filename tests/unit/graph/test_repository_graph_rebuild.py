@@ -5,6 +5,7 @@ a fresh instance's single build: call/import edges and file_symbols are reset
 (not appended to), and symbols of files deleted between builds must not linger
 (P1, 2026-08-11).
 """
+
 import os
 import tempfile
 import textwrap

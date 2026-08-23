@@ -15,6 +15,7 @@ not MagicMock, so a missing attribute on the fake surfaces immediately.
 
 Run: pytest tests/unit/test_patch_subprocess_timeout.py -v
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -103,12 +104,11 @@ class TestDiffApplyHelperTimeouts:
         user_file.write_text("user data\n")
         monkeypatch.setattr(diff_apply, "_git_status_untracked", lambda repo: None)
         report = diff_apply._rollback(
-            tmp_path, ["x.py"],
+            tmp_path,
+            ["x.py"],
             snapshot={"pre_untracked": None, "pre_exists": {}},
         )
-        assert user_file.exists(), (
-            "fail-closed rollback deleted a pre-existing untracked file"
-        )
+        assert user_file.exists(), "fail-closed rollback deleted a pre-existing untracked file"
         assert report.get("cleanup_skipped_reason") == "pre_untracked_unknown", report
 
     def test_apply_patch_3way_skipped_when_clean_state_unverifiable(self, monkeypatch, tmp_path):
@@ -125,9 +125,7 @@ class TestDiffApplyHelperTimeouts:
         subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
-        (repo / "app.py").write_text(
-            "def greet(name):\n    return name\n\ndef add(a, b):\n    return a + b\n"
-        )
+        (repo / "app.py").write_text("def greet(name):\n    return name\n\ndef add(a, b):\n    return a + b\n")
         subprocess.run(["git", "add", "."], cwd=repo, check=True)
         subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
 
@@ -147,14 +145,10 @@ class TestDiffApplyHelperTimeouts:
 
         # git status can't be verified (hung git): the gate must refuse 3-way.
         monkeypatch.setattr(diff_apply, "_is_worktree_clean", lambda repo: None)
-        monkeypatch.setattr(
-            diff_apply, "_git_status_porcelain", lambda repo, **kw: " M app.py"
-        )
+        monkeypatch.setattr(diff_apply, "_git_status_porcelain", lambda repo, **kw: " M app.py")
 
         before = (repo / "app.py").read_text()
-        ok, _msg, reason, d = diff_apply.apply_patch(
-            str(repo), patch, file_path_hint="app.py", skip_3way=False
-        )
+        ok, _msg, reason, d = diff_apply.apply_patch(str(repo), patch, file_path_hint="app.py", skip_3way=False)
         assert not ok
         assert reason == diff_apply.REASON_3WAY_SKIPPED_UNVERIFIABLE, (reason, d)
         assert d["used_strategy"] == "git-apply-3way-skipped-unverifiable", d

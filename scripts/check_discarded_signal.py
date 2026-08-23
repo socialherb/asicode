@@ -24,6 +24,7 @@ Usage:
     python scripts/check_discarded_signal.py --write-baseline  # regen
     python scripts/check_discarded_signal.py <file>.py ...      # per-file
 """
+
 from __future__ import annotations
 
 import ast
@@ -34,10 +35,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "scripts" / "discarded_signal_baseline.txt"
 
-_SKIP_DIRS = frozenset({
-    "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules",
-    ".venv", "venv", "env", ".tox", "dist", "build", ".eggs", ".git",
-})
+_SKIP_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        ".git",
+    }
+)
 _SCAN_ROOTS = ("external_llm", "services", "webapp")
 
 
@@ -47,11 +60,7 @@ def _should_skip(path: Path) -> bool:
 
 def _in_scope(rel: str) -> bool:
     p = Path(rel)
-    return (
-        p.suffix == ".py"
-        and not _should_skip(p)
-        and (p == Path("asi.py") or p.parts[0] in _SCAN_ROOTS)
-    )
+    return p.suffix == ".py" and not _should_skip(p) and (p == Path("asi.py") or p.parts[0] in _SCAN_ROOTS)
 
 
 def _name_uses_in_raise(raise_node: ast.Raise, name: str) -> tuple[list[int], list[int]]:
@@ -66,11 +75,7 @@ def _name_uses_in_raise(raise_node: ast.Raise, name: str) -> tuple[list[int], li
     for node in ast.walk(raise_node):
         if isinstance(node, ast.JoinedStr):
             for val in node.values:
-                if (
-                    isinstance(val, ast.FormattedValue)
-                    and isinstance(val.value, ast.Name)
-                    and val.value.id == name
-                ):
+                if isinstance(val, ast.FormattedValue) and isinstance(val.value, ast.Name) and val.value.id == name:
                     fv_nodes.add(id(val.value))
                     fstring_lines.append(val.value.lineno)
     structured_lines = [
@@ -189,7 +194,7 @@ def _write_baseline(keys: set[str]) -> None:
     BASELINE.parent.mkdir(parents=True, exist_ok=True)
     header = (
         "# asicode discarded-signal baseline — KNOWN `x = <Call>` immediately\n"
-        "# followed by `raise ... f\"...{x}...\"` where x appears ONLY in the\n"
+        '# followed by `raise ... f"...{x}..."` where x appears ONLY in the\n'
         "# message f-string (never passed as structured data). Usually a bug\n"
         "# (computed signal dropped — see providers.py Ollama retry_after), but\n"
         "# display-only message strings are legitimate exceptions.\n"

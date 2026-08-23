@@ -12,6 +12,7 @@ These tests also guard the behavioural contract: finished jobs are evicted
 before killing a running one, the kill still happens outside the manager
 lock, and the public API (get_info / list_jobs / kill / cleanup) is intact.
 """
+
 import os
 import subprocess
 import sys
@@ -35,9 +36,15 @@ class _FakeProc:
 
     _next_pid = 2_000_000
 
-    def __init__(self, *, done: bool = False, kill_delay: float = 0.0,
-                 returncode: int = 0, wait_returncode: int | None = None,
-                 stuck: bool = False):
+    def __init__(
+        self,
+        *,
+        done: bool = False,
+        kill_delay: float = 0.0,
+        returncode: int = 0,
+        wait_returncode: int | None = None,
+        stuck: bool = False,
+    ):
         _FakeProc._next_pid += 1
         self.pid = _FakeProc._next_pid
         self.stdout = None
@@ -128,9 +135,7 @@ def test_max_jobs_is_hard_bound_under_concurrent_start(max_jobs):
         stop[0] = True
         mon.join(timeout=2.0)
 
-        assert peak_box[0] <= max_jobs, (
-            f"max_jobs={max_jobs} violated: observed peak={peak_box[0]}"
-        )
+        assert peak_box[0] <= max_jobs, f"max_jobs={max_jobs} violated: observed peak={peak_box[0]}"
     finally:
         mgr.shutdown()
 
@@ -187,12 +192,17 @@ def test_get_info_unknown_returns_none():
 
 # ── Output accumulation / recovery (real subprocesses) ───────────────────────
 
+
 def _real_proc(script: str):
     import subprocess
+
     return subprocess.Popen(
         ["bash", "-c", script],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         start_new_session=True,
     )
 
@@ -210,9 +220,7 @@ def test_output_survives_intermediate_reads():
             assert time.monotonic() < deadline, "PHASE1 never arrived"
             time.sleep(0.05)
         mgr.list_jobs()  # drains again — historically discarded the data
-        assert "PHASE1" in mgr.get_info(jid).stdout, (
-            "accumulated output lost by an intermediate drain"
-        )
+        assert "PHASE1" in mgr.get_info(jid).stdout, "accumulated output lost by an intermediate drain"
     finally:
         proc.kill()
         proc.wait()
@@ -275,9 +283,7 @@ def test_output_buffer_head_and_tail_under_cap():
     try:
         jid = mgr.start("big", _FakeProc())
         job = mgr._jobs[jid]  # get() removed — internal job reached directly
-        job._stdout_buf.feed(
-            "HEAD_MARKER\n" + "A" * (bjm._OUTPUT_BUF_CAP * 2) + "\nTAIL_MARKER"
-        )
+        job._stdout_buf.feed("HEAD_MARKER\n" + "A" * (bjm._OUTPUT_BUF_CAP * 2) + "\nTAIL_MARKER")
         info = mgr.get_info(jid)
         assert info.stdout.startswith("HEAD_MARKER\n"), "stream head lost"
         assert info.stdout.endswith("TAIL_MARKER")
@@ -295,13 +301,18 @@ def _noisy_proc(script: str):
     """
     import os
     import subprocess
+
     env = os.environ.copy()
     env["MallocStackLogging"] = "1"
     return subprocess.Popen(
         ["bash", "-c", script],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-        start_new_session=True, env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+        env=env,
     )
 
 
@@ -413,9 +424,8 @@ def test_reaped_output_keeps_the_tail_not_the_head():
     try:
         job_id = _real_job(
             mgr,
-            "for i in $(seq 1 4000); do echo line-$i-xxxxxxxxxxxxxxxxxxxx; done; "
-            "echo FINAL_ANSWER_42",
-            drain=True,   # payload exceeds the OS pipe buffer
+            "for i in $(seq 1 4000); do echo line-$i-xxxxxxxxxxxxxxxxxxxx; done; echo FINAL_ANSWER_42",
+            drain=True,  # payload exceeds the OS pipe buffer
         )
         mgr.cleanup()
         info = mgr.get_info(job_id)
@@ -484,8 +494,7 @@ def test_partial_output_survives_when_one_stream_is_silent(script, marker, strea
         jid = mgr.start("timed-out", proc)
         info = mgr.get_info(jid)
         assert marker in getattr(info, stream), (
-            f"pre-timeout {stream} was salvaged and then dropped: "
-            f"stdout={info.stdout!r} stderr={info.stderr!r}"
+            f"pre-timeout {stream} was salvaged and then dropped: stdout={info.stdout!r} stderr={info.stderr!r}"
         )
     finally:
         proc.kill()
@@ -509,10 +518,7 @@ def test_a_missing_recovery_attribute_does_not_discard_the_other():
 
         jid = mgr.start("half-recovered", proc)
         info = mgr.get_info(jid)
-        assert "ONLY_OUT" in info.stdout, (
-            f"a missing _recovered_stderr discarded the recovered stdout: "
-            f"{info.stdout!r}"
-        )
+        assert "ONLY_OUT" in info.stdout, f"a missing _recovered_stderr discarded the recovered stdout: {info.stdout!r}"
     finally:
         proc.kill()
         proc.wait()
@@ -660,9 +666,7 @@ def test_stuck_eviction_victim_does_not_freeze_as_killing():
         assert victim_id not in mgr._jobs, "victim should have been evicted"
         assert victim_id in mgr._stale_jobs, "stuck victim was not re-tracked"
         info = mgr.get_info(victim_id)
-        assert info is not None and info.status == "running", (
-            f"victim frozen as {info.status if info else None!r}"
-        )
+        assert info is not None and info.status == "running", f"victim frozen as {info.status if info else None!r}"
 
         # The process finally dies from the SIGKILL that was delivered while
         # it was stuck — the reaper must converge the ring to the REAL
@@ -721,9 +725,7 @@ def test_stale_jobs_capped_at_max_jobs_fifo():
         j2 = mgr.start("v2", _FakeProc(stuck=True))
         mgr.start("v3", _FakeProc(stuck=True))  # evicts j2; its kill also sticks
         with mgr._lock:
-            assert len(mgr._stale_jobs) == 1, (
-                f"_stale_jobs grew past max_jobs: {list(mgr._stale_jobs)}"
-            )
+            assert len(mgr._stale_jobs) == 1, f"_stale_jobs grew past max_jobs: {list(mgr._stale_jobs)}"
             assert list(mgr._stale_jobs) == [j2], "FIFO: oldest (j1) must drop, j2 kept"
         # The dropped victim's last snapshot stays retrievable via the ring.
         info = mgr.get_info(j1)
@@ -741,6 +743,8 @@ def test_shutdown_clears_stale_jobs():
     assert len(mgr._stale_jobs) == 1
     mgr.shutdown()
     assert mgr._stale_jobs == {}, "stale tracking survived shutdown"
+
+
 def test_direct_kill_of_stuck_job_stays_running_not_killing():
     """R3: a DIRECT kill of a process that survives SIGKILL must keep the job
     honest — "running", still tracked in _jobs, reaped when it finally dies.
@@ -902,9 +906,7 @@ def test_info_reports_true_output_totals_beyond_cap():
 
         info = mgr.get_info(job_id)
         assert info.stdout_total == bjm._OUTPUT_BUF_CAP * 2 + 100_000
-        assert len(info.stdout) < info.stdout_total, (
-            "capped text must not be mistaken for the true output size"
-        )
+        assert len(info.stdout) < info.stdout_total, "capped text must not be mistaken for the true output size"
 
         listed = mgr.list_jobs()
         assert listed[0].stdout_total == bjm._OUTPUT_BUF_CAP * 2 + 100_000

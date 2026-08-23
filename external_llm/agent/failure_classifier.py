@@ -3,11 +3,9 @@ from __future__ import annotations
 import errno
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 
 class RecoveryAction(str, Enum):
-
     RETRY_SAME = "retry_same"
     # The call itself was malformed — a required argument was missing
     # ("'code' is required").  The recovery is to re-issue the call WITH the
@@ -23,13 +21,11 @@ class RecoveryAction(str, Enum):
 
 @dataclass
 class FailureClassification:
-
     action: RecoveryAction
     reason: str
 
 
 class FailureClassifier:
-
     def classify(self, tool_name: str, result) -> FailureClassification:
         # Priority 0: the handler's own structured verdict.
         #
@@ -103,10 +99,17 @@ _TEXT_MISSING_ARGS = ("is required",)
 # re-read the file and quote it exactly — never to switch tools.  Used only in
 # the text fallback, for the handful of edit paths that return without setting
 # ``metadata["failure_class"]``.
-_TEXT_MATCHING_EDIT_TOOLS = frozenset({
-    "edit_text", "anchor_edit", "edit_file", "modify_symbol",
-    "apply_patch", "edit_ast", "write_plan",
-})
+_TEXT_MATCHING_EDIT_TOOLS = frozenset(
+    {
+        "edit_text",
+        "anchor_edit",
+        "edit_file",
+        "modify_symbol",
+        "apply_patch",
+        "edit_ast",
+        "write_plan",
+    }
+)
 
 # ``FailureClass`` value → recovery, for the classes a shipping tool actually
 # publishes.  Deliberately partial: a class with no unambiguous single recovery
@@ -118,31 +121,31 @@ _TEXT_MATCHING_EDIT_TOOLS = frozenset({
 # counter from zero.
 _ACTION_BY_FAILURE_CLASS: dict[str, tuple[RecoveryAction, str]] = {
     # the search/anchor text did not match — re-read and quote exactly
-    "search_string_mismatch":    (RecoveryAction.READ_FIRST, "patch context mismatch"),
-    "anchor_miss":               (RecoveryAction.READ_FIRST, "patch context mismatch"),
-    "anchor_loss":               (RecoveryAction.READ_FIRST, "patch context mismatch"),
-    "multiline_mismatch":        (RecoveryAction.READ_FIRST, "patch context mismatch"),
-    "anchor_multiline_pattern":  (RecoveryAction.READ_FIRST, "patch context mismatch"),
-    "patch_apply_failed":        (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "search_string_mismatch": (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "anchor_miss": (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "anchor_loss": (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "multiline_mismatch": (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "anchor_multiline_pattern": (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "patch_apply_failed": (RecoveryAction.READ_FIRST, "patch context mismatch"),
     # matched in more than one place — more surrounding context is needed
-    "anchor_not_unique":         (RecoveryAction.READ_FIRST, "patch context mismatch"),
+    "anchor_not_unique": (RecoveryAction.READ_FIRST, "patch context mismatch"),
     # the edit was already there
-    "already_equal":             (RecoveryAction.SKIP, "patch already applied"),
-    "already_satisfied":         (RecoveryAction.SKIP, "patch already applied"),
-    "no_effect":                 (RecoveryAction.SKIP, "patch already applied"),
-    "no_op_edit":                (RecoveryAction.SKIP, "patch already applied"),
+    "already_equal": (RecoveryAction.SKIP, "patch already applied"),
+    "already_satisfied": (RecoveryAction.SKIP, "patch already applied"),
+    "no_effect": (RecoveryAction.SKIP, "patch already applied"),
+    "no_op_edit": (RecoveryAction.SKIP, "patch already applied"),
     # design_chat_loop's byte-identical apply_patch hard gate (its only issuer)
-    "no_effective_change":       (RecoveryAction.SKIP, "patch already applied"),
+    "no_effective_change": (RecoveryAction.SKIP, "patch already applied"),
     # genuinely absent on disk
-    "file_not_found":            (RecoveryAction.SWITCH_TOOL, "file missing"),
-    "missing_path":              (RecoveryAction.SWITCH_TOOL, "file missing"),
+    "file_not_found": (RecoveryAction.SWITCH_TOOL, "file missing"),
+    "missing_path": (RecoveryAction.SWITCH_TOOL, "file missing"),
     # environment, not the call
-    "timeout":                   (RecoveryAction.RETRY_SAME, "transient failure"),
-    "api_connection_error":      (RecoveryAction.RETRY_SAME, "transient failure"),
+    "timeout": (RecoveryAction.RETRY_SAME, "transient failure"),
+    "api_connection_error": (RecoveryAction.RETRY_SAME, "transient failure"),
 }
 
 
-def _classify_by_failure_class(result) -> Optional[FailureClassification]:
+def _classify_by_failure_class(result) -> FailureClassification | None:
     """Classify from ``result.metadata["failure_class"]`` when the handler set one.
 
     Normalised through ``operation_models.normalize_failure_class`` so legacy /
@@ -159,6 +162,7 @@ def _classify_by_failure_class(result) -> Optional[FailureClassification]:
         return None
     try:
         from .operation_models import normalize_failure_class
+
         value = normalize_failure_class(raw).value
     except Exception:  # pragma: no cover - operation_models always importable
         value = str(raw).lower()
@@ -182,7 +186,7 @@ _TRANSIENT_TYPES = (
 )
 
 
-def _classify_by_type(error) -> Optional[FailureClassification]:
+def _classify_by_type(error) -> FailureClassification | None:
     """Classify by Python exception type — locale-independent, no string parsing."""
     if isinstance(error, _FILE_MISSING_TYPES):
         return FailureClassification(action=RecoveryAction.SWITCH_TOOL, reason="file missing")
@@ -195,6 +199,7 @@ def _classify_by_type(error) -> Optional[FailureClassification]:
 
 # ── Code-based classification ─────────────────────────────────────────────────
 
+
 def _has_code_keyword(code: str, keywords: frozenset[str]) -> bool:
     """Check if any keyword appears as an underscore-delimited token.
 
@@ -205,13 +210,9 @@ def _has_code_keyword(code: str, keywords: frozenset[str]) -> bool:
     return bool(keywords & set(code.lower().split("_")))
 
 
-def _classify_by_code(error) -> Optional[FailureClassification]:
+def _classify_by_code(error) -> FailureClassification | None:
     """Classify by structured error code — works across frameworks and locales."""
-    code = (
-        getattr(error, "code", None)
-        or getattr(error, "error_code", None)
-        or getattr(error, "errno", None)
-    )
+    code = getattr(error, "code", None) or getattr(error, "error_code", None) or getattr(error, "errno", None)
     if code is None:
         return None
 
@@ -235,6 +236,7 @@ def _classify_by_code(error) -> Optional[FailureClassification]:
 
 
 # ── Text-based classification (last resort) ───────────────────────────────────
+
 
 def _has_text_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     """Check if any phrase appears in lowercased *text*.

@@ -7,6 +7,7 @@ Covers:
 - _tool_run_lint rendering the fix hint inline and exposing fixable
   issues in metadata
 """
+
 from __future__ import annotations
 
 import json
@@ -19,15 +20,14 @@ from external_llm.agent.tool_registry import ToolResult
 
 # ── LintResult.fixable_count ──────────────────────────────────────────────
 
+
 def test_fixable_count_counts_only_issues_with_fix():
     result = LintResult(
         ok=False,
         issues=[
-            LintIssue(file="a.py", line=1, col=1, code="F401", message="unused",
-                      fix="Remove unused import"),
+            LintIssue(file="a.py", line=1, col=1, code="F401", message="unused", fix="Remove unused import"),
             LintIssue(file="a.py", line=2, col=1, code="E501", message="long"),
-            LintIssue(file="a.py", line=3, col=1, code="F841", message="assigned",
-                      fix="Remove assignment"),
+            LintIssue(file="a.py", line=3, col=1, code="F841", message="assigned", fix="Remove assignment"),
         ],
     )
     assert result.fixable_count == 2
@@ -62,7 +62,9 @@ def _mock_ruff_run(stdout: str, returncode: int = 1):
     return mock.patch(
         "external_llm.agent.lint_runner.subprocess.run",
         return_value=types.SimpleNamespace(
-            returncode=returncode, stdout=stdout, stderr="",
+            returncode=returncode,
+            stdout=stdout,
+            stderr="",
         ),
     )
 
@@ -87,6 +89,7 @@ def test_run_ruff_summary_omits_suffix_when_none_fixable(tmp_path):
 
 
 # ── _tool_run_lint rendering / metadata ───────────────────────────────────
+
 
 class _FakeConfig:
     max_lint_issues = 50
@@ -117,11 +120,15 @@ def test_tool_run_lint_renders_fix_inline():
         ok=False,
         summary="2 lint issue(s) found (1 auto-fixable)",
         issues=[
-            LintIssue(file="a.py", line=1, col=1, code="F401",
-                      message="`os` imported but unused",
-                      fix="Remove unused import: `os`"),
-            LintIssue(file="a.py", line=5, col=8, code="E501",
-                      message="Line too long (100 > 88)"),
+            LintIssue(
+                file="a.py",
+                line=1,
+                col=1,
+                code="F401",
+                message="`os` imported but unused",
+                fix="Remove unused import: `os`",
+            ),
+            LintIssue(file="a.py", line=5, col=8, code="E501", message="Line too long (100 > 88)"),
         ],
     )
     tr = _Handler(result)._tool_run_lint({"path": "a.py"})
@@ -136,8 +143,7 @@ def test_tool_run_lint_metadata_fixable():
     result = LintResult(
         ok=False,
         issues=[
-            LintIssue(file="a.py", line=1, col=1, code="F401",
-                      message="unused", fix="Remove unused import"),
+            LintIssue(file="a.py", line=1, col=1, code="F401", message="unused", fix="Remove unused import"),
             LintIssue(file="a.py", line=2, col=1, code="E501", message="long"),
         ],
     )
@@ -145,8 +151,7 @@ def test_tool_run_lint_metadata_fixable():
     assert tr.metadata["issue_count"] == 2
     assert tr.metadata["fixable_count"] == 1
     assert tr.metadata["fixable_issues"] == [
-        {"file": "a.py", "line": 1, "col": 1, "code": "F401",
-         "fix": "Remove unused import"},
+        {"file": "a.py", "line": 1, "col": 1, "code": "F401", "fix": "Remove unused import"},
     ]
 
 
@@ -163,9 +168,7 @@ def test_tool_run_lint_collapses_newlines_in_fix_hint():
     result = LintResult(
         ok=False,
         issues=[
-            LintIssue(file="a.py", line=1, col=1, code="F401",
-                      message="unused",
-                      fix="Remove unused import\n\n  `os`"),
+            LintIssue(file="a.py", line=1, col=1, code="F401", message="unused", fix="Remove unused import\n\n  `os`"),
         ],
     )
     tr = _Handler(result)._tool_run_lint({"path": "a.py"})

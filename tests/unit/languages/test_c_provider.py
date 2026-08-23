@@ -15,6 +15,7 @@ Covers the three contracts that make the gcc/g++ integration safe:
 Mirrors test_isolated_compile_resolution.py. subprocess.run / shutil.which are
 mocked so these tests need no C toolchain installed.
 """
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -38,12 +39,14 @@ def _fake_proc(returncode, stdout):
 
 # ── C: resolution safety ────────────────────────────────────────────────────
 
+
 class TestCResolutionSafety:
     def _validate(self, stdout, returncode=1):
         p = CSyntaxProvider()
-        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"), \
-             patch("external_llm.languages.c_provider.subprocess.run",
-                   return_value=_fake_proc(returncode, stdout)):
+        with (
+            patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"),
+            patch("external_llm.languages.c_provider.subprocess.run", return_value=_fake_proc(returncode, stdout)),
+        ):
             return p.validate_syntax("main.c", "irrelevant — subprocess mocked")
 
     def test_clang_missing_header_phrasing_is_filtered(self):
@@ -90,12 +93,14 @@ class TestCResolutionSafety:
 
 # ── C++: resolution safety ──────────────────────────────────────────────────
 
+
 class TestCppResolutionSafety:
     def _validate(self, stdout, returncode=1):
         p = CppSyntaxProvider()
-        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/g++"), \
-             patch("external_llm.languages.c_provider.subprocess.run",
-                   return_value=_fake_proc(returncode, stdout)):
+        with (
+            patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/g++"),
+            patch("external_llm.languages.c_provider.subprocess.run", return_value=_fake_proc(returncode, stdout)),
+        ):
             return p.validate_syntax("main.cpp", "irrelevant — subprocess mocked")
 
     def test_missing_header_is_filtered(self):
@@ -122,6 +127,7 @@ class TestCppResolutionSafety:
 
 
 # ── Graceful degrade (no compiler on $PATH) ─────────────────────────────────
+
 
 class TestCompilerAbsentDegrade:
     # ── When no compiler is on $PATH, tree-sitter provides a zero-toolchain
@@ -162,6 +168,7 @@ class TestCompilerAbsentDegrade:
     def test_semantics_degrades_when_no_compiler(self):
         import os
         import tempfile
+
         with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
             tf.write("int main(void){return 0;}")
             path = tf.name
@@ -174,6 +181,7 @@ class TestCompilerAbsentDegrade:
 
 
 # ── Resolution classifier phrases (base.py) ─────────────────────────────────
+
 
 class TestCResolutionClassifier:
     def test_c_phrases_cover_both_compilers(self):
@@ -192,8 +200,7 @@ class TestCResolutionClassifier:
 
     def test_filter_drops_only_resolution_errors(self):
         errs = [
-            SyntaxError_(file="f.c", line=1, col=10,
-                         message="fatal error: foo.h: No such file or directory"),
+            SyntaxError_(file="f.c", line=1, col=10, message="fatal error: foo.h: No such file or directory"),
             SyntaxError_(file="f.c", line=5, col=2, message="expected ';' after expression"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.C)
@@ -212,8 +219,7 @@ class TestContextDependentFiltering:
 
     def test_c_implicit_decl_kept_when_no_include_error(self):
         errs = [
-            SyntaxError_(file="f.c", line=3, col=5,
-                         message="warning: implicit declaration of function 'printf'"),
+            SyntaxError_(file="f.c", line=3, col=5, message="warning: implicit declaration of function 'printf'"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.C)
         # "implicit declaration of" is context-dependent; without an include
@@ -224,10 +230,8 @@ class TestContextDependentFiltering:
 
     def test_c_implicit_decl_filtered_when_include_fails(self):
         errs = [
-            SyntaxError_(file="f.c", line=1, col=10,
-                         message="fatal error: stdio.h: No such file or directory"),
-            SyntaxError_(file="f.c", line=3, col=5,
-                         message="warning: implicit declaration of function 'printf'"),
+            SyntaxError_(file="f.c", line=1, col=10, message="fatal error: stdio.h: No such file or directory"),
+            SyntaxError_(file="f.c", line=3, col=5, message="warning: implicit declaration of function 'printf'"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.C)
         # Include failure present → implicit declaration is a cascade, not a typo.
@@ -240,8 +244,7 @@ class TestContextDependentFiltering:
         like ``total += valeu;``.  Without a failed include this is a real error
         that must gate the edit."""
         errs = [
-            SyntaxError_(file="f.cpp", line=5, col=12,
-                         message="'valeu' was not declared in this scope"),
+            SyntaxError_(file="f.cpp", line=5, col=12, message="'valeu' was not declared in this scope"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.CPP)
         assert len(kept) == 1
@@ -251,12 +254,9 @@ class TestContextDependentFiltering:
         """'was not declared in this scope' that cascades from a missing header
         must still be filtered so the valid edit is not rolled back."""
         errs = [
-            SyntaxError_(file="f.cpp", line=1, col=10,
-                         message="fatal error: vector: No such file or directory"),
-            SyntaxError_(file="f.cpp", line=7, col=5,
-                         message="'std' was not declared in this scope"),
-            SyntaxError_(file="f.cpp", line=8, col=5,
-                         message="'vector' has not been declared"),
+            SyntaxError_(file="f.cpp", line=1, col=10, message="fatal error: vector: No such file or directory"),
+            SyntaxError_(file="f.cpp", line=7, col=5, message="'std' was not declared in this scope"),
+            SyntaxError_(file="f.cpp", line=8, col=5, message="'vector' has not been declared"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.CPP)
         assert len(kept) == 0
@@ -265,8 +265,9 @@ class TestContextDependentFiltering:
 
     def test_include_error_always_filtered(self):
         errs = [
-            SyntaxError_(file="f.cpp", line=1, col=10,
-                         message="fatal error: boost/preprocessor.hpp: No such file or directory"),
+            SyntaxError_(
+                file="f.cpp", line=1, col=10, message="fatal error: boost/preprocessor.hpp: No such file or directory"
+            ),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.CPP)
         assert len(kept) == 0
@@ -277,10 +278,8 @@ class TestContextDependentFiltering:
         """A genuine syntax error must gate the edit even when a context-dependent
         typo is also present."""
         errs = [
-            SyntaxError_(file="f.cpp", line=5, col=12,
-                         message="'valeu' was not declared in this scope"),
-            SyntaxError_(file="f.cpp", line=10, col=1,
-                         message="expected ';' after expression"),
+            SyntaxError_(file="f.cpp", line=5, col=12, message="'valeu' was not declared in this scope"),
+            SyntaxError_(file="f.cpp", line=10, col=1, message="expected ';' after expression"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.CPP)
         assert len(kept) == 2  # both are genuine (no include error)
@@ -288,9 +287,11 @@ class TestContextDependentFiltering:
 
 # ── Registry / wiring ───────────────────────────────────────────────────────
 
+
 class TestRegistryWiring:
     def test_c_and_cpp_providers_registered(self):
         from external_llm.languages.registry import LanguageRegistry
+
         r = LanguageRegistry.instance()
         assert r.get("foo.c").__class__.__name__ == "CSyntaxProvider"
         assert r.get("bar.cpp").__class__.__name__ == "CppSyntaxProvider"
@@ -311,18 +312,20 @@ class TestRegistryWiring:
 
     def test_tool_map_lists_c_and_cpp(self):
         from external_llm.languages.dependency_checker import _LANGUAGE_TOOL_MAP
+
         assert [t.cmd for t in _LANGUAGE_TOOL_MAP[LanguageId.C]] == ["gcc"]
         assert [t.cmd for t in _LANGUAGE_TOOL_MAP[LanguageId.CPP]] == ["g++"]
 
 
 # ── Symbol search (tree-sitter / regex fallback) ────────────────────────────
 
+
 class TestSymbolSearch:
     SRC = (
         "#include <stdio.h>\n"
         "static int helper(int x){ return x+1; }\n"
         "struct Point { int x; int y; };\n"
-        "int main(void){ printf(\"%d\", helper(5)); return 0; }\n"
+        'int main(void){ printf("%d", helper(5)); return 0; }\n'
     )
 
     def test_find_function(self):
@@ -349,10 +352,12 @@ class TestSymbolSearch:
 # / ``validate_semantics`` and every ``ok is True`` assertion below turns red,
 # because the primary C compile genuinely fails.
 
+
 class TestHeaderUnionValidation:
     @staticmethod
     def _run_factory():
         """Distinguish C vs C++ compile by the resolved compiler name (cmd[0])."""
+
         def _run(cmd, **kwargs):
             cc = cmd[0]
             if cc in ("gcc", "clang"):
@@ -360,14 +365,16 @@ class TestHeaderUnionValidation:
                 return _fake_proc(1, "t.h:1:1: error: unknown type name 'namespace'\n")
             # g++-CPP accepts valid C++.
             return _fake_proc(0, "")
+
         return _run
 
     def test_h_cpp_header_passes_syntax_union(self):
         """A ``.h`` C++ header must NOT be rolled back (gcc-C fails, g++ ok)."""
         p = CSyntaxProvider()
-        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"), \
-             patch("external_llm.languages.c_provider.subprocess.run",
-                   side_effect=self._run_factory()):
+        with (
+            patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"),
+            patch("external_llm.languages.c_provider.subprocess.run", side_effect=self._run_factory()),
+        ):
             r = p.validate_syntax("types.h", "namespace geo { struct Point { int x; }; }")
         assert r.ok is True
         assert r.language is LanguageId.C
@@ -380,8 +387,10 @@ class TestHeaderUnionValidation:
             # Both gcc and g++ reject "int x = ;".
             return _fake_proc(1, "t.h:1:9: error: expected expression\n")
 
-        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"), \
-             patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run):
+        with (
+            patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"),
+            patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run),
+        ):
             r = p.validate_syntax("types.h", "int x = ;")
         assert r.ok is False
 
@@ -394,8 +403,10 @@ class TestHeaderUnionValidation:
             calls.append(cmd[0])
             return _fake_proc(1, "t.c:1:1: error: unknown type name 'namespace'\n")
 
-        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"), \
-             patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run):
+        with (
+            patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"),
+            patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run),
+        ):
             r = p.validate_syntax("main.c", "namespace geo {}")
         assert r.ok is False
         # No C++ retry for .c — only the C compile ran.
@@ -415,8 +426,10 @@ class TestHeaderUnionValidation:
                 return _fake_proc(1, "types.h:1:1: error: unknown type name 'namespace'\n")
             return _fake_proc(0, "")
 
-        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/g++"), \
-             patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run):
+        with (
+            patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/g++"),
+            patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run),
+        ):
             r = p.validate_semantics(str(h_file))
         assert r.ok is True
         # The C++ retry actually fired.
@@ -428,6 +441,7 @@ class TestHeaderUnionValidation:
 # brace inside them (``char *a = "{";``) corrupted depth and returned the wrong
 # end line. Each case below returns the WRONG line on the pre-fix code.
 
+
 class TestFindBlockEndLiterals:
     @staticmethod
     def _end(src):
@@ -437,9 +451,9 @@ class TestFindBlockEndLiterals:
     def test_unbalanced_brace_in_string(self):
         # ONE extra '{' inside a string literal; body really closes on line 3.
         src = (
-            "void f() {\n"        # line 1: depth 1
+            "void f() {\n"  # line 1: depth 1
             '    char *a = "{";\n'  # line 2: '{' inside string (must be skipped)
-            "}\n"                 # line 3: depth 0 → return 3
+            "}\n"  # line 3: depth 0 → return 3
         )
         # Pre-fix: '{' in string → depth 2, then '}' line 3 → depth 1 ≠ 0 →
         # runs off end → returns fallback line 1.
@@ -447,27 +461,27 @@ class TestFindBlockEndLiterals:
 
     def test_closing_brace_in_block_comment(self):
         src = (
-            "void f() {\n"     # line 1: depth 1
-            "    /* } */\n"    # line 2: '}' inside comment (must be skipped)
-            "}\n"              # line 3: depth 0 → return 3
+            "void f() {\n"  # line 1: depth 1
+            "    /* } */\n"  # line 2: '}' inside comment (must be skipped)
+            "}\n"  # line 3: depth 0 → return 3
         )
         # Pre-fix: '}' in comment → depth 0 → returns 2 (wrong).
         assert self._end(src) == 3
 
     def test_closing_brace_in_char_literal(self):
         src = (
-            "void f() {\n"      # line 1: depth 1
+            "void f() {\n"  # line 1: depth 1
             "    char c = '}';\n"  # line 2: '}' inside char literal
-            "}\n"               # line 3: depth 0 → return 3
+            "}\n"  # line 3: depth 0 → return 3
         )
         # Pre-fix: '}' in char → depth 0 → returns 2 (wrong).
         assert self._end(src) == 3
 
     def test_line_comment_with_brace(self):
         src = (
-            "void f() {\n"   # line 1: depth 1
-            "    // {\n"     # line 2: '{' in line comment
-            "}\n"            # line 3: depth 0 → return 3
+            "void f() {\n"  # line 1: depth 1
+            "    // {\n"  # line 2: '{' in line comment
+            "}\n"  # line 3: depth 0 → return 3
         )
         # Pre-fix: '{' in comment → depth 2; '}' line 3 → depth 1 → fallback 1.
         assert self._end(src) == 3
@@ -475,9 +489,9 @@ class TestFindBlockEndLiterals:
     def test_escaped_quote_in_string(self):
         # Ensure `\"` escape does not terminate the string scan early.
         src = (
-            'void f() {\n'           # line 1: depth 1
+            "void f() {\n"  # line 1: depth 1
             '    char *s = "\\"}";\n'  # line 2: escaped quote, then '}' in string
-            "}\n"                    # line 3: depth 0 → return 3
+            "}\n"  # line 3: depth 0 → return 3
         )
         assert self._end(src) == 3
 
@@ -487,12 +501,13 @@ class TestFindBlockEndLiterals:
 # (b) NOT leak across instances (fresh provider → mock fires). The singleton
 # registry provider keeps the cache across the agent loop.
 
+
 class TestCompilerResolutionCache:
     def test_cache_dedupes_within_instance(self):
         from external_llm.languages.c_provider import _C_COMPILERS
+
         p = CSyntaxProvider()
-        with patch("external_llm.languages.c_provider.shutil.which",
-                   return_value="/usr/bin/gcc") as m:
+        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc") as m:
             r1 = p._resolve_compilers(_C_COMPILERS)
             r2 = p._resolve_compilers(_C_COMPILERS)  # cached hit
             assert m.call_count == 1  # second call served from cache
@@ -501,9 +516,9 @@ class TestCompilerResolutionCache:
     def test_fresh_instance_re_resolves(self):
         """Test isolation: a new instance has an empty cache → mock fires."""
         from external_llm.languages.c_provider import _C_COMPILERS
+
         p2 = CSyntaxProvider()
-        with patch("external_llm.languages.c_provider.shutil.which",
-                   return_value=None) as m:
+        with patch("external_llm.languages.c_provider.shutil.which", return_value=None) as m:
             r = p2._resolve_compilers(_C_COMPILERS)
             # gcc→None then clang→None: both candidates probed (2 which() calls),
             # proving the fresh instance did NOT inherit a cached value.
@@ -513,13 +528,14 @@ class TestCompilerResolutionCache:
     def test_cache_keyed_by_candidates(self):
         """C and C++ candidate tuples are independent cache keys."""
         from external_llm.languages.c_provider import _C_COMPILERS, _CPP_COMPILERS
+
         p = CSyntaxProvider()
-        with patch("external_llm.languages.c_provider.shutil.which",
-                   return_value="/usr/bin/x"):
+        with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/x"):
             c_res = p._resolve_compilers(_C_COMPILERS)
             cpp_res = p._resolve_compilers(_CPP_COMPILERS)
         assert c_res == "gcc"
         assert cpp_res == "g++"
+
     # ── Path normalization: same-basename sibling safety ─────────────────────────
     # Regression: the sibling-TU diagnostic filter and the compile_commands.json
     # matcher compared basenames. (1) a sibling TU with the SAME basename in another
@@ -541,7 +557,6 @@ class TestCompilerResolutionCache:
             assert not _same_path("", "/a", "/a/b/util.c")
             assert not _same_path("util.c", "/a/b", "")
 
-
     class TestKeepOnlyTargetDiagnostics:
         @staticmethod
         def _err(file, message):
@@ -562,7 +577,6 @@ class TestCompilerResolutionCache:
             errors = [self._err("util.c", "a"), self._err("./util.c", "b")]
             kept = _keep_only_target_diagnostics(errors, target, "/proj/src")
             assert len(kept) == 2
-
 
     class TestMatchCompileCommandsEntry:
         def test_exact_path_wins_over_same_basename(self):
@@ -586,7 +600,6 @@ class TestCompilerResolutionCache:
             entries = [{"file": "/a/other.c", "directory": "/a", "arguments": []}]
             assert _match_compile_commands_entry(entries, "/proj/src/util.c") is None
 
-
     class TestSemanticsSiblingFiltering:
         def test_sibling_same_basename_error_does_not_fail_target(self, tmp_path):
             """A same-basename sibling TU error must not roll back the target file."""
@@ -595,13 +608,18 @@ class TestCompilerResolutionCache:
             p = CSyntaxProvider()
 
             def _run(cmd, **kwargs):
-                return _fake_proc(1, (
-                    "other/util.c:4:5: error: use of undeclared identifier 'x'\n"
-                    "util.c:2:7: error: expected ';' after expression\n"
-                ))
+                return _fake_proc(
+                    1,
+                    (
+                        "other/util.c:4:5: error: use of undeclared identifier 'x'\n"
+                        "util.c:2:7: error: expected ';' after expression\n"
+                    ),
+                )
 
-            with patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"), \
-                 patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run):
+            with (
+                patch("external_llm.languages.c_provider.shutil.which", return_value="/usr/bin/gcc"),
+                patch("external_llm.languages.c_provider.subprocess.run", side_effect=_run),
+            ):
                 r = p.validate_semantics(str(f))
             assert r.ok is False
             assert len(r.errors) == 1

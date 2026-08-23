@@ -14,23 +14,14 @@ def test_normalize_failure_class_none():
     assert normalize_failure_class(None) == FailureClass.UNKNOWN
 
 
-
-
-
 def test_normalize_failure_class_empty():
 
     assert normalize_failure_class("") == FailureClass.UNKNOWN
 
 
-
-
-
 def test_normalize_failure_class_exact():
 
     assert normalize_failure_class("syntax_error") == FailureClass.SYNTAX_ERROR
-
-
-
 
 
 def test_normalize_failure_class_unknown():

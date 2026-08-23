@@ -15,12 +15,13 @@ Two-layer architecture:
 Both layers share the same tree-sitter parsing infrastructure.
 Reuses `tree_sitter_utils.is_available()` — no new parser introduced.
 """
+
 from __future__ import annotations
 
 import hashlib
 import logging
 import threading as _threading
-from typing import Any, Optional  # f821-protected
+from typing import Any  # f821-protected
 
 from external_llm.editor.semantic.ts_ir_models import (
     ExportKind,
@@ -79,6 +80,7 @@ def _build_tsx_parser():
     """
     try:
         from external_llm.languages import tree_sitter_utils as _tsu
+
         return _tsu.get_parser("tsx")
     except Exception as e:
         logger.debug("TSX parser not available: %s", e)
@@ -93,6 +95,7 @@ def _build_jsx_parser():
     """
     try:
         from external_llm.languages import tree_sitter_utils as _tsu
+
         return _tsu.get_parser("javascript")
     except Exception as e:
         logger.debug("JSX parser not available: %s", e)
@@ -173,7 +176,7 @@ class TSSemanticTracer:
         raw = f"{self._file_path}:{node.start_byte}:{node.end_byte}"
         return hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()[:12]
 
-    def _make_meta(self, node, parent_id: Optional[str] = None) -> IRNodeMeta:
+    def _make_meta(self, node, parent_id: str | None = None) -> IRNodeMeta:
         """Build IRNodeMeta from a tree-sitter node."""
         return IRNodeMeta(
             node_id=self._make_node_id(node),
@@ -218,14 +221,14 @@ class TSSemanticTracer:
 
         # Unwrap export
         is_exported = False
-        export_kind: Optional[ExportKind] = None
+        export_kind: ExportKind | None = None
         inner = node
         if ntype == "export_statement":
             is_exported = True
             has_default = any(
-                self._text(c) == "default" for c in node.children
-                if c.type in ("default", "identifier")
-                or self._text(c) == "default"
+                self._text(c) == "default"
+                for c in node.children
+                if c.type in ("default", "identifier") or self._text(c) == "default"
             )
             export_kind = ExportKind.DEFAULT if has_default else ExportKind.NAMED
 
@@ -233,9 +236,12 @@ class TSSemanticTracer:
             found_inner = False
             for child in node.children:
                 if child.type in (
-                    "function_declaration", "class_declaration",
-                    "lexical_declaration", "interface_declaration",
-                    "type_alias_declaration", "enum_declaration",
+                    "function_declaration",
+                    "class_declaration",
+                    "lexical_declaration",
+                    "interface_declaration",
+                    "type_alias_declaration",
+                    "enum_declaration",
                 ):
                     inner = child
                     found_inner = True
@@ -249,12 +255,10 @@ class TSSemanticTracer:
         ntype = inner.type
 
         if ntype == "function_declaration":
-            func = self._core_parse_function(
-                inner, module, is_exported, export_kind)
+            func = self._core_parse_function(inner, module, is_exported, export_kind)
             module.functions.append(func)
             if is_exported:
-                module.exports.append(IRExport(
-                    name=func.name, kind=export_kind or ExportKind.NAMED))
+                module.exports.append(IRExport(name=func.name, kind=export_kind or ExportKind.NAMED))
             # Collect calls + usages + assignments inside this function
             self._core_collect_calls(inner, func.name, module)
             self._core_collect_usages(inner, func.name, module)
@@ -264,12 +268,10 @@ class TSSemanticTracer:
             self._core_process_lexical(inner, module, is_exported, export_kind)
 
         elif ntype == "class_declaration":
-            cls = self._core_parse_class(
-                inner, module, is_exported, export_kind)
+            cls = self._core_parse_class(inner, module, is_exported, export_kind)
             module.classes.append(cls)
             if is_exported:
-                module.exports.append(IRExport(
-                    name=cls.name, kind=export_kind or ExportKind.NAMED))
+                module.exports.append(IRExport(name=cls.name, kind=export_kind or ExportKind.NAMED))
 
         elif ntype == "interface_declaration":
             iface = self._core_parse_interface(inner, module, is_exported)
@@ -295,15 +297,15 @@ class TSSemanticTracer:
 
     # ── core: import ─────────────────────────────────────────────────────
 
-    def _core_parse_import(self, node) -> Optional[IRImport]:
+    def _core_parse_import(self, node) -> IRImport | None:
         source_node = node.child_by_field_name("source")
         if not source_node:
             return None  # pragma: no cover — import_statement always carries a source; errors parse as ERROR
 
         source = self._text(source_node).strip("'\"")
         specifiers: list[str] = []
-        default_name: Optional[str] = None
-        namespace_name: Optional[str] = None
+        default_name: str | None = None
+        namespace_name: str | None = None
         is_type_only = False
 
         for child in node.children:
@@ -327,8 +329,11 @@ class TSSemanticTracer:
                                 namespace_name = self._text(ns_child)
 
         return IRImport(
-            source=source, specifiers=specifiers, default_name=default_name,
-            namespace_name=namespace_name, is_type_only=is_type_only,
+            source=source,
+            specifiers=specifiers,
+            default_name=default_name,
+            namespace_name=namespace_name,
+            is_type_only=is_type_only,
             meta=self._make_meta(node),
         )
 
@@ -346,19 +351,20 @@ class TSSemanticTracer:
                             name = self._text(name_node)
                             if alias_node:
                                 name = self._text(alias_node)
-                            module.exports.append(IRExport(
-                                name=name, kind=ExportKind.NAMED))
+                            module.exports.append(IRExport(name=name, kind=ExportKind.NAMED))
             elif child.type == "identifier":
                 text = self._text(child)
                 if text != "default":
-                    module.exports.append(IRExport(
-                        name=text, kind=ExportKind.DEFAULT))
+                    module.exports.append(IRExport(name=text, kind=ExportKind.DEFAULT))
 
     # ── core: function ───────────────────────────────────────────────────
 
     def _core_parse_function(
-        self, node, module: TSModule,
-        is_exported: bool, export_kind: Optional[ExportKind],
+        self,
+        node,
+        module: TSModule,
+        is_exported: bool,
+        export_kind: ExportKind | None,
         scope: str = "<module>",
     ) -> IRFunction:
         name = self._node_field_text(node, "name") or "anonymous"
@@ -367,27 +373,31 @@ class TSSemanticTracer:
         meta = self._make_meta(node)
 
         func = IRFunction(
-            name=name, params=params, is_async=is_async,
-            is_exported=is_exported, export_kind=export_kind,
+            name=name,
+            params=params,
+            is_async=is_async,
+            is_exported=is_exported,
+            export_kind=export_kind,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
             meta=meta,
         )
 
         # P2.5: register symbol + param symbols
-        module.symbols.append(IRSymbol(
-            name=name, kind=SymbolKind.FUNCTION, scope=scope, meta=meta))
+        module.symbols.append(IRSymbol(name=name, kind=SymbolKind.FUNCTION, scope=scope, meta=meta))
         for p in params:
-            module.symbols.append(IRSymbol(
-                name=p.name, kind=SymbolKind.PARAM, scope=name))
+            module.symbols.append(IRSymbol(name=p.name, kind=SymbolKind.PARAM, scope=name))
 
         return func
 
     # ── core: lexical declaration ────────────────────────────────────────
 
     def _core_process_lexical(
-        self, node, module: TSModule,
-        is_exported: bool, export_kind: Optional[ExportKind],
+        self,
+        node,
+        module: TSModule,
+        is_exported: bool,
+        export_kind: ExportKind | None,
         scope: str = "<module>",
     ) -> None:
         decl_kind = "const"
@@ -411,24 +421,31 @@ class TSSemanticTracer:
                     if elem.type == "identifier":
                         elem_name = self._text(elem)
                         meta = self._make_meta(elem)
-                        module.variables.append(IRVariable(
-                            name=elem_name, decl_kind=decl_kind,
-                            start_line=node.start_point.row + 1,
-                            end_line=node.end_point.row + 1,
-                            meta=meta,
-                        ))
-                        module.symbols.append(IRSymbol(
-                            name=elem_name, kind=SymbolKind.VARIABLE,
-                            scope=scope, meta=meta))
+                        module.variables.append(
+                            IRVariable(
+                                name=elem_name,
+                                decl_kind=decl_kind,
+                                start_line=node.start_point.row + 1,
+                                end_line=node.end_point.row + 1,
+                                meta=meta,
+                            )
+                        )
+                        module.symbols.append(
+                            IRSymbol(name=elem_name, kind=SymbolKind.VARIABLE, scope=scope, meta=meta)
+                        )
                 # Assignment for destructuring
                 if value_node:
                     source = self._core_callee_name(value_node) if value_node.type == "call_expression" else None
                     source_type = self._classify_initializer(value_node)
-                    module.assignments.append(IRAssignment(
-                        target="[destructured]", source=source,
-                        source_type=source_type, scope=scope,
-                        meta=self._make_meta(child),
-                    ))
+                    module.assignments.append(
+                        IRAssignment(
+                            target="[destructured]",
+                            source=source,
+                            source_type=source_type,
+                            scope=scope,
+                            meta=self._make_meta(child),
+                        )
+                    )
                 continue
 
             name = self._text(name_node)
@@ -436,8 +453,7 @@ class TSSemanticTracer:
 
             # Arrow / function expression → treat as function
             if value_node and value_node.type in _FUNC_LIKE:
-                func = self._core_parse_function(
-                    value_node, module, is_exported, export_kind, scope)
+                func = self._core_parse_function(value_node, module, is_exported, export_kind, scope)
                 # Override name (arrow functions use variable name)
                 func.name = name
                 func.start_line = node.start_point.row + 1
@@ -451,28 +467,28 @@ class TSSemanticTracer:
                         continue
                 module.functions.append(func)
                 if is_exported:
-                    module.exports.append(IRExport(
-                        name=name, kind=export_kind or ExportKind.NAMED))
+                    module.exports.append(IRExport(name=name, kind=export_kind or ExportKind.NAMED))
                 self._core_collect_calls(value_node, name, module)
                 self._core_collect_usages(value_node, name, module)
                 self._core_collect_assignments(value_node, name, module)
             else:
                 # Regular variable
                 init_type = None
-                source: Optional[str] = None
+                source: str | None = None
                 if value_node:
                     init_type = self._classify_initializer(value_node)
-                module.variables.append(IRVariable(
-                    name=name, decl_kind=decl_kind,
-                    initializer_type=init_type,
-                    start_line=node.start_point.row + 1,
-                    end_line=node.end_point.row + 1,
-                    meta=node_meta,
-                ))
+                module.variables.append(
+                    IRVariable(
+                        name=name,
+                        decl_kind=decl_kind,
+                        initializer_type=init_type,
+                        start_line=node.start_point.row + 1,
+                        end_line=node.end_point.row + 1,
+                        meta=node_meta,
+                    )
+                )
                 # P2.5: symbol
-                module.symbols.append(IRSymbol(
-                    name=name, kind=SymbolKind.VARIABLE,
-                    scope=scope, meta=node_meta))
+                module.symbols.append(IRSymbol(name=name, kind=SymbolKind.VARIABLE, scope=scope, meta=node_meta))
                 # P2.5: assignment
                 if value_node:
                     if value_node.type == "call_expression":
@@ -484,25 +500,31 @@ class TSSemanticTracer:
                             if vc.type == "identifier":
                                 source = self._text(vc)
                                 break
-                    module.assignments.append(IRAssignment(
-                        target=name, source=source,
-                        source_type=init_type, scope=scope,
-                        meta=self._make_meta(child),
-                    ))
+                    module.assignments.append(
+                        IRAssignment(
+                            target=name,
+                            source=source,
+                            source_type=init_type,
+                            scope=scope,
+                            meta=self._make_meta(child),
+                        )
+                    )
                 if is_exported:
-                    module.exports.append(IRExport(
-                        name=name, kind=export_kind or ExportKind.NAMED))
+                    module.exports.append(IRExport(name=name, kind=export_kind or ExportKind.NAMED))
                 # Top-level call in initializer
                 if value_node and value_node.type == "call_expression":
                     callee = self._core_callee_name(value_node)
                     if callee:
-                        module.call_sites.append(IRCallSite(
-                            caller=scope, callee=callee,
-                            line=value_node.start_point.row + 1,
-                            meta=self._make_meta(value_node),
-                        ))
+                        module.call_sites.append(
+                            IRCallSite(
+                                caller=scope,
+                                callee=callee,
+                                line=value_node.start_point.row + 1,
+                                meta=self._make_meta(value_node),
+                            )
+                        )
 
-    def _classify_initializer(self, node) -> Optional[str]:
+    def _classify_initializer(self, node) -> str | None:
         t = node.type
         if t == "call_expression":
             return "call"
@@ -525,14 +547,17 @@ class TSSemanticTracer:
     # ── core: class ──────────────────────────────────────────────────────
 
     def _core_parse_class(
-        self, node, module: TSModule,
-        is_exported: bool, export_kind: Optional[ExportKind],
+        self,
+        node,
+        module: TSModule,
+        is_exported: bool,
+        export_kind: ExportKind | None,
     ) -> IRClass:
         name = self._node_field_text(node, "name") or "anonymous"
-        extends: Optional[str] = None
+        extends: str | None = None
         implements: list[str] = []
         methods: list[IRMethod] = []
-        properties: list[str] = []
+        properties: list[IRClassProperty] = []
         meta = self._make_meta(node)
 
         # Heritage
@@ -544,11 +569,14 @@ class TSSemanticTracer:
                             if ec.type in ("identifier", "member_expression"):
                                 extends = self._text(ec)
                     elif hc.type == "implements_clause":
-                        implements.extend(self._text(ic) for ic in hc.children if ic.type in ("identifier", "generic_type", "type_identifier"))
+                        implements.extend(
+                            self._text(ic)
+                            for ic in hc.children
+                            if ic.type in ("identifier", "generic_type", "type_identifier")
+                        )
 
         # P2.5: class symbol
-        module.symbols.append(IRSymbol(
-            name=name, kind=SymbolKind.CLASS, scope="<module>", meta=meta))
+        module.symbols.append(IRSymbol(name=name, kind=SymbolKind.CLASS, scope="<module>", meta=meta))
 
         # Body
         body = node.child_by_field_name("body")
@@ -558,27 +586,39 @@ class TSSemanticTracer:
                     m = self._core_parse_method(member, module, name)
                     methods.append(m)
                 elif member.type in (
-                    "public_field_definition", "property_definition",
+                    "public_field_definition",
+                    "property_definition",
                     "field_definition",
                 ):
                     pname = self._node_field_text(member, "name")
                     if pname:
                         from external_llm.editor.semantic.ts_ir_models import IRClassProperty
-                        properties.append(IRClassProperty(
-                            name=pname, meta=self._make_meta(member),
-                        ))
+
+                        properties.append(
+                            IRClassProperty(
+                                name=pname,
+                                meta=self._make_meta(member),
+                            )
+                        )
 
         return IRClass(
-            name=name, methods=methods, properties=properties,
-            extends=extends, implements=implements,
-            is_exported=is_exported, export_kind=export_kind,
+            name=name,
+            methods=methods,
+            properties=properties,
+            extends=extends,
+            implements=implements,
+            is_exported=is_exported,
+            export_kind=export_kind,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
             meta=meta,
         )
 
     def _core_parse_method(
-        self, node, module: TSModule, class_name: str,
+        self,
+        node,
+        module: TSModule,
+        class_name: str,
     ) -> IRMethod:
         name = self._node_field_text(node, "name") or "anonymous"
         params = self._core_extract_params(node)
@@ -603,12 +643,15 @@ class TSSemanticTracer:
                     calls.append(callee)
 
         # P2.5: method symbol
-        module.symbols.append(IRSymbol(
-            name=name, kind=SymbolKind.METHOD, scope=class_name, meta=meta))
+        module.symbols.append(IRSymbol(name=name, kind=SymbolKind.METHOD, scope=class_name, meta=meta))
 
         return IRMethod(
-            name=name, params=params, is_async=is_async,
-            is_static=is_static, is_getter=is_getter, is_setter=is_setter,
+            name=name,
+            params=params,
+            is_async=is_async,
+            is_static=is_static,
+            is_getter=is_getter,
+            is_setter=is_setter,
             calls=calls,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
@@ -618,17 +661,24 @@ class TSSemanticTracer:
     # ── core: interface ──────────────────────────────────────────────────
 
     def _core_parse_interface(
-        self, node, module: TSModule, is_exported: bool,
+        self,
+        node,
+        module: TSModule,
+        is_exported: bool,
     ) -> IRInterface:
         name = self._node_field_text(node, "name") or "anonymous"
-        properties: list[str] = []
+        properties: list[IRClassProperty] = []
         methods: list[str] = []
         extends: list[str] = []
         meta = self._make_meta(node)
 
         for child in node.children:
             if child.type == "extends_type_clause":
-                extends.extend(self._text(ec) for ec in child.children if ec.type in ("identifier", "generic_type", "type_identifier"))
+                extends.extend(
+                    self._text(ec)
+                    for ec in child.children
+                    if ec.type in ("identifier", "generic_type", "type_identifier")
+                )
 
         body = node.child_by_field_name("body")
         if body:
@@ -637,20 +687,26 @@ class TSSemanticTracer:
                     pname = self._node_field_text(member, "name")
                     if pname:
                         from external_llm.editor.semantic.ts_ir_models import IRClassProperty
-                        properties.append(IRClassProperty(
-                            name=pname, meta=self._make_meta(member),
-                        ))
+
+                        properties.append(
+                            IRClassProperty(
+                                name=pname,
+                                meta=self._make_meta(member),
+                            )
+                        )
                 elif member.type == "method_signature":
                     mname = self._node_field_text(member, "name")
                     if mname:
                         methods.append(mname)
 
-        module.symbols.append(IRSymbol(
-            name=name, kind=SymbolKind.INTERFACE, scope="<module>", meta=meta))
+        module.symbols.append(IRSymbol(name=name, kind=SymbolKind.INTERFACE, scope="<module>", meta=meta))
 
         return IRInterface(
-            name=name, properties=properties, methods=methods,
-            extends=extends, is_exported=is_exported,
+            name=name,
+            properties=properties,
+            methods=methods,
+            extends=extends,
+            is_exported=is_exported,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
             meta=meta,
@@ -659,15 +715,17 @@ class TSSemanticTracer:
     # ── core: type alias ─────────────────────────────────────────────────
 
     def _core_parse_type_alias(
-        self, node, module: TSModule, is_exported: bool,
+        self,
+        node,
+        module: TSModule,
+        is_exported: bool,
     ) -> IRTypeAlias:
         name = self._node_field_text(node, "name") or "anonymous"
         meta = self._make_meta(node)
-        module.symbols.append(IRSymbol(
-            name=name, kind=SymbolKind.TYPE_ALIAS, scope="<module>",
-            meta=meta))
+        module.symbols.append(IRSymbol(name=name, kind=SymbolKind.TYPE_ALIAS, scope="<module>", meta=meta))
         return IRTypeAlias(
-            name=name, is_exported=is_exported,
+            name=name,
+            is_exported=is_exported,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
             meta=meta,
@@ -676,18 +734,26 @@ class TSSemanticTracer:
     # ── core: enum ───────────────────────────────────────────────────────
 
     def _core_parse_enum(
-        self, node, module: TSModule, is_exported: bool,
+        self,
+        node,
+        module: TSModule,
+        is_exported: bool,
     ) -> IREnum:
         name = self._node_field_text(node, "name") or "anonymous"
         meta = self._make_meta(node)
         members: list[str] = []
         body = node.child_by_field_name("body")
         if body:
-            members.extend(self._text(child).split("=")[0].strip() for child in body.children if child.type in ("enum_assignment", "property_identifier"))
-        module.symbols.append(IRSymbol(
-            name=name, kind=SymbolKind.ENUM, scope="<module>", meta=meta))
+            members.extend(
+                self._text(child).split("=")[0].strip()
+                for child in body.children
+                if child.type in ("enum_assignment", "property_identifier")
+            )
+        module.symbols.append(IRSymbol(name=name, kind=SymbolKind.ENUM, scope="<module>", meta=meta))
         return IREnum(
-            name=name, members=members, is_exported=is_exported,
+            name=name,
+            members=members,
+            is_exported=is_exported,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
             meta=meta,
@@ -696,7 +762,10 @@ class TSSemanticTracer:
     # ── core: call graph ─────────────────────────────────────────────────
 
     def _core_collect_calls(
-        self, node, caller: str, module: TSModule,
+        self,
+        node,
+        caller: str,
+        module: TSModule,
     ) -> None:
         """Walk a subtree and record all call_expression nodes."""
         for desc in self._walk(node):
@@ -706,9 +775,9 @@ class TSSemanticTracer:
             if not func_node:
                 continue  # pragma: no cover — call_expression always has a function field
 
-            callee: Optional[str] = None
+            callee: str | None = None
             is_method = False
-            receiver: Optional[str] = None
+            receiver: str | None = None
 
             if func_node.type == "identifier":
                 callee = self._text(func_node)
@@ -721,17 +790,24 @@ class TSSemanticTracer:
                     is_method = True
 
             if callee:
-                module.call_sites.append(IRCallSite(
-                    caller=caller, callee=callee,
-                    is_method_call=is_method, receiver=receiver,
-                    line=desc.start_point.row + 1,
-                    meta=self._make_meta(desc),
-                ))
+                module.call_sites.append(
+                    IRCallSite(
+                        caller=caller,
+                        callee=callee,
+                        is_method_call=is_method,
+                        receiver=receiver,
+                        line=desc.start_point.row + 1,
+                        meta=self._make_meta(desc),
+                    )
+                )
 
     # ── P2.5: usage graph ────────────────────────────────────────────────
 
     def _core_collect_usages(
-        self, node, scope: str, module: TSModule,
+        self,
+        node,
+        scope: str,
+        module: TSModule,
     ) -> None:
         """Walk a subtree and record identifier references as usages."""
         for desc in self._walk(node):
@@ -744,8 +820,10 @@ class TSSemanticTracer:
             parent_type = parent.type
             # Skip if this identifier IS the declaration name
             if parent_type in (
-                "function_declaration", "class_declaration",
-                "interface_declaration", "type_alias_declaration",
+                "function_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "type_alias_declaration",
                 "enum_declaration",
             ):
                 name_node = parent.child_by_field_name("name")
@@ -758,7 +836,8 @@ class TSSemanticTracer:
                     continue
             # Skip formal parameter names
             if parent_type in (
-                "formal_parameters", "required_parameter",
+                "formal_parameters",
+                "required_parameter",
                 "optional_parameter",
             ):
                 continue
@@ -772,15 +851,21 @@ class TSSemanticTracer:
                     continue  # pragma: no cover — member properties are property_identifier, filtered at L738
 
             name = self._text(desc)
-            module.usages.append(IRUsage(
-                symbol=name, scope=scope,
-                meta=self._make_meta(desc),
-            ))
+            module.usages.append(
+                IRUsage(
+                    symbol=name,
+                    scope=scope,
+                    meta=self._make_meta(desc),
+                )
+            )
 
     # ── P2.5: assignment tracking ────────────────────────────────────────
 
     def _core_collect_assignments(
-        self, node, scope: str, module: TSModule,
+        self,
+        node,
+        scope: str,
+        module: TSModule,
     ) -> None:
         """Walk a subtree and record variable assignments."""
         for desc in self._walk(node):
@@ -795,7 +880,7 @@ class TSSemanticTracer:
                 continue
 
             target = self._text(name_node)
-            source: Optional[str] = None
+            source: str | None = None
             source_type = self._classify_initializer(value_node)
 
             if value_node.type == "call_expression":
@@ -813,13 +898,17 @@ class TSSemanticTracer:
                         source = self._core_callee_name(vc)
                         break
 
-            module.assignments.append(IRAssignment(
-                target=target, source=source,
-                source_type=source_type, scope=scope,
-                meta=self._make_meta(desc),
-            ))
+            module.assignments.append(
+                IRAssignment(
+                    target=target,
+                    source=source,
+                    source_type=source_type,
+                    scope=scope,
+                    meta=self._make_meta(desc),
+                )
+            )
 
-    def _core_callee_name(self, call_node) -> Optional[str]:
+    def _core_callee_name(self, call_node) -> str | None:
         """Extract callee name from a call_expression (simple or member)."""
         func_node = call_node.child_by_field_name("function")
         if not func_node:
@@ -848,14 +937,13 @@ class TSSemanticTracer:
                 # Clean up type annotation from name
                 if ":" in name:
                     name = name.split(":")[0].strip()  # pragma: no cover — pattern field excludes the type annotation
-                is_rest = any(
-                    c.type == "..." for c in child.children)
+                is_rest = any(c.type == "..." for c in child.children)
                 has_default = child.child_by_field_name("value") is not None
-                params.append(TSParam(
-                    name=name, has_default=has_default, is_rest=is_rest))
+                params.append(TSParam(name=name, has_default=has_default, is_rest=is_rest))
             elif child.type == "rest_pattern":
-                params.extend(TSParam(
-                            name=self._text(rc), is_rest=True) for rc in child.children if rc.type == "identifier")
+                params.extend(
+                    TSParam(name=self._text(rc), is_rest=True) for rc in child.children if rc.type == "identifier"
+                )
             elif child.type == "object_pattern":
                 params.append(TSParam(name="{...}"))
             elif child.type == "array_pattern":
@@ -867,9 +955,9 @@ class TSSemanticTracer:
     # ══════════════════════════════════════════════════════════════════════
 
     def _text(self, node) -> str:
-        return self._code_bytes[node.start_byte: node.end_byte].decode("utf-8")
+        return self._code_bytes[node.start_byte : node.end_byte].decode("utf-8")
 
-    def _node_field_text(self, node, field: str) -> Optional[str]:
+    def _node_field_text(self, node, field: str) -> str | None:
         child = node.child_by_field_name(field)
         return self._text(child) if child else None
 

@@ -22,7 +22,7 @@ import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .agent.context_manager import SessionCompressionContext
 from .common.file_lock import cross_process_flock
@@ -139,7 +139,7 @@ class DesignSessionManager:
         self._cache[session_id] = session
         return session
 
-    def _load_raw(self, session_id: str) -> Optional[DesignSession]:
+    def _load_raw(self, session_id: str) -> DesignSession | None:
         """Load session directly from disk (no cache). Returns None if missing or corrupt."""
         path = self._session_path(session_id)
         if not path.exists():
@@ -196,7 +196,7 @@ class DesignSessionManager:
         # (get_or_create created it, no add_turn yet) has no disk file, the
         # suppressed stat failure left mtime unbound, and every subsequent
         # cache hit crashed with UnboundLocalError on the comparison below.
-        mtime: Optional[float] = None
+        mtime: float | None = None
         with suppress(OSError):
             mtime = path.stat().st_mtime
         if mtime is None or mtime == self._mtimes.get(session.session_id):
@@ -261,7 +261,7 @@ class DesignSessionManager:
         digest: str = "",
         exclude_from_compression: bool = False,
         in_progress: bool = False,
-        tool_results: Optional[list] = None,
+        tool_results: list | None = None,
         auto: bool = False,
     ) -> None:
         """Add a turn to the session.
@@ -382,7 +382,7 @@ class DesignSessionManager:
     _IN_PROGRESS_MAX_AGE = 3600  # 1 hour
 
     @staticmethod
-    def _owner_pid(owner: str) -> Optional[int]:
+    def _owner_pid(owner: str) -> int | None:
         """Extract PID from owner string ("pid:1234"). Non-standard owner returns None."""
         if isinstance(owner, str) and owner.startswith("pid:"):
             with suppress(ValueError):
@@ -687,10 +687,10 @@ class DesignSessionManager:
         out: list[str] = []
         block: list[dict] = []
         block_bytes = 0
-        _BLOCK_MAX_BYTES = 64 * 1024  # at most 64 KiB of originals per summary
+        _block_max_bytes = 64 * 1024  # at most 64 KiB of originals per summary
         for rec, raw in records:
             raw_bytes = len(raw) + 1
-            if folded < budget and block_bytes + raw_bytes <= _BLOCK_MAX_BYTES:
+            if folded < budget and block_bytes + raw_bytes <= _block_max_bytes:
                 block.append(rec)
                 block_bytes += raw_bytes
                 folded += raw_bytes

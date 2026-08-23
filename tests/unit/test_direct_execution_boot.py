@@ -28,6 +28,7 @@ The guard invocation ``--prompt-stdin`` with empty stdin reaches
 import, then exits 1 at the "empty input from stdin" check — *before*
 ``run_repl`` / ``run_once`` boot vector/tree-sitter, so it completes in ~150ms.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -85,14 +86,17 @@ class TestDirectExecutionBoot:
         the sys.modules guard is a no-op when ``__name__ == "asi"`` (not
         ``"__main__"``), and the barrel-bound public names are callable."""
         proc = subprocess.run(
-            [sys.executable, "-c",
-             "import asi; "
-             "assert asi.__name__ == 'asi', asi.__name__; "
-             "assert callable(asi.main); "
-             "assert callable(asi.run_repl); "
-             "assert callable(asi.run_once); "
-             "assert callable(asi._resolve_repo_root); "
-             "print('OK')"],
+            [
+                sys.executable,
+                "-c",
+                "import asi; "
+                "assert asi.__name__ == 'asi', asi.__name__; "
+                "assert callable(asi.main); "
+                "assert callable(asi.run_repl); "
+                "assert callable(asi.run_once); "
+                "assert callable(asi._resolve_repo_root); "
+                "print('OK')",
+            ],
             cwd=str(REPO),
             capture_output=True,
             text=True,

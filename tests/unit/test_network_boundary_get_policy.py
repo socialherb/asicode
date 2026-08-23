@@ -16,6 +16,7 @@ Policy (structural, no keyword matching of the vulnerable code):
   ``""``). Use ``(x.get(K) or {})`` instead, which covers both key
   absence and explicit null.
 """
+
 from __future__ import annotations
 
 import ast
@@ -36,11 +37,7 @@ def _imports_network_library(tree: ast.Module) -> bool:
 
 
 def _receiver_is_unsafe_inner_get(recv: ast.AST) -> bool:
-    if not (
-        isinstance(recv, ast.Call)
-        and isinstance(recv.func, ast.Attribute)
-        and recv.func.attr == "get"
-    ):
+    if not (isinstance(recv, ast.Call) and isinstance(recv.func, ast.Attribute) and recv.func.attr == "get"):
         return False
     for arg in recv.args[1:]:  # defaults only — args[0] is the key
         if isinstance(arg, (ast.Dict, ast.List, ast.Set)):

@@ -5,11 +5,11 @@ could use these without pulling in the whole editor/ subtree. That editor path
 went with the PLANNER lane, so this is now the sole definition rather than the
 shared half of a pair.
 """
+
 from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 from external_llm.common.indent_utils import reindent_to_anchor
 
@@ -33,12 +33,12 @@ def _match_anchor(pattern: str, line: str) -> bool:
 
 
 def _find_anchor_line(
-    lines: "list[str]",
+    lines: list[str],
     pattern: str,
     occurrence: int = -1,
-    ctx_before: "Optional[str]" = None,
-    ctx_after: "Optional[str]" = None,
-) -> "Optional[int]":
+    ctx_before: str | None = None,
+    ctx_after: str | None = None,
+) -> int | None:
     """Find 0-indexed line matching *pattern* with occurrence semantics.
 
     occurrence > 0 → nth occurrence (1-indexed)
@@ -69,7 +69,8 @@ def _find_anchor_line(
                     "[ANCHOR_NON_UNIQUE] pattern %r matched %d times "
                     "(occurrence=-1→last match). Specify anchor_occurrence, "
                     "ctx_before, or ctx_after for deterministic resolution.",
-                    pattern, _count,
+                    pattern,
+                    _count,
                 )
         elif _count == occurrence:
             return _i
@@ -79,7 +80,10 @@ def _find_anchor_line(
             "[ANCHOR_OCCURRENCE_FALLBACK] pattern %r: requested occurrence=%d "
             "but only %d match(es) found — falling back to last match "
             "(line %d, 0-indexed).",
-            pattern[:120], occurrence, _count, _last_match,
+            pattern[:120],
+            occurrence,
+            _count,
+            _last_match,
         )
         return _last_match
     if occurrence == -1 and _last_match is not None:
@@ -88,12 +92,12 @@ def _find_anchor_line(
 
 
 def resolve_multiline_anchor(
-    lines: "list[str]",
+    lines: list[str],
     pattern: str,
     occurrence: int = -1,
-    ctx_before: "Optional[str]" = None,
-    ctx_after: "Optional[str]" = None,
-) -> "dict":
+    ctx_before: str | None = None,
+    ctx_after: str | None = None,
+) -> dict:
     """Resolve a ``\\n``-containing anchor_pattern to an inclusive line range.
 
     Enables ``insert_before`` / ``insert_after`` / ``replace_line`` to accept a
@@ -132,8 +136,11 @@ def resolve_multiline_anchor(
     _count = len(_pat_lines)
 
     _anchor = _find_anchor_line(
-        lines, _search_pat, occurrence,
-        ctx_before=ctx_before, ctx_after=ctx_after,
+        lines,
+        _search_pat,
+        occurrence,
+        ctx_before=ctx_before,
+        ctx_after=ctx_after,
     )
     if _anchor is None:
         return {
@@ -205,20 +212,23 @@ def resolve_multiline_anchor(
 
     _end = min(_anchor + _count - 1, len(lines) - 1)
     logger.info(
-        "[ANCHOR_MULTILINE_RESOLVED] %d-line pattern matched file lines %d-%d "
-        "(0-indexed %d-%d)",
-        _count, _anchor + 1, _end + 1, _anchor, _end,
+        "[ANCHOR_MULTILINE_RESOLVED] %d-line pattern matched file lines %d-%d (0-indexed %d-%d)",
+        _count,
+        _anchor + 1,
+        _end + 1,
+        _anchor,
+        _end,
     )
     return {"ok": True, "anchor": _anchor, "end": _end, "count": _count}
 
 
 def _fuzzy_find_anchor_line(
-    lines: "list[str]",
+    lines: list[str],
     pattern: str,
-    snippet_lines: "Optional[list[str]]" = None,
-    edit_mode: "Optional[str]" = None,
+    snippet_lines: list[str] | None = None,
+    edit_mode: str | None = None,
     threshold: float = 0.75,
-) -> "tuple[Optional[int], float]":
+) -> tuple[int | None, float]:
     """Conservative fuzzy fallback for anchor resolution.
 
     Token-overlap (Jaccard) similarity against every line, with structural
@@ -245,7 +255,7 @@ def _fuzzy_find_anchor_line(
 
     _pat_tokens = set(_pat_tokens_raw)
     # Collect ALL candidates with their scores (need runner-up for margin gate)
-    _candidates: "list[tuple[float, int]]" = []  # (score, 0-indexed lineno)
+    _candidates: list[tuple[float, int]] = []  # (score, 0-indexed lineno)
     for _i, _line in enumerate(lines):
         _line_tokens = set(_line.split())
         if not _line_tokens:
@@ -272,8 +282,11 @@ def _fuzzy_find_anchor_line(
                 "[ANCHOR_FUZZY_AMBIGUOUS] pattern %r: best score %.2f at line %d "
                 "vs runner-up %.2f at line %d — margin too small, refusing fuzzy "
                 "match (require exact anchor or ctx_before/after).",
-                pattern[:80], _best_score, _best_lineno + 1,
-                _runner_up_score, _candidates[1][1] + 1,
+                pattern[:80],
+                _best_score,
+                _best_lineno + 1,
+                _runner_up_score,
+                _candidates[1][1] + 1,
             )
             return None, 0.0
 
@@ -296,23 +309,29 @@ def _fuzzy_find_anchor_line(
                     "[ANCHOR_FUZZY_INDENT_MISMATCH] pattern %r: snippet base indent "
                     "%d < candidate line indent %d (line %d) — refusing fuzzy match "
                     "to avoid nesting a shallower construct in a deeper context.",
-                    pattern[:80], _snip_base_indent, _anchor_indent, _best_lineno + 1,
+                    pattern[:80],
+                    _snip_base_indent,
+                    _anchor_indent,
+                    _best_lineno + 1,
                 )
                 return None, 0.0
 
     logger.warning(
         "[ANCHOR_FUZZY_MATCH] pattern %r not found exactly — fuzzy match at "
         "line %d (score=%.2f, mode=%s). ⚠️ verify with read_file.",
-        pattern[:80], _best_lineno + 1, _best_score, edit_mode,
+        pattern[:80],
+        _best_lineno + 1,
+        _best_score,
+        edit_mode,
     )
     return _best_lineno, _best_score
 
 
 def _inherit_anchor_indent_if_bare(
-    insert_lines: "list[str]",
+    insert_lines: list[str],
     anchor_line: str,
-    dest_unit: Optional[int] = None,
-) -> "list[str]":
+    dest_unit: int | None = None,
+) -> list[str]:
     """Indent a replace_line snippet to its anchor *only when it is bare*.
 
     ``replace_line`` treats the planner's snippet as authoritative, including
@@ -326,10 +345,10 @@ def _inherit_anchor_indent_if_bare(
     for _sl in insert_lines:
         _ss = _sl.lstrip()
         if _ss:
-            _sw = _sl[:len(_sl) - len(_ss)]
+            _sw = _sl[: len(_sl) - len(_ss)]
             if _snip_base is None or len(_sw) < len(_snip_base):
                 _snip_base = _sw
-    _anchor_lead = anchor_line[:len(anchor_line) - len(anchor_line.lstrip())]
+    _anchor_lead = anchor_line[: len(anchor_line) - len(anchor_line.lstrip())]
     if _anchor_lead and not _snip_base:
         return reindent_to_anchor(insert_lines, anchor_line, dest_unit)
     return insert_lines

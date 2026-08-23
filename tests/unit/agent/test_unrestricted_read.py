@@ -15,6 +15,7 @@ These tests pin:
   5. write-path confinement: modify_symbol/edit_ast stay confined to repo_root
      regardless of the flag (via ``_secure_path(confine=True)``).
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -204,9 +205,7 @@ class TestWritePathAlwaysConfined:
         repo, _ = self._make_target(tmp_path)
         (repo / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
         reg = ToolRegistry(str(repo), AgentConfig(unrestricted_read=True))
-        result = reg._tool_modify_symbol(
-            {"file_path": "mod.py", "symbol": "f", "code": "def f():\n    return 7\n"}
-        )
+        result = reg._tool_modify_symbol({"file_path": "mod.py", "symbol": "f", "code": "def f():\n    return 7\n"})
         assert result.ok is True
         assert "return 7" in (repo / "mod.py").read_text(encoding="utf-8")
 
@@ -240,9 +239,7 @@ class TestSecurePathRootResolveCache:
         with patch.object(Path, "resolve", counting_resolve):
             assert reg._secure_path("inside.py") is not None
             first_call_count = len(resolve_calls)
-            assert first_call_count == 2, (
-                f"first call: root + candidate resolves expected 2, got {first_call_count}"
-            )
+            assert first_call_count == 2, f"first call: root + candidate resolves expected 2, got {first_call_count}"
             assert reg._secure_path("inside.py") is not None
         assert len(resolve_calls) == first_call_count + 1, (
             "second call must re-resolve ONLY the candidate (root memoized)"

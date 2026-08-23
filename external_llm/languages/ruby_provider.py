@@ -5,9 +5,8 @@ since no bundled Ruby toolchain is assumed. Symbols are served via the
 provider index (_nonpy_index_for), removing the need for the legacy
 hardcoded rg fallback.
 """
-from __future__ import annotations
 
-from typing import Optional
+from __future__ import annotations
 
 from .base import SyntaxProvider, tree_sitter_syntax_fallback
 from .models import (
@@ -45,27 +44,35 @@ class RubySyntaxProvider(SyntaxProvider):
         patterns: list[SymbolPattern] = []
         if kind in ("function", "method", "any"):
             # def name(  or  def name   (paren-less) or  def self.name(
-            patterns.append(SymbolPattern(
-                kind="method",
-                regex=r"\bdef\s+{name}\s*[({]",
-                description="Ruby instance method definition",
-            ))
-            patterns.append(SymbolPattern(
-                kind="method",
-                regex=r"\bdef\s+self\.{name}\s*[({]",
-                description="Ruby class method (def self.name)",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="method",
+                    regex=r"\bdef\s+{name}\s*[({]",
+                    description="Ruby instance method definition",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="method",
+                    regex=r"\bdef\s+self\.{name}\s*[({]",
+                    description="Ruby class method (def self.name)",
+                )
+            )
         if kind in ("class", "any"):
-            patterns.append(SymbolPattern(
-                kind="class",
-                regex=r"\bclass\s+{name}\s*(?:<|\b|$)",
-                description="Ruby class declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="module",
-                regex=r"\bmodule\s+{name}\b",
-                description="Ruby module declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="class",
+                    regex=r"\bclass\s+{name}\s*(?:<|\b|$)",
+                    description="Ruby class declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="module",
+                    regex=r"\bmodule\s+{name}\b",
+                    description="Ruby module declaration",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -73,17 +80,13 @@ class RubySyntaxProvider(SyntaxProvider):
     def get_file_globs(self) -> list[str]:
         return ["*.rb"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

@@ -33,6 +33,7 @@ Constraint: ``common`` must NOT import ``agent`` (design-insight invariant).
 This module is pure stdlib (``os`` + ``subprocess``), so it sits at the bottom
 of the dependency graph and is safe for any layer to import.
 """
+
 from __future__ import annotations
 
 import logging
@@ -40,7 +41,6 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
 
 from .cache_utils import _FILE_INDEX_CACHE_MAX, _capped_put
 from .walk_policy import _walk_should_skip_dir
@@ -58,11 +58,29 @@ _FILE_INDEX_CACHE: dict[str, tuple[float, list[str]]] = {}
 _FILE_INDEX_GEN: int = 0  # incremented on invalidation; stale writes skip cache store
 # os.walk fallback skip-set (no .gitignore awareness — used only for non-git
 # trees, which have no vendored copies to exclude in the first place).
-_FILE_INDEX_SKIP_DIRS = frozenset({
-    ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist", ".tox",
-    ".eggs", ".cache", ".idea", ".vscode", "site-packages",
-})
+_FILE_INDEX_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+        ".tox",
+        ".eggs",
+        ".cache",
+        ".idea",
+        ".vscode",
+        "site-packages",
+    }
+)
+
 
 def canonical_repo_key(repo_root: str) -> str:
     """Canonical cache key for *repo_root* — shared by the file-index cache and
@@ -82,7 +100,7 @@ def canonical_repo_key(repo_root: str) -> str:
         return str(repo_root)
 
 
-def git_list_repo_files(repo_root: str) -> Optional[list[str]]:
+def git_list_repo_files(repo_root: str) -> list[str] | None:
     """Return sorted repo-relative paths via ``git ls-files`` (NUL-separated).
 
     Uses ``-z`` (REQUIRED — porcelain output C-quotes non-ASCII paths like

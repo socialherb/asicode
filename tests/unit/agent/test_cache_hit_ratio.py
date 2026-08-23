@@ -8,6 +8,7 @@ Anthropic cache-heavy turns. This pins the corrected behavior (delegating to
 ``cache_hit_pct``) and guards the subset-provider path (OpenAI/DeepSeek) and
 the explicit-kwargs call form used by design_chat_loop.
 """
+
 from types import SimpleNamespace
 
 from external_llm.agent.agent_turn_pipeline import _cache_hit_ratio

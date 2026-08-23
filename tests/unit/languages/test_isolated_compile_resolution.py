@@ -16,6 +16,7 @@ charm.land/bubbles/v2/help) was rolled back by apply_patch/anchor_edit with
 edit was valid (edit_text, whose gate is Python-only, applied the same edit
 fine). subprocess.run is mocked so these tests need no toolchain.
 """
+
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -35,11 +36,11 @@ def _fake_proc(returncode, stdout):
 
 # ── Go ──────────────────────────────────────────────────────────────────────
 
+
 class TestGoResolutionSafety:
     def _validate(self, stdout, returncode=1):
         p = GoSyntaxProvider()
-        with patch("external_llm.languages.go_provider.subprocess.run",
-                   return_value=_fake_proc(returncode, stdout)):
+        with patch("external_llm.languages.go_provider.subprocess.run", return_value=_fake_proc(returncode, stdout)):
             return p.validate_syntax("main.go", "irrelevant — subprocess mocked")
 
     def test_module_resolution_error_is_not_a_syntax_error(self):
@@ -61,10 +62,7 @@ class TestGoResolutionSafety:
         assert len(r.errors) == 1
 
     def test_mixed_keeps_only_syntax_error(self):
-        out = (
-            "main.go:3:2: no required module provides package foo/bar\n"
-            "main.go:5:1: expected ';', found 'EOF'\n"
-        )
+        out = "main.go:3:2: no required module provides package foo/bar\nmain.go:5:1: expected ';', found 'EOF'\n"
         r = self._validate(out)
         assert r.ok is False
         assert len(r.errors) == 1
@@ -77,11 +75,11 @@ class TestGoResolutionSafety:
 
 # ── Java ────────────────────────────────────────────────────────────────────
 
+
 class TestJavaResolutionSafety:
     def _validate(self, stdout, returncode=1):
         p = JavaSyntaxProvider()
-        with patch("external_llm.languages.java_provider.subprocess.run",
-                   return_value=_fake_proc(returncode, stdout)):
+        with patch("external_llm.languages.java_provider.subprocess.run", return_value=_fake_proc(returncode, stdout)):
             return p.validate_syntax("Server.java", "irrelevant — subprocess mocked")
 
     def test_resolution_errors_are_ignored(self):
@@ -104,10 +102,7 @@ class TestJavaResolutionSafety:
         # ONLY "cannot find symbol". Without the "package … does not exist"
         # context this is a real error that must gate the edit — otherwise the
         # typo silently passes (the exact C/C++ gate-bypass class, now Java).
-        out = (
-            "Server.java:12: error: cannot find symbol\n"
-            "  symbol:   variable valeu\n"
-        )
+        out = "Server.java:12: error: cannot find symbol\n  symbol:   variable valeu\n"
         r = self._validate(out)
         assert r.ok is False
         assert len(r.errors) == 1
@@ -137,6 +132,7 @@ class TestJavaResolutionSafety:
         # that disabled Java syntax validation entirely. The -d target must be
         # a real (temp) directory.
         import os
+
         captured = {}
 
         def _capture(cmd, *a, **k):
@@ -148,8 +144,7 @@ class TestJavaResolutionSafety:
             return _fake_proc(0, "")
 
         p = JavaSyntaxProvider()
-        with patch("external_llm.languages.java_provider.subprocess.run",
-                   side_effect=_capture):
+        with patch("external_llm.languages.java_provider.subprocess.run", side_effect=_capture):
             p.validate_syntax("Server.java", "public class Server {}")
         assert captured["d_target"] != os.devnull
         assert captured["is_dir"] is True
@@ -157,11 +152,13 @@ class TestJavaResolutionSafety:
 
 # ── Kotlin ──────────────────────────────────────────────────────────────────
 
+
 class TestKotlinResolutionSafety:
     def _validate(self, stdout, returncode=1, content="irrelevant — subprocess mocked"):
         p = KotlinSyntaxProvider()
-        with patch("external_llm.languages.kotlin_provider.subprocess.run",
-                   return_value=_fake_proc(returncode, stdout)):
+        with patch(
+            "external_llm.languages.kotlin_provider.subprocess.run", return_value=_fake_proc(returncode, stdout)
+        ):
             return p.validate_syntax("Server.kt", content)
 
     def test_resolution_errors_from_failed_import_are_ignored(self):
@@ -193,13 +190,7 @@ class TestKotlinResolutionSafety:
         Previously this was unconditionally filtered, silently disabling the
         syntax gate (same defect class as the Java 'cannot find symbol' /
         g++ 'was not declared in this scope' fix)."""
-        content = (
-            "fun main() {\n"
-            "    var total = 0\n"
-            "    total += valeu\n"
-            "    println(total)\n"
-            "}\n"
-        )
+        content = "fun main() {\n    var total = 0\n    total += valeu\n    println(total)\n}\n"
         out = "Server.kt:3:14: error: unresolved reference 'valeu'\n"
         r = self._validate(out, content=content)
         assert r.ok is False
@@ -225,6 +216,7 @@ class TestKotlinResolutionSafety:
         # bug). The command must NOT pass ``-script`` and must point ``-d`` at a
         # real (temp) directory.
         import os
+
         captured = {}
 
         def _capture(cmd, *a, **k):
@@ -236,8 +228,7 @@ class TestKotlinResolutionSafety:
             return _fake_proc(0, "")
 
         p = KotlinSyntaxProvider()
-        with patch("external_llm.languages.kotlin_provider.subprocess.run",
-                   side_effect=_capture):
+        with patch("external_llm.languages.kotlin_provider.subprocess.run", side_effect=_capture):
             p.validate_syntax("Server.kt", "fun main() {}")
         assert captured["has_script"] is False
         assert captured["d_target"] != os.devnull
@@ -245,6 +236,7 @@ class TestKotlinResolutionSafety:
 
 
 # ── Shared classifier (base.py) ─────────────────────────────────────────────
+
 
 class TestResolutionClassifier:
     def test_go_phrases(self):
@@ -299,8 +291,9 @@ class TestResolutionClassifier:
         # "is public, should be declared" is dropped (isolated-compile artifact)
         # but does NOT grant resolution context, so the typo is kept.
         errs = [
-            SyntaxError_(file="f.java", line=1, col=0,
-                         message="class Foo is public, should be declared in a file named Foo.java"),
+            SyntaxError_(
+                file="f.java", line=1, col=0, message="class Foo is public, should be declared in a file named Foo.java"
+            ),
             SyntaxError_(file="f.java", line=12, col=0, message="cannot find symbol"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.JAVA)
@@ -314,8 +307,7 @@ class TestResolutionClassifier:
         # has no _RESOLUTION_CONTEXT_PHRASES, so the default (None) context is
         # always False — the provider supplies line-based context instead.
         errs = [
-            SyntaxError_(file="f.kt", line=3, col=14,
-                         message="unresolved reference 'valeu'"),
+            SyntaxError_(file="f.kt", line=3, col=14, message="unresolved reference 'valeu'"),
         ]
         kept = _filter_genuine_syntax_errors(errs, LanguageId.KOTLIN)
         assert len(kept) == 1
@@ -325,26 +317,26 @@ class TestResolutionClassifier:
         # Provider detected an import-line failure → has_resolution_context=True
         # → the co-occurring usage error is cascade noise, dropped.
         errs = [
-            SyntaxError_(file="f.kt", line=1, col=8,
-                         message="unresolved reference 'kotlinx'"),
-            SyntaxError_(file="f.kt", line=5, col=5,
-                         message="unresolved reference 'GlobalScope'"),
+            SyntaxError_(file="f.kt", line=1, col=8, message="unresolved reference 'kotlinx'"),
+            SyntaxError_(file="f.kt", line=5, col=5, message="unresolved reference 'GlobalScope'"),
         ]
         kept = _filter_genuine_syntax_errors(
-            errs, LanguageId.KOTLIN, has_resolution_context=True,
+            errs,
+            LanguageId.KOTLIN,
+            has_resolution_context=True,
         )
         assert kept == []
 
     def test_kotlin_genuine_syntax_error_kept_with_import_context(self):
         # Even when an import failed, a genuine SYNTAX error must still gate.
         errs = [
-            SyntaxError_(file="f.kt", line=1, col=8,
-                         message="unresolved reference 'kotlinx'"),
-            SyntaxError_(file="f.kt", line=5, col=1,
-                         message="expecting member declaration"),
+            SyntaxError_(file="f.kt", line=1, col=8, message="unresolved reference 'kotlinx'"),
+            SyntaxError_(file="f.kt", line=5, col=1, message="expecting member declaration"),
         ]
         kept = _filter_genuine_syntax_errors(
-            errs, LanguageId.KOTLIN, has_resolution_context=True,
+            errs,
+            LanguageId.KOTLIN,
+            has_resolution_context=True,
         )
         assert len(kept) == 1
         assert "expecting member declaration" in kept[0].message

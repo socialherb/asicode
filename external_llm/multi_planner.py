@@ -9,12 +9,12 @@ Takes complex requests like "create login functionality" and:
 
 Works with ExternalLLMService to handle multi-file changes.
 """
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from .agent.config.thresholds import config as _cfg
 from .client import effective_content
@@ -44,7 +44,7 @@ class FileOperation:
     priority: int = 0
 
     # Template/example to follow
-    template_file: Optional[str] = None
+    template_file: str | None = None
 
     # Specific instructions for this file
     instructions: str = ""
@@ -147,17 +147,10 @@ class MultiFilePlanner:
 
         return plan
 
-    def _create_complex_plan(
-        self,
-        analysis: RequestAnalysis,
-        structure: ProjectStructure
-    ) -> ExecutionPlan:
+    def _create_complex_plan(self, analysis: RequestAnalysis, structure: ProjectStructure) -> ExecutionPlan:
         """Create plan for complex requests (multiple files)"""
 
-        plan = ExecutionPlan(
-            original_request=analysis.original_request,
-            strategy="sequential"
-        )
+        plan = ExecutionPlan(original_request=analysis.original_request, strategy="sequential")
 
         feature = analysis.feature_name
 
@@ -168,9 +161,7 @@ class MultiFilePlanner:
         else:
             # Use generic feature planning — Developer LLM handles
             # framework-specific details based on project context
-            plan.operations.extend(
-                self._plan_generic_feature(feature or "feature", structure)
-            )
+            plan.operations.extend(self._plan_generic_feature(feature or "feature", structure))
 
         # Add success criteria
         plan.success_criteria = self._define_success_criteria(plan.operations)
@@ -183,24 +174,28 @@ class MultiFilePlanner:
         ops = []
 
         # Main module
-        ops.append(FileOperation(
-            file_path=f"{feature}.py",
-            operation="create",
-            description=f"Create {feature} module",
-            priority=0,
-            instructions=f"Implement {feature} functionality with proper structure",
-        ))
+        ops.append(
+            FileOperation(
+                file_path=f"{feature}.py",
+                operation="create",
+                description=f"Create {feature} module",
+                priority=0,
+                instructions=f"Implement {feature} functionality with proper structure",
+            )
+        )
 
         # Tests
         if structure.test_dir:
-            ops.append(FileOperation(
-                file_path=f"{structure.test_dir}/test_{feature}.py",
-                operation="create",
-                description=f"Create tests for {feature}",
-                priority=1,
-                dependencies=[f"{feature}.py"],
-                instructions=f"Write unit tests for {feature} module",
-            ))
+            ops.append(
+                FileOperation(
+                    file_path=f"{structure.test_dir}/test_{feature}.py",
+                    operation="create",
+                    description=f"Create tests for {feature}",
+                    priority=1,
+                    dependencies=[f"{feature}.py"],
+                    instructions=f"Write unit tests for {feature} module",
+                )
+            )
 
         return ops
 
@@ -220,18 +215,18 @@ class MultiFilePlanner:
 
             # Determine priority based on file type
             priority = 0
-            if file_path.endswith('.css'):
+            if file_path.endswith(".css"):
                 priority = 2  # CSS after HTML/JS
-            elif file_path.endswith(('.js', '.jsx')):
+            elif file_path.endswith((".js", ".jsx")):
                 priority = 1  # JS after HTML
-            elif file_path.endswith('.html'):
+            elif file_path.endswith(".html"):
                 priority = 0  # HTML first
 
             # Add dependencies for CSS/JS files
             dependencies = []
-            if file_path.endswith(('.css', '.js')):
+            if file_path.endswith((".css", ".js")):
                 # CSS/JS might depend on HTML template
-                html_files = [f for f in analysis.suggested_files if f.endswith('.html')]
+                html_files = [f for f in analysis.suggested_files if f.endswith(".html")]
                 if html_files:
                     dependencies.append(html_files[0])
 
@@ -243,7 +238,7 @@ class MultiFilePlanner:
                 description=description,
                 dependencies=dependencies,
                 priority=priority,
-                instructions=instructions
+                instructions=instructions,
             )
             ops.append(op)
 
@@ -274,10 +269,7 @@ class MultiFilePlanner:
                 # iteration so a None never raises TypeError here.
                 deps = op.dependencies or ()
                 # Check if all dependencies are satisfied
-                deps_satisfied = all(
-                    any(done.file_path == dep for done in ordered)
-                    for dep in deps
-                )
+                deps_satisfied = all(any(done.file_path == dep for done in ordered) for dep in deps)
 
                 if deps_satisfied or not deps:
                     ordered.append(op)
@@ -303,10 +295,7 @@ class MultiFilePlanner:
             return "moderate"
         return "complex"
 
-    def _define_success_criteria(
-        self,
-        operations: list[FileOperation]
-    ) -> list[str]:
+    def _define_success_criteria(self, operations: list[FileOperation]) -> list[str]:
         """Define success criteria for the plan"""
 
         criteria = []
@@ -323,7 +312,6 @@ class MultiFilePlanner:
         return criteria
 
 
-
 class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
     """
     Enhanced MultiFilePlanner that uses LLM for plan generation
@@ -332,13 +320,7 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
     while leveraging project analysis for context.
     """
 
-    def __init__(
-        self,
-        repo_root: str,
-        llm_client=None,
-        llm_model: Optional[str] = None,
-        temperature: float = 0.0
-    ):
+    def __init__(self, repo_root: str, llm_client=None, llm_model: str | None = None, temperature: float = 0.0):
         """
         Initialize LLM-enhanced planner
 
@@ -382,11 +364,8 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
         return super().create_plan(user_request)
 
     def _create_llm_based_plan(
-        self,
-        user_request: str,
-        analysis: RequestAnalysis,
-        structure: ProjectStructure
-    ) -> Optional[ExecutionPlan]:
+        self, user_request: str, analysis: RequestAnalysis, structure: ProjectStructure
+    ) -> ExecutionPlan | None:
         """
         Create execution plan using LLM
 
@@ -405,9 +384,7 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
         project_context = self._build_project_context_summary(structure)
 
         # Build LLM prompt for planning
-        prompt = self._build_llm_planning_prompt(
-            user_request, analysis, structure, project_context
-        )
+        prompt = self._build_llm_planning_prompt(user_request, analysis, structure, project_context)
 
         try:
             # Import here to avoid circular dependencies
@@ -417,9 +394,9 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
             messages = [
                 LLMMessage(
                     role="system",
-                    content="You are an expert software architect who creates detailed execution plans for code changes."
+                    content="You are an expert software architect who creates detailed execution plans for code changes.",
                 ),
-                LLMMessage(role="user", content=prompt)
+                LLMMessage(role="user", content=prompt),
             ]
 
             # Call LLM
@@ -464,7 +441,7 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
         if structure.directories:
             lines.append("- **Directory Structure**:")
             for purpose, dirs in structure.directories.items():
-                if purpose != 'other' and dirs:
+                if purpose != "other" and dirs:
                     lines.append(f"  - {purpose}: {', '.join(dirs)}")
 
         if structure.naming_style:
@@ -481,11 +458,7 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
         return "\n".join(lines) if lines else "No project context available."
 
     def _build_llm_planning_prompt(
-        self,
-        user_request: str,
-        analysis: RequestAnalysis,
-        structure: ProjectStructure,
-        project_context: str
+        self, user_request: str, analysis: RequestAnalysis, structure: ProjectStructure, project_context: str
     ) -> str:
         """Build LLM prompt for hierarchical, step-by-step planning"""
         return f"""# Architecture-Driven Implementation Plan
@@ -498,8 +471,8 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
 
 ## Request Analysis
 - Intent: {analysis.intent}
-- Feature: {analysis.feature_name or 'Not specified'}
-- Tech stack: {', '.join(analysis.tech_stack) if analysis.tech_stack else 'Not detected'}
+- Feature: {analysis.feature_name or "Not specified"}
+- Tech stack: {", ".join(analysis.tech_stack) if analysis.tech_stack else "Not detected"}
 
 ## Task: Think Step by Step
 You are an expert software architect. Your task is to design and plan the implementation of this feature in a hierarchical, step-by-step manner.
@@ -569,12 +542,11 @@ plan:
 2. **Consider existing patterns**: Follow the project's existing structure and conventions
 3. **Be realistic**: Create an achievable plan with clear dependencies
 4. **Be specific**: Provide concrete file paths and implementation details
-5. **Consider the framework**: {structure.framework or 'Generic Python'} best practices
+5. **Consider the framework**: {structure.framework or "Generic Python"} best practices
 
 Now, think through the architecture step by step and generate the plan:"""
 
-
-    def _parse_llm_plan_response(self, llm_content: str, original_request: str) -> Optional[ExecutionPlan]:
+    def _parse_llm_plan_response(self, llm_content: str, original_request: str) -> ExecutionPlan | None:
         """
         Parse LLM response to extract execution plan
 
@@ -594,7 +566,7 @@ Now, think through the architecture step by step and generate the plan:"""
             import yaml
 
             # Try to extract YAML block from response
-            yaml_pattern = r'```(?:yaml|yml)?\s*(.*?)```'
+            yaml_pattern = r"```(?:yaml|yml)?\s*(.*?)```"
             matches = re.findall(yaml_pattern, llm_content, re.DOTALL)
 
             if not matches:
@@ -602,7 +574,7 @@ Now, think through the architecture step by step and generate the plan:"""
                 # Look for "plan:" or "operations:" patterns
                 yaml_section = llm_content
                 # Try to find from "plan:" to end
-                plan_start = llm_content.find('plan:')
+                plan_start = llm_content.find("plan:")
                 # "plan:" found → take from there; last resort: use entire content
                 yaml_section = llm_content[plan_start:] if plan_start != -1 else llm_content
 
@@ -616,52 +588,52 @@ Now, think through the architecture step by step and generate the plan:"""
                     # Parse YAML
                     parsed = yaml.safe_load(yaml_text)
 
-                    if not parsed or 'plan' not in parsed:
+                    if not parsed or "plan" not in parsed:
                         # Maybe the content is the plan directly
-                        if isinstance(parsed, dict) and 'operations' in parsed:
+                        if isinstance(parsed, dict) and "operations" in parsed:
                             plan_data = parsed
                         else:
                             continue
                     else:
-                        plan_data = parsed['plan']
+                        plan_data = parsed["plan"]
 
                     # Create ExecutionPlan - handle both old and new formats
                     operations = []
 
                     # Check if we have phases (new format) or direct operations (old format)
-                    if 'phases' in plan_data:
+                    if "phases" in plan_data:
                         # New format: phases contain operations
-                        for phase in plan_data.get('phases', []):
-                            for op_data in phase.get('operations', []):
+                        for phase in plan_data.get("phases", []):
+                            for op_data in phase.get("operations", []):
                                 # Log op_data for debugging
                                 logger.debug("Parsing op_data from phase: %s", op_data)
                                 # Get file path, try 'file_path' first, then 'file'
-                                file_path = op_data.get('file_path') or op_data.get('file') or ''
+                                file_path = op_data.get("file_path") or op_data.get("file") or ""
                                 operation = FileOperation(
                                     file_path=file_path,
-                                    operation=op_data.get('operation', 'modify'),
-                                    description=op_data.get('description', ''),
-                                    dependencies=op_data.get('dependencies') or [],
-                                    priority=op_data.get('priority', 0),
-                                    instructions=op_data.get('instructions', ''),
-                                    template_file=op_data.get('template_file'),
+                                    operation=op_data.get("operation", "modify"),
+                                    description=op_data.get("description", ""),
+                                    dependencies=op_data.get("dependencies") or [],
+                                    priority=op_data.get("priority", 0),
+                                    instructions=op_data.get("instructions", ""),
+                                    template_file=op_data.get("template_file"),
                                 )
                                 operations.append(operation)
                     else:
                         # Old format: direct operations list
-                        for op_data in plan_data.get('operations', []):
+                        for op_data in plan_data.get("operations", []):
                             # Log op_data for debugging
                             logger.debug("Parsing op_data: %s", op_data)
                             # Get file path, try 'file_path' first, then 'file'
-                            file_path = op_data.get('file_path') or op_data.get('file') or ''
+                            file_path = op_data.get("file_path") or op_data.get("file") or ""
                             operation = FileOperation(
                                 file_path=file_path,
-                                operation=op_data.get('operation', 'modify'),
-                                description=op_data.get('description', ''),
-                                dependencies=op_data.get('dependencies') or [],
-                                priority=op_data.get('priority', 0),
-                                instructions=op_data.get('instructions', ''),
-                                template_file=op_data.get('template_file'),
+                                operation=op_data.get("operation", "modify"),
+                                description=op_data.get("description", ""),
+                                dependencies=op_data.get("dependencies") or [],
+                                priority=op_data.get("priority", 0),
+                                instructions=op_data.get("instructions", ""),
+                                template_file=op_data.get("template_file"),
                             )
                             operations.append(operation)
 
@@ -674,10 +646,10 @@ Now, think through the architecture step by step and generate the plan:"""
                     plan = ExecutionPlan(
                         original_request=original_request,
                         operations=operations,
-                        strategy=plan_data.get('strategy') or 'sequential',
-                        complexity=plan_data.get('complexity') or 'moderate',
-                        success_criteria=plan_data.get('success_criteria') or [],
-                        warnings=plan_data.get('warnings') or [],
+                        strategy=plan_data.get("strategy") or "sequential",
+                        complexity=plan_data.get("complexity") or "moderate",
+                        success_criteria=plan_data.get("success_criteria") or [],
+                        warnings=plan_data.get("warnings") or [],
                     )
 
                     logger.info("Parsed LLM plan with %s operations", len(operations))

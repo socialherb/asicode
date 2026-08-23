@@ -9,6 +9,7 @@ Regression coverage:
   - Screenshots are written under ``.asicode/`` (not ``<repo_root>/screenshots``)
     so the user's working tree is not polluted.
 """
+
 from __future__ import annotations
 
 import os
@@ -56,6 +57,7 @@ class _WedgedExecutor:
 
 # ── screenshot placement ────────────────────────────────────────────────
 
+
 def test_screenshot_dir_under_asicode(tmp_path):
     host = _Host()
     host.repo_root = str(tmp_path)
@@ -68,6 +70,7 @@ def test_screenshot_dir_under_asicode(tmp_path):
 
 
 # ── wedge recovery ──────────────────────────────────────────────────────
+
 
 def test_reset_browser_on_wedge_clears_state_and_recreates_executor(monkeypatch):
     monkeypatch.setattr(BrowserActionToolsMixin, "_browser", object())
@@ -129,6 +132,7 @@ def test_browser_action_recovers_after_hard_timeout(monkeypatch):
 
 # ── atexit handler hygiene ──────────────────────────────────────────────
 
+
 def test_wedge_recovery_does_not_accumulate_atexit_handlers(monkeypatch):
     """Each _reset_browser_on_wedge must NOT re-register an atexit handler.
 
@@ -139,9 +143,7 @@ def test_wedge_recovery_does_not_accumulate_atexit_handlers(monkeypatch):
     import; recovery must not touch atexit at all.
     """
     registrations = []
-    monkeypatch.setattr(
-        browser_tools.atexit, "register", lambda *a, **k: registrations.append(a)
-    )
+    monkeypatch.setattr(browser_tools.atexit, "register", lambda *a, **k: registrations.append(a))
 
     # Drive several wedge recoveries; each recreates the executor.
     created = []

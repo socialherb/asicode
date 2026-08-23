@@ -5,6 +5,7 @@ Covers:
     above threshold (truncate + keep recent), edge-case boundary snap.
   * ``_changelog_has_version`` — present / absent / missing file.
 """
+
 from __future__ import annotations
 
 import os
@@ -155,19 +156,19 @@ class TestChangelogHasVersion:
     def test_missing_file(self, mock_repo):
         """Non-existent CHANGELOG.md returns False (no crash)."""
         from pathlib import Path as _Path
+
         mock_repo.__truediv__.return_value = _Path("/nonexistent/CHANGELOG.md")
         assert _changelog_has_version("0.2.12") is False
 
     @patch("scripts.release_public.REPO", autospec=True)
     def test_semver_not_partial_match(self, mock_repo):
         """``## [0.2.1]`` does NOT match a search for ``0.2.12``."""
-        mock_repo.__truediv__.return_value.read_text.return_value = (
-            "# Changelog\n\n## [0.2.1] - 2026-07-01\n"
-        )
+        mock_repo.__truediv__.return_value.read_text.return_value = "# Changelog\n\n## [0.2.1] - 2026-07-01\n"
         assert _changelog_has_version("0.2.12") is False
 
 
 # ── Checkpoint-backed /undo (the non-git path) ───────────────────────────────
+
 
 class TestCheckpointUndoHelpers:
     """``/undo`` outside a git work tree.
@@ -191,8 +192,7 @@ class TestCheckpointUndoHelpers:
         ).ok
         assert reg.dispatch(
             "apply_patch",
-            {"path": "made.py",
-             "content": "--- /dev/null\n+++ b/made.py\n@@ -0,0 +1 @@\n+NEW = True\n"},
+            {"path": "made.py", "content": "--- /dev/null\n+++ b/made.py\n@@ -0,0 +1 @@\n+NEW = True\n"},
         ).ok
         assert reg.dispatch(
             "edit_text",
@@ -260,8 +260,7 @@ class TestLoadDotenvInlineComments:
 
     def test_bare_hash_in_value_is_preserved(self, tmp_path, monkeypatch):
         (tmp_path / ".env").write_text(
-            "ASI_T_URL=https://api.example.com/v1#fragment\n"
-            "ASI_T_TOKEN=abc#def\n",
+            "ASI_T_URL=https://api.example.com/v1#fragment\nASI_T_TOKEN=abc#def\n",
             encoding="utf-8",
         )
         for k in ("ASI_T_URL", "ASI_T_TOKEN"):
@@ -276,8 +275,7 @@ class TestLoadDotenvInlineComments:
 
     def test_whitespace_hash_still_strips_comment(self, tmp_path, monkeypatch):
         (tmp_path / ".env").write_text(
-            "ASI_T_C=value # note\n"
-            "ASI_T_EMPTY= #comment only\n",
+            "ASI_T_C=value # note\nASI_T_EMPTY= #comment only\n",
             encoding="utf-8",
         )
         for k in ("ASI_T_C", "ASI_T_EMPTY"):
@@ -301,9 +299,7 @@ class TestModelCandidates:
             "_KNOWN_MODELS",
             {"anthropic": ["claude-sonnet-4-6", "claude-opus-4-1"], "openai": ["gpt-4o"]},
         )
-        monkeypatch.setattr(
-            asi, "_get_ollama_models", lambda timeout=5: ["claude-local", "llama3"]
-        )
+        monkeypatch.setattr(asi, "_get_ollama_models", lambda timeout=5: ["claude-local", "llama3"])
         assert asi._model_candidates("claude") == [
             ("anthropic", "claude-sonnet-4-6"),
             ("anthropic", "claude-opus-4-1"),

@@ -50,7 +50,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.common.file_lock import cross_process_flock
 
@@ -72,10 +72,17 @@ _TRUNCATE_KEEP_CHARS = 80
 
 # Write tools whose failures we log. Mirrors ToolRegistry._WRITE_TOOLS but kept
 # local so this module has zero coupling to the registry.
-WRITE_TOOLS = frozenset({
-    "apply_patch", "write_plan", "edit_ast", "edit_file",
-    "edit_text", "modify_symbol", "anchor_edit",
-})
+WRITE_TOOLS = frozenset(
+    {
+        "apply_patch",
+        "write_plan",
+        "edit_ast",
+        "edit_file",
+        "edit_text",
+        "modify_symbol",
+        "anchor_edit",
+    }
+)
 
 # ── Error-text fallback classifier ───────────────────────────────────────────
 # Handlers set ``metadata["failure_class"]`` directly, but several failure paths
@@ -169,7 +176,7 @@ _ERROR_PATTERNS: tuple = (
 )
 
 
-def _classify_from_error(tool: str, error: Optional[str]) -> str:
+def _classify_from_error(tool: str, error: str | None) -> str:
     """Best-effort failure_class from the error text.
 
     Used only when the handler did not set ``metadata["failure_class"]``.
@@ -200,11 +207,14 @@ def _log_path() -> str:
     if override:
         return override
     return os.path.join(
-        os.path.expanduser("~"), ".asicode", "learning", "write_tool_failures.jsonl",
+        os.path.expanduser("~"),
+        ".asicode",
+        "learning",
+        "write_tool_failures.jsonl",
     )
 
 
-def _git_sha(repo_root: Optional[str]) -> str:
+def _git_sha(repo_root: str | None) -> str:
     """Short HEAD SHA for failure-log records.
 
     Delegates to the agent-wide git snapshot SSOT
@@ -223,13 +233,14 @@ def _git_sha(repo_root: Optional[str]) -> str:
     """
     try:
         from .agent_context_manager import get_git_snapshot
+
         head_hash = get_git_snapshot(repo_root or "").get("head_hash", "")
     except Exception:
         head_hash = ""  # non-critical — never block failure logging
     return head_hash[:7] if head_hash else "unknown"
 
 
-def _summarize_args(args: Optional[dict[str, Any]]) -> dict[str, Any]:
+def _summarize_args(args: dict[str, Any] | None) -> dict[str, Any]:
     """Return a compact, redacted view of tool args for log analysis.
 
     Large payload fields (patch/content/code/lines/...) are replaced by a
@@ -280,7 +291,7 @@ def _summarize_args(args: Optional[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-def _truncate(text: Optional[str], limit: int = _MAX_ERROR_CHARS) -> str:
+def _truncate(text: str | None, limit: int = _MAX_ERROR_CHARS) -> str:
     if not text:
         return ""
     return text if len(text) <= limit else text[:limit] + "…"
@@ -335,6 +346,7 @@ def _maybe_compact_log(path: str) -> None:
         if len(lines) <= _MAX_FAILURE_LOG_RECORDS:
             return
         from external_llm.common.atomic_io import atomic_write_jsonl
+
         records: list = []
         for ln in lines[-_MAX_FAILURE_LOG_RECORDS:]:
             try:
@@ -345,7 +357,8 @@ def _maybe_compact_log(path: str) -> None:
         atomic_write_jsonl(path, records)
         _logger.debug(
             "tool_failure_log: compacted to %d records (dropped %d)",
-            len(records), len(lines) - len(records),
+            len(records),
+            len(lines) - len(records),
         )
     except Exception:
         _logger.debug("tool_failure_log: compaction failed", exc_info=True)
@@ -384,7 +397,7 @@ _suggest_counts: dict[str, int] = {
     "auto_retried": 0,
     "auto_retry_success": 0,
 }
-_pending_suggest: "OrderedDict[str, None]" = OrderedDict()
+_pending_suggest: OrderedDict[str, None] = OrderedDict()
 _PENDING_SUGGEST_LIMIT = 4096
 
 
@@ -439,12 +452,12 @@ def record_write_tool_failure(
     *,
     tool: str,
     ok: bool,
-    error: Optional[str],
-    metadata: Optional[dict[str, Any]],
-    args: Optional[dict[str, Any]],
+    error: str | None,
+    metadata: dict[str, Any] | None,
+    args: dict[str, Any] | None,
     partial_failure: bool = False,
-    model: Optional[str] = None,
-    repo_root: Optional[str] = None,
+    model: str | None = None,
+    repo_root: str | None = None,
     session_key: str = "",
 ) -> None:
     """Append one failure record to the JSONL log. Never raises.
@@ -483,7 +496,9 @@ def record_write_tool_failure(
         "failure_class": _fc,
         "ok": bool(ok),
         "partial": bool(partial_failure),
-        "file_path": md.get("file_path") or md.get("path") or args.get("file_path") or args.get("path") if args else None,
+        "file_path": md.get("file_path") or md.get("path") or args.get("file_path") or args.get("path")
+        if args
+        else None,
         "error": _truncate(error),
         "args_summary": _summarize_args(args),
         "model": model or "",
@@ -531,9 +546,9 @@ def record_write_tool_failure_from_tr(
     *,
     tool: str,
     tr: Any,
-    args: Optional[dict[str, Any]],
-    model: Optional[str] = None,
-    repo_root: Optional[str] = None,
+    args: dict[str, Any] | None,
+    model: str | None = None,
+    repo_root: str | None = None,
     session_key: str = "",
 ) -> None:
     """Convenience wrapper: extract fields from a ToolResult and record.
@@ -568,9 +583,15 @@ def record_write_tool_failure_from_tr(
         # append below) — but stay observable, not silently swallowed.
         _logger.debug("tool_failure_log: auto-retry count failed", exc_info=True)
     record_write_tool_failure(
-        tool=tool, ok=ok, error=error, metadata=metadata,
-        args=args, partial_failure=partial,
-        model=model, repo_root=repo_root, session_key=session_key,
+        tool=tool,
+        ok=ok,
+        error=error,
+        metadata=metadata,
+        args=args,
+        partial_failure=partial,
+        model=model,
+        repo_root=repo_root,
+        session_key=session_key,
     )
 
 
@@ -579,7 +600,7 @@ def record_write_tool_failure_from_tr(
 # pulling in pandas/jq. Run as a module: ``python -m external_llm.agent.tool_failure_log``
 
 
-def summarize_log(path: Optional[str] = None) -> dict[str, Any]:
+def summarize_log(path: str | None = None) -> dict[str, Any]:
     """Return a breakdown of recorded write-tool failures.
 
     Useful for a quick "what's been failing?" overview. Returns a dict with
@@ -638,8 +659,7 @@ def _main() -> None:
     if summary["recent"]:
         print("\nMost recent failure:")
         r = summary["recent"][-1]
-        print(f"  {r.get('timestamp_iso', '?')}  {r.get('tool')}  "
-              f"[{r.get('failure_class')}]  {r.get('file_path', '')}")
+        print(f"  {r.get('timestamp_iso', '?')}  {r.get('tool')}  [{r.get('failure_class')}]  {r.get('file_path', '')}")
         err = r.get("error", "")
         if err:
             print(f"  error: {err[:200]}")

@@ -8,6 +8,7 @@ text content) and records the truncation on the turn-level outcome channel
 (record_agent_result), the only place a truncation storm surfaces in the
 metrics.
 """
+
 import subprocess
 from unittest import mock
 
@@ -66,8 +67,13 @@ _BASE_BUDGET = _cfg.tokens.AGENT_TOOL_CALL * 2
 
 def _tool_response(content: str, tool_calls, finish_reason: str):
     return ToolCallResponse(
-        content=content, model="m", provider="stub", tokens_used=1,
-        finish_reason=finish_reason, raw_response=None, tool_calls=tool_calls,
+        content=content,
+        model="m",
+        provider="stub",
+        tokens_used=1,
+        finish_reason=finish_reason,
+        raw_response=None,
+        tool_calls=tool_calls,
     )
 
 
@@ -88,15 +94,18 @@ def _make_loop(client, _repo):
 
 # ── finish_reason=length with a partial tool call ────────────────────────────
 
+
 def test_truncated_tool_calls_cleared_and_not_dispatched(_repo):
     """After the 3-attempt budget ladder (agent_loop parity) exhausts, the
     partial tool call is cleared (never dispatched), while the text content is
     preserved so the turn loop can continue naturally."""
-    client = _StubClient(_tool_response(
-        "partial text",
-        [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
-        finish_reason="length",
-    ))
+    client = _StubClient(
+        _tool_response(
+            "partial text",
+            [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
+            finish_reason="length",
+        )
+    )
     loop, reg = _make_loop(client, _repo)
     res = loop.respond([LLMMessage(role="user", content="do stuff")])
     assert reg.dispatch.call_count == 0
@@ -105,17 +114,20 @@ def test_truncated_tool_calls_cleared_and_not_dispatched(_repo):
 
 
 def test_finish_reason_truncated_value_also_guarded(_repo):
-    client = _StubClient(_tool_response(
-        "partial",
-        [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
-        finish_reason="truncated",
-    ))
+    client = _StubClient(
+        _tool_response(
+            "partial",
+            [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
+            finish_reason="truncated",
+        )
+    )
     loop, reg = _make_loop(client, _repo)
     loop.respond([LLMMessage(role="user", content="do stuff")])
     assert reg.dispatch.call_count == 0
 
 
 # ── Outcome-channel recording (truncation storm visibility) ─────────────────
+
 
 def test_truncation_recorded_on_outcome_channel(_repo, monkeypatch):
     """finish_reason=length records record_agent_result(truncated=True): the
@@ -125,11 +137,13 @@ def test_truncation_recorded_on_outcome_channel(_repo, monkeypatch):
     fake.record_llm_call = mock.Mock()
     fake.record_agent_result = mock.Mock()
     monkeypatch.setattr(dcl_mod, "get_global_collector", lambda: fake)
-    client = _StubClient(_tool_response(
-        "partial",
-        [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
-        finish_reason="length",
-    ))
+    client = _StubClient(
+        _tool_response(
+            "partial",
+            [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
+            finish_reason="length",
+        )
+    )
     loop, _reg = _make_loop(client, _repo)
     loop.respond([LLMMessage(role="user", content="do stuff")])
     fake.record_agent_result.assert_called_once_with(truncated=True)
@@ -141,9 +155,13 @@ def test_normal_stop_not_recorded_as_truncation(_repo, monkeypatch):
     fake.record_llm_call = mock.Mock()
     fake.record_agent_result = mock.Mock()
     monkeypatch.setattr(dcl_mod, "get_global_collector", lambda: fake)
-    client = _StubClient(_tool_response(
-        "final answer", [], finish_reason="stop",
-    ))
+    client = _StubClient(
+        _tool_response(
+            "final answer",
+            [],
+            finish_reason="stop",
+        )
+    )
     loop, _reg = _make_loop(client, _repo)
     res = loop.respond([LLMMessage(role="user", content="do stuff")])
     assert res.content == "final answer"
@@ -152,18 +170,21 @@ def test_normal_stop_not_recorded_as_truncation(_repo, monkeypatch):
 
 # ── Truncation max_tokens ladder (agent_loop parity) ────────────────────────
 
+
 def test_truncation_ladder_doubles_budget_and_succeeds(_repo):
     """finish_reason=length retries with a doubled max_tokens budget (agent_loop
     parity); on success the turn proceeds normally — the truncated partial tool
     call is never dispatched."""
-    client = _ScriptedClient([
-        _tool_response(
-            "partial",
-            [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
-            finish_reason="length",
-        ),
-        _tool_response("final answer", [], finish_reason="stop"),
-    ])
+    client = _ScriptedClient(
+        [
+            _tool_response(
+                "partial",
+                [ToolCallRequest(call_id="c1", name="read_file", args={"path": "README.md"})],
+                finish_reason="length",
+            ),
+            _tool_response("final answer", [], finish_reason="stop"),
+        ]
+    )
     loop, reg = _make_loop(client, _repo)
     res = loop.respond([LLMMessage(role="user", content="do stuff")])
     assert client.calls == 2
@@ -175,11 +196,13 @@ def test_truncation_ladder_doubles_budget_and_succeeds(_repo):
 def test_truncation_ladder_two_retries_then_succeeds(_repo):
     """Both truncation signals ("length" and "truncated") climb the same ladder:
     base -> 2x -> 4x, then a clean response ends the turn."""
-    client = _ScriptedClient([
-        _tool_response("p1", [], finish_reason="length"),
-        _tool_response("p2", [], finish_reason="truncated"),
-        _tool_response("final", [], finish_reason="stop"),
-    ])
+    client = _ScriptedClient(
+        [
+            _tool_response("p1", [], finish_reason="length"),
+            _tool_response("p2", [], finish_reason="truncated"),
+            _tool_response("final", [], finish_reason="stop"),
+        ]
+    )
     loop, _reg = _make_loop(client, _repo)
     res = loop.respond([LLMMessage(role="user", content="do stuff")])
     assert client.calls == 3

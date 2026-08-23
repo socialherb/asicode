@@ -9,6 +9,7 @@ exactly once, in either order.
 The TS/JS outline (``_outline_ts_js``) follows the same contract through
 ``_ts_module_map`` / ``_ts_file_cache`` — see TestTsOutlineSharesFindSymbolCache.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -148,9 +149,7 @@ class TestOutlineCacheInvalidation:
         the extractor's contract)."""
         repo = tmp_path / "repo"
         repo.mkdir()
-        (repo / "broken.py").write_text(
-            "def ok_fn():\n    return 1\ndef bad_fn(:\n", encoding="utf-8"
-        )
+        (repo / "broken.py").write_text("def ok_fn():\n    return 1\ndef bad_fn(:\n", encoding="utf-8")
         searcher = SymbolSearcher(str(repo))
         outline = searcher.get_file_outline("broken.py")
         assert any(s.name == "ok_fn" for s in outline)
@@ -164,9 +163,7 @@ class TestPerFileCacheLruBound:
         searcher, calls = _counting_searcher(tmp_path, monkeypatch)
         repo = Path(searcher.repo_root)
         for name in ("a", "b", "c"):
-            (repo / f"{name}.py").write_text(
-                f"def {name}():\n    pass\n", encoding="utf-8"
-            )
+            (repo / f"{name}.py").write_text(f"def {name}():\n    pass\n", encoding="utf-8")
         for name in ("a", "b", "c"):
             assert searcher._python_symbol_map(repo / f"{name}.py")
         # cap enforced: only the 2 most-recently-used files remain
@@ -182,9 +179,7 @@ class TestPerFileCacheLruBound:
         searcher, calls = _counting_searcher(tmp_path, monkeypatch)
         repo = Path(searcher.repo_root)
         for name in ("a", "b"):
-            (repo / f"{name}.py").write_text(
-                f"def {name}():\n    pass\n", encoding="utf-8"
-            )
+            (repo / f"{name}.py").write_text(f"def {name}():\n    pass\n", encoding="utf-8")
         for name in ("a", "b"):
             assert searcher._python_symbol_map(repo / f"{name}.py")
         # hit on a moves it to MRU (order becomes b, a)
@@ -203,9 +198,7 @@ class TestPerFileCacheLruBound:
         repo = tmp_path / "tsrepo"
         repo.mkdir()
         for name in ("a", "b", "c"):
-            (repo / f"{name}.ts").write_text(
-                f"export function {name}() {{ return 1; }}\n", encoding="utf-8"
-            )
+            (repo / f"{name}.ts").write_text(f"export function {name}() {{ return 1; }}\n", encoding="utf-8")
         searcher = SymbolSearcher(str(repo))
         for name in ("a", "b", "c"):
             searcher._ts_module_map(repo / f"{name}.ts")
@@ -221,9 +214,7 @@ class TestRealpathMemoLruBound:
         searcher = SymbolSearcher(str(tmp_path))
         calls: list[str] = []
         _orig = _ss.os.path.realpath
-        monkeypatch.setattr(
-            _ss.os.path, "realpath", lambda p: (calls.append(p), _orig(p))[1]
-        )
+        monkeypatch.setattr(_ss.os.path, "realpath", lambda p: (calls.append(p), _orig(p))[1])
         for name in ("a", "b", "c"):
             searcher._cache_key(tmp_path / f"{name}.py")
         # cap enforced: only the 2 most-recently-used keys remain
@@ -241,9 +232,7 @@ class TestRealpathMemoLruBound:
         searcher = SymbolSearcher(str(tmp_path))
         calls: list[str] = []
         _orig = _ss.os.path.realpath
-        monkeypatch.setattr(
-            _ss.os.path, "realpath", lambda p: (calls.append(p), _orig(p))[1]
-        )
+        monkeypatch.setattr(_ss.os.path, "realpath", lambda p: (calls.append(p), _orig(p))[1])
         searcher._cache_key(tmp_path / "a.py")
         searcher._cache_key(tmp_path / "b.py")
         # hit on a moves it to MRU (order becomes b, a)

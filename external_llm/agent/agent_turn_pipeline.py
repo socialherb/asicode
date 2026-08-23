@@ -8,13 +8,14 @@ Extracted from agent_loop.py to keep that file manageable.
 AgentLoop inherits TurnPipelineMixin, so all methods have full access to
 self.config, self.registry, etc.
 """
+
 from __future__ import annotations
 
 import dataclasses
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from external_llm.agent._response_utils import extract_llm_reasoning
 from external_llm.agent.message_shapes import (
@@ -64,6 +65,11 @@ from .config.thresholds import _env_flag, config
 from .context_budget import _resolve_context_limit
 from .performance_metrics import get_global_collector
 from .tool_registry import ToolResult
+
+if TYPE_CHECKING:
+    from external_llm.agent.performance_metrics import PerformanceCollector
+    from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+    from external_llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +141,9 @@ def _write_touched_test_file(tool_name: str, tool_args: dict) -> bool:
                 elif isinstance(_parsed, list):
                     _write_ops = _parsed
             except (json.JSONDecodeError, TypeError):
-                logger.debug("<module>::_write_touched_test_file:0 suppressed (json.JSONDecodeError, TypeError)", exc_info=True)
+                logger.debug(
+                    "<module>::_write_touched_test_file:0 suppressed (json.JSONDecodeError, TypeError)", exc_info=True
+                )
         elif isinstance(_plan, list):
             # Bare list — write_tools.py wraps as {"ops": plan}.
             _write_ops = _plan
@@ -178,23 +186,60 @@ class TurnPipelineMixin:
     # Patch engine for tolerant patch mode (lazy import)
     _patch_engine = None
 
+    # ── Host-class attributes (provided by AgentLoop, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: AgentLoop.__init__ owns the real values, so these are pure
+    # typing scaffolding (no setattr, no __getattr__). Mirrors the docstring
+    # contract above; keep the two in sync.
+    config: AgentConfig
+    registry: ToolRegistry
+    llm_client: LLMClient
+    performance_collector: PerformanceCollector
+    _failure_classifier: Any
+    _tool_retry_counter: Any
+    _patch_fail_count: int
+    # Host methods (defined in AgentLoop / PhaseManagerMixin /
+    # ContextManagerMixin / FastPathMixin). Only the *existence* matters to
+    # this mixin; exact signatures live at the definitions.
+    _cb: Any
+    _build_initial_messages: Any
+    _build_continuation_messages: Any
+    _llm_call_with_tools: Any
+    _is_trivial_edit_request: Any
+    _save_session_log: Any
+    _strip_thinking_text: Any
+    _append_native_tool_messages: Any
+    _record_tool_success: Any
+    _record_tool_failure: Any
+    _auto_repair_apply_patch_args: Any
+    _rollback_patches: Any
+    _try_readonly_early_finish: Any
+    _build_tool_result_message: Any
+    _trim_context: Any
+    _run_self_review: Any
+    _auto_test_and_inject: Any
+    _build_tool_hint: Any
+    _build_phase_state_message: Any
+    _advance_phase_after_success: Any
+    _trajectory_compress: Any
+
     # ------------------------------------------------------------------
     # Turn loop entry point
     # ------------------------------------------------------------------
 
-    def _run_llm_loop(self, ctx: TurnContext) -> "AgentResult":
+    def _run_llm_loop(self, ctx: TurnContext) -> AgentResult:
         """LLM tool-loop: build initial messages, run turn loop, handle cancellation/errors."""
         ctx.plan_current_index = 0
 
         # ── Design chat continuation: use preserved messages instead of fresh build ──
-        _continuation = getattr(self, '_continuation_data', None)
+        _continuation = getattr(self, "_continuation_data", None)
         _is_planner = (
-            getattr(ctx.route, 'lane', None) is not None
-            and str(getattr(ctx.route, 'lane', '')).upper() == 'PLANNER'
+            getattr(ctx.route, "lane", None) is not None and str(getattr(ctx.route, "lane", "")).upper() == "PLANNER"
         )
         if _continuation and not _is_planner:
             ctx.messages = self._build_continuation_messages(
-                _continuation, ctx.request,
+                _continuation,
+                ctx.request,
             )
             logger.info(
                 "Using continuation messages: conversation=%d turns",
@@ -215,7 +260,7 @@ class TurnPipelineMixin:
         ctx.last_call_completion_tokens = 0
         ctx.provider_name = self.llm_client.get_provider_name().lower()
         ctx.model_name = self.config.model_name
-        ctx.base_url = getattr(self.llm_client, 'base_url', '') or ''
+        ctx.base_url = getattr(self.llm_client, "base_url", "") or ""
 
         ctx.write_tool_used = False
         ctx.rollback_performed = False
@@ -226,6 +271,7 @@ class TurnPipelineMixin:
         # re-arms (id()-based keys reused freed addresses and silenced recall
         # for the whole process lifetime — see failure_pattern_store note).
         from .failure_pattern_store import new_session_key
+
         ctx.recall_session_key = new_session_key()
         ctx.no_tool_nudge_count = 0
         ctx.any_tool_called = False
@@ -262,12 +308,15 @@ class TurnPipelineMixin:
                 ctx.reads_since_last_edit = _prep.reads_since_last_edit
 
                 logger.info("Agent turn %d (native_tools=%s)", ctx.turn_num, ctx.has_native_tools)
-                self._cb("turn_start", {
-                    "turn": ctx.turn_num,
-                    "native_tools": ctx.has_native_tools,
-                    "provider": ctx.provider_name,
-                    "model": getattr(self.config, "model_name", "") or "",
-                })
+                self._cb(
+                    "turn_start",
+                    {
+                        "turn": ctx.turn_num,
+                        "native_tools": ctx.has_native_tools,
+                        "provider": ctx.provider_name,
+                        "model": getattr(self.config, "model_name", "") or "",
+                    },
+                )
 
                 # Streaming token callback: forwards text_delta chunks to the
                 # frontend as they arrive, so the final summary streams
@@ -278,10 +327,16 @@ class TurnPipelineMixin:
                 _llm_call_start = time.monotonic()
                 try:
                     response = self._llm_call_with_tools(
-                            _prep.messages,
-                            token_callback=_token_cb,
-                        )
-                except (LLMConnectionError, LLMRateLimitError, LLMServerUnavailableError, LLMQuotaExceededError, LLMAuthenticationError) as e:
+                        _prep.messages,
+                        token_callback=_token_cb,
+                    )
+                except (
+                    LLMConnectionError,
+                    LLMRateLimitError,
+                    LLMServerUnavailableError,
+                    LLMQuotaExceededError,
+                    LLMAuthenticationError,
+                ) as e:
                     if isinstance(e, LLMConnectionError):
                         error_type = "connection"
                         error_message = f"LLM connection error: {e}"
@@ -298,11 +353,14 @@ class TurnPipelineMixin:
                         error_type = "rate_limit"
                         error_message = f"LLM rate limit error: {e}"
                     logger.exception("LLM error on turn %d", ctx.turn_num)
-                    self._cb("error", {
-                        "message": error_message,
-                        "error_type": error_type,
-                        "turn": ctx.turn_num,
-                    })
+                    self._cb(
+                        "error",
+                        {
+                            "message": error_message,
+                            "error_type": error_type,
+                            "turn": ctx.turn_num,
+                        },
+                    )
                     # Turn-level outcome channel: this turn terminated with an
                     # LLM error. The per-provider llm_metrics.failures already
                     # counts the call; the agent_result channel records the
@@ -316,11 +374,12 @@ class TurnPipelineMixin:
                         status="error",
                         turns=ctx.turns,
                         error=error_message,
-                        applied_patches=self.registry.applied_patches,
+                        applied_patches=list(self.registry.applied_patches),
                         metadata={
                             "performance": performance_summary,
                         },
                     )
+
                 def _rget(_key: str, _default=None, _response=response):
                     # B023: bind the per-iteration response at def time. All
                     # call sites are synchronous within this iteration today,
@@ -362,42 +421,58 @@ class TurnPipelineMixin:
                 if _pt or _ct:
                     _turn_cost = estimate_cost(ctx.provider_name, _pt, _ct, model=ctx.model_name)
                     _total_cost = estimate_cost(
-                        ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name)
+                        ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name
+                    )
                     _turn_actual_cost = estimate_cache_adjusted_cost(
-                        ctx.provider_name, _pt, _ct, _crt, _cct, model=ctx.model_name, base_url=ctx.base_url)
+                        ctx.provider_name, _pt, _ct, _crt, _cct, model=ctx.model_name, base_url=ctx.base_url
+                    )
                     _total_actual_cost = estimate_cache_adjusted_cost(
-                        ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                        ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url)
-                    self._cb("token_usage", {
-                        "turn": ctx.turn_num,
-                        "prompt_tokens": _pt,
-                        "completion_tokens": _ct,
-                        "cache_read_tokens": _crt,
-                        "cache_creation_tokens": _cct,
-                        "total_prompt_tokens": ctx.total_prompt_tokens,
-                        "total_completion_tokens": ctx.total_completion_tokens,
-                        "total_cache_read_tokens": ctx.total_cache_read_tokens,
-                        "total_cache_creation_tokens": ctx.total_cache_creation_tokens,
-                        "turn_cost_usd": round(_turn_cost, 6),
-                        "total_cost_usd": round(_total_cost, 6),
-                        "turn_actual_cost_usd": round(_turn_actual_cost, 6),
-                        "total_actual_cost_usd": round(_total_actual_cost, 6),
-                        "provider": ctx.provider_name,
-                        "llm_elapsed_ms": _llm_elapsed_ms,
-                        "finish_reason": _finish_reason,
-                        "tool_calls_count": _tool_calls_count,
-                    })
+                        ctx.provider_name,
+                        ctx.total_prompt_tokens,
+                        ctx.total_completion_tokens,
+                        ctx.total_cache_read_tokens,
+                        ctx.total_cache_creation_tokens,
+                        model=ctx.model_name,
+                        base_url=ctx.base_url,
+                    )
+                    self._cb(
+                        "token_usage",
+                        {
+                            "turn": ctx.turn_num,
+                            "prompt_tokens": _pt,
+                            "completion_tokens": _ct,
+                            "cache_read_tokens": _crt,
+                            "cache_creation_tokens": _cct,
+                            "total_prompt_tokens": ctx.total_prompt_tokens,
+                            "total_completion_tokens": ctx.total_completion_tokens,
+                            "total_cache_read_tokens": ctx.total_cache_read_tokens,
+                            "total_cache_creation_tokens": ctx.total_cache_creation_tokens,
+                            "turn_cost_usd": round(_turn_cost, 6),
+                            "total_cost_usd": round(_total_cost, 6),
+                            "turn_actual_cost_usd": round(_turn_actual_cost, 6),
+                            "total_actual_cost_usd": round(_total_actual_cost, 6),
+                            "provider": ctx.provider_name,
+                            "llm_elapsed_ms": _llm_elapsed_ms,
+                            "finish_reason": _finish_reason,
+                            "tool_calls_count": _tool_calls_count,
+                        },
+                    )
 
-                tool_calls = _raw_tool_calls if isinstance(_raw_tool_calls, (list, tuple)) else []
+                # Normalize to a real list: tuples from gateway shims must not
+                # leak into _execute_and_process_tool_calls' list-typed param.
+                tool_calls = list(_raw_tool_calls) if isinstance(_raw_tool_calls, (list, tuple)) else []
                 content = _rget("content", "")
 
                 if content and content.strip():
-                    self._cb("agent_thinking", {
-                        "turn": ctx.turn_num,
-                        "content": content.strip()[:2000],
-                        "agent_id": self.config.agent_id,
-                        "has_tool_calls": bool(tool_calls),
-                    })
+                    self._cb(
+                        "agent_thinking",
+                        {
+                            "turn": ctx.turn_num,
+                            "content": content.strip()[:2000],
+                            "agent_id": self.config.agent_id,
+                            "has_tool_calls": bool(tool_calls),
+                        },
+                    )
 
                 # Completion detection: finish_reason=stop/end_turn with tool_calls
                 if tool_calls and _finish_reason in ("stop", "end_turn"):
@@ -421,6 +496,12 @@ class TurnPipelineMixin:
                         # instead of false-success re-nudge death loop.
                         ctx.any_tool_called = False
                         continue
+                    if _fa.result is None:
+                        # Unreachable by construction (_handle_final_answer_turn
+                        # always sets result when nudge_message is None), but a
+                        # defensive bar keeps _run_llm_loop's AgentResult return
+                        # type honest for type checkers.
+                        raise RuntimeError("final-answer outcome carried no result")
                     return _fa.result
 
                 # Execute tool calls
@@ -507,14 +588,17 @@ class TurnPipelineMixin:
                 if rc:
                     return rc
             except (AttributeError, TypeError, IndexError):
-                logger.debug("<module>::TurnPipelineMixin::_effective_final_content:0 suppressed (AttributeError, TypeError, IndexError)", exc_info=True)
+                logger.debug(
+                    "<module>::TurnPipelineMixin::_effective_final_content:0 suppressed (AttributeError, TypeError, IndexError)",
+                    exc_info=True,
+                )
         return content if isinstance(content, str) else ""
 
     # ------------------------------------------------------------------
     # Max turns handler
     # ------------------------------------------------------------------
 
-    def _handle_max_turns_reached(self, ctx: TurnContext) -> "AgentResult":
+    def _handle_max_turns_reached(self, ctx: TurnContext) -> AgentResult:
         """Handle max_turns exhaustion: attempt one final no-tool LLM call, return result."""
         logger.warning("Agent reached max_turns=%d", self.config.max_turns)
 
@@ -523,9 +607,9 @@ class TurnPipelineMixin:
 
         try:
             response = self._llm_call_with_tools(
-                    ctx.messages,
-                    token_callback=_token_cb,
-                )
+                ctx.messages,
+                token_callback=_token_cb,
+            )
 
             def _rget(key: str, default=None):
                 getter = getattr(response, "get", None)
@@ -533,7 +617,10 @@ class TurnPipelineMixin:
                     try:
                         return getter(key, default)
                     except (AttributeError, TypeError, KeyError):
-                        logger.debug("<module>::TurnPipelineMixin::_handle_max_turns_reached::_rget:0 suppressed (AttributeError, TypeError, KeyError)", exc_info=True)
+                        logger.debug(
+                            "<module>::TurnPipelineMixin::_handle_max_turns_reached::_rget:0 suppressed (AttributeError, TypeError, KeyError)",
+                            exc_info=True,
+                        )
                 return getattr(response, key, default)
 
             _pt = _rget("prompt_tokens", 0)
@@ -559,11 +646,13 @@ class TurnPipelineMixin:
             final_tool_calls = _rget("tool_calls", []) or []
 
             if final_tool_calls:
-                ctx.messages.append(LLMMessage(
-                    role="user",
-                    content="[WRAP UP] Turn limit reached. Do NOT call any more tools. "
-                            "Summarize what was accomplished. Do NOT continue working — the session is ending."
-                ))
+                ctx.messages.append(
+                    LLMMessage(
+                        role="user",
+                        content="[WRAP UP] Turn limit reached. Do NOT call any more tools. "
+                        "Summarize what was accomplished. Do NOT continue working — the session is ending.",
+                    )
+                )
                 response = self._llm_call_with_tools(
                     ctx.messages,
                     token_callback=_token_cb,
@@ -598,13 +687,13 @@ class TurnPipelineMixin:
             if (not ctx.read_only_request) and (not self.registry.applied_patches):
                 raise RuntimeError("write-intent request reached final completion path without any applied patches")
 
-            review_summary: Optional[str] = None
+            review_summary: str | None = None
             should_do_review = self.config.self_review_enabled and self.registry.applied_patches
             if should_do_review and self._is_trivial_edit_request(ctx.request):
                 should_do_review = False
             if should_do_review:
                 review_summary = self._run_self_review()
-                if review_summary and ' lgtm ' not in f' {review_summary.lower()} ':
+                if review_summary and " lgtm " not in f" {review_summary.lower()} ":
                     final_msg += f"\n\n---\n**[Self-Review]** {review_summary}"
 
             self.performance_collector.end_session()
@@ -614,7 +703,7 @@ class TurnPipelineMixin:
                 status="success",
                 turns=ctx.turns,
                 final_message=final_msg,
-                applied_patches=self.registry.applied_patches,
+                applied_patches=list(self.registry.applied_patches),
                 metadata={
                     "turns_used": self.config.max_turns,
                     "plan": ctx.plan,
@@ -626,9 +715,7 @@ class TurnPipelineMixin:
                     "self_review": {
                         "enabled": self.config.self_review_enabled,
                         "summary": review_summary,
-                        "issues_found": bool(
-                            review_summary and ' lgtm ' not in f' {review_summary.lower()} '
-                        ),
+                        "issues_found": bool(review_summary and " lgtm " not in f" {review_summary.lower()} "),
                     },
                     "tokens": _token_metadata(ctx),
                     "performance": performance_summary,
@@ -655,7 +742,7 @@ class TurnPipelineMixin:
             status="max_turns",
             turns=ctx.turns,
             final_message=f"Reached maximum turns ({self.config.max_turns})",
-            applied_patches=self.registry.applied_patches,
+            applied_patches=list(self.registry.applied_patches),
             metadata={
                 "turns_used": self.config.max_turns,
                 "git_state": ctx.git_state,
@@ -668,9 +755,13 @@ class TurnPipelineMixin:
             },
         )
         self._save_session_log(
-            ctx.session_id, ctx.request, _max_result,
-            ctx.total_prompt_tokens, ctx.total_completion_tokens,
-            ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens,
+            ctx.session_id,
+            ctx.request,
+            _max_result,
+            ctx.total_prompt_tokens,
+            ctx.total_completion_tokens,
+            ctx.total_cache_read_tokens,
+            ctx.total_cache_creation_tokens,
         )
         return _max_result
 
@@ -682,7 +773,7 @@ class TurnPipelineMixin:
         self,
         ctx: TurnContext,
         final_msg: str,
-    ) -> "_FinalAnswerOutcome":
+    ) -> _FinalAnswerOutcome:
 
         logger.info("Agent finished after %d turns", ctx.turn_num - 1)
 
@@ -716,8 +807,11 @@ class TurnPipelineMixin:
                     },
                 )
                 self._save_session_log(
-                    ctx.session_id, ctx.request, _noop_result,
-                    ctx.total_prompt_tokens, ctx.total_completion_tokens,
+                    ctx.session_id,
+                    ctx.request,
+                    _noop_result,
+                    ctx.total_prompt_tokens,
+                    ctx.total_completion_tokens,
                 )
                 return _FinalAnswerOutcome(result=_noop_result)
 
@@ -735,8 +829,11 @@ class TurnPipelineMixin:
                     },
                 )
                 self._save_session_log(
-                    ctx.session_id, ctx.request, _text_reply_result,
-                    ctx.total_prompt_tokens, ctx.total_completion_tokens,
+                    ctx.session_id,
+                    ctx.request,
+                    _text_reply_result,
+                    ctx.total_prompt_tokens,
+                    ctx.total_completion_tokens,
                 )
                 return _FinalAnswerOutcome(result=_text_reply_result)
 
@@ -759,8 +856,10 @@ class TurnPipelineMixin:
                     f"Task: {ctx.request[:2000]}"
                 )
                 nudge_msg = LLMMessage(role="user", content=nudge_content)
-                self._cb("tool_nudge", {"turn": ctx.turn_num, "nudge_count": ctx.no_tool_nudge_count,
-                                        "agent_id": self.config.agent_id})
+                self._cb(
+                    "tool_nudge",
+                    {"turn": ctx.turn_num, "nudge_count": ctx.no_tool_nudge_count, "agent_id": self.config.agent_id},
+                )
                 logger.info("Re-nudging small model (nudge %d/%d)", ctx.no_tool_nudge_count, _NO_TOOL_NUDGE_MAX)
                 return _FinalAnswerOutcome(nudge_message=nudge_msg, nudge_count=ctx.no_tool_nudge_count)
 
@@ -770,11 +869,8 @@ class TurnPipelineMixin:
             _false_success_result = AgentResult(
                 status="error",
                 turns=ctx.turns,
-                final_message=(
-                    final_msg
-                    or "Model finished without calling apply_patch, and no patch was applied."
-                ),
-                applied_patches=self.registry.applied_patches,
+                final_message=(final_msg or "Model finished without calling apply_patch, and no patch was applied."),
+                applied_patches=list(self.registry.applied_patches),
                 error="write_intent_finished_without_patch",
                 metadata={
                     "turns_used": ctx.turn_num - 1,
@@ -796,12 +892,15 @@ class TurnPipelineMixin:
                 },
             )
             self._save_session_log(
-                ctx.session_id, ctx.request, _false_success_result,
-                ctx.total_prompt_tokens, ctx.total_completion_tokens,
+                ctx.session_id,
+                ctx.request,
+                _false_success_result,
+                ctx.total_prompt_tokens,
+                ctx.total_completion_tokens,
             )
             return _FinalAnswerOutcome(result=_false_success_result)
 
-        review_summary: Optional[str] = None
+        review_summary: str | None = None
 
         should_do_review = self.config.self_review_enabled and self.registry.applied_patches
         if should_do_review and self._is_trivial_edit_request(ctx.request):
@@ -810,11 +909,8 @@ class TurnPipelineMixin:
 
         if should_do_review:
             review_summary = self._run_self_review()
-            if review_summary and ' lgtm ' not in f' {review_summary.lower()} ':
-                final_msg = (
-                    final_msg
-                    + f"\n\n---\n**[Self-Review]** {review_summary}"
-                )
+            if review_summary and " lgtm " not in f" {review_summary.lower()} ":
+                final_msg = final_msg + f"\n\n---\n**[Self-Review]** {review_summary}"
 
         # LLM re-invocation for future-tense detection removed — once a patch has been applied,
         # the task is complete even if the sentence is in future tense. Unnecessary LLM calls
@@ -827,7 +923,7 @@ class TurnPipelineMixin:
             status="success",
             turns=ctx.turns,
             final_message=final_msg,
-            applied_patches=self.registry.applied_patches,
+            applied_patches=list(self.registry.applied_patches),
             metadata={
                 "turns_used": ctx.turn_num - 1,
                 "plan": ctx.plan,
@@ -839,18 +935,18 @@ class TurnPipelineMixin:
                 "self_review": {
                     "enabled": self.config.self_review_enabled,
                     "summary": review_summary,
-                    "issues_found": bool(
-                        review_summary
-                        and ' lgtm ' not in f' {review_summary.lower()} '
-                    ),
+                    "issues_found": bool(review_summary and " lgtm " not in f" {review_summary.lower()} "),
                 },
                 "tokens": _token_metadata(ctx),
                 "performance": performance_summary,
             },
         )
         self._save_session_log(
-            ctx.session_id, ctx.request, _final_result,
-            ctx.total_prompt_tokens, ctx.total_completion_tokens,
+            ctx.session_id,
+            ctx.request,
+            _final_result,
+            ctx.total_prompt_tokens,
+            ctx.total_completion_tokens,
         )
         return _FinalAnswerOutcome(result=_final_result)
 
@@ -863,21 +959,22 @@ class TurnPipelineMixin:
         ctx: TurnContext,
         response: Any,
         new_messages: list,
-    ) -> "_PostToolResult":
+    ) -> _PostToolResult:
         """Process results after tool execution: sanitize, update messages, auto-observe, TDD."""
         try:
             if hasattr(response, "content") and isinstance(response.content, str):
                 response.content = self._strip_thinking_text(response.content)
         except (AttributeError, TypeError):
-            logger.debug("<module>::TurnPipelineMixin::_process_post_tool_turn:0 suppressed (AttributeError, TypeError)", exc_info=True)
+            logger.debug(
+                "<module>::TurnPipelineMixin::_process_post_tool_turn:0 suppressed (AttributeError, TypeError)",
+                exc_info=True,
+            )
 
         ctx.messages = self._append_native_tool_messages(ctx.messages, response, new_messages)
 
-        _PATCH_TOOLS = {"apply_patch", "write_plan"}
+        _patch_tools = {"apply_patch", "write_plan"}
         patch_ok_this_turn = any(
-            t.tool_name in _PATCH_TOOLS and t.tool_result.ok
-            for t in ctx.turns
-            if t.turn_num == ctx.turn_num
+            t.tool_name in _patch_tools and t.tool_result.ok for t in ctx.turns if t.turn_num == ctx.turn_num
         )
 
         # Auto-observation after successful patch.
@@ -886,14 +983,10 @@ class TurnPipelineMixin:
         # every turn, ballooning ctx.messages with redundant content. Both
         # apply_patch and write_plan record affected paths in their ToolResult
         # metadata under "touched_files" (write_plan via diff_apply details).
-        if (
-            patch_ok_this_turn
-            and self.config.auto_observation_enabled
-            and not self.config.auto_test_on_patch
-        ):
+        if patch_ok_this_turn and self.config.auto_observation_enabled and not self.config.auto_test_on_patch:
             _obs_paths: list[str] = []
             for _t in ctx.turns:
-                if _t.turn_num != ctx.turn_num or _t.tool_name not in _PATCH_TOOLS:
+                if _t.turn_num != ctx.turn_num or _t.tool_name not in _patch_tools:
                     continue
                 _tr = _t.tool_result
                 if not getattr(_tr, "ok", False):
@@ -908,15 +1001,15 @@ class TurnPipelineMixin:
                     _diff_proc = _sp.run(
                         ["git", "diff", "--", *_obs_paths],
                         cwd=self.registry.repo_root,
-                        capture_output=True, text=True, timeout=10,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
                     )
                     obs_content = (_diff_proc.stdout or "").strip()
                 except Exception:
                     obs_content = ""
             if obs_content:
-                ctx.messages.append(
-                    LLMMessage(role="user", content=f"[auto_observation]\n{obs_content}")
-                )
+                ctx.messages.append(LLMMessage(role="user", content=f"[auto_observation]\n{obs_content}"))
                 self._cb("auto_observation", {"turn": ctx.turn_num, "diff": obs_content})
 
         # Early finish after successful patch (no TDD, no self-review)
@@ -929,7 +1022,7 @@ class TurnPipelineMixin:
                 status="success",
                 turns=ctx.turns,
                 final_message=_llm_last_msg or "Task completed. Changes applied.",
-                applied_patches=self.registry.applied_patches,
+                applied_patches=list(self.registry.applied_patches),
                 metadata={
                     "turns_used": ctx.turn_num,
                     "plan": ctx.plan,
@@ -952,10 +1045,19 @@ class TurnPipelineMixin:
                 },
             )
             self._save_session_log(
-                ctx.session_id, ctx.request, _final_result,
-                ctx.total_prompt_tokens, ctx.total_completion_tokens,
+                ctx.session_id,
+                ctx.request,
+                _final_result,
+                ctx.total_prompt_tokens,
+                ctx.total_completion_tokens,
             )
-            return _PostToolResult(messages=ctx.messages, tdd_fail_count=ctx.tdd_fail_count, tdd_total_runs=ctx.tdd_total_runs, tdd_total_pass=ctx.tdd_total_pass, early_return=_final_result)
+            return _PostToolResult(
+                messages=ctx.messages,
+                tdd_fail_count=ctx.tdd_fail_count,
+                tdd_total_runs=ctx.tdd_total_runs,
+                tdd_total_pass=ctx.tdd_total_pass,
+                early_return=_final_result,
+            )
 
         # TDD auto-test
         if self.config.auto_test_on_patch and patch_ok_this_turn:
@@ -974,7 +1076,7 @@ class TurnPipelineMixin:
                         status="success",
                         turns=ctx.turns,
                         final_message=_llm_last_msg2 or "All tests passed. Changes applied.",
-                        applied_patches=self.registry.applied_patches,
+                        applied_patches=list(self.registry.applied_patches),
                         metadata={
                             "turns_used": ctx.turn_num,
                             "plan": ctx.plan,
@@ -1018,7 +1120,7 @@ class TurnPipelineMixin:
     # Turn message preparation
     # ------------------------------------------------------------------
 
-    def _prepare_turn_messages(self, ctx: TurnContext) -> "_TurnPrepResult":
+    def _prepare_turn_messages(self, ctx: TurnContext) -> _TurnPrepResult:
         """Prepare message list for one LLM turn.
 
         Injects hints and guidance via ctx.ephemeral_pending (merged at return),
@@ -1038,36 +1140,29 @@ class TurnPipelineMixin:
             # python-only tools the request never carries — get_tool_names'
             # docstring declares this agreement an explicit contract.
             tool_schemas=(
-                self.registry.get_tool_schemas(lang_filter=self.registry.repo_language)
-                if self.registry else None
+                self.registry.get_tool_schemas(lang_filter=self.registry.repo_language) if self.registry else None
             ),
             base_url=getattr(ctx, "base_url", None),
         )
 
-        if (
-            ctx.turn_num == 1
-            and not ctx.search_first_hint_done
-            and ctx.target_keywords
-            and not ctx.known_target_file
-        ):
+        if ctx.turn_num == 1 and not ctx.search_first_hint_done and ctx.target_keywords and not ctx.known_target_file:
             _sf_targets = ", ".join(f'"{k}"' for k in ctx.target_keywords[:2])
-            ctx.ephemeral_pending.append(LLMMessage(
-                role="system",
-                content=(
-                    f"[TOOL HINT] Text change task detected. Target: {_sf_targets}.\n"
-                    "Priority order to locate the target:\n"
-                    "  1. find_symbol — fastest if the target is a function/class/symbol name.\n"
-                    "  2. bash (grep -rn) — use if the target is arbitrary text, not a named symbol.\n"
-                    "  3. read_symbol or bash (cat) — ONLY after you know the exact file and line from step 1 or 2.\n"
-                    "Do NOT browse files randomly without locating the target first."
-                ),
-            ))
+            ctx.ephemeral_pending.append(
+                LLMMessage(
+                    role="system",
+                    content=(
+                        f"[TOOL HINT] Text change task detected. Target: {_sf_targets}.\n"
+                        "Priority order to locate the target:\n"
+                        "  1. find_symbol — fastest if the target is a function/class/symbol name.\n"
+                        "  2. bash (grep -rn) — use if the target is arbitrary text, not a named symbol.\n"
+                        "  3. read_symbol or bash (cat) — ONLY after you know the exact file and line from step 1 or 2.\n"
+                        "Do NOT browse files randomly without locating the target first."
+                    ),
+                )
+            )
             ctx.search_first_hint_done = True
 
-        if (
-            ctx.reads_since_last_edit >= _NO_PROGRESS_THRESHOLD
-            and ctx.goal_reminder_injected < 3
-        ):
+        if ctx.reads_since_last_edit >= _NO_PROGRESS_THRESHOLD and ctx.goal_reminder_injected < 3:
             _rf_count = ctx.reads_since_last_edit
             _reminder_text = (
                 f"[GOAL REMINDER] You have called {_rf_count} exploration tools "
@@ -1079,32 +1174,38 @@ class TurnPipelineMixin:
             )
             if ctx.goal_reminder_injected >= 1:
                 _reminder_text += (
-                    "\n\nIf you have enough context, apply the edit NOW with apply_patch. "
-                    "Do not read more files."
+                    "\n\nIf you have enough context, apply the edit NOW with apply_patch. Do not read more files."
                 )
-            ctx.ephemeral_pending.append(LLMMessage(
-                role="user",
-                content=_reminder_text,
-            ))
+            ctx.ephemeral_pending.append(
+                LLMMessage(
+                    role="user",
+                    content=_reminder_text,
+                )
+            )
             ctx.goal_reminder_injected += 1
             ctx.reads_since_last_edit = 0
             logger.info(
                 "Goal reminder injected (reminder #%d, was %d reads without edit)",
-                ctx.goal_reminder_injected, _rf_count,
+                ctx.goal_reminder_injected,
+                _rf_count,
             )
-            self._cb("goal_reminder", {
-                "turn": ctx.turn_num,
-                "reads_without_edit": _rf_count,
-                "reminder_count": ctx.goal_reminder_injected,
-            })
+            self._cb(
+                "goal_reminder",
+                {
+                    "turn": ctx.turn_num,
+                    "reads_without_edit": _rf_count,
+                    "reminder_count": ctx.goal_reminder_injected,
+                },
+            )
         try:
             tool_hint = self._build_tool_hint()
             if tool_hint:
-                ctx.ephemeral_pending.append(
-                    LLMMessage(role="system", content=tool_hint)
-                )
+                ctx.ephemeral_pending.append(LLMMessage(role="system", content=tool_hint))
         except (AttributeError, TypeError):
-            logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:0 suppressed (AttributeError, TypeError)", exc_info=True)
+            logger.debug(
+                "<module>::TurnPipelineMixin::_prepare_turn_messages:0 suppressed (AttributeError, TypeError)",
+                exc_info=True,
+            )
 
         # Planner progress hint
         if ctx.plan_subtasks and ctx.plan_current_index < len(ctx.plan_subtasks):
@@ -1112,15 +1213,16 @@ class TurnPipelineMixin:
                 task = ctx.plan_subtasks[ctx.plan_current_index]
                 hint = (
                     "[PLAN PROGRESS]\n"
-                    f"Current subtask ({ctx.plan_current_index+1}/{len(ctx.plan_subtasks)}): "
-                    f"{task.get('title','')}\n"
+                    f"Current subtask ({ctx.plan_current_index + 1}/{len(ctx.plan_subtasks)}): "
+                    f"{task.get('title', '')}\n"
                     f"Target files: {', '.join(task.get('files') or [])}"
                 )
-                ctx.ephemeral_pending.append(
-                    LLMMessage(role="user", content=hint)
-                )
+                ctx.ephemeral_pending.append(LLMMessage(role="user", content=hint))
             except (AttributeError, TypeError):
-                logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:1 suppressed (AttributeError, TypeError)", exc_info=True)
+                logger.debug(
+                    "<module>::TurnPipelineMixin::_prepare_turn_messages:1 suppressed (AttributeError, TypeError)",
+                    exc_info=True,
+                )
 
         if ctx.read_only_request or ctx.is_local_model:
             try:
@@ -1131,13 +1233,12 @@ class TurnPipelineMixin:
                     )
                 )
             except (AttributeError, TypeError):
-                logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:2 suppressed (AttributeError, TypeError)", exc_info=True)
+                logger.debug(
+                    "<module>::TurnPipelineMixin::_prepare_turn_messages:2 suppressed (AttributeError, TypeError)",
+                    exc_info=True,
+                )
 
-        if (
-            ctx.known_target_file
-            and not ctx.read_only_request
-            and ctx.turn_num == 1
-        ):
+        if ctx.known_target_file and not ctx.read_only_request and ctx.turn_num == 1:
             try:
                 ctx.ephemeral_pending.append(
                     LLMMessage(
@@ -1152,42 +1253,55 @@ class TurnPipelineMixin:
                     )
                 )
             except (AttributeError, TypeError):
-                logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:3 suppressed (AttributeError, TypeError)", exc_info=True)
+                logger.debug(
+                    "<module>::TurnPipelineMixin::_prepare_turn_messages:3 suppressed (AttributeError, TypeError)",
+                    exc_info=True,
+                )
 
         try:
             if ctx.turn_num > 2:
                 traj = self._trajectory_compress(ctx.turns)
                 if traj:
-                    ctx.ephemeral_pending.append(
-                        LLMMessage(role="user", content=traj)
-                    )
+                    ctx.ephemeral_pending.append(LLMMessage(role="user", content=traj))
         except (AttributeError, TypeError):
-            logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:4 suppressed (AttributeError, TypeError)", exc_info=True)
+            logger.debug(
+                "<module>::TurnPipelineMixin::_prepare_turn_messages:4 suppressed (AttributeError, TypeError)",
+                exc_info=True,
+            )
 
         if self.config.cancel_event and self.config.cancel_event.is_set():
             raise AgentCancelled("cancelled by user")
 
         if self.config.message_queue is not None:
             import queue as _queue_mod
+
             while True:
                 try:
                     mid_msg = self.config.message_queue.get_nowait()
-                    ctx.messages.append(LLMMessage(
-                        role="user",
-                        content=f"[USER INTERRUPT] {mid_msg}",
-                    ))
-                    self._cb("user_message_received", {
-                        "message": mid_msg,
-                        "turn": ctx.turn_num,
-                    })
+                    ctx.messages.append(
+                        LLMMessage(
+                            role="user",
+                            content=f"[USER INTERRUPT] {mid_msg}",
+                        )
+                    )
+                    self._cb(
+                        "user_message_received",
+                        {
+                            "message": mid_msg,
+                            "turn": ctx.turn_num,
+                        },
+                    )
                     logger.info("Mid-task user message injected at turn %d: %s", ctx.turn_num, mid_msg[:80])
                 except _queue_mod.Empty:
-                    logger.debug("<module>::TurnPipelineMixin::_prepare_turn_messages:5 suppressed _queue_mod.Empty", exc_info=True)
+                    logger.debug(
+                        "<module>::TurnPipelineMixin::_prepare_turn_messages:5 suppressed _queue_mod.Empty",
+                        exc_info=True,
+                    )
                     break
 
         ctx.messages = self._trim_context(ctx.messages)
 
-        _max_turns = getattr(self.config, 'max_turns', 0)
+        _max_turns = getattr(self.config, "max_turns", 0)
         if _max_turns > 0 and not ctx.budget_warned and ctx.turn_num >= _max_turns - 4:
             budget_warned_msg = (
                 f"[BUDGET WARNING] You have approximately {_max_turns - ctx.turn_num + 1} turns remaining. "
@@ -1217,7 +1331,7 @@ class TurnPipelineMixin:
         plan_current_index: int,
         read_only_request: bool,
         turn_num: int,
-    ) -> "_PreparedCallsResult":
+    ) -> _PreparedCallsResult:
         """Build prepared_calls from raw tool_calls, filter, emit previews.
 
         May raise AgentCancelled if cancel_event is set.
@@ -1228,36 +1342,38 @@ class TurnPipelineMixin:
             try:
                 last_tool = turns[-1].tool_name if turns else None
                 if last_tool in {"apply_patch", "write_plan"}:
-                    plan_current_index = min(
-                        plan_current_index + 1,
-                        len(plan_subtasks)
-                    )
+                    plan_current_index = min(plan_current_index + 1, len(plan_subtasks))
             except (TypeError, AttributeError):
-                logger.debug("<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:0 suppressed (TypeError, AttributeError)", exc_info=True)
+                logger.debug(
+                    "<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:0 suppressed (TypeError, AttributeError)",
+                    exc_info=True,
+                )
 
         prepared_calls = []
         _unknown_tool_notices: list[str] = []
 
+        # Pre-bind so the except path below cannot leak an unbound name: the
+        # masking notices read _repo_lang after the try/except, and a guard
+        # failure must degrade to "no language filter" (None), never NameError.
+        _repo_lang = None
+        _known_tools: frozenset[str] = frozenset()
+        _masked_tools: frozenset[str] = frozenset()
         try:
             _repo_lang = getattr(self.registry, "repo_language", None)
             if hasattr(self.registry, "get_tool_names"):
-                _known_tools = self.registry.get_tool_names(lang_filter=_repo_lang)
+                _known_tools = frozenset(str(t) for t in self.registry.get_tool_names(lang_filter=_repo_lang))
                 # Tools hidden by language masking (non-Python repo). Distinguishing
                 # them from genuinely-unknown tools lets us emit a precise notice
                 # instead of the generic read-only-mode message.
-                _masked_tools = (
-                    self.registry.get_tool_names() - _known_tools
-                    if _repo_lang is not None else frozenset()
-                )
+                _all_names = frozenset(str(t) for t in self.registry.get_tool_names())
+                _masked_tools = _all_names - _known_tools if _repo_lang is not None else frozenset()
             else:
-                _known_tools = {
-                    t.get("name")
-                    for t in (self.registry.get_tool_schemas() or [])
-                    if t.get("name")
-                }
+                _known_tools = frozenset(
+                    str(t.get("name")) for t in (self.registry.get_tool_schemas() or []) if t.get("name")
+                )
                 _masked_tools = frozenset()
         except (AttributeError, TypeError, KeyError):
-            _known_tools = set()
+            _known_tools = frozenset()
             _masked_tools = frozenset()
 
         for call in tool_calls:
@@ -1306,8 +1422,11 @@ class TurnPipelineMixin:
                 continue
 
             if _masked_tools and tool_name in _masked_tools:
-                logger.warning("Skipping Python-only tool call '%s' (repo is %s)",
-                               tool_name, getattr(_repo_lang, "value", _repo_lang))
+                logger.warning(
+                    "Skipping Python-only tool call '%s' (repo is %s)",
+                    tool_name,
+                    getattr(_repo_lang, "value", _repo_lang),
+                )
                 _unknown_tool_notices.append(
                     f"Tool `{tool_name}` is a Python-only tool and is not available "
                     f"in this {getattr(_repo_lang, 'value', _repo_lang)} repository. "
@@ -1328,18 +1447,19 @@ class TurnPipelineMixin:
                 continue
 
             call_id = str(call.get("id") or f"call_{turn_num}_{tool_name}")
-            prepared_calls.append({
-                "tool": tool_name,
-                "args": tool_args,
-                "call_id": call_id,
-                "original_call": call,
-            })
+            prepared_calls.append(
+                {
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "call_id": call_id,
+                    "original_call": call,
+                }
+            )
 
             logger.info("Tool call (pending): %s(%s)", tool_name, list(tool_args.keys()))
 
         phase_rule_messages: list[LLMMessage] = [
-            LLMMessage(role="user", content=f"[PHASE RULE] {n}")
-            for n in _unknown_tool_notices
+            LLMMessage(role="user", content=f"[PHASE RULE] {n}") for n in _unknown_tool_notices
         ]
         # The phase/read-only pass through _filter_prepared_calls used to sit
         # here. It never removed a call and never produced a notice, so the
@@ -1359,14 +1479,20 @@ class TurnPipelineMixin:
         if self.config.stream_callback:
             for _pc in prepared_calls:
                 try:
-                    self._cb("tool_call_preview", {
-                        "turn": turn_num,
-                        "tool": _pc["tool"],
-                        "args": self.registry.normalize_args_for_display(_pc["args"]),
-                        "agent_id": self.config.agent_id,
-                    })
+                    self._cb(
+                        "tool_call_preview",
+                        {
+                            "turn": turn_num,
+                            "tool": _pc["tool"],
+                            "args": self.registry.normalize_args_for_display(_pc["args"]),
+                            "agent_id": self.config.agent_id,
+                        },
+                    )
                 except (AttributeError, TypeError):
-                    logger.debug("<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:4 suppressed (AttributeError, TypeError)", exc_info=True)
+                    logger.debug(
+                        "<module>::TurnPipelineMixin::_build_and_filter_prepared_calls:4 suppressed (AttributeError, TypeError)",
+                        exc_info=True,
+                    )
 
         if self.config.cancel_event and self.config.cancel_event.is_set():
             raise AgentCancelled("cancelled by user before tool execution")
@@ -1398,7 +1524,7 @@ class TurnPipelineMixin:
         git_state: Any,
         turn_num: int,
         turns: list,
-    ) -> "_ResultsProcessingOutcome":
+    ) -> _ResultsProcessingOutcome:
         """Process tool call results: track writes, early-finish, chaining, fail-loop, SSE emit."""
         _noop_confirmed = False
 
@@ -1422,48 +1548,59 @@ class TurnPipelineMixin:
             # Cacheability is the registry's SSOT (is_result_cacheable), not
             # ``write_tools`` (which omits serial-only tools like ask_user/job).
             if result.metadata and result.metadata.get("cache_hit"):
-                _cache_outcome: Optional[bool] = True
+                _cache_outcome: bool | None = True
             elif self.registry and self.registry.is_result_cacheable(tool_name):
                 _cache_outcome = False
             else:
                 _cache_outcome = None
             self.performance_collector.record_tool_call(
-                tool_name, result.execution_time,
+                tool_name,
+                result.execution_time,
                 cache_hit=_cache_outcome,
                 failed=not result.ok,
             )
 
             # Read-only early finish detection
             if read_only_request and not write_tool_used:
-                early_result = self._try_readonly_early_finish(
-                    tool_name, result, request, read_only_request
-                )
+                early_result = self._try_readonly_early_finish(tool_name, result, request, read_only_request)
                 if early_result is not None:
                     if self.config.stream_callback:
-                        content_limit = 8000 if tool_name in _STREAM_LARGE_TOOLS else (6000 if tool_name in _STREAM_VERBOSE_TOOLS else 2000)
+                        content_limit = (
+                            8000
+                            if tool_name in _STREAM_LARGE_TOOLS
+                            else (6000 if tool_name in _STREAM_VERBOSE_TOOLS else 2000)
+                        )
                         try:
-                            self._cb("tool_call", {
-                                "turn": turn_num,
-                                "tool": tool_name,
-                                "args": self.registry.normalize_args_for_display(tool_args),
-                                "result": {
-                                    "ok": result.ok,
-                                    "content": result.content[:content_limit],
-                                    "error": result.error,
+                            self._cb(
+                                "tool_call",
+                                {
+                                    "turn": turn_num,
+                                    "tool": tool_name,
+                                    "args": self.registry.normalize_args_for_display(tool_args),
+                                    "result": {
+                                        "ok": result.ok,
+                                        "content": result.content[:content_limit],
+                                        "error": result.error,
+                                    },
+                                    "agent_id": self.config.agent_id,
                                 },
-                                "agent_id": self.config.agent_id,
-                            })
+                            )
                         except Exception:
-                            logger.debug("<module>::TurnPipelineMixin::_process_tool_results:0 suppressed Exception", exc_info=True)
+                            logger.debug(
+                                "<module>::TurnPipelineMixin::_process_tool_results:0 suppressed Exception",
+                                exc_info=True,
+                            )
                     # `turns` is ctx.turns, which the caller already appended
                     # this tool call to before invoking _process_tool_results.
                     # Building another AgentTurn here would double-count it.
                     early_result.turns = list(turns)
-                    early_result.metadata.update({
-                        "turns_used": turn_num,
-                        "readonly_early_finish": True,
-                        "deterministic_tool": tool_name,
-                    })
+                    early_result.metadata.update(
+                        {
+                            "turns_used": turn_num,
+                            "readonly_early_finish": True,
+                            "deterministic_tool": tool_name,
+                        }
+                    )
                     self.performance_collector.end_session()
                     performance_summary = self.performance_collector.get_summary()
                     early_result.metadata["performance"] = performance_summary
@@ -1496,22 +1633,23 @@ class TurnPipelineMixin:
             # below so the two never tangle.
             try:
                 from .failure_pattern_store import record_recall_outcome
+
                 record_recall_outcome(ok=result.ok, session_key=session_key)
             except Exception:  # recall bookkeeping must not break the pipeline
                 logger.debug("<module>::TurnPipelineMixin::_process_tool_results:1 suppressed Exception", exc_info=True)
             if not result.ok:
-                classification = self._failure_classifier.classify(
-                    tool_name,
-                    result
-                )
+                classification = self._failure_classifier.classify(tool_name, result)
                 try:
                     result.metadata = result.metadata or {}
                     result.metadata["failure_classification"] = {
                         "action": classification.action,
-                        "reason": classification.reason
+                        "reason": classification.reason,
                     }
                 except (AttributeError, TypeError):
-                    logger.debug("<module>::TurnPipelineMixin::_process_tool_results:2 suppressed (AttributeError, TypeError)", exc_info=True)
+                    logger.debug(
+                        "<module>::TurnPipelineMixin::_process_tool_results:2 suppressed (AttributeError, TypeError)",
+                        exc_info=True,
+                    )
                 # ── Per-repo persistent failure recall ─────────────────────────
                 # recall_on_failure is the single shared hook (also used by the
                 # CLI design-chat loop): classify → in-session dedup → record →
@@ -1522,8 +1660,11 @@ class TurnPipelineMixin:
                 # still keys off fail_streak independently.
                 try:
                     from .failure_pattern_store import recall_on_failure
+
                     _recall_hint = recall_on_failure(
-                        tool_name, tool_args, result,
+                        tool_name,
+                        tool_args,
+                        result,
                         getattr(self.registry, "repo_root", "") or "",
                         # session_key is a fresh per-run key (new_session_key()
                         # at _run_llm_loop entry) → a new run re-records &
@@ -1532,11 +1673,11 @@ class TurnPipelineMixin:
                         session_key=session_key,
                     )
                     if _recall_hint:
-                        new_messages.append(
-                            LLMMessage(role="user", content=_recall_hint)
-                        )
+                        new_messages.append(LLMMessage(role="user", content=_recall_hint))
                 except Exception:  # recall must never break the pipeline
-                    logger.debug("<module>::TurnPipelineMixin::_process_tool_results:3 suppressed Exception", exc_info=True)
+                    logger.debug(
+                        "<module>::TurnPipelineMixin::_process_tool_results:3 suppressed Exception", exc_info=True
+                    )
                 self._tool_retry_counter[tool_name] += 1
                 if self._tool_retry_counter[tool_name] >= _TOOL_RETRY_LIMIT:
                     _exhaust_warn = LLMMessage(
@@ -1550,12 +1691,15 @@ class TurnPipelineMixin:
                         ),
                     )
                     new_messages.append(_exhaust_warn)
-                    self._cb("fail_loop_detected", {
-                        "turn": turn_num,
-                        "tool": tool_name,
-                        "streak": self._tool_retry_counter[tool_name],
-                        "signal": "tool_exhaustion",
-                    })
+                    self._cb(
+                        "fail_loop_detected",
+                        {
+                            "turn": turn_num,
+                            "tool": tool_name,
+                            "streak": self._tool_retry_counter[tool_name],
+                            "signal": "tool_exhaustion",
+                        },
+                    )
                     self._tool_retry_counter[tool_name] = 0
                 fail_streak[_loop_key] = fail_streak.get(_loop_key, 0) + 1
                 if fail_streak[_loop_key] == fail_streak_threshold:
@@ -1581,11 +1725,14 @@ class TurnPipelineMixin:
                         ),
                     )
                     new_messages.append(strategy_warn)
-                    self._cb("fail_loop_detected", {
-                        "turn": turn_num,
-                        "tool": tool_name,
-                        "streak": fail_streak[_loop_key],
-                    })
+                    self._cb(
+                        "fail_loop_detected",
+                        {
+                            "turn": turn_num,
+                            "tool": tool_name,
+                            "streak": fail_streak[_loop_key],
+                        },
+                    )
             else:
                 fail_streak.pop(_loop_key, None)
                 self._tool_retry_counter[tool_name] = 0
@@ -1609,36 +1756,49 @@ class TurnPipelineMixin:
                     logger.info("No-op confirmed via %s empty/no-change error", tool_name)
 
             if self.config.stream_callback:
-                content_limit = 8000 if tool_name in _STREAM_LARGE_TOOLS else (6000 if tool_name in _STREAM_VERBOSE_TOOLS else 2000)
+                content_limit = (
+                    8000 if tool_name in _STREAM_LARGE_TOOLS else (6000 if tool_name in _STREAM_VERBOSE_TOOLS else 2000)
+                )
                 try:
-                    self._cb("tool_call", {
-                        "turn": turn_num,
-                        "tool": tool_name,
-                        "args": self.registry.normalize_args_for_display(tool_args),
-                        "result": {
-                            "ok": result.ok,
-                            "content": result.content[:content_limit],
-                            "error": result.error,
+                    self._cb(
+                        "tool_call",
+                        {
+                            "turn": turn_num,
+                            "tool": tool_name,
+                            "args": self.registry.normalize_args_for_display(tool_args),
+                            "result": {
+                                "ok": result.ok,
+                                "content": result.content[:content_limit],
+                                "error": result.error,
+                            },
+                            "agent_id": self.config.agent_id,
                         },
-                        "agent_id": self.config.agent_id,
-                    })
+                    )
                 except (AttributeError, TypeError):
-                    logger.debug("<module>::TurnPipelineMixin::_process_tool_results:4 suppressed (AttributeError, TypeError)", exc_info=True)
+                    logger.debug(
+                        "<module>::TurnPipelineMixin::_process_tool_results:4 suppressed (AttributeError, TypeError)",
+                        exc_info=True,
+                    )
 
-            new_messages.append(
-                self._build_tool_result_message(call_id, tool_name, result, tool_args)
-            )
+            new_messages.append(self._build_tool_result_message(call_id, tool_name, result, tool_args))
 
             # Read-only exploration tools. Counting these toward
             # reads_since_last_edit lets the GOAL REMINDER fire when the agent
             # loops on reads (incl. read_symbol/read_file) without editing.
-            _EXPLORATION_TOOLS = {
-                "bash", "find_symbol", "find_references",
-                "find_relevant_files", "read_file", "read_symbol",
-                "get_file_outline", "get_project_info", "grep", "glob",
+            _exploration_tools = {
+                "bash",
+                "find_symbol",
+                "find_references",
+                "find_relevant_files",
+                "read_file",
+                "read_symbol",
+                "get_file_outline",
+                "get_project_info",
+                "grep",
+                "glob",
             }
             if result.ok:
-                if tool_name in _EXPLORATION_TOOLS:
+                if tool_name in _exploration_tools:
                     reads_since_last_edit += 1
                 if tool_name in write_tools:
                     # Reset the read counter on ANY successful write — not just
@@ -1659,12 +1819,15 @@ class TurnPipelineMixin:
                     try:
                         if getattr(self.config, "scoped_verification", False):
                             from .test_impact_selector import invalidate_index
+
                             if _write_touched_test_file(tool_name, tool_args):
                                 _rr = getattr(self.registry, "repo_root", None)
                                 if _rr:
                                     invalidate_index(_rr)
                     except Exception:  # must never break the pipeline
-                        logger.debug("<module>::TurnPipelineMixin::_process_tool_results:5 suppressed Exception", exc_info=True)
+                        logger.debug(
+                            "<module>::TurnPipelineMixin::_process_tool_results:5 suppressed Exception", exc_info=True
+                        )
 
         return _ResultsProcessingOutcome(
             new_messages=new_messages,
@@ -1762,7 +1925,7 @@ class TurnPipelineMixin:
         self,
         ctx: TurnContext,
         tool_calls: list,
-    ) -> "_ToolTurnOutcome":
+    ) -> _ToolTurnOutcome:
         """Prepare, execute, and process tool calls for one LLM turn.
 
         Returns _ToolTurnOutcome. If early_return is set, caller should return it immediately.
@@ -1802,18 +1965,17 @@ class TurnPipelineMixin:
         plan_current_index = _pcr.plan_current_index
 
         # Parallel execution if enabled
-        if (hasattr(self.config, 'parallel_tool_execution_enabled') and
-            self.config.parallel_tool_execution_enabled and
-            len(prepared_calls) > 1):
+        if (
+            hasattr(self.config, "parallel_tool_execution_enabled")
+            and self.config.parallel_tool_execution_enabled
+            and len(prepared_calls) > 1
+        ):
             parallel_calls = [{"tool": pc["tool"], "args": pc["args"]} for pc in prepared_calls]
             try:
                 results = self.registry.dispatch_parallel(parallel_calls)
             except StopIteration:
                 logger.exception("Tool dispatch_parallel StopIteration (mock side_effect exhausted)")
-                results = [
-                    ToolResult(ok=False, content="", error="StopIteration", metadata={})
-                    for _ in parallel_calls
-                ]
+                results = [ToolResult(ok=False, content="", error="StopIteration", metadata={}) for _ in parallel_calls]
             # Parity with the serial branch: a multi-call turn still counts as
             # "tools called" for the false-success gate, must feed the
             # adaptive-routing success/failure memory channels, and failed
@@ -1829,11 +1991,12 @@ class TurnPipelineMixin:
                     else:
                         self._record_tool_failure(_pc["tool"], _pc["args"])
                 except (AttributeError, TypeError):
-                    logger.debug("<module>::TurnPipelineMixin::_execute_and_process_tool_calls:2 suppressed (AttributeError, TypeError)", exc_info=True)
+                    logger.debug(
+                        "<module>::TurnPipelineMixin::_execute_and_process_tool_calls:2 suppressed (AttributeError, TypeError)",
+                        exc_info=True,
+                    )
                 results[_i] = self._post_dispatch_patch_recovery(_pc["tool"], _pc["args"], _r)
-            _log_parallel_write_failures(
-                results, parallel_calls, self, session_key=ctx.recall_session_key
-            )
+            _log_parallel_write_failures(results, parallel_calls, self, session_key=ctx.recall_session_key)
         else:
             results = []
             for pc in prepared_calls:
@@ -1858,18 +2021,22 @@ class TurnPipelineMixin:
                                 from .tool_failure_log import (
                                     record_write_tool_failure_from_tr,
                                 )
+
                                 record_write_tool_failure_from_tr(
-                                    tool=tool_name, tr=result, args=tool_args,
+                                    tool=tool_name,
+                                    tr=result,
+                                    args=tool_args,
                                     model=getattr(self.config, "model", None),
                                     repo_root=getattr(self.registry, "repo_root", None),
                                     session_key=ctx.recall_session_key,
                                 )
                             except Exception:
-                                logger.debug(
-                                    "tool_failure_log: record failed", exc_info=True
-                                )
+                                logger.debug("tool_failure_log: record failed", exc_info=True)
                     except (AttributeError, TypeError):
-                        logger.debug("<module>::TurnPipelineMixin::_execute_and_process_tool_calls:2 suppressed (AttributeError, TypeError)", exc_info=True)
+                        logger.debug(
+                            "<module>::TurnPipelineMixin::_execute_and_process_tool_calls:2 suppressed (AttributeError, TypeError)",
+                            exc_info=True,
+                        )
                 except StopIteration:
                     logger.exception(
                         "Tool dispatch StopIteration (mock side_effect exhausted): %s",
@@ -1896,12 +2063,14 @@ class TurnPipelineMixin:
         # read .turns — intelligent_service's turn_summary and its
         # "turns_used": len(turns) — therefore always saw nothing.
         for _pc, _res in zip(prepared_calls, results, strict=False):
-            ctx.turns.append(AgentTurn(
-                turn_num=ctx.turn_num,
-                tool_name=_pc["tool"],
-                tool_args=_pc["args"],
-                tool_result=_res,
-            ))
+            ctx.turns.append(
+                AgentTurn(
+                    turn_num=ctx.turn_num,
+                    tool_name=_pc["tool"],
+                    tool_args=_pc["args"],
+                    tool_result=_res,
+                )
+            )
 
         _rpr = self._process_tool_results(
             results=results,
@@ -1956,99 +2125,98 @@ class TurnPipelineMixin:
 
     # ------------------------------------------------------------------
     def _post_dispatch_patch_recovery(self, tool_name: str, tool_args: dict, result) -> Any:
-            """Apply the apply_patch recovery ladder to a dispatched result.
+        """Apply the apply_patch recovery ladder to a dispatched result.
 
-            Two stages, both apply_patch-only:
-              1. auto-repair (max 1 retry) via ``_auto_repair_apply_patch_args``;
-              2. tolerant-patch mode: count consecutive failures and, at the
-                 threshold, auto-convert the patch to edit_blocks via PatchEngine
-                 and dispatch it as write_plan.
+        Two stages, both apply_patch-only:
+          1. auto-repair (max 1 retry) via ``_auto_repair_apply_patch_args``;
+          2. tolerant-patch mode: count consecutive failures and, at the
+             threshold, auto-convert the patch to edit_blocks via PatchEngine
+             and dispatch it as write_plan.
 
-            Shared by the serial and parallel dispatch branches in
-            ``_execute_and_process_tool_calls`` so a failed apply_patch gets the
-            same recovery whether it ran alone or was batched with other tools in
-            one turn. Returns the (possibly replaced) final result.
-            """
-            if tool_name != "apply_patch":
-                return result
-            if not result.ok:
-                new_args = self._auto_repair_apply_patch_args(tool_args)
-                if new_args:
-                    logger.debug("Auto-repair for apply_patch: attempting repair")
-                    # Capture the failure cause BEFORE retry_result replaces
-                    # `result`; on success result.error becomes None and the
-                    # original error would otherwise be lost from metadata.
-                    _orig_error = result.error
-                    retry_result = self.registry.dispatch(tool_name, new_args)
-                    if retry_result.ok:
-                        result = retry_result
-                        result.metadata["auto_repair"] = {
-                            "attempted": True,
-                            "kind": "patch_format_fix",
-                            "original_error": _orig_error,
-                            "success": True,
-                        }
-                    else:
-                        result.metadata["auto_repair"] = {
-                            "attempted": True,
-                            "kind": "patch_format_fix",
-                            "original_error": _orig_error,
-                            "success": False,
-                            "retry_error": retry_result.error,
-                        }
-            if result.ok:
-                self._patch_fail_count = 0
-            else:
-                self._patch_fail_count += 1
-                max_failures = getattr(self.config, "tolerant_patch_max_failures", 2)
-                if (
-                    getattr(self.config, "tolerant_patch_mode", False)
-                    and self._patch_fail_count >= max_failures
-                ):
-                    patch_text = tool_args.get("patch", "")
-                    path_hint = tool_args.get("path")
-                    eb_result = None
-                    # patch_engine is first-party — import cannot fail.
-                    from ..patch_engine import PatchEngine
-                    if PatchEngine is not None:
-                        try:
-                            engine = PatchEngine(self.registry.repo_root)
-                            converted = engine.convert_patch_to_edit_blocks(patch_text, path_hint)
-                            if converted:
-                                plan = {
-                                    "kind": "ASICODE_PLAN_V1",
-                                    "ops": [{"op": "edit_blocks", "path": converted["file_path"], "blocks": converted["blocks"]}],
-                                }
-                                plan_str = json.dumps(plan, ensure_ascii=False)
-                                eb_result = self.registry.dispatch("write_plan", {"plan": plan_str})
-                                if eb_result.ok:
-                                    eb_result.metadata["auto_converted_from_patch"] = True
-                                    eb_result.metadata["edit_blocks_count"] = len(converted["blocks"])
-                                    eb_result.content = (
-                                        f"Patch auto-converted to edit_blocks and applied successfully "
-                                        f"({len(converted['blocks'])} block(s) in {converted['file_path']}).\n" + (eb_result.content or "")
-                                    )
-                        except Exception as e:
-                            logger.debug("PatchEngine convert_patch_to_edit_blocks failed: %s", e)
-                            eb_result = None
-                    if eb_result is not None:
-                        if eb_result.ok:
-                            logger.info(
-                                "edit_blocks auto-conversion succeeded after %d patch failures",
-                                self._patch_fail_count,
-                            )
-                            self._patch_fail_count = 0
-                            result = eb_result
-                        else:
-                            logger.debug(
-                                "edit_blocks auto-conversion also failed: %s", eb_result.error
-                            )
-                            result.metadata["edit_blocks_fallback_error"] = eb_result.error
+        Shared by the serial and parallel dispatch branches in
+        ``_execute_and_process_tool_calls`` so a failed apply_patch gets the
+        same recovery whether it ran alone or was batched with other tools in
+        one turn. Returns the (possibly replaced) final result.
+        """
+        if tool_name != "apply_patch":
             return result
+        if not result.ok:
+            new_args = self._auto_repair_apply_patch_args(tool_args)
+            if new_args:
+                logger.debug("Auto-repair for apply_patch: attempting repair")
+                # Capture the failure cause BEFORE retry_result replaces
+                # `result`; on success result.error becomes None and the
+                # original error would otherwise be lost from metadata.
+                _orig_error = result.error
+                retry_result = self.registry.dispatch(tool_name, new_args)
+                if retry_result.ok:
+                    result = retry_result
+                    result.metadata["auto_repair"] = {
+                        "attempted": True,
+                        "kind": "patch_format_fix",
+                        "original_error": _orig_error,
+                        "success": True,
+                    }
+                else:
+                    result.metadata["auto_repair"] = {
+                        "attempted": True,
+                        "kind": "patch_format_fix",
+                        "original_error": _orig_error,
+                        "success": False,
+                        "retry_error": retry_result.error,
+                    }
+        if result.ok:
+            self._patch_fail_count = 0
+        else:
+            self._patch_fail_count += 1
+            max_failures = getattr(self.config, "tolerant_patch_max_failures", 2)
+            if getattr(self.config, "tolerant_patch_mode", False) and self._patch_fail_count >= max_failures:
+                patch_text = tool_args.get("patch", "")
+                path_hint = tool_args.get("path")
+                eb_result = None
+                # patch_engine is first-party — import cannot fail.
+                from ..patch_engine import PatchEngine
 
-        # ------------------------------------------------------------------
-        # Loop cancellation handler
-        # ------------------------------------------------------------------
+                if PatchEngine is not None:
+                    try:
+                        engine = PatchEngine(self.registry.repo_root)
+                        converted = engine.convert_patch_to_edit_blocks(patch_text, path_hint)
+                        if converted:
+                            plan = {
+                                "kind": "ASICODE_PLAN_V1",
+                                "ops": [
+                                    {"op": "edit_blocks", "path": converted["file_path"], "blocks": converted["blocks"]}
+                                ],
+                            }
+                            plan_str = json.dumps(plan, ensure_ascii=False)
+                            eb_result = self.registry.dispatch("write_plan", {"plan": plan_str})
+                            if eb_result.ok:
+                                eb_result.metadata["auto_converted_from_patch"] = True
+                                eb_result.metadata["edit_blocks_count"] = len(converted["blocks"])
+                                eb_result.content = (
+                                    f"Patch auto-converted to edit_blocks and applied successfully "
+                                    f"({len(converted['blocks'])} block(s) in {converted['file_path']}).\n"
+                                    + (eb_result.content or "")
+                                )
+                    except Exception as e:
+                        logger.debug("PatchEngine convert_patch_to_edit_blocks failed: %s", e)
+                        eb_result = None
+                if eb_result is not None:
+                    if eb_result.ok:
+                        logger.info(
+                            "edit_blocks auto-conversion succeeded after %d patch failures",
+                            self._patch_fail_count,
+                        )
+                        self._patch_fail_count = 0
+                        result = eb_result
+                    else:
+                        logger.debug("edit_blocks auto-conversion also failed: %s", eb_result.error)
+                        result.metadata["edit_blocks_fallback_error"] = eb_result.error
+        return result
+
+    # ------------------------------------------------------------------
+    # Loop cancellation handler
+    # ------------------------------------------------------------------
     # Loop cancellation handler
     # ------------------------------------------------------------------
 
@@ -2056,7 +2224,7 @@ class TurnPipelineMixin:
         self,
         turns: list,
         git_state: Any,
-    ) -> "AgentResult":
+    ) -> AgentResult:
         """Handle AgentCancelled: rollback patches and return cancelled result."""
         logger.info("Agent execution cancelled")
         self._cb("cancelled", {"message": "Agent execution cancelled by user"})
@@ -2070,27 +2238,32 @@ class TurnPipelineMixin:
             rollback_performed = True
 
             if rollback_result["success"]:
-                logger.info("Successfully rolled back %d/%d patches",
-                           rollback_result["rolled_back"], rollback_result["total"])
+                logger.info(
+                    "Successfully rolled back %d/%d patches", rollback_result["rolled_back"], rollback_result["total"]
+                )
                 # Clear applied_patches after successful rollback so DIFF_VERIFY
                 # does not falsely warn that git diff is empty.
                 self.registry.applied_patches.clear()
             else:
-                logger.warning("Partial or failed rollback: %d/%d patches rolled back",
-                              rollback_result["rolled_back"], rollback_result["total"])
+                logger.warning(
+                    "Partial or failed rollback: %d/%d patches rolled back",
+                    rollback_result["rolled_back"],
+                    rollback_result["total"],
+                )
                 for i, result in enumerate(rollback_result.get("results", [])):
                     if not result.get("success"):
-                        logger.error("Rollback failed for patch %d: %s",
-                                    result.get("patch_index", i), result.get("message", "unknown error"))
+                        logger.error(
+                            "Rollback failed for patch %d: %s",
+                            result.get("patch_index", i),
+                            result.get("message", "unknown error"),
+                        )
                 # Partial rollback: keep applied_patches so DIFF_VERIFY and
                 # downstream callers know some changes are still in the working tree.
         else:
             logger.info("No patches to rollback")
             rollback_result = {"success": True, "message": "No patches to rollback", "rolled_back": 0}
 
-        rollback_msg, rollback_meta = _summarize_rollback(
-            rollback_result if rollback_performed else None
-        )
+        rollback_msg, rollback_meta = _summarize_rollback(rollback_result if rollback_performed else None)
 
         self.performance_collector.end_session()
         performance_summary = self.performance_collector.get_summary()
@@ -2099,7 +2272,7 @@ class TurnPipelineMixin:
             status="cancelled",
             turns=turns,
             final_message=f"Agent execution cancelled. {rollback_msg}",
-            applied_patches=self.registry.applied_patches,
+            applied_patches=list(self.registry.applied_patches),
             metadata={
                 "turns_used": len(turns),
                 "git_state": git_state,
@@ -2119,7 +2292,7 @@ class TurnPipelineMixin:
         git_state: Any,
         rollback_performed: bool,
         rollback_result: Any,
-    ) -> "AgentResult":
+    ) -> AgentResult:
         """Handle unexpected Exception: rollback patches and return error result."""
         logger.exception("Unexpected error in agent loop")
 
@@ -2148,27 +2321,29 @@ class TurnPipelineMixin:
             rollback_performed = True
 
             if rollback_result["success"]:
-                logger.info("Successfully rolled back %d/%d patches",
-                           rollback_result["rolled_back"], rollback_result["total"])
+                logger.info(
+                    "Successfully rolled back %d/%d patches", rollback_result["rolled_back"], rollback_result["total"]
+                )
                 # Clear applied_patches after successful rollback so DIFF_VERIFY
                 # does not falsely warn that git diff is empty.
                 self.registry.applied_patches.clear()
             else:
-                logger.warning("Partial or failed rollback: %d/%d patches rolled back",
-                              rollback_result["rolled_back"], rollback_result["total"])
+                logger.warning(
+                    "Partial or failed rollback: %d/%d patches rolled back",
+                    rollback_result["rolled_back"],
+                    rollback_result["total"],
+                )
 
         self.performance_collector.end_session()
         performance_summary = self.performance_collector.get_summary()
 
-        rollback_msg, rollback_meta = _summarize_rollback(
-            rollback_result if rollback_performed else None
-        )
+        rollback_msg, rollback_meta = _summarize_rollback(rollback_result if rollback_performed else None)
 
         return AgentResult(
             status="error",
             turns=turns,
             error=f"Unexpected error: {error}. {rollback_msg}" if rollback_performed else f"Unexpected error: {error}",
-            applied_patches=self.registry.applied_patches,
+            applied_patches=list(self.registry.applied_patches),
             metadata={
                 "turns_used": len(turns),
                 "git_state": git_state,
@@ -2181,6 +2356,7 @@ class TurnPipelineMixin:
 # ------------------------------------------------------------------
 # Module-level helper: evict consumed tool results
 # ------------------------------------------------------------------
+
 
 def _summarize_rollback(rollback_result: Any) -> tuple:
     """Build a human-readable message + structured metadata from a rollback result.
@@ -2198,19 +2374,15 @@ def _summarize_rollback(rollback_result: Any) -> tuple:
     if not rollback_result:
         return (
             "No patches needed rollback.",
-            {"performed": False, "result": None,
-             "needs_manual_rollback": False, "affected_files": []},
+            {"performed": False, "result": None, "needs_manual_rollback": False, "affected_files": []},
         )
 
     results_list = rollback_result.get("results", []) if isinstance(rollback_result, dict) else []
-    needs_manual = [
-        r for r in results_list
-        if isinstance(r, dict) and r.get("needs_manual_rollback")
-    ]
+    needs_manual = [r for r in results_list if isinstance(r, dict) and r.get("needs_manual_rollback")]
     affected = []
     seen = set()
     for r in needs_manual:
-        for f in (r.get("affected_files") or []):
+        for f in r.get("affected_files") or []:
             if f not in seen:
                 seen.add(f)
                 affected.append(f)
@@ -2236,6 +2408,8 @@ def _summarize_rollback(rollback_result: Any) -> tuple:
         "affected_files": affected,
     }
     return (msg, meta)
+
+
 def _log_parallel_write_failures(results, parallel_calls, pipeline, session_key=""):
     """Persist write-tool outcomes produced by ``dispatch_parallel``.
 
@@ -2248,13 +2422,15 @@ def _log_parallel_write_failures(results, parallel_calls, pipeline, session_key=
     """
     try:
         from .tool_failure_log import record_write_tool_failure_from_tr
+
         write_tools = pipeline.registry._WRITE_TOOLS
         for idx, result in enumerate(results):
             tool_name = parallel_calls[idx]["tool"] if idx < len(parallel_calls) else ""
             if tool_name not in write_tools:
                 continue
             record_write_tool_failure_from_tr(
-                tool=tool_name, tr=result,
+                tool=tool_name,
+                tr=result,
                 args=parallel_calls[idx].get("args"),
                 model=getattr(pipeline.config, "model", None),
                 repo_root=getattr(pipeline.registry, "repo_root", None),
@@ -2262,6 +2438,8 @@ def _log_parallel_write_failures(results, parallel_calls, pipeline, session_key=
             )
     except Exception:
         logger.debug("tool_failure_log: parallel record failed", exc_info=True)
+
+
 # Marker prefix stamped onto stubbed tool_result content. Doubles as the
 # idempotency guard so already-evicted results are not re-processed.
 _EVICTED_MARKER = "[EVICTED TOOL OUTPUT"
@@ -2319,7 +2497,7 @@ _EVICTION_OCCUPANCY_TRIGGER = 0.75
 _EVICTION_ENABLED = _env_flag("ASICODE_TOOL_RESULT_EVICTION", False)
 
 
-def _evict_for_loop(messages, model: str = "", tool_schemas=None, base_url: Optional[str] = None):
+def _evict_for_loop(messages, model: str = "", tool_schemas=None, base_url: str | None = None):
     """Occupancy-gated tool-result eviction for an in-flight agent tool-loop.
 
     Single source of truth for the trigger: callers pass only the model
@@ -2349,9 +2527,7 @@ def _evict_for_loop(messages, model: str = "", tool_schemas=None, base_url: Opti
         return messages
     try:
         limit = _resolve_context_limit(model or "", base_url=base_url)
-        cap = context_message_cap(
-            limit, config.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN, tool_schemas
-        )
+        cap = context_message_cap(limit, config.tokens.CONTEXT_HARD_CAP_SAFETY_MARGIN, tool_schemas)
         est = estimate_tokens_from_msgs(messages)
     except Exception:
         logger.debug("eviction occupancy estimate failed; skipping", exc_info=True)
@@ -2359,6 +2535,8 @@ def _evict_for_loop(messages, model: str = "", tool_schemas=None, base_url: Opti
     if est <= cap * _EVICTION_OCCUPANCY_TRIGGER:
         return messages
     return _evict_consumed_tool_results(messages, keep_recent=_EVICTION_KEEP_RECENT)
+
+
 def _stub_tool_result(m, name_map: dict | None = None):
     """Return a COPY of tool_result message ``m`` with its content replaced by a
     compact eviction stub, or ``m`` itself when it is already stubbed / too small
@@ -2406,8 +2584,7 @@ def _stub_tool_result(m, name_map: dict | None = None):
     return dataclasses.replace(m, content=stub, raw_content=None)
 
 
-def _cache_hit_ratio(ctx=None, *, cache_read_tokens=0, prompt_tokens=0,
-                     cache_creation_tokens=0, provider="") -> float:
+def _cache_hit_ratio(ctx=None, *, cache_read_tokens=0, prompt_tokens=0, cache_creation_tokens=0, provider="") -> float:
     """Compute cache hit ratio (0..1), honoring provider token accounting.
 
     For separate-accounting providers (Anthropic/z.ai) ``prompt_tokens``
@@ -2429,7 +2606,6 @@ def _cache_hit_ratio(ctx=None, *, cache_read_tokens=0, prompt_tokens=0,
     )
 
 
-
 def _token_metadata(ctx) -> dict:
     """Build ``AgentResult.metadata["tokens"]`` — single source for every exit path.
 
@@ -2441,12 +2617,23 @@ def _token_metadata(ctx) -> dict:
         "prompt": ctx.total_prompt_tokens,
         "completion": ctx.total_completion_tokens,
         "total": ctx.total_prompt_tokens + ctx.total_completion_tokens,
-        "cost_usd": round(estimate_cost(
-            ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name), 6),
+        "cost_usd": round(
+            estimate_cost(
+                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens, model=ctx.model_name
+            ),
+            6,
+        ),
         "cache_adjusted_cost_usd": round(
             estimate_cache_adjusted_cost(
-                ctx.provider_name, ctx.total_prompt_tokens, ctx.total_completion_tokens,
-                ctx.total_cache_read_tokens, ctx.total_cache_creation_tokens, model=ctx.model_name, base_url=ctx.base_url), 6,
+                ctx.provider_name,
+                ctx.total_prompt_tokens,
+                ctx.total_completion_tokens,
+                ctx.total_cache_read_tokens,
+                ctx.total_cache_creation_tokens,
+                model=ctx.model_name,
+                base_url=ctx.base_url,
+            ),
+            6,
         ),
         "cache_read_tokens": ctx.total_cache_read_tokens,
         "cache_creation_tokens": ctx.total_cache_creation_tokens,
@@ -2489,10 +2676,7 @@ def _is_stubbed_tool_result(m) -> bool:
 
 def _eviction_stub(label: str, size: int) -> str:
     """Build the eviction stub text shared by every provider format."""
-    return (
-        f"{_EVICTED_MARKER}: {label} — {size} chars "
-        f"evicted to save context; re-read if still needed.]"
-    )
+    return f"{_EVICTED_MARKER}: {label} — {size} chars evicted to save context; re-read if still needed.]"
 
 
 def _payload_size(content) -> int:
@@ -2524,6 +2708,8 @@ def _stub_tool_result_blocks(m, stub: str, replace_block) -> Any:
         return dataclasses.replace(m, content=stub, raw_content=None)
     stubbed_raw = [replace_block(b) if isinstance(b, dict) else b for b in raw_content]
     return dataclasses.replace(m, content="", raw_content=stubbed_raw)
+
+
 def _stub_anthropic_tool_result(m, stub: str, name_map: dict | None = None):
     """Stub an anthropic-format tool result message (``role="user"`` with
     ``raw_content`` containing ``tool_result`` blocks).
@@ -2539,6 +2725,7 @@ def _stub_anthropic_tool_result(m, stub: str, name_map: dict | None = None):
     the correct tool.  Text blocks (e.g. strategy warnings folded into the
     same message) are left intact.
     """
+
     def replace_block(block: dict) -> dict:
         if block.get("type") != "tool_result":
             return block
@@ -2549,6 +2736,7 @@ def _stub_anthropic_tool_result(m, stub: str, name_map: dict | None = None):
         bsize = _payload_size(inner)
         label = f"{bname} ({tid})" if bname and tid else (bname or tid or "tool")
         return {**block, "content": _eviction_stub(label, bsize)}
+
     return _stub_tool_result_blocks(m, stub, replace_block)
 
 
@@ -2562,6 +2750,7 @@ def _stub_gemini_tool_result(m, stub: str, name_map: dict | None = None):
     is accepted for signature symmetry with the Anthropic handler but is not
     required.
     """
+
     def replace_block(block: dict) -> dict:
         if "functionResponse" not in block:
             return block
@@ -2572,12 +2761,17 @@ def _stub_gemini_tool_result(m, stub: str, name_map: dict | None = None):
         # content field) — the response dict is the serializable unit here.
         resp = fr.get("response", {})
         rcontent = resp.get("content", "") if isinstance(resp, dict) else ""
-        psize = len(rcontent) if isinstance(rcontent, str) else (
-            len(json.dumps(resp, ensure_ascii=False)) if resp else 0
+        psize = (
+            len(rcontent) if isinstance(rcontent, str) else (len(json.dumps(resp, ensure_ascii=False)) if resp else 0)
         )
-        return {**block, "functionResponse": {
-            **fr, "response": {"content": _eviction_stub(gname, psize)},
-        }}
+        return {
+            **block,
+            "functionResponse": {
+                **fr,
+                "response": {"content": _eviction_stub(gname, psize)},
+            },
+        }
+
     return _stub_tool_result_blocks(m, stub, replace_block)
 
 
@@ -2661,11 +2855,7 @@ def _evict_consumed_tool_results(messages, keep_recent: int = 6, batch_evict_thr
     # resets after each batch.  This gives a true N-turn cadence (every
     # ``batch_evict_threshold`` turns) instead of a one-shot delay.
     if batch_evict_threshold > 0:
-        pending_count = sum(
-            1 for m in messages
-            if is_tool_result(m)
-            and not _is_stubbed_tool_result(m)
-        )
+        pending_count = sum(1 for m in messages if is_tool_result(m) and not _is_stubbed_tool_result(m))
         if pending_count < keep_recent + batch_evict_threshold:
             return messages
 
@@ -2713,8 +2903,9 @@ def _evict_consumed_tool_results(messages, keep_recent: int = 6, batch_evict_thr
         # "1.25x rewrite" the break-even cost model prices. Fires at
         # most every ``batch_evict_threshold`` turns (the hysteresis gate above).
         logger.debug(
-            "evict_tool_results: stubbed %d new tool result(s) "
-            "(keep_recent=%d, batch_evict_threshold=%d)",
-            stubbed, keep_recent, batch_evict_threshold,
+            "evict_tool_results: stubbed %d new tool result(s) (keep_recent=%d, batch_evict_threshold=%d)",
+            stubbed,
+            keep_recent,
+            batch_evict_threshold,
         )
     return result

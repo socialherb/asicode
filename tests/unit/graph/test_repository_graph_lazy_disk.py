@@ -16,6 +16,7 @@ for data nothing would read — 0.205s → 0.023s).  These tests pin:
   2026-08-12) inherits the process-wide manifest-length memo, so a warm
   in-process rebuild never loads the JSON either.
 """
+
 import json
 import textwrap
 
@@ -230,9 +231,7 @@ def test_cap_overflow_snapshot_converges_to_full_walk(tmp_path, monkeypatch, cap
     assert g1.cache_stats["changed"] == 5  # every fresh parse counts now
     assert g1.cache_stats["parsed_uncapped"] == 3  # 5 walked - 2 admitted
     assert g1.cache_stats["hit"] == 0
-    assert any("re-parsed beyond" in r.message for r in caplog.records), (
-        "cap-pressure WARNING expected"
-    )
+    assert any("re-parsed beyond" in r.message for r in caplog.records), "cap-pressure WARNING expected"
 
     cache_path = tmp_path / ".cache" / "structural_graph_v1.json"
     blob = json.loads(cache_path.read_text())

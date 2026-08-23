@@ -6,6 +6,7 @@ against a real (tmp_path) git repository so tracked/untracked revert semantics
 are verified end-to-end, plus the filtering (baseline / assigned / infra
 subtraction) that makes the reverted set safe.
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,7 +22,11 @@ from external_llm.agent.orchestrator import OrchestratorAgent, OrchestratorConfi
 
 def _git(repo, *args):
     return subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, check=True,
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
 
@@ -41,7 +46,9 @@ def repo(tmp_path):
 
 def _make_orch(policy="warn"):
     orch = OrchestratorAgent(
-        Mock(), Mock(), OrchestratorConfig(scope_violation_policy=policy),
+        Mock(),
+        Mock(),
+        OrchestratorConfig(scope_violation_policy=policy),
     )
     orch._baseline_dirty_paths = set()
     orch._global_assigned_paths = set()
@@ -62,7 +69,8 @@ class TestRevertUnassignedChanges:
             f.write("worker-stray-edit\n")
         orch = _make_orch("revert")
         reverted = orch._revert_unassigned_changes(
-            repo, [{"file": "tracked_other.txt"}],
+            repo,
+            [{"file": "tracked_other.txt"}],
         )
         assert reverted == ["tracked_other.txt"]
         with open(os.path.join(repo, "tracked_other.txt")) as f:
@@ -74,7 +82,8 @@ class TestRevertUnassignedChanges:
             f.write("created-during-run\n")
         orch = _make_orch("revert")
         reverted = orch._revert_unassigned_changes(
-            repo, [{"file": "stray_new.txt"}],
+            repo,
+            [{"file": "stray_new.txt"}],
         )
         assert reverted == ["stray_new.txt"]
         assert not os.path.exists(os.path.join(repo, "stray_new.txt"))
@@ -101,7 +110,8 @@ class TestRevertUnassignedChanges:
         # a path that is neither tracked nor on disk must not raise
         orch = _make_orch("revert")
         reverted = orch._revert_unassigned_changes(
-            repo, [{"file": "nonexistent.xyz"}],
+            repo,
+            [{"file": "nonexistent.xyz"}],
         )
         assert reverted == []
 
@@ -113,9 +123,16 @@ class TestApplyScopeViolationPolicy:
     def test_empty_genuine_is_noop(self, repo):
         orch = _make_orch("revert")
         res = _result()
-        assert orch._apply_scope_violation_policy(
-            repo, [], res, agent_id="s1", mode="ipc",
-        ) == []
+        assert (
+            orch._apply_scope_violation_policy(
+                repo,
+                [],
+                res,
+                agent_id="s1",
+                mode="ipc",
+            )
+            == []
+        )
         assert res.status == "success"
 
     def test_warn_leaves_files_and_status(self, repo):
@@ -124,10 +141,14 @@ class TestApplyScopeViolationPolicy:
         orch = _make_orch("warn")
         res = _result()
         out = orch._apply_scope_violation_policy(
-            repo, [{"file": "stray.txt"}], res, agent_id="s1", mode="ipc",
+            repo,
+            [{"file": "stray.txt"}],
+            res,
+            agent_id="s1",
+            mode="ipc",
         )
-        assert out == []                                   # warn returns nothing
-        assert res.status == "success"                     # unchanged
+        assert out == []  # warn returns nothing
+        assert res.status == "success"  # unchanged
         assert os.path.exists(os.path.join(repo, "stray.txt"))  # file left in place
 
     def test_revert_restores_and_returns_list(self, repo):
@@ -136,7 +157,11 @@ class TestApplyScopeViolationPolicy:
         orch = _make_orch("revert")
         res = _result()
         out = orch._apply_scope_violation_policy(
-            repo, [{"file": "stray.txt"}], res, agent_id="s1", mode="ipc",
+            repo,
+            [{"file": "stray.txt"}],
+            res,
+            agent_id="s1",
+            mode="ipc",
         )
         assert out == ["stray.txt"]
         assert not os.path.exists(os.path.join(repo, "stray.txt"))
@@ -147,9 +172,13 @@ class TestApplyScopeViolationPolicy:
         orch = _make_orch("fail")
         res = _result(final_message="did work")
         out = orch._apply_scope_violation_policy(
-            repo, [{"file": "stray.txt"}], res, agent_id="s1", mode="ipc",
+            repo,
+            [{"file": "stray.txt"}],
+            res,
+            agent_id="s1",
+            mode="ipc",
         )
-        assert out == []                                  # fail does not revert
+        assert out == []  # fail does not revert
         assert res.status == "error"
         assert "scope_violation" in res.final_message
 
@@ -159,8 +188,11 @@ class TestApplyScopeViolationPolicy:
         orch = _make_orch("warn")
         with caplog.at_level(logging.WARNING):
             orch._apply_scope_violation_policy(
-                repo, [{"file": "stray.txt"}], _result(),
-                agent_id="s1", mode="ipc",
+                repo,
+                [{"file": "stray.txt"}],
+                _result(),
+                agent_id="s1",
+                mode="ipc",
             )
         assert any("OUT-OF-SCOPE" in r.message for r in caplog.records)
 
@@ -178,11 +210,12 @@ class TestDetectGenuineViolations:
             f.write("assigned-edited\n")
         orch = _make_orch("warn")
         genuine = orch._detect_genuine_violations(
-            repo, ["assigned.txt"],   # assigned.txt is this worker's own file
+            repo,
+            ["assigned.txt"],  # assigned.txt is this worker's own file
         )
         files = {g["file"] for g in genuine}
         assert "stray.txt" in files
-        assert "assigned.txt" not in files      # own assignment excluded
+        assert "assigned.txt" not in files  # own assignment excluded
 
     def test_baseline_dirt_excluded(self, repo):
         # pre-run dirt captured in _baseline_dirty_paths is excluded
@@ -229,6 +262,7 @@ class TestRevertBatching:
 
     def test_batch_tracked_and_untracked(self, repo, monkeypatch):
         import subprocess as _sp
+
         # tracked stray: overwrite the committed tracked file
         with open(os.path.join(repo, "tracked_other.txt"), "w") as f:
             f.write("stray\n")
@@ -244,6 +278,7 @@ class TestRevertBatching:
             if args[:1] == ["git"]:
                 git_calls.append(args[1] if len(args) > 1 else "")
             return real_run(args, *a, **k)
+
         monkeypatch.setattr("subprocess.run", _spy)
 
         orch = _make_orch("revert")
@@ -285,6 +320,7 @@ class TestRevertBatching:
                 # produce a non-zero rc; per-file fallback must then run.
                 return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
             return real_run(args, *a, **k)
+
         monkeypatch.setattr("subprocess.run", _spy)
 
         orch = _make_orch("revert")

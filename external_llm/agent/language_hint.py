@@ -4,6 +4,7 @@ Provides single-source-of-truth unicode range definitions and detection
 functions used for word-count normalisation (task router) and other
 language-agnostic CJK identification tasks.
 """
+
 from __future__ import annotations
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -11,21 +12,21 @@ from __future__ import annotations
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Hangul Syllables (U+AC00-U+D7A3): 11,172 complete syllables
-_HANGUL_START = '\uac00'
-_HANGUL_END = '\ud7a3' # 힣
+_HANGUL_START = "\uac00"
+_HANGUL_END = "\ud7a3"  # 힣
 
 # CJK Unified Ideographs (U+4E00-U+9FFF)
 # CJK Symbols and Punctuation (U+3000-U+303F)
-_CJK_IDEOGRAPH_START = '\u4e00'
-_CJK_IDEOGRAPH_END = '\u9fff'
-_CJK_SYM_START = '\u3000'
-_CJK_SYM_END = '\u303f'
+_CJK_IDEOGRAPH_START = "\u4e00"
+_CJK_IDEOGRAPH_END = "\u9fff"
+_CJK_SYM_START = "\u3000"
+_CJK_SYM_END = "\u303f"
 
 # Katakana (U+30A0-U+30FF) and Hiragana (U+3040-U+309F)
-_KATAKANA_START = '\u30a0'
-_KATAKANA_END = '\u30ff'
-_HIRAGANA_START = '\u3040'
-_HIRAGANA_END = '\u309f'
+_KATAKANA_START = "\u30a0"
+_KATAKANA_END = "\u30ff"
+_HIRAGANA_START = "\u3040"
+_HIRAGANA_END = "\u309f"
 
 
 def is_hangul(c: str) -> bool:

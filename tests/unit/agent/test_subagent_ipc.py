@@ -7,6 +7,7 @@ dropped when a shutdown sentinel is also present (the cancel/exception →
 _cleanup_ipc_workers path used to drop it because the poll loop checked
 shutdown before task).
 """
+
 from __future__ import annotations
 
 import json
@@ -113,7 +114,10 @@ def test_poll_acquisition_is_atomic_no_double_dispatch(tmp_path):
     def worker(idx):
         barrier.wait()  # release both threads simultaneously
         results[idx] = poll_for_task(
-            repo, "worker-1", poll_interval_s=0.02, timeout_s=0.5,
+            repo,
+            "worker-1",
+            poll_interval_s=0.02,
+            timeout_s=0.5,
         )
 
     t1 = threading.Thread(target=worker, args=(0,))
@@ -162,8 +166,7 @@ def test_wait_for_result_rejects_stale_result_via_epoch(tmp_path):
     d = os.path.join(repo, ".asicode", "subagents", "worker-1")
     # Drop a STALE result with a wrong epoch (simulating a previous run).
     stale = SubagentResult(task_id="worker-1", status="success", epoch=999)
-    _atomic_write(os.path.join(d, "result.json"),
-                  __import__("json").dumps(stale.to_dict()))
+    _atomic_write(os.path.join(d, "result.json"), __import__("json").dumps(stale.to_dict()))
 
     r = wait_for_result(repo, "worker-1", poll_interval_s=0.02, timeout_s=0.3)
     assert r is None, "stale result (epoch mismatch) must NOT be returned"
@@ -171,6 +174,7 @@ def test_wait_for_result_rejects_stale_result_via_epoch(tmp_path):
     # Now write a FRESH result with the matching epoch → must resolve.
     # Read expected epoch from the sidecar to echo it exactly.
     import json as _json
+
     with open(os.path.join(d, "expected.json")) as f:
         expected_epoch = _json.load(f)["epoch"]
     fresh = SubagentResult(task_id="worker-1", status="success", epoch=expected_epoch)
@@ -195,6 +199,7 @@ def test_wait_for_result_deletes_stale_result_file(tmp_path):
     # Drop a STALE result with a wrong epoch (simulating a leftover from a
     # previous run that clear_result missed).
     import json as _json
+
     stale = SubagentResult(task_id="worker-1", status="success", epoch=999)
     _atomic_write(result_path, _json.dumps(stale.to_dict()))
     assert os.path.exists(result_path)
@@ -203,9 +208,7 @@ def test_wait_for_result_deletes_stale_result_file(tmp_path):
     assert r is None, "stale result (epoch mismatch) must NOT be returned"
     # The stale file must have been removed so the poll loop does not re-read
     # the same rejected file on every subsequent cycle.
-    assert not os.path.exists(result_path), (
-        "stale result.json must be deleted after epoch-mismatch rejection"
-    )
+    assert not os.path.exists(result_path), "stale result.json must be deleted after epoch-mismatch rejection"
 
 
 def test_wait_for_result_accepts_legacy_zero_epoch_result(tmp_path):
@@ -214,8 +217,7 @@ def test_wait_for_result_accepts_legacy_zero_epoch_result(tmp_path):
     write_task(repo, _task("worker-1"))
     d = os.path.join(repo, ".asicode", "subagents", "worker-1")
     legacy = SubagentResult(task_id="worker-1", status="success", epoch=0)
-    _atomic_write(os.path.join(d, "result.json"),
-                  __import__("json").dumps(legacy.to_dict()))
+    _atomic_write(os.path.join(d, "result.json"), __import__("json").dumps(legacy.to_dict()))
     r = wait_for_result(repo, "worker-1", poll_interval_s=0.02, timeout_s=1.0)
     assert r is not None and r.status == "success"
 
@@ -228,6 +230,7 @@ def test_atomic_write_concurrent_no_corruption(tmp_path):
     so the final file is exactly one complete payload.
     """
     import json as _json
+
     path = str(tmp_path / "out.json")
     n = 8
     payloads = [_json.dumps({"i": i, "pad": "x" * 8000}) for i in range(n)]
@@ -309,6 +312,7 @@ def test_write_task_reuse_writes_expected_epoch_to_task_dir(tmp_path):
     path is already covered by test_wait_for_result_rejects_stale_result_via_epoch.
     """
     import json as _json
+
     repo = str(tmp_path)
     # Reuse path: worker_id differs from task.task_id.
     write_task(repo, _task("task-99"), worker_id="reusable-W")
@@ -318,10 +322,12 @@ def test_write_task_reuse_writes_expected_epoch_to_task_dir(tmp_path):
     # task.json went to the WORKER dir (so the reused worker polls and finds it).
     assert os.path.isfile(os.path.join(worker_dir, "task.json"))
     # expected.json must be in the TASK dir (paired with result.json), NOT worker.
-    assert os.path.isfile(os.path.join(task_dir, "expected.json")), \
+    assert os.path.isfile(os.path.join(task_dir, "expected.json")), (
         "expected.json must live in the task dir for epoch validation to work"
-    assert not os.path.isfile(os.path.join(worker_dir, "expected.json")), \
+    )
+    assert not os.path.isfile(os.path.join(worker_dir, "expected.json")), (
         "expected.json leaked into the worker dir (reuse-path bug)"
+    )
 
     # And the epoch there must match the dispatched task's epoch.
     # (task.json itself lives in the worker dir in reuse mode.)
@@ -460,7 +466,9 @@ def test_build_subagent_prompt_prefers_predecessor_context():
         "[Current task]\nWrite tests\n\n[Assigned files: test_a.py]"
     )
     task = SubagentTask(
-        task_id="dev_2", title="t", description="Write tests",
+        task_id="dev_2",
+        title="t",
+        description="Write tests",
         predecessor_context=rich,
     )
     assert build_subagent_prompt(task) == rich
@@ -471,7 +479,9 @@ def test_build_subagent_prompt_prefers_predecessor_context():
 def test_build_subagent_prompt_wraps_original_request_goal():
     """original_request (the overall user goal) is wrapped around the task."""
     task = SubagentTask(
-        task_id="dev_1", title="t", description="Implement parser",
+        task_id="dev_1",
+        title="t",
+        description="Implement parser",
         original_request="Build a JSON parser library",
     )
     out = build_subagent_prompt(task)
@@ -484,7 +494,8 @@ def test_build_subagent_prompt_wraps_original_request_goal():
 def test_build_subagent_prompt_no_double_wrap_when_goal_embedded():
     """If the original_request text already appears in the context, don't duplicate."""
     task = SubagentTask(
-        task_id="dev_1", title="t",
+        task_id="dev_1",
+        title="t",
         description="Continue the goal",
         original_request="THE GOAL",
         predecessor_context="Context mentioning THE GOAL already",
@@ -499,7 +510,9 @@ def test_build_subagent_prompt_mirrors_in_process_wrapping(monkeypatch):
     """The wrapping format must match orchestrator._run_subagent exactly:
     '[Original request goal]\\n{goal}\\n\\n[This sub-agent's task]\\n{body}'."""
     task = SubagentTask(
-        task_id="dev_1", title="t", description="BODY",
+        task_id="dev_1",
+        title="t",
+        description="BODY",
         original_request="GOAL",
     )
     expected = "[Original request goal]\nGOAL\n\n[This sub-agent's task]\nBODY"
@@ -664,9 +677,9 @@ def test_partition_changed_files_rename_both_positions_no_ghost(tmp_path, monkey
     subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
 
     crafted = (
-        "R  new_x.py\x00old_x.py\x00"   # X-position rename (staged)
-        " R new_y.py\x00old_y.py\x00"   # Y-position rename (worktree) — the regression
-        " C new_c.py\x00old_c.py\x00"   # Y-position copy (worktree)
+        "R  new_x.py\x00old_x.py\x00"  # X-position rename (staged)
+        " R new_y.py\x00old_y.py\x00"  # Y-position rename (worktree) — the regression
+        " C new_c.py\x00old_c.py\x00"  # Y-position copy (worktree)
     )
 
     class _Fake:
@@ -678,7 +691,8 @@ def test_partition_changed_files_rename_both_positions_no_ghost(tmp_path, monkey
     monkeypatch.setattr(subprocess, "run", _fake_run)
 
     in_scope, out_scope = partition_changed_files(
-        str(repo), ["new_x.py", "new_y.py", "new_c.py"],
+        str(repo),
+        ["new_x.py", "new_y.py", "new_c.py"],
     )
     all_reported = sorted(p["file"] for p in in_scope) + sorted(p["file"] for p in out_scope)
     # Exactly the three NEW paths — no OLD fields, no 3-char-chopped ghosts
@@ -691,7 +705,8 @@ def test_subagent_result_carries_unassigned_changes():
     from external_llm.agent.subagent_ipc import SubagentResult
 
     r = SubagentResult(
-        task_id="t1", status="success",
+        task_id="t1",
+        status="success",
         applied_patches=[{"file": "a.py"}],
         unassigned_changes=[{"file": "verify-repo/stats.py"}],
         epoch=42,
@@ -721,6 +736,7 @@ def test_cancel_sentinel_roundtrip(tmp_path):
         check_cancel_sentinel,
         write_cancel_sentinel,
     )
+
     repo = str(tmp_path)
     assert check_cancel_sentinel(repo, "worker-1") is False
     write_cancel_sentinel(repo, "worker-1")
@@ -738,6 +754,7 @@ def test_write_task_clears_stale_cancel_sentinel(tmp_path):
         check_cancel_sentinel,
         write_cancel_sentinel,
     )
+
     repo = str(tmp_path)
     d = os.path.join(repo, ".asicode", "subagents", "worker-1")
     os.makedirs(d)
@@ -757,11 +774,13 @@ def test_cancel_sentinel_does_not_exit_poll_loop(tmp_path):
     (here: timing out) rather than exiting.  This proves the two signals are
     distinct and cancel cannot be mistaken for shutdown by the poll path."""
     from external_llm.agent.subagent_ipc import write_cancel_sentinel
+
     repo = str(tmp_path)
     write_cancel_sentinel(repo, "worker-1")
     # No task, no shutdown — poll must time out (return None after timeout),
     # NOT exit immediately.  A short timeout keeps the test fast.
     import time
+
     t0 = time.monotonic()
     result = poll_for_task(repo, "worker-1", poll_interval_s=0.02, timeout_s=0.3)
     elapsed = time.monotonic() - t0
@@ -770,6 +789,7 @@ def test_cancel_sentinel_does_not_exit_poll_loop(tmp_path):
     assert elapsed >= 0.25, f"poll exited too fast ({elapsed:.2f}s) — cancel misread as shutdown?"
     # cancel.json is still present (the poll path does not consume it).
     from external_llm.agent.subagent_ipc import check_cancel_sentinel
+
     assert check_cancel_sentinel(repo, "worker-1") is True
 
 
@@ -778,11 +798,13 @@ def test_cancel_sentinel_does_not_exit_poll_loop(tmp_path):
 
 def test_is_process_alive_true_for_self():
     from external_llm.agent.subagent_ipc import _is_process_alive
+
     assert _is_process_alive(os.getpid()) is True
 
 
 def test_is_process_alive_false_for_dead_pid():
     from external_llm.agent.subagent_ipc import _is_process_alive
+
     # A pid essentially guaranteed not to be a live process on the test host.
     assert _is_process_alive(2**31 - 1) is False
 
@@ -800,14 +822,17 @@ def test_poll_for_task_exits_when_parent_gone(tmp_path, monkeypatch):
     import time as _t
 
     from external_llm.agent import subagent_ipc as _ipc_mod
+
     repo = str(tmp_path)
     os.makedirs(os.path.join(repo, ".asicode", "subagents", "worker-1"))
     monkeypatch.setattr(_ipc_mod, "_is_process_alive", lambda pid: False)
 
     t0 = _t.monotonic()
     result = poll_for_task(
-        repo, "worker-1",
-        poll_interval_s=0.01, timeout_s=5.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.01,
+        timeout_s=5.0,
         expected_parent_pid=9999,  # the (now-dead) orchestrator pid
     )
     elapsed = _t.monotonic() - t0
@@ -821,6 +846,7 @@ def test_poll_for_task_polls_when_parent_alive(tmp_path, monkeypatch):
     import time as _t
 
     from external_llm.agent import subagent_ipc as _ipc_mod
+
     repo = str(tmp_path)
     os.makedirs(os.path.join(repo, ".asicode", "subagents", "worker-1"))
     monkeypatch.setattr(_ipc_mod, "_is_process_alive", lambda pid: True)
@@ -831,8 +857,10 @@ def test_poll_for_task_polls_when_parent_alive(tmp_path, monkeypatch):
 
     t0 = _t.monotonic()
     result = poll_for_task(
-        repo, "worker-1",
-        poll_interval_s=0.01, timeout_s=0.3,
+        repo,
+        "worker-1",
+        poll_interval_s=0.01,
+        timeout_s=0.3,
         expected_parent_pid=4242,  # still alive — must NOT early-exit
     )
     elapsed = _t.monotonic() - t0
@@ -846,6 +874,7 @@ def test_poll_for_task_no_orphan_check_when_pid_unset(tmp_path, monkeypatch):
     import time as _t
 
     from external_llm.agent import subagent_ipc as _ipc_mod
+
     repo = str(tmp_path)
     os.makedirs(os.path.join(repo, ".asicode", "subagents", "worker-1"))
     # Even if the "parent" looks dead, with the check disabled we poll to timeout.
@@ -853,7 +882,10 @@ def test_poll_for_task_no_orphan_check_when_pid_unset(tmp_path, monkeypatch):
 
     t0 = _t.monotonic()
     result = poll_for_task(
-        repo, "worker-1", poll_interval_s=0.01, timeout_s=0.3,
+        repo,
+        "worker-1",
+        poll_interval_s=0.01,
+        timeout_s=0.3,
         # expected_parent_pid omitted → opt-out
     )
     elapsed = _t.monotonic() - t0
@@ -877,6 +909,7 @@ def test_poll_for_task_quarantines_structurally_malformed_task(tmp_path):
     (not left as an orphaned .claimed file) and the worker keeps polling
     instead of crashing."""
     import glob
+
     repo = str(tmp_path)
     d = os.path.join(repo, ".asicode", "subagents", "worker-1")
     os.makedirs(d)
@@ -892,10 +925,10 @@ def test_poll_for_task_quarantines_structurally_malformed_task(tmp_path):
     # No crash; the worker moved on (here: honoured the shutdown → None).
     assert result is None
     # The malformed task was quarantined, not left as an orphaned .claimed file.
-    assert glob.glob(os.path.join(d, "task.json.claimed.*.bad")), \
-        "malformed task.json was not quarantined"
-    assert not os.path.isfile(os.path.join(d, "task.json")), \
+    assert glob.glob(os.path.join(d, "task.json.claimed.*.bad")), "malformed task.json was not quarantined"
+    assert not os.path.isfile(os.path.join(d, "task.json")), (
         "claimed (malformed) task.json should have been renamed away"
+    )
 
 
 def test_wait_for_result_tolerates_structurally_malformed_result(tmp_path):
@@ -906,6 +939,7 @@ def test_wait_for_result_tolerates_structurally_malformed_result(tmp_path):
     result (caught + polled past) so the call degrades to a graceful timeout
     (returns None) instead of raising."""
     from external_llm.agent.subagent_ipc import wait_for_result
+
     repo = str(tmp_path)
     d = os.path.join(repo, ".asicode", "subagents", "agent-7")
     os.makedirs(d)
@@ -915,11 +949,14 @@ def test_wait_for_result_tolerates_structurally_malformed_result(tmp_path):
         json.dump({"final_message": "no task_id/status here"}, f)
 
     result = wait_for_result(
-        repo, "agent-7",
-        poll_interval_s=0.02, timeout_s=0.4,
+        repo,
+        "agent-7",
+        poll_interval_s=0.02,
+        timeout_s=0.4,
     )
     # Must NOT raise; a permanently-malformed result degrades to timeout (None).
     assert result is None
+
 
 # ── PermissionError / jitter / timeout passthrough ─────────────────────────
 
@@ -950,8 +987,10 @@ def test_wait_for_result_tolerates_permission_error(tmp_path, monkeypatch):
     monkeypatch.setattr(_builtins, "open", _failing_open)
 
     result = wait_for_result(
-        repo, "agent-7",
-        poll_interval_s=0.02, timeout_s=0.4,
+        repo,
+        "agent-7",
+        poll_interval_s=0.02,
+        timeout_s=0.4,
     )
     # Must NOT raise; the PermissionError is swallowed so the poll loop
     # continues and eventually times out.
@@ -975,15 +1014,10 @@ def test_next_backoff_includes_jitter():
         assert r >= interval * _POLL_BACKOFF_FACTOR, (
             f"backoff {r} < interval * factor ({interval * _POLL_BACKOFF_FACTOR})"
         )
-        assert r <= _POLL_BACKOFF_CAP_S, (
-            f"backoff {r} > cap ({_POLL_BACKOFF_CAP_S})"
-        )
+        assert r <= _POLL_BACKOFF_CAP_S, f"backoff {r} > cap ({_POLL_BACKOFF_CAP_S})"
 
     # With jitter the values should not all be identical.
-    assert len(set(results)) > 1, (
-        "100 consecutive calls produced identical values — "
-        "jitter appears to be missing"
-    )
+    assert len(set(results)) > 1, "100 consecutive calls produced identical values — jitter appears to be missing"
 
 
 def test_derive_applied_patches_uses_custom_timeout(tmp_path):
@@ -999,9 +1033,7 @@ def test_derive_applied_patches_uses_custom_timeout(tmp_path):
         derive_applied_patches(str(tmp_path), ["a.py"], timeout_s=15.0)
 
         _, kwargs = mock_run.call_args
-        assert kwargs.get("timeout") == 15.0, (
-            f"expected timeout=15.0, got {kwargs.get('timeout')}"
-        )
+        assert kwargs.get("timeout") == 15.0, f"expected timeout=15.0, got {kwargs.get('timeout')}"
 
 
 # ── Worker heartbeat: cross-process liveness for wait_for_result ────────────
@@ -1021,9 +1053,7 @@ def test_write_heartbeat_writes_json(tmp_path):
     assert data["agent_id"] == "worker-1"
     assert data["ts"] > 0
     # Lives in the task's OWN directory (same as result.json).
-    assert path == _heartbeat_path(
-        os.path.join(repo, ".asicode", "subagents", "worker-1")
-    )
+    assert path == _heartbeat_path(os.path.join(repo, ".asicode", "subagents", "worker-1"))
 
 
 def test_read_heartbeat_age_s_none_when_absent(tmp_path):
@@ -1072,14 +1102,15 @@ def test_wait_for_result_presumes_dead_on_stale_heartbeat(tmp_path):
     t0 = _time.monotonic()
     # stale threshold 100s, but timeout 5s — dead detection must trip first.
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.02, timeout_s=5.0, heartbeat_stale_s=100.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.02,
+        timeout_s=5.0,
+        heartbeat_stale_s=100.0,
     )
     elapsed = _time.monotonic() - t0
     assert r is None, "stale heartbeat must cause presumed-dead return"
-    assert elapsed < 2.0, (
-        f"dead detection should bail within ~1 poll, took {elapsed:.1f}s"
-    )
+    assert elapsed < 2.0, f"dead detection should bail within ~1 poll, took {elapsed:.1f}s"
 
 
 def test_wait_for_result_no_heartbeat_uses_normal_timeout(tmp_path):
@@ -1088,8 +1119,11 @@ def test_wait_for_result_no_heartbeat_uses_normal_timeout(tmp_path):
     repo = str(tmp_path)
     t0 = _time.monotonic()
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.05, timeout_s=0.4, heartbeat_stale_s=0.1,
+        repo,
+        "worker-1",
+        poll_interval_s=0.05,
+        timeout_s=0.4,
+        heartbeat_stale_s=0.1,
     )
     elapsed = _time.monotonic() - t0
     assert r is None
@@ -1105,8 +1139,11 @@ def test_wait_for_result_fresh_heartbeat_does_not_bail(tmp_path):
     repo = str(tmp_path)
     write_heartbeat(repo, "worker-1", pid=1)
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.02, timeout_s=1.0, heartbeat_stale_s=100.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.02,
+        timeout_s=1.0,
+        heartbeat_stale_s=100.0,
     )
     # No result written, heartbeat fresh → should wait the full timeout.
     assert r is None
@@ -1137,15 +1174,16 @@ def test_wait_for_result_startup_timeout_no_heartbeat(tmp_path):
     repo = str(tmp_path)
     t0 = _time.monotonic()
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.02, timeout_s=10.0,
-        startup_timeout_s=0.3, heartbeat_stale_s=0.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.02,
+        timeout_s=10.0,
+        startup_timeout_s=0.3,
+        heartbeat_stale_s=0.0,
     )
     elapsed = _time.monotonic() - t0
     assert r is None, "startup timeout with no heartbeat must bail"
-    assert 0.25 <= elapsed < 2.0, (
-        f"expected ~startup deadline, took {elapsed:.2f}s"
-    )
+    assert 0.25 <= elapsed < 2.0, f"expected ~startup deadline, took {elapsed:.2f}s"
 
 
 def test_wait_for_result_startup_timeout_inert_after_heartbeat(tmp_path):
@@ -1159,15 +1197,20 @@ def test_wait_for_result_startup_timeout_inert_after_heartbeat(tmp_path):
     write_heartbeat(repo, "worker-1", pid=1)
     t0 = _time.monotonic()
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.02, timeout_s=0.4,
-        startup_timeout_s=0.1, heartbeat_stale_s=100.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.02,
+        timeout_s=0.4,
+        startup_timeout_s=0.1,
+        heartbeat_stale_s=100.0,
     )
     elapsed = _time.monotonic() - t0
     assert r is None  # no result written
     # Heartbeat was fresh → startup guard inert → waited the full timeout, not
     # the 0.1s startup deadline.
     assert elapsed >= 0.35, f"startup guard fired despite fresh heartbeat ({elapsed:.2f}s)"
+
+
 def test_wait_for_result_startup_timeout_inert_with_liveness_disabled(tmp_path):
     """Regression: heartbeat_stale_s<=0 (liveness disabled) + startup_timeout_s>0
     must NOT falsely abandon a live worker that IS writing heartbeats.
@@ -1184,18 +1227,18 @@ def test_wait_for_result_startup_timeout_inert_with_liveness_disabled(tmp_path):
     write_heartbeat(repo, "worker-1", pid=1)
     t0 = _time.monotonic()
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.02, timeout_s=0.4,
-        startup_timeout_s=0.1, heartbeat_stale_s=0.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.02,
+        timeout_s=0.4,
+        startup_timeout_s=0.1,
+        heartbeat_stale_s=0.0,
     )
     elapsed = _time.monotonic() - t0
     assert r is None  # no result written
     # Fresh heartbeat present + liveness disabled → startup guard must stay inert
     # → waited the full timeout, not the 0.1s startup deadline.
-    assert elapsed >= 0.35, (
-        f"startup guard fired despite fresh heartbeat (liveness disabled) "
-        f"after {elapsed:.2f}s"
-    )
+    assert elapsed >= 0.35, f"startup guard fired despite fresh heartbeat (liveness disabled) after {elapsed:.2f}s"
 
 
 def test_wait_for_result_startup_timeout_disabled_by_default(tmp_path):
@@ -1205,8 +1248,10 @@ def test_wait_for_result_startup_timeout_disabled_by_default(tmp_path):
     repo = str(tmp_path)
     t0 = _time.monotonic()
     r = wait_for_result(
-        repo, "worker-1",
-        poll_interval_s=0.05, timeout_s=0.4,
+        repo,
+        "worker-1",
+        poll_interval_s=0.05,
+        timeout_s=0.4,
         heartbeat_stale_s=0.1,  # also disabled-ish: no heartbeat → no stale trip
     )
     elapsed = _time.monotonic() - t0
@@ -1218,35 +1263,39 @@ def test_wait_for_result_startup_timeout_disabled_by_default(tmp_path):
 def test_poll_for_task_idle_warn_emits_warning(tmp_path, caplog):
     """After idle_warn_s of no task, poll_for_task emits a WARNING diagnostic."""
     import logging as _lg
+
     repo = str(tmp_path)
     os.makedirs(os.path.join(repo, ".asicode", "subagents", "worker-1"))
     with caplog.at_level(_lg.WARNING, logger="external_llm.agent.subagent_ipc"):
         poll_for_task(
-            repo, "worker-1",
-            poll_interval_s=0.01, timeout_s=0.3, idle_warn_s=0.1,
+            repo,
+            "worker-1",
+            poll_interval_s=0.01,
+            timeout_s=0.3,
+            idle_warn_s=0.1,
         )
-    assert any("idle" in rec.message for rec in caplog.records), (
-        "expected an idle warning after idle_warn_s of no task"
-    )
+    assert any("idle" in rec.message for rec in caplog.records), "expected an idle warning after idle_warn_s of no task"
 
 
 def test_poll_for_task_max_poll_s_caps_infinite_poll(tmp_path):
     """timeout_s=None is bounded by max_poll_s so a worker cannot poll forever
     when the orchestrator is alive but never dispatches / shuts down."""
     import time as _t
+
     repo = str(tmp_path)
     os.makedirs(os.path.join(repo, ".asicode", "subagents", "worker-1"))
     t0 = _t.monotonic()
     r = poll_for_task(
-        repo, "worker-1",
-        poll_interval_s=0.01, timeout_s=None,
-        max_poll_s=0.3, idle_warn_s=0.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.01,
+        timeout_s=None,
+        max_poll_s=0.3,
+        idle_warn_s=0.0,
     )
     elapsed = _t.monotonic() - t0
     assert r is None
-    assert 0.25 <= elapsed < 2.0, (
-        f"expected max_poll_s cap (~0.3s), took {elapsed:.2f}s"
-    )
+    assert 0.25 <= elapsed < 2.0, f"expected max_poll_s cap (~0.3s), took {elapsed:.2f}s"
 
 
 def test_poll_for_task_max_poll_s_inert_for_finite_timeout(tmp_path):
@@ -1254,20 +1303,22 @@ def test_poll_for_task_max_poll_s_inert_for_finite_timeout(tmp_path):
     bounds the timeout_s=None path) so a small max_poll_s cannot truncate a
     larger timeout_s."""
     import time as _t
+
     repo = str(tmp_path)
     os.makedirs(os.path.join(repo, ".asicode", "subagents", "worker-1"))
     t0 = _t.monotonic()
     r = poll_for_task(
-        repo, "worker-1",
-        poll_interval_s=0.05, timeout_s=0.4,
+        repo,
+        "worker-1",
+        poll_interval_s=0.05,
+        timeout_s=0.4,
         max_poll_s=0.1,  # smaller than timeout_s — must be ignored
         idle_warn_s=0.0,
     )
     elapsed = _t.monotonic() - t0
     assert r is None
     assert elapsed >= 0.35, (
-        f"finite timeout_s should govern, but exited after {elapsed:.2f}s "
-        f"(max_poll_s=0.1 wrongly applied?)"
+        f"finite timeout_s should govern, but exited after {elapsed:.2f}s (max_poll_s=0.1 wrongly applied?)"
     )
 
 
@@ -1283,6 +1334,7 @@ def test_quarantine_and_recheck_adopts_fresh_raced_write(tmp_path):
     captures the fresh file and the epoch re-check adopts it.
     """
     from external_llm.agent.subagent_ipc import _quarantine_and_recheck
+
     d = os.path.join(str(tmp_path), ".asicode", "subagents", "worker-1")
     os.makedirs(d, exist_ok=True)
     result_path = os.path.join(d, "result.json")
@@ -1291,14 +1343,13 @@ def test_quarantine_and_recheck_adopts_fresh_raced_write(tmp_path):
 
     adopted = _quarantine_and_recheck(result_path, 777, "worker-1")
     assert adopted is not None and adopted.epoch == 777
-    assert not os.path.exists(result_path), (
-        "adopted file removed from result_path (returned in-memory, not lost)"
-    )
+    assert not os.path.exists(result_path), "adopted file removed from result_path (returned in-memory, not lost)"
 
 
 def test_quarantine_and_recheck_drops_genuinely_stale(tmp_path):
     """A genuinely stale result (epoch mismatch at rename time) is discarded."""
     from external_llm.agent.subagent_ipc import _quarantine_and_recheck
+
     d = os.path.join(str(tmp_path), ".asicode", "subagents", "worker-1")
     os.makedirs(d, exist_ok=True)
     result_path = os.path.join(d, "result.json")
@@ -1313,6 +1364,7 @@ def test_quarantine_and_recheck_drops_genuinely_stale(tmp_path):
 def test_quarantine_and_recheck_handles_missing_file(tmp_path):
     """If the result file vanished before the rename, return None (no crash)."""
     from external_llm.agent.subagent_ipc import _quarantine_and_recheck
+
     d = os.path.join(str(tmp_path), ".asicode", "subagents", "worker-1")
     os.makedirs(d, exist_ok=True)
     result_path = os.path.join(d, "result.json")  # never created
@@ -1329,6 +1381,7 @@ def test_wait_for_result_soft_timeout_extends_on_fresh_heartbeat(tmp_path):
     import time as _time
 
     from external_llm.agent.subagent_ipc import write_heartbeat, write_result
+
     repo = str(tmp_path)
     write_task(repo, _task("worker-1"))
     d = os.path.join(repo, ".asicode", "subagents", "worker-1")
@@ -1339,20 +1392,24 @@ def test_wait_for_result_soft_timeout_extends_on_fresh_heartbeat(tmp_path):
     def _delayed():
         _time.sleep(1.2)  # lands after timeout_s=0.4, before max_timeout_s=3.0
         write_result(repo, SubagentResult(task_id="worker-1", status="success", epoch=expected_epoch))
+
     threading.Thread(target=_delayed, daemon=True).start()
 
     r = wait_for_result(
-        repo, "worker-1", poll_interval_s=0.05, timeout_s=0.4, max_timeout_s=3.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.05,
+        timeout_s=0.4,
+        max_timeout_s=3.0,
     )
-    assert r is not None and r.epoch == expected_epoch, (
-        "fresh heartbeat should extend deadline past timeout_s"
-    )
+    assert r is not None and r.epoch == expected_epoch, "fresh heartbeat should extend deadline past timeout_s"
 
 
 def test_wait_for_result_no_extension_without_max_timeout(tmp_path):
     """Without max_timeout_s (> timeout_s), a fresh heartbeat does NOT extend —
     timeout_s remains the hard deadline (default behavior preserved)."""
     from external_llm.agent.subagent_ipc import write_heartbeat
+
     repo = str(tmp_path)
     write_task(repo, _task("worker-1"))
     write_heartbeat(repo, "worker-1", pid=123)
@@ -1364,6 +1421,7 @@ def test_wait_for_result_stale_heartbeat_still_kills_under_soft_timeout(tmp_path
     """Under soft timeout, a STALE heartbeat still bails early — the extension
     only rewards a FRESH (alive) worker, never a dead one."""
     from external_llm.agent.subagent_ipc import write_heartbeat
+
     repo = str(tmp_path)
     write_task(repo, _task("worker-1"))
     # Write a heartbeat, then backdate it well past the stale threshold.
@@ -1372,7 +1430,11 @@ def test_wait_for_result_stale_heartbeat_still_kills_under_soft_timeout(tmp_path
     with open(hb_path, "w") as fh:
         json.dump({"ts": 1.0, "pid": 123, "agent_id": "worker-1"}, fh)
     r = wait_for_result(
-        repo, "worker-1", poll_interval_s=0.02, timeout_s=1.0, max_timeout_s=5.0,
+        repo,
+        "worker-1",
+        poll_interval_s=0.02,
+        timeout_s=1.0,
+        max_timeout_s=5.0,
         heartbeat_stale_s=1.0,
     )
     assert r is None, "stale heartbeat must still bail early even with max_timeout_s set"
@@ -1385,6 +1447,7 @@ def test_write_heartbeat_carries_progress_hints(tmp_path):
     """write_heartbeat records turn/last_tool so the orchestrator can show
     progress ("turn 5, run_tests") instead of only elapsed time."""
     from external_llm.agent.subagent_ipc import read_heartbeat_state, write_heartbeat
+
     repo = str(tmp_path)
     write_heartbeat(repo, "worker-1", pid=42, turn=5, last_tool="run_tests")
     st = read_heartbeat_state(repo, "worker-1")
@@ -1398,6 +1461,7 @@ def test_write_heartbeat_carries_progress_hints(tmp_path):
 def test_write_heartbeat_progress_defaults(tmp_path):
     """Legacy call (no turn/last_tool) writes zeros/empty — backward compatible."""
     from external_llm.agent.subagent_ipc import read_heartbeat_state, write_heartbeat
+
     repo = str(tmp_path)
     write_heartbeat(repo, "worker-1", pid=1)
     st = read_heartbeat_state(repo, "worker-1")
@@ -1407,6 +1471,7 @@ def test_write_heartbeat_progress_defaults(tmp_path):
 
 def test_read_heartbeat_state_none_when_absent(tmp_path):
     from external_llm.agent.subagent_ipc import read_heartbeat_state
+
     assert read_heartbeat_state(str(tmp_path), "worker-1") is None
 
 
@@ -1422,6 +1487,7 @@ def test_write_worker_idle_heartbeat_writes_json(tmp_path):
         _IDLE_HEARTBEAT_FILENAME,
         write_worker_idle_heartbeat,
     )
+
     repo = tmp_path
     path = write_worker_idle_heartbeat(str(repo), "worker-1", pid=4242)
     assert path is not None
@@ -1438,6 +1504,7 @@ def test_read_worker_idle_heartbeat_age_none_when_absent(tmp_path):
     """No heartbeat ⇒ None (inconclusive, NOT dead). Callers must keep
     optimistic reuse for legacy / pre-heartbeat workers."""
     from external_llm.agent.subagent_ipc import read_worker_idle_heartbeat_age
+
     assert read_worker_idle_heartbeat_age(str(tmp_path), "worker-1") is None
 
 
@@ -1449,9 +1516,11 @@ def test_read_worker_idle_heartbeat_age_returns_positive_age(tmp_path):
         read_worker_idle_heartbeat_age,
         write_worker_idle_heartbeat,
     )
+
     write_worker_idle_heartbeat(str(tmp_path), "worker-1", pid=1)
     # Backdate the ts by rewriting with an old timestamp.
     import json as _json
+
     hb = tmp_path / ".asicode" / "subagents" / "worker-1" / "worker.heartbeat.json"
     hb.write_text(_json.dumps({"ts": _time.time() - 100.0, "pid": 1}))
     age = read_worker_idle_heartbeat_age(str(tmp_path), "worker-1")
@@ -1468,6 +1537,7 @@ def test_write_worker_exited_heartbeat_overwrites_idle_state(tmp_path):
         write_worker_exited_heartbeat,
         write_worker_idle_heartbeat,
     )
+
     repo = str(tmp_path)
     assert read_worker_idle_heartbeat_state(repo, "w1") is None
     p_idle = write_worker_idle_heartbeat(repo, "w1", pid=123)
@@ -1496,8 +1566,11 @@ def test_poll_for_task_self_exits_when_orchestrator_pid_dead(tmp_path):
     proc.wait()
     t0 = _time.monotonic()
     r = poll_for_task(
-        repo_root=str(tmp_path), agent_id="w1", poll_interval_s=0.1,
-        timeout_s=30.0, orchestrator_pid=dead_pid,
+        repo_root=str(tmp_path),
+        agent_id="w1",
+        poll_interval_s=0.1,
+        timeout_s=30.0,
+        orchestrator_pid=dead_pid,
     )
     assert r is None
     assert (_time.monotonic() - t0) < 5.0, "must exit on the dead-pid probe, not the 30s timeout"
@@ -1513,8 +1586,11 @@ def test_poll_for_task_keeps_polling_when_orchestrator_pid_alive(tmp_path):
 
     t0 = _time.monotonic()
     r = poll_for_task(
-        repo_root=str(tmp_path), agent_id="w1", poll_interval_s=0.1,
-        timeout_s=0.5, orchestrator_pid=_os.getpid(),
+        repo_root=str(tmp_path),
+        agent_id="w1",
+        poll_interval_s=0.1,
+        timeout_s=0.5,
+        orchestrator_pid=_os.getpid(),
     )
     assert r is None
     assert (_time.monotonic() - t0) >= 0.5  # ran to the timeout, no false orphan
@@ -1528,21 +1604,21 @@ def test_write_worker_idle_heartbeat_observability_fields(tmp_path):
     from external_llm.agent.subagent_ipc import write_worker_idle_heartbeat
 
     write_worker_idle_heartbeat(
-        str(tmp_path), "w1", pid=1,
-        tasks_served=7, last_task_id="dev_3", uptime_s=123.456,
+        str(tmp_path),
+        "w1",
+        pid=1,
+        tasks_served=7,
+        last_task_id="dev_3",
+        uptime_s=123.456,
     )
-    data = _json.loads(
-        (tmp_path / ".asicode" / "subagents" / "w1" / "worker.heartbeat.json").read_text()
-    )
+    data = _json.loads((tmp_path / ".asicode" / "subagents" / "w1" / "worker.heartbeat.json").read_text())
     assert data["state"] == "idle"
     assert data["tasks_served"] == 7
     assert data["last_task_id"] == "dev_3"
     assert data["uptime_s"] == 123.5
     # Defaults stay backward-compatible (callers that do not track stats).
     write_worker_idle_heartbeat(str(tmp_path), "w2", pid=1)
-    data2 = _json.loads(
-        (tmp_path / ".asicode" / "subagents" / "w2" / "worker.heartbeat.json").read_text()
-    )
+    data2 = _json.loads((tmp_path / ".asicode" / "subagents" / "w2" / "worker.heartbeat.json").read_text())
     assert data2["tasks_served"] == 0 and data2["last_task_id"] == ""
 
 
@@ -1624,7 +1700,7 @@ def test_heartbeat_readers_share_single_exception_semantics(tmp_path):
     # succeeds on it, and readers historically diverged — read_heartbeat_state
     # returns the value as-is while others raise AttributeError on .get —
     # which the refactor preserves, not unifies.)
-    for broken in ("{not valid json", "", "{trailing,", '   '):
+    for broken in ("{not valid json", "", "{trailing,", "   "):
         _write_both(broken)
         results = {
             "state": read_heartbeat_state(repo, "w1"),
@@ -1655,8 +1731,7 @@ def test_heartbeat_age_collapses_bad_ts_to_none(tmp_path):
     )
 
     repo = str(tmp_path)
-    ts_payloads = ['{"ts": "abc", "pid": 1}', '{"ts": null, "pid": 1}',
-                   '{"ts": 0, "pid": 1}', '{"ts": -1, "pid": 1}']
+    ts_payloads = ['{"ts": "abc", "pid": 1}', '{"ts": null, "pid": 1}', '{"ts": 0, "pid": 1}', '{"ts": -1, "pid": 1}']
     for payload in ts_payloads:
         d = _subagent_dir(repo, "w1")
         for fname in (_heartbeat_path(d), os.path.join(d, _IDLE_HEARTBEAT_FILENAME)):
@@ -1695,6 +1770,7 @@ def test_heartbeat_readers_do_not_create_directory(tmp_path):
 
     # Sanity: a writer DOES create it.
     from external_llm.agent.subagent_ipc import write_worker_idle_heartbeat
+
     write_worker_idle_heartbeat(repo, "never-started", pid=1)
     assert os.path.isdir(worker_dir)
 
@@ -1713,8 +1789,11 @@ def test_wait_for_result_cancel_mid_wait_returns_promptly(tmp_path):
     timer.start()
     try:
         result = wait_for_result(
-            str(tmp_path), "cancel-mid", cancel_event=ev,
-            poll_interval_s=0.05, timeout_s=30.0,
+            str(tmp_path),
+            "cancel-mid",
+            cancel_event=ev,
+            poll_interval_s=0.05,
+            timeout_s=30.0,
         )
     finally:
         timer.cancel()
@@ -1733,8 +1812,11 @@ def test_wait_for_result_pre_set_cancel_returns_immediately(tmp_path):
     ev.set()
     t0 = time.monotonic()
     result = wait_for_result(
-        str(tmp_path), "cancel-pre", cancel_event=ev,
-        poll_interval_s=0.05, timeout_s=30.0,
+        str(tmp_path),
+        "cancel-pre",
+        cancel_event=ev,
+        poll_interval_s=0.05,
+        timeout_s=30.0,
     )
     assert result is None
     assert time.monotonic() - t0 < 2.0
@@ -1752,8 +1834,11 @@ def test_poll_for_task_cancel_mid_wait_returns_promptly(tmp_path):
     timer.start()
     try:
         task = poll_for_task(
-            str(tmp_path), "worker-cancel", cancel_event=ev,
-            poll_interval_s=0.05, timeout_s=30.0,
+            str(tmp_path),
+            "worker-cancel",
+            cancel_event=ev,
+            poll_interval_s=0.05,
+            timeout_s=30.0,
         )
     finally:
         timer.cancel()

@@ -14,6 +14,7 @@ Colors mirror asi's Catppuccin Mocha palette (truecolor ANSI).
 The mauve gutter bar (▌) marks every line spoken by the Claude Code Agent,
 so its words are visually distinct from asicode's own output.
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,7 +24,7 @@ import sys
 import threading
 import time
 import unicodedata
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.terminal_coordination import TERM_WRITE_LOCK, set_row_pending
 
@@ -36,7 +37,6 @@ _INTERNAL_TOOLS: set[str] = {"StructuredOutput", "output", "output_json"}
 logger = logging.getLogger(__name__)
 
 
-
 def _fg(hex_color: str) -> str:
     """Hex color → truecolor ANSI foreground escape."""
     h = hex_color.lstrip("#")
@@ -45,7 +45,7 @@ def _fg(hex_color: str) -> str:
 
 
 # Catppuccin Mocha — same hex as asi._C
-_MAUVE = _fg("#cba6f7")   # Claude Code Agent identification color
+_MAUVE = _fg("#cba6f7")  # Claude Code Agent identification color
 _GREEN = _fg("#a6e3a1")
 _RED = _fg("#f38ba8")
 _YELLOW = _fg("#f9e2af")
@@ -72,16 +72,16 @@ class StreamingDisplay:
     Claude Code Agent text is marked with a mauve ▌ gutter bar.
     """
 
-    def __init__(self, verbose: bool = False, output_file: Optional[str] = None):
+    def __init__(self, verbose: bool = False, output_file: str | None = None):
         self._verbose = verbose
         self._output_file = output_file
         self._line_buffer: list[str] = []
         self._start_time = time.perf_counter()
-        self._verdict_summary: Optional[str] = None
+        self._verdict_summary: str | None = None
         self._call_seq: int = 0
         # Text already printed as body — used for verdict details dedup
         self._text_seen: list[str] = []
-        #progress during/middle tool: tool_id → {"seq", "name", "hint", "t0"}
+        # progress during/middle tool: tool_id → {"seq", "name", "hint", "t0"}
         self._pending: dict[str, dict[str, Any]] = {}
         # Whether the last terminal line is a live ○ line (can be overwritten)
         self._live: bool = False
@@ -98,8 +98,8 @@ class StreamingDisplay:
         # every 0.25s until process exit.
         self._ticker_launch_lock = threading.Lock()
         self._spin_i: int = 0  # Spinner frame — ticker increments, render always uses current value
-        self._ticker_stop: Optional[threading.Event] = None
-        self._ticker_thread: Optional[threading.Thread] = None
+        self._ticker_stop: threading.Event | None = None
+        self._ticker_thread: threading.Thread | None = None
         self._last_out_t: float = time.perf_counter()  # Last permanent output time (idle detection)
 
     # ── event handling ───────────────────────────────────────────────────
@@ -142,9 +142,7 @@ class StreamingDisplay:
 
         # Write to output file if configured (partial content already returned above)
         if self._output_file:
-            self._line_buffer.append(
-                f"[{time.strftime('%H:%M:%S')}] [{event.type}] {event.content}"
-            )
+            self._line_buffer.append(f"[{time.strftime('%H:%M:%S')}] [{event.type}] {event.content}")
 
     def _handle_text(self, event: SessionEvent) -> None:
         """Claude Code Agent's words — mauve gutter bar per line."""
@@ -276,7 +274,9 @@ class StreamingDisplay:
             stop = threading.Event()
             self._ticker_stop = stop
             self._ticker_thread = threading.Thread(
-                target=self._ticker_worker, args=(stop,), daemon=True,
+                target=self._ticker_worker,
+                args=(stop,),
+                daemon=True,
             )
             self._ticker_thread.start()
 
@@ -394,10 +394,7 @@ class StreamingDisplay:
 
         self._print(f"  {_BORDER}{'─' * _RULE_WIDTH}{_RESET}")
         label = _display_label or "done"
-        self._print(
-            f"  {_BOLD}{color}{icon} {label}{_RESET}"
-            f"{_MUTED}  ·  {'  ·  '.join(parts)}{_RESET}"
-        )
+        self._print(f"  {_BOLD}{color}{icon} {label}{_RESET}{_MUTED}  ·  {'  ·  '.join(parts)}{_RESET}")
 
     # ── verdict rendering ────────────────────────────────────────────────
 
@@ -422,8 +419,10 @@ class StreamingDisplay:
             "insufficient_info": _MAUVE,
         }.get(status, _RESET)
         icon = {
-            "success": "✓", "failure": "✗",
-            "needs_review": "△", "insufficient_info": "?",
+            "success": "✓",
+            "failure": "✗",
+            "needs_review": "△",
+            "insufficient_info": "?",
         }.get(status, "?")
 
         self._print("")
@@ -457,11 +456,7 @@ class StreamingDisplay:
         details = re.sub(r"</?details>", "", details)
         details = re.sub(r"\n{3,}", "\n\n", details).strip()
         body = "\n".join(self._text_seen)
-        show_details = (
-            details
-            and details not in body
-            and (len(body) < 600 or len(details) > 2 * len(body))
-        )
+        show_details = details and details not in body and (len(body) < 600 or len(details) > 2 * len(body))
         if show_details:
             self._print("")
             self._print_gutter_block(details, markdown=True)
@@ -504,26 +499,26 @@ def _display_name(tool_name: str) -> str:
 # Same _out_console theme (Catppuccin Mocha) as asi.py — colors match exactly
 # so markdown rendering looks identical in both places.
 _MARKDOWN_THEME_COLORS = {
-    "markdown.h1":          "bold #89b4fa",
-    "markdown.h1.border":   "#313244",
-    "markdown.h2":          "bold #89dceb",
-    "markdown.h3":          "bold #94e2d5",
-    "markdown.h4":          "bold #cdd6f4",
-    "markdown.code":        "#89dceb",
-    "markdown.code_block":  "#cdd6f4",
-    "markdown.link":        "underline #89b4fa",
-    "markdown.link_url":    "#6c7086",
+    "markdown.h1": "bold #89b4fa",
+    "markdown.h1.border": "#313244",
+    "markdown.h2": "bold #89dceb",
+    "markdown.h3": "bold #94e2d5",
+    "markdown.h4": "bold #cdd6f4",
+    "markdown.code": "#89dceb",
+    "markdown.code_block": "#cdd6f4",
+    "markdown.link": "underline #89b4fa",
+    "markdown.link_url": "#6c7086",
     "markdown.item.bullet": "#fab387",
     "markdown.item.number": "#fab387",
-    "markdown.hr":          "#313244",
+    "markdown.hr": "#313244",
     "markdown.block_quote": "italic #6c7086",
 }
 
 
-def _markdown_lines(text: str, width: int) -> Optional[list[str]]:
+def _markdown_lines(text: str, width: int) -> list[str] | None:
     """Render markdown as ANSI line list (caller attaches the gutter).
 
-    Uses ``rich.markdown.Markdown`` (same as asi) — headings/bold/inline
+    Uses ``rich.markdown._markdown_cls`` (same as asi) — headings/bold/inline
     code/code blocks/lists/horizontal rules are rendered. Console width is fixed
     by ``width`` so all physical rows fit within width cells, preventing left
     gutter misalignment (rich handles CJK width too). Returns ``None`` if rich
@@ -538,16 +533,20 @@ def _markdown_lines(text: str, width: int) -> Optional[list[str]]:
         from rich.theme import Theme
 
         from external_llm.common.rich_markdown import markdown_cls
-        Markdown = markdown_cls()
+
+        _markdown_cls = markdown_cls()
     except Exception:
         logger.debug("rich markdown import failed", exc_info=True)
         return None
     try:
         buf = _io.StringIO()
         Console(
-            file=buf, width=max(width, 8), force_terminal=True,
-            color_system="truecolor", theme=Theme(_MARKDOWN_THEME_COLORS),
-        ).print(Markdown(text))
+            file=buf,
+            width=max(width, 8),
+            force_terminal=True,
+            color_system="truecolor",
+            theme=Theme(_MARKDOWN_THEME_COLORS),
+        ).print(_markdown_cls(text))
     except Exception:
         logger.debug("rich markdown render failed", exc_info=True)
         return None
@@ -676,7 +675,7 @@ def _wrap_cells(s: str, max_cells: int) -> list[str]:
                 piece.append(ch)
                 w += cw
             lines.append("".join(piece))
-            word = word[len(piece):]
+            word = word[len(piece) :]
         cur, cur_w = word, _disp_width(word)
     if cur or not lines:
         lines.append(cur)

@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 
 from ._response_utils import _TRUNCATION_REASONS
 from .enums import Complexity, Scope
@@ -32,7 +32,7 @@ class IntentResolver:
     def __init__(self, config: IntentResolutionConfig):
         self.config = config
         # Bounded LRU + TTL, thread-safe (matches ToolResultCache pattern).
-        self._cache: "OrderedDict[str, tuple[IntentResult, float]]" = OrderedDict()
+        self._cache: OrderedDict[str, tuple[IntentResult, float]] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._cache_max = 128  # bound (LRU eviction)
         self._llm_client = config.llm_client
@@ -121,6 +121,7 @@ class IntentResolver:
                 response = _call_llm(_initial_budget)
             except Exception as exc:
                 from ..client import LLMServerUnavailableError
+
                 if isinstance(exc, LLMServerUnavailableError):
                     raise
                 logger.warning("IntentResolver LLM call failed: %s", exc)
@@ -151,18 +152,23 @@ class IntentResolver:
                     if _choices and isinstance(_choices[0], dict):
                         _finish_reason = _choices[0].get("finish_reason")
             # Structural heuristic: valid JSON always ends with } or ] (after stripping whitespace)
-            _json_looks_truncated = bool(raw) and not raw.rstrip().endswith(('}', ']'))
+            _json_looks_truncated = bool(raw) and not raw.rstrip().endswith(("}", "]"))
 
             logger.debug(
                 "IntentResolver: finish_reason=%r json_truncated=%s raw_len=%d",
-                _finish_reason, _json_looks_truncated, len(raw),
+                _finish_reason,
+                _json_looks_truncated,
+                len(raw),
             )
 
             if _finish_reason in _TRUNCATION_REASONS or _json_looks_truncated:
                 logger.warning(
                     "IntentResolver: truncated response detected "
                     "(finish_reason=%r, json_truncated=%s) at max_tokens=%d — retrying with %d",
-                    _finish_reason, _json_looks_truncated, _initial_budget, _initial_budget * 2,
+                    _finish_reason,
+                    _json_looks_truncated,
+                    _initial_budget,
+                    _initial_budget * 2,
                 )
                 try:
                     response = _call_llm(_initial_budget * 2)
@@ -172,6 +178,7 @@ class IntentResolver:
                         raw = response or raw
                 except Exception as exc:
                     from ..client import LLMServerUnavailableError
+
                     if isinstance(exc, LLMServerUnavailableError):
                         raise
                     logger.warning("IntentResolver retry failed: %s — using partial response", exc)
@@ -183,6 +190,7 @@ class IntentResolver:
 
         except Exception as exc:
             from ..client import LLMServerUnavailableError
+
             if isinstance(exc, LLMServerUnavailableError):
                 raise
             logger.exception("IntentResolver LLM resolution failed: %s", exc)
@@ -385,7 +393,7 @@ Be concise and accurate. Return JSON only."""
         """Build user prompt with the request."""
         return f"User request: {request}"
 
-    def _recover_truncated_json(self, raw_json: str) -> Optional[dict[str, Any]]:
+    def _recover_truncated_json(self, raw_json: str) -> dict[str, Any] | None:
         """Extract complete key-value pairs from a truncated JSON string.
 
         When finish_reason=length cuts the response mid-string, we lose the tail.
@@ -446,15 +454,15 @@ Be concise and accurate. Return JSON only."""
         raw = raw_response.strip()
 
         # Extract JSON block (brace matching, no regex)
-        brace_start = raw.find('{')
+        brace_start = raw.find("{")
         if brace_start == -1:
             logger.warning("IntentResolver: no JSON found in LLM response (%d chars): %s", len(raw), raw[:2000])
             return self._create_fallback_dict(original_request)
-        brace_end = raw.rfind('}')
+        brace_end = raw.rfind("}")
         if brace_end == -1 or brace_end <= brace_start:
             logger.warning("IntentResolver: no JSON found in LLM response (%d chars): %s", len(raw), raw[:2000])
             return self._create_fallback_dict(original_request)
-        raw_json = raw[brace_start:brace_end + 1]
+        raw_json = raw[brace_start : brace_end + 1]
 
         try:
             result = json.loads(raw_json)
@@ -487,8 +495,14 @@ Be concise and accurate. Return JSON only."""
             result["normalized_query"] = original_request
 
         # Ensure lists are lists
-        for list_field in ["search_terms", "target_files", "target_symbols",
-                           "modify_symbols", "reference_symbols", "new_symbols"]:
+        for list_field in [
+            "search_terms",
+            "target_files",
+            "target_symbols",
+            "modify_symbols",
+            "reference_symbols",
+            "new_symbols",
+        ]:
             if list_field in result and not isinstance(result[list_field], list):
                 result[list_field] = []
 
@@ -535,9 +549,8 @@ Be concise and accurate. Return JSON only."""
         # LLM result to the minimal fallback via the outer except.
         _raw_search_terms = result_dict.get("search_terms", [])
         search_terms = [
-            s for s in (_raw_search_terms if isinstance(_raw_search_terms, list) else [])
-            if isinstance(s, str) and s
-        ][:self.config.max_search_terms]
+            s for s in (_raw_search_terms if isinstance(_raw_search_terms, list) else []) if isinstance(s, str) and s
+        ][: self.config.max_search_terms]
         # target_files: prefer LLM output (semantically informed) over regex.
         # The grounding engine validates paths against filesystem later.
         target_files: list[str] = []
@@ -567,7 +580,6 @@ Be concise and accurate. Return JSON only."""
             modify_symbols = list(target_symbols)
             reference_symbols = []
 
-
         # spec_hints: target_files is always empty (grounding engine handles file discovery)
         # Exception: "new_files" explicitly named by user are passed through for CREATE fast-path.
         spec_hints: dict[str, Any] = {}
@@ -575,30 +587,30 @@ Be concise and accurate. Return JSON only."""
         if isinstance(_raw_new_files, list) and _raw_new_files:
             # Only include entries that look like file paths (contain '/' or end in known ext)
             import os as _os_ir
+
             _valid_new_files = [
-                f for f in _raw_new_files
-                if isinstance(f, str) and f.strip()
-                and ('/' in f or '.' in _os_ir.path.basename(f))
+                f
+                for f in _raw_new_files
+                if isinstance(f, str) and f.strip() and ("/" in f or "." in _os_ir.path.basename(f))
             ]
             if _valid_new_files:
                 spec_hints["new_files"] = _valid_new_files
 
         # new_symbols: only relevant for add/extend/create intent
         raw_new_symbols = result_dict.get("new_symbols", [])
-        new_symbols = [
-            ns for ns in raw_new_symbols
-            if isinstance(ns, dict) and ns.get("name")
-        ]
+        new_symbols = [ns for ns in raw_new_symbols if isinstance(ns, dict) and ns.get("name")]
 
         logger.debug(
             "IntentResolver role classification: modify=%s reference=%s new=%s",
-            modify_symbols, reference_symbols, [ns.get("name") for ns in new_symbols],
+            modify_symbols,
+            reference_symbols,
+            [ns.get("name") for ns in new_symbols],
         )
 
         # Edit kind + guard statement (Intent → Policy layer)
         _edit_kind_raw = (result_dict.get("edit_kind") or "").strip().lower()
-        _VALID_EDIT_KINDS = {"guard_add", "body_only", "signature_change", "full_rewrite", "extend"}
-        _edit_kind = _edit_kind_raw if _edit_kind_raw in _VALID_EDIT_KINDS else ""
+        _valid_edit_kinds = {"guard_add", "body_only", "signature_change", "full_rewrite", "extend"}
+        _edit_kind = _edit_kind_raw if _edit_kind_raw in _valid_edit_kinds else ""
         _guard_statement = ""
         _guard_spec = None  # typed GuardIR — authoritative downstream
         if _edit_kind == "guard_add":
@@ -619,7 +631,8 @@ Be concise and accurate. Return JSON only."""
                 if _guard_spec and _guard_spec.is_parsed:
                     logger.debug(
                         "[GUARD_SPEC] intent_resolver: guard_spec built: compact=%r control=%r",
-                        _guard_spec.compact, _guard_spec.control,
+                        _guard_spec.compact,
+                        _guard_spec.control,
                     )
                 else:
                     logger.debug(
@@ -631,11 +644,13 @@ Be concise and accurate. Return JSON only."""
         # code_concepts: validate and normalize
         _raw_cc = result_dict.get("code_concepts", {}) or {}
         _code_concepts: dict[str, Any] = {}
+        _scope_phase = ""  # bound below when code_concepts present; consumed by PROJECT_WIDE override
         if isinstance(_raw_cc, dict):
             _df_raw = _raw_cc.get("data_fields", [])
             _data_fields = [
-                f for f in (_df_raw if isinstance(_df_raw, list) else [])
-                if isinstance(f, str) and re.match(r'^[\w.]+$', f) and len(f) >= 2
+                f
+                for f in (_df_raw if isinstance(_df_raw, list) else [])
+                if isinstance(f, str) and re.match(r"^[\w.]+$", f) and len(f) >= 2
             ][:8]
             _bk = _raw_cc.get("behavioral_kind", "")
             _behavioral_kind = _bk if _bk in ("enforcement", "creation", "fix", "query") else ""
@@ -733,13 +748,13 @@ Be concise and accurate. Return JSON only."""
             words = []
             _cur = []
             for _ch in text:
-                if _ch.isalnum() or _ch in ('_', '-'):
+                if _ch.isalnum() or _ch in ("_", "-"):
                     _cur.append(_ch)
                 elif _cur:
-                    words.append(''.join(_cur))
+                    words.append("".join(_cur))
                     _cur = []
             if _cur:
-                words.append(''.join(_cur))
+                words.append("".join(_cur))
             return [w for w in words if len(w) >= 2]  # Keep words with at least 2 chars
 
         # 2. Minimal stop words filtering (language-agnostic)
@@ -748,11 +763,23 @@ Be concise and accurate. Return JSON only."""
             # Minimal set: articles/prepositions in major languages
             minimal_stop = {
                 # English
-                "the", "and", "for", "with", "this", "that",
+                "the",
+                "and",
+                "for",
+                "with",
+                "this",
+                "that",
                 # Korean particles removed — regex split doesn't separate them
                 # from adjacent text in mixed-language requests
                 # Universal
-                "a", "an", "of", "to", "in", "on", "at", "by",
+                "a",
+                "an",
+                "of",
+                "to",
+                "in",
+                "on",
+                "at",
+                "by",
             }
             return [w for w in words if w not in minimal_stop]
 
@@ -761,25 +788,25 @@ Be concise and accurate. Return JSON only."""
         search_terms = filter_minimal_stop_words(all_words)
 
         # 4. Extract file patterns (char split, no regex)
-        _file_extensions = {'py', 'js', 'ts', 'tsx', 'jsx', 'html', 'css', 'md', 'json', 'yaml', 'yml', 'toml', 'txt'}
+        _file_extensions = {"py", "js", "ts", "tsx", "jsx", "html", "css", "md", "json", "yaml", "yml", "toml", "txt"}
         file_matches = []
-        _delims = ' :()[]{}<>"\'\t\n\r'
+        _delims = " :()[]{}<>\"'\t\n\r"
         _buf = []
         for _ch in request:
             if _ch in _delims:
                 if _buf:
-                    _w = ''.join(_buf).strip('.,;!')
-                    if '.' in _w:
-                        _parts = _w.rsplit('.', 1)
+                    _w = "".join(_buf).strip(".,;!")
+                    if "." in _w:
+                        _parts = _w.rsplit(".", 1)
                         if len(_parts) == 2 and _parts[1].lower() in _file_extensions:
                             file_matches.append(_w)
                     _buf = []
             else:
                 _buf.append(_ch)
         if _buf:
-            _w = ''.join(_buf).strip('.,;!')
-            if '.' in _w:
-                _parts = _w.rsplit('.', 1)
+            _w = "".join(_buf).strip(".,;!")
+            if "." in _w:
+                _parts = _w.rsplit(".", 1)
                 if len(_parts) == 2 and _parts[1].lower() in _file_extensions:
                     file_matches.append(_w)
 
@@ -792,12 +819,12 @@ Be concise and accurate. Return JSON only."""
                 lane_hint = "main_agent"
 
         # 6. Basic target inference from file matches
-        target_files = list(file_matches)[:self.config.max_target_files]
+        target_files = list(file_matches)[: self.config.max_target_files]
 
         return IntentResult(
             original_request=request,
             normalized_query=request,  # No normalization in fallback
-            search_terms=search_terms[:self.config.max_search_terms],
+            search_terms=search_terms[: self.config.max_search_terms],
             intent_type="unknown",  # No intent classification in fallback
             target_files=target_files,
             target_symbols=[],

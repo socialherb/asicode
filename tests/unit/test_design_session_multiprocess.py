@@ -11,6 +11,7 @@ When two asi processes share the same session file:
 The two DesignSessionManager instances each have independent in-memory
 caches, so this follows the same path as two real processes (sync via disk).
 """
+
 import pytest
 
 from external_llm.design_session import DesignSessionManager
@@ -48,15 +49,21 @@ def _seed_session_file(tmp_path, sid: str, turns: list[dict]) -> None:
     the tampering. Writing directly to disk is the real scenario.
     """
     import json
+
     sessions_dir = tmp_path / ".asicode" / "design_sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     safe = "".join(c for c in sid if c.isalnum() or c in "-_")
     path = sessions_dir / f"{safe}.json"
     data = {
-        "session_id": sid, "created_at": __import__("time").time(),
-        "updated_at": __import__("time").time(), "turns": turns,
-        "compressed_summary": "", "compressed_up_to": 0,
-        "archived_count": 0, "decisions": [], "chat_mode": "code",
+        "session_id": sid,
+        "created_at": __import__("time").time(),
+        "updated_at": __import__("time").time(),
+        "turns": turns,
+        "compressed_summary": "",
+        "compressed_up_to": 0,
+        "archived_count": 0,
+        "decisions": [],
+        "chat_mode": "code",
     }
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
@@ -84,8 +91,9 @@ class TestInProgressLabeling:
         mgr_b.add_turn(SID, "user", "request B", in_progress=True)
         msgs = mgr_b.build_context_messages(mgr_b.get_or_create(SID))
 
-        labeled = [m for m in msgs if m["role"] == "system" and _LABEL in m["content"]
-                   and m["content"].startswith("(turn ")]
+        labeled = [
+            m for m in msgs if m["role"] == "system" and _LABEL in m["content"] and m["content"].startswith("(turn ")
+        ]
         assert len(labeled) == 1
         assert "request A" in labeled[0]["content"]
         # A's request does not appear as a regular user message
@@ -96,8 +104,7 @@ class TestInProgressLabeling:
     def test_own_in_progress_turn_not_labeled(self, mgr_a):
         mgr_a.add_turn(SID, "user", "request A", in_progress=True)
         msgs = mgr_a.build_context_messages(mgr_a.get_or_create(SID))
-        assert not any(m["content"].startswith("(turn ") and _LABEL in m["content"]
-                       for m in msgs)
+        assert not any(m["content"].startswith("(turn ") and _LABEL in m["content"] for m in msgs)
         assert any(m["role"] == "user" and "request A" in m["content"] for m in msgs)
 
     def test_label_cleared_after_assistant_recorded(self, mgr_a, mgr_b):
@@ -107,8 +114,7 @@ class TestInProgressLabeling:
         # A's flag clearing is reflected to B via disk
         mgr_b.add_turn(SID, "assistant", "answer B")
         msgs = mgr_b.build_context_messages(mgr_b.get_or_create(SID))
-        assert not any(m["content"].startswith("(turn ") and _LABEL in m["content"]
-                       for m in msgs)
+        assert not any(m["content"].startswith("(turn ") and _LABEL in m["content"] for m in msgs)
         assert any(m["role"] == "user" and "request A" in m["content"] for m in msgs)
 
     def test_assistant_clears_only_own_turn(self, mgr_a, mgr_b):
@@ -147,31 +153,50 @@ class TestZombieInProgressReap:
     def test_dead_owner_pid_is_reaped_on_next_add_turn(self, mgr_b, tmp_path):
         """A zombie turn left on disk by A (owner=dead PID) is cleared on B's add_turn."""
         import time
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "zombie request A", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:999999"},  # almost certainly not alive
-        ])
+
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "zombie request A",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": "pid:999999",
+                },  # almost certainly not alive
+            ],
+        )
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
-        assert not any(t.get("in_progress") for t in turns), \
-            "zombie turn of a dead owner was not reaped"
+        assert not any(t.get("in_progress") for t in turns), "zombie turn of a dead owner was not reaped"
 
     def test_alive_owner_pid_is_not_reaped(self, mgr_b, tmp_path):
         """A turn owned by a live PID is not treated as a zombie."""
         import os
         import time
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "alive request A", "timestamp": time.time(),
-             "in_progress": True, "owner": f"pid:{os.getpid()}"},  # current process = alive
-        ])
+
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "alive request A",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": f"pid:{os.getpid()}",
+                },  # current process = alive
+            ],
+        )
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
-        assert any(t.get("in_progress") for t in turns), \
-            "a live owner's turn was incorrectly reaped"
+        assert any(t.get("in_progress") for t in turns), "a live owner's turn was incorrectly reaped"
 
     def test_self_pid_excluded_from_reap(self, mgr_a):
         """A turn owned by our own PID may still be in progress, so it's excluded from reap."""
         import os
+
         mgr_a._owner = f"pid:{os.getpid()}"
         mgr_a.add_turn(SID, "user", "my in-progress request", in_progress=True)
         # Our own add_turn is not treated as a zombie (nor on the next add_turn)
@@ -183,36 +208,64 @@ class TestZombieInProgressReap:
     def test_legacy_arbitrary_owner_uses_age_fallback(self, mgr_b, tmp_path):
         """If owner isn't in pid: form, only age >= MAX_AGE triggers reap (arbitrary test owner)."""
         import time
+
         old_ts = time.time() - mgr_b._IN_PROGRESS_MAX_AGE - 1
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "legacy zombie A", "timestamp": old_ts,
-             "in_progress": True, "owner": "pid:A"},  # non-standard owner → age fallback
-        ])
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "legacy zombie A",
+                    "timestamp": old_ts,
+                    "in_progress": True,
+                    "owner": "pid:A",
+                },  # non-standard owner → age fallback
+            ],
+        )
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
-        assert not any(t.get("in_progress") for t in turns), \
-            "age-based fallback failed to reap an old legacy zombie"
+        assert not any(t.get("in_progress") for t in turns), "age-based fallback failed to reap an old legacy zombie"
 
     def test_recent_legacy_owner_not_reaped(self, mgr_b, tmp_path):
         """If age < MAX_AGE, don't reap even with a non-standard owner (conservative)."""
         import time
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "recent legacy A", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:A"},
-        ])
+
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "recent legacy A",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": "pid:A",
+                },
+            ],
+        )
         mgr_b.add_turn(SID, "user", "request B")
         turns = mgr_b.get_or_create(SID).turns
-        assert any(t.get("in_progress") for t in turns), \
-            "a recent turn was incorrectly reaped by the age fallback"
+        assert any(t.get("in_progress") for t in turns), "a recent turn was incorrectly reaped by the age fallback"
 
     def test_reaped_turns_persisted_to_disk(self, tmp_path):
         """A zombie reap is persisted to disk, so it's visible even after another process restarts."""
         import os
         import time
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "zombie A", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:999998"},
-        ])
+
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "zombie A",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": "pid:999998",
+                },
+            ],
+        )
         # B triggers add_turn → the zombie reap is persisted to disk
         b = DesignSessionManager(str(tmp_path))
         b._owner = f"pid:{os.getpid()}"
@@ -221,26 +274,49 @@ class TestZombieInProgressReap:
         fresh = DesignSessionManager(str(tmp_path))
         fresh._owner = f"pid:{os.getpid()}"
         session = fresh.get_or_create(SID)
-        assert not any(t.get("in_progress") for t in session.turns), \
-            "the zombie reap was not persisted to disk"
+        assert not any(t.get("in_progress") for t in session.turns), "the zombie reap was not persisted to disk"
 
     def test_dead_pid_cached_permanently(self, mgr_b, tmp_path):
         """Once a PID is determined dead, it's cached permanently (defense against PID reuse)."""
         import time
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "zombie A", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:999997"},
-        ])
+
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "zombie A",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": "pid:999997",
+                },
+            ],
+        )
         mgr_b.add_turn(SID, "user", "trigger reap")
         assert 999997 in mgr_b._dead_pids
         # A second zombie turn from the same PID is also reaped immediately via a cache hit
-        _seed_session_file(tmp_path, SID, [
-            {"role": "user", "content": "zombie A", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:999997"},
-            {"role": "assistant", "content": "x", "timestamp": time.time()},
-            {"role": "user", "content": "zombie A2", "timestamp": time.time(),
-             "in_progress": True, "owner": "pid:999997"},
-        ])
+        _seed_session_file(
+            tmp_path,
+            SID,
+            [
+                {
+                    "role": "user",
+                    "content": "zombie A",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": "pid:999997",
+                },
+                {"role": "assistant", "content": "x", "timestamp": time.time()},
+                {
+                    "role": "user",
+                    "content": "zombie A2",
+                    "timestamp": time.time(),
+                    "in_progress": True,
+                    "owner": "pid:999997",
+                },
+            ],
+        )
         mgr_b.add_turn(SID, "user", "trigger reap 2")
         turns = mgr_b.get_or_create(SID).turns
         assert not any(t.get("in_progress") for t in turns)
@@ -256,8 +332,10 @@ class TestFailedSaveMerge:
 
         # B's next save fails (transient disk error) — u2 exists only in B's cache
         orig_write = mgr_b._write_session
+
         def _fail(_session):
             raise OSError("simulated disk failure")
+
         mgr_b._write_session = _fail
         mgr_b.add_turn(SID, "user", "u2")
         mgr_b._write_session = orig_write
@@ -281,10 +359,15 @@ class TestLegacyMigrationSafety:
 
     def test_legacy_preserve_not_reintroduced_by_adopt(self, tmp_path):
         import json
-        _seed_session_file(tmp_path, "legacy", [
-            {"role": "user", "content": "old1", "timestamp": 1.0},
-            {"role": "assistant", "content": "old2", "preserve": True, "timestamp": 2.0},
-        ])
+
+        _seed_session_file(
+            tmp_path,
+            "legacy",
+            [
+                {"role": "user", "content": "old1", "timestamp": 1.0},
+                {"role": "assistant", "content": "old2", "preserve": True, "timestamp": 2.0},
+            ],
+        )
         m = _mgr(tmp_path, "pid:A")
         s = m.get_or_create("legacy")
         assert all("preserve" not in t for t in s.turns)
@@ -296,10 +379,7 @@ class TestLegacyMigrationSafety:
         assert all("preserve" not in t for t in s.turns)
 
         # and the rewritten file is clean as well
-        raw = json.loads(
-            (tmp_path / ".asicode" / "design_sessions" / "legacy.json")
-            .read_text(encoding="utf-8")
-        )
+        raw = json.loads((tmp_path / ".asicode" / "design_sessions" / "legacy.json").read_text(encoding="utf-8"))
         assert all("preserve" not in t for t in raw["turns"])
 
 

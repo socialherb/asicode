@@ -8,6 +8,7 @@
    parse failure bailed out instead of walking back to the previous complete
    record.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,7 +20,6 @@ from external_llm.design_session import DesignSessionManager
 
 
 @pytest.fixture
-
 def mgr(tmp_path):
 
     return DesignSessionManager(repo_root=str(tmp_path))
@@ -42,20 +42,14 @@ def _write(mgr, sid, records):
 def _session(turns, compressed_up_to, archived_count=0, sid="s1"):
 
     return SimpleNamespace(
-
         session_id=sid,
-
         turns=turns,
-
         compressed_up_to=compressed_up_to,
-
         archived_count=archived_count,
-
     )
 
 
 class TestArchiveLastIndex:
-
     def test_missing_file_returns_minus_one(self, mgr):
 
         assert mgr._archive_last_index(_archive(mgr, "nope")) == -1
@@ -93,15 +87,10 @@ class TestArchiveLastIndex:
         p = _archive(mgr, "s1")
 
         p.write_text(
-
             json.dumps({"i": 3, "role": "user"}, ensure_ascii=False)
-
             + "\n"
-
             + '{"i": 4, "role": "assistant", "content": "unterminated',
-
             encoding="utf-8",
-
         )
 
         assert mgr._archive_last_index(p) == 3
@@ -111,17 +100,11 @@ class TestArchiveLastIndex:
         p = _archive(mgr, "s1")
 
         p.write_text(
-
             json.dumps({"i": 0, "role": "user"}, ensure_ascii=False)
-
             + "\n{corrupt\n"
-
             + json.dumps({"i": 2, "role": "user"}, ensure_ascii=False)
-
             + "\n",
-
             encoding="utf-8",
-
         )
 
         assert mgr._archive_last_index(p) == 2
@@ -136,7 +119,6 @@ class TestArchiveLastIndex:
 
 
 class TestArchiveCompressedTurnsDedup:
-
     def test_no_duplicate_after_crash_recovery(self, mgr):
 
         # Archive already holds i=0,1 (appended before the crash that lost the
@@ -178,7 +160,6 @@ class TestArchiveCompressedTurnsDedup:
         assert s.archived_count == 1
 
     def test_legacy_preserve_turns_migrate_and_archive(self, mgr):
-
         """The stop-at-preserve scan was removed as unreachable: nothing
 
         produces preserve=True any more (add_turn never sets it and _load_raw
@@ -191,13 +172,9 @@ class TestArchiveCompressedTurnsDedup:
 
         p = _write(mgr, "s1", [])
 
-
         s = _session(
-
             [{"role": "user"}, {"role": "assistant", "preserve": True}, {"role": "user"}],
-
             compressed_up_to=3,
-
         )
 
         # Simulate what _load_raw does to a legacy disk file:

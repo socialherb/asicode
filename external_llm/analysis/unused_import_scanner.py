@@ -266,7 +266,7 @@ def _collect_type_names_from_strings(tree: ast.Module) -> set:
        and ``TypeVar("T", ..., bound="Bar")`` positional/bound constraints.
     """
     names: set = set()
-    _TypeAliasNode = getattr(ast, "TypeAlias", ())  # PEP 695 (3.12+)
+    _type_alias_node = getattr(ast, "TypeAlias", ())  # PEP 695 (3.12+)
 
     for node in ast.walk(tree):
         # ── Annotation positions (forward references as string literals) ──
@@ -279,8 +279,8 @@ def _collect_type_names_from_strings(tree: ast.Module) -> set:
                 _add_identifiers_from_annotation(node.value, names)
         elif isinstance(node, ast.arg):
             ann = node.annotation
-        elif _TypeAliasNode and isinstance(node, _TypeAliasNode):
-            _add_identifiers_from_annotation(node.value, names)
+        elif _type_alias_node and isinstance(node, _type_alias_node):  # type: ignore[attr-defined]  # PEP 695 node (3.12+)
+            _add_identifiers_from_annotation(node.value, names)  # type: ignore[attr-defined]  # TypeAlias node (3.12+)
         _add_identifiers_from_annotation(ann, names)
 
         # ── Call-site type names (cast / TypeVar string args) ──
@@ -525,10 +525,13 @@ def scan_unused_imports(
             _uic_entry = (_uic_fp, _uic_extract_file(abs_path, rel_path))
             _uic_cache[abs_path] = _uic_entry
             _uic_dirty = True
-        if _uic_entry[1] is None:
+        if _uic_entry is None:
+            continue  # unreachable (assigned above), but keeps the type checker honest
+        _uic_analysis = _uic_entry[1]
+        if _uic_analysis is None:
             continue  # cached skip decision (unreadable / broken / no imports)
 
-        _analysis = _uic_entry[1]
+        _analysis = _uic_analysis
         import_info = _analysis["import_info"]
         all_names = _analysis["all"]
         type_checking_ranges = _analysis["ranges"]

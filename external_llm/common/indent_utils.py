@@ -6,6 +6,7 @@ detection, block reindenting, and indent-char normalization live here.
 Previously these were duplicated across 6+ locations in patch_synth,
 plan_compiler, repair_apply, symbol_handlers_anchor, and tool_registry.
 """
+
 from __future__ import annotations
 
 import io
@@ -14,7 +15,6 @@ import re
 import tokenize as _tok
 from collections import defaultdict
 from math import gcd
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 # Core primitives (level 1 — no dependencies)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def detect_indent_char(lines: list[str]) -> str:
     """Detect indent character ('\t' or ' ') from a list of file lines.
@@ -31,7 +32,7 @@ def detect_indent_char(lines: list[str]) -> str:
     for s in lines:
         stripped = s.lstrip()
         if stripped and s != stripped:
-            return "\t" if "\t" in s[:len(s) - len(stripped)] else " "
+            return "\t" if "\t" in s[: len(s) - len(stripped)] else " "
     return " "
 
 
@@ -72,7 +73,7 @@ def format_numbered_line(lineno: int, line: str) -> str:
     return f"{lineno:>6} {INDENT_GUTTER_BAR}{indent:>2}{INDENT_GUTTER_BAR} {line}"
 
 
-def _continuation_rows(text: str, lines: Optional[list[str]] = None) -> set[int]:
+def _continuation_rows(text: str, lines: list[str] | None = None) -> set[int]:
     """1-based rows of physical lines that *continue* a previous logical line.
 
     A continuation line is one that begins while a ``(`` or ``[`` is still open
@@ -95,7 +96,7 @@ def _continuation_rows(text: str, lines: Optional[list[str]] = None) -> set[int]
     """
     rows: set[int] = set()
     depth = 0
-    in_str: Optional[str] = None
+    in_str: str | None = None
     in_block_comment = False
     backslash_cont = False
     phys = lines if lines is not None else text.split("\n")
@@ -142,7 +143,7 @@ def _continuation_rows(text: str, lines: Optional[list[str]] = None) -> set[int]
     return rows
 
 
-def indent_unit(text: str, char: str, cont_rows: Optional[set[int]] = None) -> int:
+def indent_unit(text: str, char: str, cont_rows: set[int] | None = None) -> int:
     """GCD of leading-run widths for lines indented *purely* with ``char``.
 
     Gives the file's chars-per-level (e.g. 4 for 4-space, 1 for tab).
@@ -166,7 +167,7 @@ def indent_unit(text: str, char: str, cont_rows: Optional[set[int]] = None) -> i
         if row in cont_rows:
             continue
         st = ln.lstrip(" \t")
-        lead = ln[:len(ln) - len(st)]
+        lead = ln[: len(ln) - len(st)]
         if lead and set(lead) == {char}:
             u = gcd(u, len(lead))
     return u or (1 if char == "\t" else 4)
@@ -180,7 +181,8 @@ def indent_unit(text: str, char: str, cont_rows: Optional[set[int]] = None) -> i
 # which the modify_symbol (Python-only) path needs for precise depth-remap.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _analyze_logical_lines(snippet: str) -> Optional[tuple[dict, set]]:
+
+def _analyze_logical_lines(snippet: str) -> tuple[dict, set] | None:
     """Tokenize ``snippet`` to classify each physical row.
 
     Returns ``(owner, logical_rows)`` where:
@@ -200,7 +202,7 @@ def _analyze_logical_lines(snippet: str) -> Optional[tuple[dict, set]]:
     """
     owner: dict = {}
     logical_rows: set = set()
-    cur: Optional[int] = None
+    cur: int | None = None
     logical_start = True
     try:
         for t in _tok.generate_tokens(io.StringIO(snippet).readline):
@@ -208,8 +210,7 @@ def _analyze_logical_lines(snippet: str) -> Optional[tuple[dict, set]]:
             if tt == _tok.NEWLINE:
                 logical_start = True
                 continue
-            if tt in (_tok.NL, _tok.INDENT, _tok.DEDENT, _tok.COMMENT,
-                      _tok.ENCODING, _tok.ENDMARKER):
+            if tt in (_tok.NL, _tok.INDENT, _tok.DEDENT, _tok.COMMENT, _tok.ENCODING, _tok.ENDMARKER):
                 continue
             sr, er = t.start[0], t.end[0]
             if logical_start:
@@ -260,6 +261,7 @@ def _file_indent_unit_from_logical(source: str, file_char: str) -> int:
 # Block reindenting (level 2 — uses min_indent)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def shift_block(
     lines: list[str],
     before_min: int,
@@ -282,7 +284,7 @@ def shift_block(
     # ratio-based scaling produces identity (ratio=1.0) and loses the
     # file's base indentation.  Use additive fallback instead.
     if after_min == 0:
-        indent_ratio: Optional[float] = None
+        indent_ratio: float | None = None
     else:
         indent_ratio = before_min / after_min
 
@@ -298,7 +300,7 @@ def shift_block(
     return fixed
 
 
-def reindent_text(text: str, target_indent: int, indent_char: str = "") -> Optional[str]:
+def reindent_text(text: str, target_indent: int, indent_char: str = "") -> str | None:
     """Re-indent multiline text so its minimum indent becomes *target_indent*.
 
     Preserves relative indentation; empty lines unchanged.
@@ -332,12 +334,13 @@ def reindent_text(text: str, target_indent: int, indent_char: str = "") -> Optio
 # Content-aware reindent (level 3 — plan_compiler style)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _indent_of(line: str) -> str:
     """Leading whitespace of *line*, or '' if line is blank."""
-    return line[:len(line) - len(line.lstrip())] if line.strip() else ""
+    return line[: len(line) - len(line.lstrip())] if line.strip() else ""
 
 
-def _first_logical_indent(text: str) -> Optional[str]:
+def _first_logical_indent(text: str) -> str | None:
     """Leading whitespace of the first *logical* line in ``text``.
 
     Uses Python's tokenizer to distinguish logical lines (terminated by
@@ -350,7 +353,7 @@ def _first_logical_indent(text: str) -> Optional[str]:
     the caller falls back to the first non-empty line.
     """
     src = text if text.endswith("\n") else text + "\n"
-    first_logical_row: Optional[int] = None
+    first_logical_row: int | None = None
     try:
         logical_start = True
         for t in _tok.generate_tokens(io.StringIO(src).readline):
@@ -358,8 +361,7 @@ def _first_logical_indent(text: str) -> Optional[str]:
             if tt == _tok.NEWLINE:
                 logical_start = True
                 continue
-            if tt in (_tok.NL, _tok.INDENT, _tok.DEDENT,
-                      _tok.COMMENT, _tok.ENCODING, _tok.ENDMARKER):
+            if tt in (_tok.NL, _tok.INDENT, _tok.DEDENT, _tok.COMMENT, _tok.ENCODING, _tok.ENDMARKER):
                 continue
             if logical_start:
                 first_logical_row = t.start[0]
@@ -379,8 +381,8 @@ def _match_site_unit(
     actual_before: str,
     actual_base: str,
     after_unit: int,
-    file_unit: Optional[int] = None,
-    before_lines: Optional[list[str]] = None,
+    file_unit: int | None = None,
+    before_lines: list[str] | None = None,
 ) -> int:
     """Reliable per-level indent width of the match site, in its own chars.
 
@@ -404,11 +406,7 @@ def _match_site_unit(
         return 1
     phys = before_lines if before_lines is not None else actual_before.split("\n")
     cont = _continuation_rows(actual_before, phys)
-    depths = {
-        len(_indent_of(line))
-        for i, line in enumerate(phys, start=1)
-        if line.strip() and i not in cont
-    }
+    depths = {len(_indent_of(line)) for i, line in enumerate(phys, start=1) if line.strip() and i not in cont}
     if len(depths) > 1:
         # Reuse the `cont` set computed above instead of letting
         # ``indent_unit`` re-scan ``actual_before`` for continuation rows.
@@ -417,7 +415,7 @@ def _match_site_unit(
     return file_unit or after_unit or 1
 
 
-def reindent_to_match(after: str, actual_before: str, file_unit: Optional[int] = None) -> str:
+def reindent_to_match(after: str, actual_before: str, file_unit: int | None = None) -> str:
     """Align indentation of ``after`` to match ``actual_before``'s file-level indent.
 
     When fuzzy match is used (whitespace-normalized match) in edit_blocks,
@@ -492,7 +490,7 @@ def reindent_to_match(after: str, actual_before: str, file_unit: Optional[int] =
     # and carries no char info — detect the char from the body instead so a
     # tab/space mismatch is still recognised by ``cross_char``.
     after_indent_char = after_base[0] if after_base else detect_indent_char(after_lines)
-    cross_char = (after_indent_char != actual_indent_char)
+    cross_char = after_indent_char != actual_indent_char
 
     # Build content→indent map from before_lines. A stripped line that appears at
     # *different* indentations in the match site is ambiguous — content-mapping
@@ -592,6 +590,7 @@ def reindent_to_match(after: str, actual_before: str, file_unit: Optional[int] =
 # Indent-char normalization (level 3 — repair_apply style)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _indent_char_counts(text: str) -> tuple[int, int]:
     """Return (tab-led, space-led) counts across non-blank lines."""
     tabs = spaces = 0
@@ -651,7 +650,7 @@ def normalize_indent_char_to_file(new_content: str, old_content: str) -> str:
         if row in new_cont_rows:
             out.append(ln)
             continue
-        lead = body[:len(body) - len(st)]
+        lead = body[: len(body) - len(st)]
         if lead and set(lead) == {other_char}:
             depth = round(len(lead) / wrong_unit) if wrong_unit else 0
             out.append(file_char * (depth * file_unit) + st + nl)
@@ -661,7 +660,9 @@ def normalize_indent_char_to_file(new_content: str, old_content: str) -> str:
     if converted:
         logger.info(
             "[INDENT_NORM] normalized %d new line(s) to file indent char %r (unit=%d)",
-            converted, file_char, file_unit,
+            converted,
+            file_char,
+            file_unit,
         )
     return "".join(out)
 
@@ -691,7 +692,7 @@ def normalize_indent_char_to_file(new_content: str, old_content: str) -> str:
 # or make the "core" branchier than the current separate functions.
 
 
-def _block_levels(lines: list[str]) -> Optional[tuple[int, int, str]]:
+def _block_levels(lines: list[str]) -> tuple[int, int, str] | None:
     """Level analysis of an indented code block.
 
     Returns ``(min_count, unit, block_char)`` or ``None`` when no non-empty
@@ -714,9 +715,7 @@ def _block_levels(lines: list[str]) -> Optional[tuple[int, int, str]]:
         return None
     counts = [len(ln) - len(ln.lstrip()) for ln in nonblank]
     min_count = min(counts)
-    block_char = "\t" if any(
-        "\t" in ln[:len(ln) - len(ln.lstrip())] for ln in nonblank
-    ) else " "
+    block_char = "\t" if any("\t" in ln[: len(ln) - len(ln.lstrip())] for ln in nonblank) else " "
     unit = 0
     for c in counts:
         rel = c - min_count
@@ -727,9 +726,7 @@ def _block_levels(lines: list[str]) -> Optional[tuple[int, int, str]]:
     return min_count, unit, block_char
 
 
-def _resolve_space_unit(
-    dest_unit: Optional[int], unit: int, block_char: str
-) -> int:
+def _resolve_space_unit(dest_unit: int | None, unit: int, block_char: str) -> int:
     """Per-level width (chars) for a *space* destination.
 
     Prefer the caller-supplied file unit (``dest_unit``) so a tab/4-space block
@@ -744,7 +741,7 @@ def _resolve_space_unit(
 def reindent_to_anchor(
     insert_lines: list[str],
     anchor_line: str,
-    dest_unit: Optional[int] = None,
+    dest_unit: int | None = None,
 ) -> list[str]:
     """Re-indent *insert_lines* to match the leading whitespace of *anchor_line*.
 
@@ -770,7 +767,9 @@ def reindent_to_anchor(
     anchor_line  = "        if localStream:\\n"
     Returns      = ["        pc.createOffer()\\n", "          .then(...)\\n"]
     """
-    anchor_indent = re.match(r'^[ \t]*', anchor_line).group(0)
+    _anchor_match = re.match(r"^[ 	]*", anchor_line)
+    assert _anchor_match is not None  # ^[ 	]* always matches any string
+    anchor_indent = _anchor_match.group(0)
 
     # NOTE: anchor_indent may be "" (column 0).  That is valid — it means
     # "rebase to 0 indent".  We continue processing below; the loop already
@@ -803,7 +802,7 @@ def reindent_to_anchor(
     return result
 
 
-def reindent_block(text: str, base_indent: str, dest_unit: Optional[int] = None) -> str:
+def reindent_block(text: str, base_indent: str, dest_unit: int | None = None) -> str:
     """Re-base a block so its least-indented line sits at *base_indent*,
     preserving relative nesting **levels** across differing indent styles.
 

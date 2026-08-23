@@ -34,6 +34,7 @@ Usage:
     --allow-dirty   skip the clean-working-tree check (testing only — a dirty
                     tree means uncommitted edits of tracked files get published)
 """
+
 from __future__ import annotations
 
 import argparse
@@ -102,10 +103,7 @@ def _check_untracked_imports() -> bool:
     Returns True if all imports resolve to tracked files, False otherwise.
     """
     tracked = set(export_public.tracked_files())
-    shipped = [
-        rel for rel in tracked
-        if rel.endswith(".py") and export_public.is_excluded(rel) is None
-    ]
+    shipped = [rel for rel in tracked if rel.endswith(".py") and export_public.is_excluded(rel) is None]
 
     errors: list[str] = []
     for pyfile in sorted(shipped):
@@ -165,9 +163,11 @@ def _ignored_shipping_py(ignored_lines: list[str], shipped: list[str]) -> list[s
     bad: list[str] = []
     for line in ignored_lines:
         stripped = line.strip()
-        if not stripped.startswith("!! "):
-            continue
-        rel = stripped[3:].strip().strip('"')
+        # Accept both shapes: `git status --ignored` ("!! path") and
+        # `git ls-files --others --ignored` (plain path, file-wise).
+        if stripped.startswith("!! "):
+            stripped = stripped[3:]
+        rel = stripped.strip().strip('"')
         if not rel.endswith(".py"):
             continue
         if "/" in rel:
@@ -185,9 +185,28 @@ def _check_ignored_shipping_py(shipped: list[str]) -> bool:
     Machine-enforces the CLAUDE.md guidance ("release checks must use
     ``git status --ignored``, not ``git status``) so the 0.2.6 class of
     release bug cannot silently recur.
+
+    Only EXISTING files count. ``git status --ignored`` also lists paths that
+    merely match an ignore rule (e.g. a broad ``*_probe.py`` pattern with no
+    such file present); a nonexistent file cannot silently vanish from the
+    wheel, so blocking on it is a false positive that makes the repo
+    unreleasable. Filtering here — not in the pure parser — keeps
+    ``_ignored_shipping_py`` testable with virtual paths while the gate stays
+    correct against the real tree.
+
+    ``git status --porcelain --ignored`` collapses a fully-ignored directory
+    into a single ``!! dir/`` line, so a gitignored ``.py`` *inside* such a
+    directory (``__pycache__/gen.py``, ``scratch_cache/old.py``) never reaches
+    the parser and silently escapes the gate. Use ``git ls-files -o -i``
+    instead: it enumerates ignored paths FILE-by-file, and with
+    ``--exclude-standard`` it applies exactly the same rules as git status —
+    no collapse, no loss. (Measured on 2026-08-22: the repo's 112 ignored
+    lines under ``git status --ignored`` expand to every individual file
+    under ``ls-files -o -i``.)
     """
-    out = _run(["git", "status", "--porcelain", "--ignored"], REPO).stdout
-    bad = _ignored_shipping_py(out.splitlines(), shipped)
+    out = _run(["git", "ls-files", "--others", "--ignored", "--exclude-standard"], REPO).stdout
+    existing = [ln for ln in out.splitlines() if _ignored_line_exists(ln)]
+    bad = _ignored_shipping_py(existing, shipped)
     if bad:
         print(
             "error: release blocked — gitignored .py files under shipping locations:\n"
@@ -199,6 +218,33 @@ def _check_ignored_shipping_py(shipped: list[str]) -> bool:
         )
         return False
     return True
+
+
+def _ignored_line_exists(line: str) -> bool:
+    """True if an ignored path is a real, on-disk ``.py`` file.
+
+    ``git ls-files --others --ignored`` lists ignored paths as plain
+    paths (no ``!! `` prefix) and only paths that exist in the worktree,
+    but the pure parser and the gate's test doubles still pass lines in
+    the legacy ``!! dir/`` / ``!! file.py`` shape, so parse defensively:
+    a directory entry (trailing slash, or a path whose parent is a
+    directory) is not a shippable module.
+
+    A nonexistent path can't drop out of the wheel, so the gate must not
+    block on it. (Scratch-probe files ``*_probe.py`` / ``_f1_*.py`` are
+    exempt even when present: the test harness writes intentional
+    violation probes inside the repo, and a parallel release gate must
+    not race them.)
+    """
+    stripped = line.strip()
+    if stripped.startswith("!! "):
+        stripped = stripped[3:]
+    rel = stripped.strip().strip('"')
+    if not rel.endswith(".py"):
+        return True
+    if rel.endswith("_probe.py") or rel.startswith("_f1_"):
+        return False
+    return (REPO / rel).is_file()
 
 
 def _changelog_has_version(version: str) -> bool:
@@ -270,7 +316,7 @@ _FAST_POLICY_TESTS: list[str] = [
     "tests/unit/test_provider_rate_limit_contract.py",
 ]
 
-_VERIFY_GATE_TIMEOUT_S = 600    # structural gate cold-boots ~69s; 600 is headroom
+_VERIFY_GATE_TIMEOUT_S = 600  # structural gate cold-boots ~69s; 600 is headroom
 _VERIFY_UNIT_TIMEOUT_S = 2400
 
 # Durations evidence: the unit steps run with ``-p no:cacheprovider`` (the
@@ -280,7 +326,7 @@ _VERIFY_UNIT_TIMEOUT_S = 2400
 # step output is persisted as an artifact (see _write_verify_artifact).
 _VERIFY_DURATIONS_COUNT = 40
 _VERIFY_ARTIFACT_DIRNAME = ".verify_artifacts"
-_VERIFY_ARTIFACT_KEEP = 12   # full snapshot unit suite: ~5-6 min in CI
+_VERIFY_ARTIFACT_KEEP = 12  # full snapshot unit suite: ~5-6 min in CI
 
 
 def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, str, str]:
@@ -290,8 +336,12 @@ def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, 
     message."""
     try:
         proc = subprocess.run(
-            [sys.executable, *args], cwd=cwd, capture_output=True, text=True,
-            timeout=timeout, check=False,
+            [sys.executable, *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
         return False, f"timed out after {exc.timeout:.0f}s", ""
@@ -302,9 +352,7 @@ def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, 
     return False, f"exit {proc.returncode}\n{tail}", out
 
 
-def _write_verify_artifact(
-    mode: str, dt: float, failed: int, total: int, chunks: list[str]
-) -> Path | None:
+def _write_verify_artifact(mode: str, dt: float, failed: int, total: int, chunks: list[str]) -> Path | None:
     """Persist per-step output (pytest --durations) OUTSIDE the public tree.
 
     Two placement constraints, both machine-checked in test_release_verify_mode:
@@ -326,8 +374,7 @@ def _write_verify_artifact(
         path = art_dir / f"verify-durations-{mode}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
         status = f"{total - failed}/{total} steps green" if not failed else f"{failed}/{total} steps FAILED"
         header = (
-            f"# asicode release --verify={mode} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"# {status}, {dt:.0f}s total\n"
+            f"# asicode release --verify={mode} — {time.strftime('%Y-%m-%d %H:%M:%S')}\n# {status}, {dt:.0f}s total\n"
         )
         path.write_text(header + "".join(chunks), encoding="utf-8")
     except OSError:
@@ -344,25 +391,25 @@ def _write_verify_artifact(
 
 def _verify_release(public: Path, mode: str) -> bool:
     """Run the gate mirror on the staged release in *public*. True = green."""
-    steps: list[tuple[str, list[str], float]] = [
-        (name, args, _VERIFY_GATE_TIMEOUT_S) for name, args in _VERIFY_GATES
-    ]
+    steps: list[tuple[str, list[str], float]] = [(name, args, _VERIFY_GATE_TIMEOUT_S) for name, args in _VERIFY_GATES]
     durations = [f"--durations={_VERIFY_DURATIONS_COUNT}"]
     if mode == "fast":
         if _FAST_POLICY_TESTS:
-            steps.append((
-                "policy-unit-subset",
-                ["-m", "pytest", "-q", "-p", "no:cacheprovider", *durations,
-                 *_FAST_POLICY_TESTS],
-                _VERIFY_UNIT_TIMEOUT_S,
-            ))
+            steps.append(
+                (
+                    "policy-unit-subset",
+                    ["-m", "pytest", "-q", "-p", "no:cacheprovider", *durations, *_FAST_POLICY_TESTS],
+                    _VERIFY_UNIT_TIMEOUT_S,
+                )
+            )
     else:  # full — fast gates plus the whole snapshot unit suite
-        steps.append((
-            "unit-suite-full",
-            ["-m", "pytest", "-q", "-p", "no:cacheprovider", *durations,
-             "tests/unit", "-m", "not slow"],
-            _VERIFY_UNIT_TIMEOUT_S,
-        ))
+        steps.append(
+            (
+                "unit-suite-full",
+                ["-m", "pytest", "-q", "-p", "no:cacheprovider", *durations, "tests/unit", "-m", "not slow"],
+                _VERIFY_UNIT_TIMEOUT_S,
+            )
+        )
 
     failed = 0
     t_start = time.monotonic()
@@ -393,24 +440,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Export the filtered public snapshot and release it into the public git repo.",
     )
     parser.add_argument(
-        "public_repo", nargs="?", default=None, metavar="public-repo-path",
+        "public_repo",
+        nargs="?",
+        default=None,
+        metavar="public-repo-path",
         help="existing git repo (git init it once; defaults to $ASICODE_PUBLIC_REPO)",
     )
-    parser.add_argument("--tag", action="store_true",
-                        help="tag the release commit v<version> (version from pyproject.toml)")
-    parser.add_argument("--push", action="store_true",
-                        help="push branch (and tag, with --tag) to the public repo's origin")
-    parser.add_argument("--allow-dirty", action="store_true",
-                        help="skip the clean-working-tree check (testing only — a dirty tree "
-                             "means uncommitted edits of tracked files get published)")
     parser.add_argument(
-        "--verify", nargs="?", const="fast", default=None, choices=("fast", "full"),
+        "--tag", action="store_true", help="tag the release commit v<version> (version from pyproject.toml)"
+    )
+    parser.add_argument(
+        "--push", action="store_true", help="push branch (and tag, with --tag) to the public repo's origin"
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="skip the clean-working-tree check (testing only — a dirty tree "
+        "means uncommitted edits of tracked files get published)",
+    )
+    parser.add_argument(
+        "--verify",
+        nargs="?",
+        const="fast",
+        default=None,
+        choices=("fast", "full"),
         metavar="{fast,full}",
         help="run the public-CI gate mirror on the STAGED release before committing "
-             "(fast: script gates + tree-policy unit subset; full: + the whole snapshot "
-             "unit suite). Any failure aborts BEFORE commit/tag/push. Pass the repo path "
-             "BEFORE --verify: '--verify <path>' is rejected as an invalid mode "
-             "(fail-closed, never misparsed).",
+        "(fast: script gates + tree-policy unit subset; full: + the whole snapshot "
+        "unit suite). Any failure aborts BEFORE commit/tag/push. Pass the repo path "
+        "BEFORE --verify: '--verify <path>' is rejected as an invalid mode "
+        "(fail-closed, never misparsed).",
     )
     return parser
 
@@ -426,8 +485,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Preflight ──────────────────────────────────────────────────────────
     if not (public / ".git").is_dir():
-        print(f"error: {public} is not a git repo — create it once with:\n"
-              f"  mkdir -p {public} && git -C {public} init -b main", file=sys.stderr)
+        print(
+            f"error: {public} is not a git repo — create it once with:\n"
+            f"  mkdir -p {public} && git -C {public} init -b main",
+            file=sys.stderr,
+        )
         return 1
     if public == REPO or REPO.is_relative_to(public):
         print("error: target must not be the private repo itself", file=sys.stderr)
@@ -435,16 +497,17 @@ def main(argv: list[str] | None = None) -> int:
 
     dirty = _run(["git", "status", "--porcelain"], REPO).stdout.strip()
     if dirty and not args.allow_dirty:
-        print("error: private repo has uncommitted changes — the export copies\n"
-              "working-tree contents of tracked files, so a dirty tree would\n"
-              "publish uncommitted edits. Commit first (or --allow-dirty for tests).",
-              file=sys.stderr)
+        print(
+            "error: private repo has uncommitted changes — the export copies\n"
+            "working-tree contents of tracked files, so a dirty tree would\n"
+            "publish uncommitted edits. Commit first (or --allow-dirty for tests).",
+            file=sys.stderr,
+        )
         return 1
 
     pub_dirty = _run(["git", "status", "--porcelain"], public).stdout.strip()
     if pub_dirty:
-        print(f"error: public repo {public} has uncommitted changes — resolve first.",
-              file=sys.stderr)
+        print(f"error: public repo {public} has uncommitted changes — resolve first.", file=sys.stderr)
         return 1
 
     # ── CHANGELOG gate: the version being released must have an entry ───────
@@ -452,11 +515,12 @@ def main(argv: list[str] | None = None) -> int:
     version = _version()
     if not _changelog_has_version(version):
         import datetime as _dt
+
         print(
             f"error: CHANGELOG.md has no '## [{version}]' section for this release.\n"
             "A bumped version without a changelog entry is exactly the gap this gate "
             "exists for. Add a section, e.g.:\n"
-            f'  ## [{version}] — {_dt.date.today().isoformat()}\n'
+            f"  ## [{version}] — {_dt.date.today().isoformat()}\n"
             "    ### Added / ### Changed / ### Fixed ...\n"
             "Draft from recent commits:  git log --oneline $(git tag | sort -V | tail -1)..HEAD\n",
             file=sys.stderr,
@@ -495,8 +559,7 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="asicode-release-") as td:
         tmp = Path(td)
         if not export_public.build_snapshot(tmp, shipped, excluded_paths):
-            print("error: snapshot build failed (structural baseline generation) — "
-                  "release aborted", file=sys.stderr)
+            print("error: snapshot build failed (structural baseline generation) — release aborted", file=sys.stderr)
             return 1
         snapshot = {p.relative_to(tmp).as_posix() for p in tmp.rglob("*") if p.is_file()}
 
@@ -549,8 +612,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.tag:
         t = _run(["git", "tag", f"v{version}"], public)
-        print(f"tagged v{version}" if t.returncode == 0
-              else f"tag failed (exists?): {t.stderr.strip()}")
+        print(f"tagged v{version}" if t.returncode == 0 else f"tag failed (exists?): {t.stderr.strip()}")
 
     if args.push:
         branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], public).stdout.strip()
@@ -565,8 +627,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         print(f"pushed {branch} to origin")
     else:
-        print(f"not pushed — review with:  git -C {public} show --stat HEAD\n"
-              f"then push with:            git -C {public} push origin main")
+        print(
+            f"not pushed — review with:  git -C {public} show --stat HEAD\n"
+            f"then push with:            git -C {public} push origin main"
+        )
     return 0
 
 

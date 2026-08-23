@@ -5,6 +5,7 @@ delegate_to_helper dispatch surface, and the ask_user guard branches
 (disabled / limit / no-callback / callback exception) that the checkpoint
 contract tests do not reach.
 """
+
 from __future__ import annotations
 
 import threading
@@ -232,9 +233,7 @@ def test_delegate_builds_context_from_target_symbol(tmp_path, monkeypatch):
             return types.SimpleNamespace(content="## Context\nhelper code")
 
     monkeypatch.setattr(ss, "get_symbol_searcher", lambda root: _FakeSearcher())
-    monkeypatch.setattr(
-        "external_llm.context.context_packs.HelperContextBuilder", _FakeBuilder
-    )
+    monkeypatch.setattr("external_llm.context.context_packs.HelperContextBuilder", _FakeBuilder)
     la = _FakeLocalAssistant(result={"success": True, "code": "ok"})
     host = _Host(repo_root=str(tmp_path), local_assistant=la)
     res = host._tool_delegate_to_helper(
@@ -267,14 +266,10 @@ def test_delegate_builds_context_from_file_snippet(tmp_path, monkeypatch):
             # builder wraps the snippet into pack content (its real contract)
             return types.SimpleNamespace(content=f"## Context\n{kwargs.get('local_snippet')}")
 
-    monkeypatch.setattr(
-        "external_llm.context.context_packs.HelperContextBuilder", _FakeBuilder
-    )
+    monkeypatch.setattr("external_llm.context.context_packs.HelperContextBuilder", _FakeBuilder)
     la = _FakeLocalAssistant(result={"success": True, "code": "ok"})
     host = _Host(repo_root=str(tmp_path), local_assistant=la)
-    res = host._tool_delegate_to_helper(
-        {"role": "r", "instruction": "i", "file_path": "mod.py"}
-    )
+    res = host._tool_delegate_to_helper({"role": "r", "instruction": "i", "file_path": "mod.py"})
     assert res.ok is True
     assert "1: line 1" in seen["local_snippet"]
     assert "1: line 1" in la.last_kwargs["context_code"]
@@ -290,9 +285,7 @@ def test_delegate_context_build_failure_is_suppressed(tmp_path, monkeypatch):
     monkeypatch.setattr(ss, "get_symbol_searcher", _raise)
     la = _FakeLocalAssistant(result={"success": True, "code": "ok"})
     host = _Host(repo_root=str(tmp_path), local_assistant=la)
-    res = host._tool_delegate_to_helper(
-        {"role": "r", "instruction": "i", "target_symbol": "x"}
-    )
+    res = host._tool_delegate_to_helper({"role": "r", "instruction": "i", "target_symbol": "x"})
     # outer try/except -> context build failure logged, delegation proceeds
     assert res.ok is True
 

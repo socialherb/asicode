@@ -11,6 +11,7 @@ the structural invariants that must hold across arbitrarily many cycles:
   * the fresh categorisation of the current cycle is preserved
   * size stays roughly linear (not quadratic) across cycles
 """
+
 from __future__ import annotations
 
 from external_llm.agent.context_manager import (
@@ -47,14 +48,10 @@ def _fresh_batch(label: str):
 def _assert_invariants(msg, cycle):
     body = msg.content
     # exactly one END marker
-    assert body.count(_END) == 1, (
-        f"cycle {cycle}: expected exactly 1 END marker, got {body.count(_END)}\n{body}"
-    )
+    assert body.count(_END) == 1, f"cycle {cycle}: expected exactly 1 END marker, got {body.count(_END)}\n{body}"
     # at most one carry-forward section (zero after stripping on re-compress)
     n_cf = body.count(_CF)
-    assert n_cf <= 1, (
-        f"cycle {cycle}: nested carry-forward sections ({n_cf}) — infinite growth\n{body}"
-    )
+    assert n_cf <= 1, f"cycle {cycle}: nested carry-forward sections ({n_cf}) — infinite growth\n{body}"
     # body must START with the header and END with the marker (structural shape)
     assert body.startswith(_START), f"cycle {cycle}: missing header"
     assert body.rstrip().endswith(_END), f"cycle {cycle}: trailing marker corrupted"
@@ -83,10 +80,8 @@ def test_first_recompress_no_duplicate_end_marker():
     cf_idx = c1.content.find(_CF)
     end_idx = c1.content.rfind(_END)
     assert cf_idx != -1 and end_idx != -1 and cf_idx < end_idx
-    carried = c1.content[cf_idx + len(_CF):end_idx]
-    assert _END not in carried, (
-        f"END marker leaked into carried-forward payload:\n{carried}"
-    )
+    carried = c1.content[cf_idx + len(_CF) : end_idx]
+    assert _END not in carried, f"END marker leaked into carried-forward payload:\n{carried}"
 
 
 def test_carryforward_marker_stripped_on_recompress():
@@ -99,9 +94,7 @@ def test_carryforward_marker_stripped_on_recompress():
     cf_idx = c1.content.find(_CF)
     assert cf_idx != -1, "cycle 1 should carry cycle 0 forward"
     cf_section = c1.content[cf_idx:]
-    assert _CF not in cf_section[len(_CF):], (
-        f"nested CF marker inside carried-forward section\n{cf_section}"
-    )
+    assert _CF not in cf_section[len(_CF) :], f"nested CF marker inside carried-forward section\n{cf_section}"
 
 
 def test_multi_cycle_size_growth_is_subquadratic():
@@ -115,9 +108,7 @@ def test_multi_cycle_size_growth_is_subquadratic():
         sizes.append(len(prev.content.encode("utf-8")))
     # The final size must be within 2x of the first carry-forward size
     # (capped content, not the sum of all 8 cycles).
-    assert sizes[-1] < 2 * sizes[1], (
-        f"size not bounded across cycles: {sizes}"
-    )
+    assert sizes[-1] < 2 * sizes[1], f"size not bounded across cycles: {sizes}"
 
 
 def test_fresh_categorisation_preserved_on_recompress():
@@ -129,9 +120,7 @@ def test_fresh_categorisation_preserved_on_recompress():
     cf_idx = c1.content.find(_CF)
     fresh_idx = c1.content.find("FRESH_MARKER_XYZ")
     assert fresh_idx != -1, "fresh categorisation lost"
-    assert fresh_idx < cf_idx, (
-        f"fresh content not before carry-forward (fresh={fresh_idx}, cf={cf_idx})"
-    )
+    assert fresh_idx < cf_idx, f"fresh content not before carry-forward (fresh={fresh_idx}, cf={cf_idx})"
 
 
 # ── Anthropic-native tool_result categorisation (P1 regression) ──────────────
@@ -165,9 +154,7 @@ def _anthropic_tool_pair(tool_name: str, tool_use_id: str, *, ok: bool, body: st
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
-                    "content": _json.dumps(
-                        {"ok": ok, "content": body, "error": "boom" if not ok else None}
-                    ),
+                    "content": _json.dumps({"ok": ok, "content": body, "error": "boom" if not ok else None}),
                 },
             ],
         ),
@@ -180,7 +167,7 @@ def _anthropic_section(body: str, label: str) -> str | None:
     idx = body.find(label)
     if idx == -1:
         return None
-    rest = body[idx + len(label):]
+    rest = body[idx + len(label) :]
     return rest.split("\n\n", 1)[0]
 
 
@@ -190,13 +177,9 @@ def test_anthropic_tool_result_classified_by_recovered_name():
     dropped = _anthropic_tool_pair("apply_patch", "toolu_01A", ok=True, body="patched foo.py")
     msg = _compress(None, dropped)
     changes = _anthropic_section(msg.content, "Applied changes")
-    assert changes is not None and "apply_patch" in changes, (
-        f"apply_patch not in Changes section\n{msg.content}"
-    )
+    assert changes is not None and "apply_patch" in changes, f"apply_patch not in Changes section\n{msg.content}"
     other = _anthropic_section(msg.content, "Other tool calls")
-    assert other is None or "apply_patch" not in other, (
-        f"apply_patch mis-bucketed into Other tool calls\n{msg.content}"
-    )
+    assert other is None or "apply_patch" not in other, f"apply_patch mis-bucketed into Other tool calls\n{msg.content}"
 
 
 def test_anthropic_tool_result_search_bucket():
@@ -204,9 +187,7 @@ def test_anthropic_tool_result_search_bucket():
     dropped = _anthropic_tool_pair("find_symbol", "toolu_02B", ok=True, body="foo at L10")
     msg = _compress(None, dropped)
     search = _anthropic_section(msg.content, "Symbol / search results")
-    assert search is not None and "find_symbol" in search, (
-        f"find_symbol not in search section\n{msg.content}"
-    )
+    assert search is not None and "find_symbol" in search, f"find_symbol not in search section\n{msg.content}"
 
 
 def test_anthropic_tool_result_failure_bucket():
@@ -239,9 +220,7 @@ def test_anthropic_tool_result_unmapped_id_falls_back():
     ]
     msg = _compress(None, dropped)
     other = _anthropic_section(msg.content, "Other tool calls")
-    assert other is not None and "orphan body" in other, (
-        f"unmapped tool_result not summarised\n{msg.content}"
-    )
+    assert other is not None and "orphan body" in other, f"unmapped tool_result not summarised\n{msg.content}"
 
 
 def test_anthropic_tool_result_files_read_bucket():
@@ -254,23 +233,17 @@ def test_anthropic_tool_result_files_read_bucket():
     dropped = _anthropic_tool_pair("read_file", "toolu_04D", ok=True, body="def foo(): ...")
     msg = _compress(None, dropped)
     files = _anthropic_section(msg.content, "Files read")
-    assert files is not None and "read_file" in files, (
-        f"read_file not in Files read section\n{msg.content}"
-    )
+    assert files is not None and "read_file" in files, f"read_file not in Files read section\n{msg.content}"
     other = _anthropic_section(msg.content, "Other tool calls")
-    assert other is None or "read_file" not in other, (
-        f"read_file mis-bucketed into Other tool calls\n{msg.content}"
-    )
+    assert other is None or "read_file" not in other, f"read_file mis-bucketed into Other tool calls\n{msg.content}"
 
 
 def test_role_tool_files_read_bucket():
     """Standard role='tool' path: read-only tool results land under 'Files read'
     (read_file / read_symbol / get_file_outline); mixed tools stay elsewhere."""
     dropped = [
-        LLMMessage(role="tool", name="read_symbol", content=_json.dumps(
-            {"ok": True, "content": "def target(): ..."})),
-        LLMMessage(role="tool", name="get_file_outline", content=_json.dumps(
-            {"ok": True, "content": "classes: A, B"})),
+        LLMMessage(role="tool", name="read_symbol", content=_json.dumps({"ok": True, "content": "def target(): ..."})),
+        LLMMessage(role="tool", name="get_file_outline", content=_json.dumps({"ok": True, "content": "classes: A, B"})),
     ]
     msg = _compress(None, dropped)
     files = _anthropic_section(msg.content, "Files read")

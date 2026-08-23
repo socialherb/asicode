@@ -16,6 +16,7 @@ point the semantic auto-repair uses, so a write tool cannot skip it. These tests
 drive each tool through the real ``dispatch`` path — invoking the handler
 directly would bypass exactly the layer under test.
 """
+
 from __future__ import annotations
 
 import tempfile
@@ -30,9 +31,14 @@ from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 @pytest.fixture
 def cfg():
     return AgentConfig(
-        max_turns=5, run_tests=False, run_lint=False, auto_test_on_patch=False,
-        self_review_enabled=False, rag_enabled=False,
-        vector_cache_enabled=False, parallel_tool_execution_enabled=False,
+        max_turns=5,
+        run_tests=False,
+        run_lint=False,
+        auto_test_on_patch=False,
+        self_review_enabled=False,
+        rag_enabled=False,
+        vector_cache_enabled=False,
+        parallel_tool_execution_enabled=False,
     )
 
 
@@ -56,17 +62,16 @@ def _visible(reg) -> set[str]:
 
 
 def _find(reg, name: str) -> str:
-    return (reg.dispatch("find_symbol", {"name": name}).content or "")
+    return reg.dispatch("find_symbol", {"name": name}).content or ""
 
 
 # ── one case per write tool ───────────────────────────────────────────────
 # Each returns the dispatch args; the file it targets is pre-created where the
 # tool requires an existing target, so only the *symbol* is new.
 
+
 def _case_apply_patch_new(d: Path) -> tuple[str, dict]:
-    return "apply_patch", {
-        "patch": "--- /dev/null\n+++ b/brand_new.py\n@@ -0,0 +1 @@\n+def brand_new(): pass\n"
-    }
+    return "apply_patch", {"patch": "--- /dev/null\n+++ b/brand_new.py\n@@ -0,0 +1 @@\n+def brand_new(): pass\n"}
 
 
 def _case_apply_patch_existing(d: Path) -> tuple[str, dict]:
@@ -82,22 +87,27 @@ def _case_apply_patch_existing(d: Path) -> tuple[str, dict]:
 def _case_edit_text(d: Path) -> tuple[str, dict]:
     (d / "brand_new.py").write_text("def placeholder(): pass\n", encoding="utf-8")
     return "edit_text", {
-        "path": "brand_new.py", "old_string": "placeholder", "new_string": "brand_new",
+        "path": "brand_new.py",
+        "old_string": "placeholder",
+        "new_string": "brand_new",
     }
 
 
 def _case_anchor_edit(d: Path) -> tuple[str, dict]:
     (d / "brand_new.py").write_text("def placeholder():\n    pass\n", encoding="utf-8")
     return "anchor_edit", {
-        "file_path": "brand_new.py", "anchor_pattern": "def placeholder():",
-        "edit_mode": "replace_line", "code_snippet": "def brand_new():",
+        "file_path": "brand_new.py",
+        "anchor_pattern": "def placeholder():",
+        "edit_mode": "replace_line",
+        "code_snippet": "def brand_new():",
     }
 
 
 def _case_modify_symbol(d: Path) -> tuple[str, dict]:
     (d / "brand_new.py").write_text("def placeholder():\n    pass\n", encoding="utf-8")
     return "modify_symbol", {
-        "file_path": "brand_new.py", "symbol": "placeholder",
+        "file_path": "brand_new.py",
+        "symbol": "placeholder",
         "code": "def brand_new():\n    return 1\n",
     }
 
@@ -124,12 +134,8 @@ def test_write_tool_invalidates_the_walk_cache(repo, label):
     result = reg.dispatch(tool, args)
     assert result.ok, f"{label} failed to write: {result.error}"
 
-    assert "brand_new.py" in _visible(reg), (
-        f"{label}: walk cache still stale after a successful write"
-    )
-    assert "Found" in _find(reg, "brand_new"), (
-        f"{label}: find_symbol cannot see a symbol that is on disk"
-    )
+    assert "brand_new.py" in _visible(reg), f"{label}: walk cache still stale after a successful write"
+    assert "Found" in _find(reg, "brand_new"), f"{label}: find_symbol cannot see a symbol that is on disk"
 
 
 @pytest.mark.parametrize("label", sorted(_CASES))
@@ -140,7 +146,8 @@ def test_write_tool_reaches_the_central_invalidation_hook(repo, label, monkeypat
     calls: list = []
     orig = type(reg)._invalidate_cache_after_write
     monkeypatch.setattr(
-        type(reg), "_invalidate_cache_after_write",
+        type(reg),
+        "_invalidate_cache_after_write",
         lambda self, paths: (calls.append(list(paths)), orig(self, paths))[1],
     )
     tool, args = _CASES[label](d)
@@ -156,12 +163,18 @@ def test_failed_write_does_not_invalidate(repo, monkeypatch):
     calls: list = []
     orig = type(reg)._invalidate_cache_after_write
     monkeypatch.setattr(
-        type(reg), "_invalidate_cache_after_write",
+        type(reg),
+        "_invalidate_cache_after_write",
         lambda self, paths: (calls.append(list(paths)), orig(self, paths))[1],
     )
-    result = reg.dispatch("edit_text", {
-        "path": "a.py", "old_string": "NO_SUCH_TEXT_ANYWHERE", "new_string": "x",
-    })
+    result = reg.dispatch(
+        "edit_text",
+        {
+            "path": "a.py",
+            "old_string": "NO_SUCH_TEXT_ANYWHERE",
+            "new_string": "x",
+        },
+    )
     assert not result.ok
     assert calls == [], "invalidation ran for a failed write"
 
@@ -171,7 +184,8 @@ def test_read_only_tool_does_not_invalidate(repo, monkeypatch):
     calls: list = []
     orig = type(reg)._invalidate_cache_after_write
     monkeypatch.setattr(
-        type(reg), "_invalidate_cache_after_write",
+        type(reg),
+        "_invalidate_cache_after_write",
         lambda self, paths: (calls.append(list(paths)), orig(self, paths))[1],
     )
     reg.dispatch("find_symbol", {"name": "anything"})
@@ -188,6 +202,7 @@ def test_read_only_tool_does_not_invalidate(repo, monkeypatch):
 #    `bash('cat > path << EOF ...')`. A mutating bash cleared the tool-result
 #    cache and nothing else, so bash-authored files (Python ones too) were
 #    invisible to find_symbol.
+
 
 @pytest.fixture
 def multilang_repo(cfg):
@@ -206,46 +221,57 @@ def multilang_repo(cfg):
 def test_nonpython_symbol_visible_right_after_edit(multilang_repo):
     """Editing a .go file must expose its new symbol immediately."""
     reg, d = multilang_repo
-    res = reg.dispatch("edit_text", {
-        "file_path": "a.go", "old_string": "func GoAlpha()",
-        "new_string": "func GoBeta() int { return 9 }\n\nfunc GoAlpha()",
-    })
+    res = reg.dispatch(
+        "edit_text",
+        {
+            "file_path": "a.go",
+            "old_string": "func GoAlpha()",
+            "new_string": "func GoBeta() int { return 9 }\n\nfunc GoAlpha()",
+        },
+    )
     assert res.ok, res.error
     assert "GoBeta" in (d / "a.go").read_text(encoding="utf-8")
-    assert "No definitions found" not in _find(reg, "GoBeta"), (
-        "non-Python symbol invisible after the agent's own edit"
-    )
+    assert "No definitions found" not in _find(reg, "GoBeta"), "non-Python symbol invisible after the agent's own edit"
 
 
 def test_python_and_nonpython_are_symmetric(multilang_repo):
     """Neither language may be the privileged one."""
     reg, _d = multilang_repo
-    reg.dispatch("edit_text", {
-        "file_path": "a.py", "old_string": "def py_alpha():",
-        "new_string": "def PyBeta():\n    return 9\n\n\ndef py_alpha():",
-    })
-    reg.dispatch("edit_text", {
-        "file_path": "a.go", "old_string": "func GoAlpha()",
-        "new_string": "func GoBeta() int { return 9 }\n\nfunc GoAlpha()",
-    })
+    reg.dispatch(
+        "edit_text",
+        {
+            "file_path": "a.py",
+            "old_string": "def py_alpha():",
+            "new_string": "def PyBeta():\n    return 9\n\n\ndef py_alpha():",
+        },
+    )
+    reg.dispatch(
+        "edit_text",
+        {
+            "file_path": "a.go",
+            "old_string": "func GoAlpha()",
+            "new_string": "func GoBeta() int { return 9 }\n\nfunc GoAlpha()",
+        },
+    )
     py_ok = "No definitions found" not in _find(reg, "PyBeta")
     go_ok = "No definitions found" not in _find(reg, "GoBeta")
     assert py_ok == go_ok is True, f"asymmetry: python={py_ok} nonpython={go_ok}"
 
 
-@pytest.mark.parametrize("fname,body,symbol", [
-    ("bash_made.py", "def BashPySym():\\n    return 1\\n", "BashPySym"),
-    ("bash_made.go", "package main\\n\\nfunc BashGoSym() int { return 1 }\\n", "BashGoSym"),
-])
+@pytest.mark.parametrize(
+    "fname,body,symbol",
+    [
+        ("bash_made.py", "def BashPySym():\\n    return 1\\n", "BashPySym"),
+        ("bash_made.go", "package main\\n\\nfunc BashGoSym() int { return 1 }\\n", "BashGoSym"),
+    ],
+)
 def test_bash_created_file_is_visible_to_find_symbol(multilang_repo, fname, body, symbol):
     """bash is a first-class write path and must invalidate like the tools do."""
     reg, d = multilang_repo
     res = reg.dispatch("bash", {"command": f"printf '{body}' > {fname}"})
     assert res.ok, res.error
     assert (d / fname).exists()
-    assert "No definitions found" not in _find(reg, symbol), (
-        f"{fname} created by bash is invisible to find_symbol"
-    )
+    assert "No definitions found" not in _find(reg, symbol), f"{fname} created by bash is invisible to find_symbol"
 
 
 def test_readonly_bash_does_not_invalidate(multilang_repo):
@@ -260,10 +286,7 @@ def test_readonly_bash_does_not_invalidate(multilang_repo):
     reg.dispatch("read_file", {"path": "a.py"})
     reg.dispatch("bash", {"command": "ls -la"})
     again = reg.dispatch("read_file", {"path": "a.py"})
-    assert bool((again.metadata or {}).get("cache_hit")) is True, (
-        "read-only bash cleared the read cache"
-    )
-
+    assert bool((again.metadata or {}).get("cache_hit")) is True, "read-only bash cleared the read cache"
 
 
 def test_mutating_bash_drops_the_facade_rg_graph(multilang_repo):
@@ -281,20 +304,15 @@ def test_mutating_bash_drops_the_facade_rg_graph(multilang_repo):
     reg, d = multilang_repo
     # Warm the facade RG graph so a stale read is possible (the bug is
     # invisible on a cold graph, which rebuilds lazily on the next query).
-    assert reg._call_graph.get_symbol("py_alpha") is not None, (
-        "precondition: RG graph should serve existing symbols"
-    )
+    assert reg._call_graph.get_symbol("py_alpha") is not None, "precondition: RG graph should serve existing symbols"
     assert reg._call_graph._graph is not None, "precondition: RG graph should be warm"
 
     res = reg.dispatch("bash", {"command": "printf 'def BashGsgSym():\\n    return 1\\n' > bash_gsg.py"})
     assert res.ok, res.error
     assert (d / "bash_gsg.py").exists()
     assert reg._call_graph._graph is None, (
-        "mutating bash left the facade RG graph warm — RG-backed queries "
-        "served pre-bash state (B1)"
+        "mutating bash left the facade RG graph warm — RG-backed queries served pre-bash state (B1)"
     )
     # The next RG-backed query rebuilds lazily and must see the new symbol.
     node = reg._call_graph.get_symbol("BashGsgSym")
-    assert node is not None and node.name == "BashGsgSym", (
-        "RG get_symbol cannot see a symbol created by mutating bash"
-    )
+    assert node is not None and node.name == "BashGsgSym", "RG get_symbol cannot see a symbol created by mutating bash"

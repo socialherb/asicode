@@ -13,6 +13,7 @@ These tests pin the parity fix: the canonical ``is_balance_quota_signal``
 helper (single source in client.py, shared by both endpoints) classifies
 correctly, and every 429 site in ZAIAnthropicClient raises the right error.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -26,6 +27,7 @@ from external_llm.client import (
 )
 
 # ── canonical helper (client.py) ────────────────────────────────────────────
+
 
 def test_balance_signal_true_for_zai_code_1113():
     assert is_balance_quota_signal(1113, "") is True
@@ -48,6 +50,7 @@ def test_balance_signal_false_for_none_and_empty():
 
 # ── end-to-end: ZAIAnthropicClient.chat (primary endpoint) ──────────────────
 
+
 class _Resp:
     def __init__(self, status_code, text="", headers=None):
         self.status_code = status_code
@@ -56,13 +59,11 @@ class _Resp:
 
     def json(self):
         import json as _json
+
         return _json.loads(self.text)
 
 
-_BALANCE_BODY = (
-    '{"error":{"code":"1113","message":"Insufficient balance or no resource '
-    'package. Please recharge."}}'
-)
+_BALANCE_BODY = '{"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}'
 _PHRASE_BODY = '{"error":{"message":"please recharge your account to continue"}}'
 _OVERLOAD_BODY = '{"error":{"code":"1305","message":"server overloaded"}}'
 _RATELIMIT_BODY = '{"error":{"code":"1302","message":"rate limited"}}'
@@ -111,22 +112,20 @@ def test_zai_anthropic_chat_rate_limit_error_code_preserved(monkeypatch):
 
 # ── chat_with_tools exercises a different 429 site ──────────────────────────
 
+
 def test_zai_anthropic_chat_with_tools_balance_429_raises_quota(monkeypatch):
     client = _zai_client(monkeypatch, _Resp(429, text=_BALANCE_BODY))
     with pytest.raises(LLMQuotaExceededError):
-        client.chat_with_tools(
-            [LLMMessage(role="user", content="hi")], tools=[], model="glm-5.2"
-        )
+        client.chat_with_tools([LLMMessage(role="user", content="hi")], tools=[], model="glm-5.2")
 
 
 # ── plain Anthropic (Claude) regression: genuine 429 unaffected ─────────────
+
 
 def test_plain_anthropic_genuine_429_still_rate_limit(monkeypatch):
     """Claude never emits balance code 1113, so a Claude 429 stays a rate
     limit — the balance check is a no-op for non-zai providers."""
     client = AnthropicClient(api_key="test")
-    monkeypatch.setattr(
-        client._session, "post", lambda *a, **k: _Resp(429, text=_OVERLOAD_BODY)
-    )
+    monkeypatch.setattr(client._session, "post", lambda *a, **k: _Resp(429, text=_OVERLOAD_BODY))
     with pytest.raises(LLMRateLimitError):
         client.chat([LLMMessage(role="user", content="hi")], model="claude-3-5-sonnet-20241022")

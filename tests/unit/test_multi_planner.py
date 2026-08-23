@@ -6,6 +6,7 @@ default) when the key *exists* with a null value, so a single null field used to
 crash ``_order_operations`` (``for dep in None`` -> TypeError) and silently
 discard an otherwise-valid LLM plan.
 """
+
 from external_llm.multi_planner import (
     FileOperation,
     LLMEnhancedMultiFilePlanner,
@@ -61,8 +62,7 @@ def test_order_operations_handles_null_dependencies_without_crash():
     assert [o.file_path for o in ordered] == ["a.py", "b.py"]
 
     # Direct guard: stray None dependencies
-    stray = [FileOperation(file_path="x.py", operation="create",
-                           description="", dependencies=None)]
+    stray = [FileOperation(file_path="x.py", operation="create", description="", dependencies=None)]
     ordered2 = p._order_operations(stray)
     assert len(ordered2) == 1 and ordered2[0].file_path == "x.py"
 
@@ -73,9 +73,7 @@ class _ReasoningOnlyResponse:
 
     def __init__(self, plan_text: str):
         self.content = ""
-        self.raw_response = {
-            "choices": [{"message": {"reasoning_content": plan_text}}]
-        }
+        self.raw_response = {"choices": [{"message": {"reasoning_content": plan_text}}]}
 
 
 class _StubClient:

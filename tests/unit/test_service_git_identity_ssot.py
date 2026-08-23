@@ -11,6 +11,7 @@ imports the SSOT LAZILY inside ``_git_sha``, so it re-resolves the
 ``agent_context_manager`` attribute each call — see
 ``test_git_sha_delegates_to_snapshot_and_collapses_burst``.)
 """
+
 import external_llm.service as svc_mod
 from external_llm.agent import agent_context_manager as acm
 from external_llm.service import ExternalLLMService
@@ -45,6 +46,7 @@ def test_git_identity_falls_back_on_snapshot_error(monkeypatch, tmp_path):
     """If the SSOT raises (e.g. transient import failure), the method falls
     back to the direct ``_git_cmd_best_effort`` path so this best-effort
     metadata never hard-fails."""
+
     def _boom(rr):
         raise RuntimeError("SSOT unavailable")
 

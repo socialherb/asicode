@@ -1,4 +1,5 @@
 """Test and lint tool handlers for ToolRegistry."""
+
 from __future__ import annotations
 
 import os
@@ -12,8 +13,24 @@ from ..cancel_scope import effective_cancel
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
+
+
 class TestToolsMixin:
     """Mixin providing test and lint tool implementations for ToolRegistry."""
+
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry (and duck-typed test hosts) own the real
+    # values, so these are pure typing scaffolding.
+    #   _make_result  — ToolRegistry._make_result(**kwargs) -> ToolResult
+    #   config        — host config (cancel_event, test_timeout_sec,
+    #                   max_lint_issues)
+    #   repo_root     — repository root path (str)
+    #   _lint_runner  — LintRunner instance (ToolRegistry._lint_runner)
+    _make_result: Any
+    config: Any
+    repo_root: str
+    _lint_runner: Any
 
     @staticmethod
     def _detect_provider_from_args(extra_args):
@@ -21,13 +38,13 @@ class TestToolsMixin:
         registry = LanguageRegistry.instance()
         for arg in extra_args:
             ext = os.path.splitext(arg)[1].lower()
-            if ext in ('.ts', '.tsx', '.js', '.jsx', '.go', '.java', '.kt'):
+            if ext in (".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt"):
                 provider = registry.get(arg)
                 if provider and provider.capabilities().has_test_runner:
                     return provider
         return None
 
-    def _tool_run_tests(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_run_tests(self, args: dict[str, Any]) -> ToolResult:
         # effective_cancel merges the agent-loop ESC event (whole-turn) with any
         # per-call scope this dispatch runs under (MCP wait_for timeout / aborted
         # parallel batch) — the dispatch-entry check must observe both.
@@ -48,8 +65,8 @@ class TestToolsMixin:
         # String instead of list — split on whitespace as best-effort recovery
         extra_args = extra_args.split() if isinstance(extra_args, str) else list(extra_args)
         # Strip leading "python3 -m pytest" / "pytest" / "python -m pytest" tokens
-        _PYTEST_PREFIX_TOKENS = {"python3", "python", "-m", "pytest"}
-        while extra_args and extra_args[0] in _PYTEST_PREFIX_TOKENS:
+        _pytest_prefix_tokens = {"python3", "python", "-m", "pytest"}
+        while extra_args and extra_args[0] in _pytest_prefix_tokens:
             extra_args.pop(0)
 
         # test_runner is first-party — import cannot fail.
@@ -106,8 +123,7 @@ class TestToolsMixin:
         # timeout otherwise arrives as a real failure with no way to tell.
         if result.cancelled:
             content_parts.append(
-                "## 🛑 Test run CANCELLED — killed by cancel request.\n"
-                "Counts below are partial and NOT a test failure."
+                "## 🛑 Test run CANCELLED — killed by cancel request.\nCounts below are partial and NOT a test failure."
             )
         elif result.timed_out:
             content_parts.append(
@@ -118,8 +134,14 @@ class TestToolsMixin:
                 "these as failures."
             )
 
-        total_tests = result.passed_count + result.failed_count + result.error_count + \
-                     result.skipped_count + result.xpassed_count + result.xfailed_count
+        total_tests = (
+            result.passed_count
+            + result.failed_count
+            + result.error_count
+            + result.skipped_count
+            + result.xpassed_count
+            + result.xfailed_count
+        )
         if total_tests > 0 or result.summary_line:
             if result.summary_line:
                 content_parts.append(f"## Test Summary — {result.summary_line}")
@@ -144,23 +166,23 @@ class TestToolsMixin:
             content_parts.append("\n## Failed Tests")
             for test in result.failed_test_details[:10]:
                 content_parts.append(f"### {test.get('name', 'Unknown test')}")
-                error_type = test.get('error_type', '')
-                message = test.get('message', '')
+                error_type = test.get("error_type", "")
+                message = test.get("message", "")
                 if error_type or message:
                     error_desc = error_type
                     if message:
                         error_desc += f": {message}"
                     content_parts.append(error_desc)
 
-                file_path = test.get('file', '')
-                line_num = test.get('line', 0)
+                file_path = test.get("file", "")
+                line_num = test.get("line", 0)
                 if file_path:
                     line_info = f"Line: {line_num}" if line_num > 0 else ""
                     content_parts.append(f"File: {file_path}" + (f", {line_info}" if line_info else ""))
 
-                traceback = test.get('traceback', '')
+                traceback = test.get("traceback", "")
                 if traceback:
-                    traceback_lines = traceback.split('\n')[:5]
+                    traceback_lines = traceback.split("\n")[:5]
                     content_parts.append("Traceback (first lines):")
                     content_parts.extend(f"  {line}" for line in traceback_lines)
                 content_parts.append("")
@@ -169,23 +191,23 @@ class TestToolsMixin:
             content_parts.append("\n## Error Tests")
             for test in result.error_test_details[:10]:
                 content_parts.append(f"### {test.get('name', 'Unknown test')}")
-                error_type = test.get('error_type', '')
-                message = test.get('message', '')
+                error_type = test.get("error_type", "")
+                message = test.get("message", "")
                 if error_type or message:
                     error_desc = error_type
                     if message:
                         error_desc += f": {message}"
                     content_parts.append(error_desc)
 
-                file_path = test.get('file', '')
-                line_num = test.get('line', 0)
+                file_path = test.get("file", "")
+                line_num = test.get("line", 0)
                 if file_path:
                     line_info = f"Line: {line_num}" if line_num > 0 else ""
                     content_parts.append(f"File: {file_path}" + (f", {line_info}" if line_info else ""))
 
-                traceback = test.get('traceback', '')
+                traceback = test.get("traceback", "")
                 if traceback:
-                    traceback_lines = traceback.split('\n')[:5]
+                    traceback_lines = traceback.split("\n")[:5]
                     content_parts.append("Traceback (first lines):")
                     content_parts.extend(f"  {line}" for line in traceback_lines)
                 content_parts.append("")
@@ -211,19 +233,23 @@ class TestToolsMixin:
         # analysis or recovery suggestions to the browser.
         with suppress(OSError, RuntimeError, ValueError, TypeError):  # Never break test tool behavior
             from external_llm.editor.agent.autonomous.proactive_runner import _runners, _runners_lock
+
             _repo = getattr(self, "repo_root", None)
             if _repo:
                 with _runners_lock:
                     _runner = _runners.get(_repo)
                 if _runner:
-                    _runner.notify_test_result(result.ok, {
-                        "ok": result.ok,
-                        "summary_line": result.summary_line or "",
-                        "failing_tests": result.failing_tests or [],
-                        "first_traceback": result.first_traceback or "",
-                        "failed_count": result.failed_count,
-                        "passed_count": result.passed_count,
-                    })
+                    _runner.notify_test_result(
+                        result.ok,
+                        {
+                            "ok": result.ok,
+                            "summary_line": result.summary_line or "",
+                            "failing_tests": result.failing_tests or [],
+                            "first_traceback": result.first_traceback or "",
+                            "failed_count": result.failed_count,
+                            "passed_count": result.passed_count,
+                        },
+                    )
 
         if result.cancelled:
             return self._make_result(
@@ -240,7 +266,7 @@ class TestToolsMixin:
             metadata=metadata,
         )
 
-    def _tool_run_lint(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_run_lint(self, args: dict[str, Any]) -> ToolResult:
         path = args.get("path", ".")
         result = self._lint_runner.run_lint(path, max_issues=self.config.max_lint_issues)
 
@@ -265,9 +291,9 @@ class TestToolsMixin:
             if result.fixable_count:
                 metadata["fixable_count"] = result.fixable_count
                 metadata["fixable_issues"] = [
-                    {"file": i.file, "line": i.line, "col": i.col,
-                     "code": i.code, "fix": i.fix}
-                    for i in result.issues if i.fix
+                    {"file": i.file, "line": i.line, "col": i.col, "code": i.code, "fix": i.fix}
+                    for i in result.issues
+                    if i.fix
                 ][:20]
             return self._make_result(
                 ok=not is_real_error,
@@ -277,7 +303,7 @@ class TestToolsMixin:
 
         return self._make_result(ok=True, content=result.summary)
 
-    def _tool_find_tests_for_symbol(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_find_tests_for_symbol(self, args: dict[str, Any]) -> ToolResult:
         """Find test files covering a symbol or file. Python, TS/JS, and Go.
 
         Reports each hit with WHY it matched, not just its path. The finder

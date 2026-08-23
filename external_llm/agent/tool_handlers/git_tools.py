@@ -1,4 +1,5 @@
 """Shell tool handlers for ToolRegistry."""
+
 from __future__ import annotations
 
 import ast as _ast
@@ -14,7 +15,7 @@ import subprocess
 import time as _time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from ...common.subprocess_utils import CANCEL_POLL_INTERVAL as _CANCEL_POLL_INTERVAL
 from ...common.subprocess_utils import run_bounded_subprocess as _run_bounded_subprocess
@@ -70,9 +71,7 @@ _ENV_ASSIGN_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # `$RM` / `${RM}` / `${VENV}/bin/python` in the EXECUTABLE slot. Anchored at the
 # start because only a token that BEGINS with the expansion can have the
 # expansion decide which program runs (`x$RM` is a word, not a command name).
-_EXEC_SLOT_VAR_RE = _re.compile(
-    r"^\$(?:\{(?P<brace>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
-)
+_EXEC_SLOT_VAR_RE = _re.compile(r"^\$(?:\{(?P<brace>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))")
 # `timeout 5 cmd` / `timeout 5s cmd` / `nice 10 cmd` — a wrapper's numeric arg.
 _WRAPPER_NUM_ARG_RE = _re.compile(r"^[0-9]+(?:\.[0-9]+)?[smhd]?$")
 
@@ -89,9 +88,7 @@ _BASH_EXECUTABLE = _shutil.which("bash") or "/bin/sh"
 # Previously these were re-compiled on EVERY _tool_shell_exec invocation via
 # __import__("re").compile(...). Compiling once at module load avoids the
 # per-call dict lookup + cache-check overhead. See _tool_shell_exec usage below.
-_PYTHON_CMD_RE = _re.compile(
-    r"(?<![a-zA-Z0-9_.\-/])python(?![a-zA-Z0-9_.\-])(?=\s|[|&;`(\$]|$)"
-)
+_PYTHON_CMD_RE = _re.compile(r"(?<![a-zA-Z0-9_.\-/])python(?![a-zA-Z0-9_.\-])(?=\s|[|&;`(\$]|$)")
 _CAT_A_RE = _re.compile(r"\bcat\s+-A\b")
 _FIND_RE = _re.compile(r"\bfind\s+")
 _FIND_EXCLUDED_RE = _re.compile(r"-not\s+-path\s+['\"]?\./([^/'\")\s]+)")
@@ -270,6 +267,7 @@ def _apply_shell_shims(command: str) -> str:
     """
     return _SHELL_SHIM_PRELUDE + command
 
+
 # Detect pytest invocations so pytest-specific recovery (missing entry-point
 # plugin) only fires for pytest, not other argparse tools that also emit
 # "unrecognized arguments:". Matches a pytest runner token at the start of a
@@ -277,9 +275,7 @@ def _apply_shell_shims(command: str) -> str:
 # be a standalone program name — 'py.test', 'pytest', or '<python> -m pytest'.
 # Negatives: 'pip install pytest' (pytest is an arg, not the runner), quoted
 # 'pytest' inside a grep pattern, 'python3 test_runner.py'.
-_PYTEST_CMD_RE = _re.compile(
-    r"(?:^|[|;]|&&|\|\|)\s*(?:\S*python\S*\s+-m\s+pytest|\bpytest\b|\bpy\.test\b)(?=\s|$)"
-)
+_PYTEST_CMD_RE = _re.compile(r"(?:^|[|;]|&&|\|\|)\s*(?:\S*python\S*\s+-m\s+pytest|\bpytest\b|\bpy\.test\b)(?=\s|$)")
 
 # Noise dirs auto-excluded when the LLM emits a bare `find *.py` without venv/
 # node_modules exclusions. Module-level (not per-call) so the list is built once
@@ -468,12 +464,9 @@ def _blank_heredoc_bodies(command: str, *, interpreter_names: frozenset | None =
             if not m:  # pragma: no cover
                 break
             line_start = command.rfind("\n", 0, m.start()) + 1
-            prefix = command[line_start:m.start()]
+            prefix = command[line_start : m.start()]
             _recv, _seg = _segment_executable(prefix)
-            if (
-                _recv in interpreter_names
-                and not any(_SHELL_C_FLAG_RE.match(_t) for _t in _seg)
-            ):
+            if _recv in interpreter_names and not any(_SHELL_C_FLAG_RE.match(_t) for _t in _seg):
                 preserve.add(idx)
             idx += 1
             pos = spans[idx - 1][1]
@@ -597,13 +590,15 @@ def _python_payload_effects(code: str) -> tuple:
         _arg = _node.args[0] if _node.args else None
         if isinstance(_arg, _ast.Constant) and isinstance(_arg.value, str):
             _shell_strings.append(_arg.value)
-        elif isinstance(_arg, (_ast.List, _ast.Tuple)) and _arg.elts and all(
-            isinstance(_e, _ast.Constant) and isinstance(_e.value, str)
-            for _e in _arg.elts
-        ):
-            # The argv form is not shell, but its executable slot is the thing
-            # the scan reads, and joining is enough to expose it.
-            _shell_strings.append(" ".join(_e.value for _e in _arg.elts))
+        elif isinstance(_arg, (_ast.List, _ast.Tuple)) and _arg.elts:
+            # List comprehension guards narrow for pyright (all() over a
+            # generator does not); semantics identical to the old
+            # all(isinstance(...) ...) check.
+            _const_elts = [e for e in _arg.elts if isinstance(e, _ast.Constant) and isinstance(e.value, str)]
+            if len(_const_elts) == len(_arg.elts):
+                # The argv form is not shell, but its executable slot is the thing
+                # the scan reads, and joining is enough to expose it.
+                _shell_strings.append(" ".join(str(_e.value) for _e in _const_elts))
         else:
             _opaque = True
     return _destructive, _shell_strings, _opaque
@@ -665,12 +660,10 @@ def _truncate_bash_output(content: str, max_chars: int, true_len: int = 0) -> st
     _truncated = max(true_len, len(content)) - _cap
     _half = _cap // 2
     return (
-        content[:_half]
-        + f"\n... [truncated {_truncated} chars (middle) — bash output exceeded the "
+        content[:_half] + f"\n... [truncated {_truncated} chars (middle) — bash output exceeded the "
         f"~{max_chars // 3000}K-token budget. Showing head+tail; pytest/traceback "
         f"diagnostics live at the tail. Re-run with a narrower filter "
-        f"(grep, or `wc -c`/`wc -l` to size it first).]\n"
-        + content[-_half:]
+        f"(grep, or `wc -c`/`wc -l` to size it first).]\n" + content[-_half:]
     )
 
 
@@ -687,9 +680,19 @@ _SEPARATOR_ONLY_RE = _re.compile(r"[;&|]+|[{}]")
 
 
 _ANSI_C_SIMPLE_ESCAPES = {
-    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f",
-    "n": "\n", "r": "\r", "t": "\t", "v": "\v",
-    "\\": "\\", "'": "'", '"': '"', "?": "?",
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
 }
 
 
@@ -865,16 +868,8 @@ def _normalize_for_scan(command: str) -> str:
         # region, substitution bodies included (the body is unquoted, but IFS
         # splitting happens at WORD-split time on the body's OWN words, which the
         # scan already separates — decoding it here would only mis-space them).
-        _unquoted_ctx = (
-            not in_single
-            and (not in_double or cmdsub_depth > 0 or in_dq_backtick)
-        )
-        if (
-            _unquoted_ctx
-            and ch == "$"
-            and i + 1 < len(command)
-            and command[i + 1] == "'"
-        ):
+        _unquoted_ctx = not in_single and (not in_double or cmdsub_depth > 0 or in_dq_backtick)
+        if _unquoted_ctx and ch == "$" and i + 1 < len(command) and command[i + 1] == "'":
             j = i + 2
             body = []
             while j < len(command):
@@ -891,15 +886,13 @@ def _normalize_for_scan(command: str) -> str:
             out.append(_shlex_safe_literal(_decode_ansi_c("".join(body))))
             i = j + 1  # consume the closing quote
             continue
-        if (ch == "$" and not in_single and not in_double
-                and cmdsub_depth == 0 and not in_dq_backtick):
-            if command[i:i + 6] == "${IFS}":
+        if ch == "$" and not in_single and not in_double and cmdsub_depth == 0 and not in_dq_backtick:
+            if command[i : i + 6] == "${IFS}":
                 out.append(" ")
                 i += 6
                 continue
-            if command[i:i + 4] == "$IFS" and (
-                i + 4 >= len(command)
-                or not (command[i + 4].isalnum() or command[i + 4] == "_")
+            if command[i : i + 4] == "$IFS" and (
+                i + 4 >= len(command) or not (command[i + 4].isalnum() or command[i + 4] == "_")
             ):
                 out.append(" ")
                 i += 4
@@ -1049,13 +1042,10 @@ def _matches_forbidden_flag(token: str, forbidden: set) -> bool:
     if head in forbidden:
         return True
     # Short form with an attached value: `-i.bak` for `-i`.
-    return any(
-        len(flag) == 2 and not flag.startswith("--") and token.startswith(flag)
-        for flag in forbidden
-    )
+    return any(len(flag) == 2 and not flag.startswith("--") and token.startswith(flag) for flag in forbidden)
 
 
-def _split_shell_separators(tokens, original_command: Optional[str] = None) -> list:
+def _split_shell_separators(tokens, original_command: str | None = None) -> list:
     """Break unquoted ``;`` / ``&`` / ``|`` runs out of *tokens* into their own items.
 
     ``shlex.split`` does not treat those as separators, so a segment boundary can
@@ -1188,10 +1178,21 @@ _SHELL_C_FLAG_RE = _re.compile(r"^-[A-Za-z]*c$")
 # Module-level so the main danger scan and _segment_executable share ONE
 # definition — the heredoc receiver check used to reimplement the slot rules
 # with a string heuristic, and the two drifted (see _segment_executable).
-_SHELL_SYNTAX: frozenset = frozenset({
-    "for", "in", "do", "done", "if", "then", "else", "fi", "while", "until",
-    "echo",
-})
+_SHELL_SYNTAX: frozenset = frozenset(
+    {
+        "for",
+        "in",
+        "do",
+        "done",
+        "if",
+        "then",
+        "else",
+        "fi",
+        "while",
+        "until",
+        "echo",
+    }
+)
 
 
 def _segment_executable(text: str) -> tuple:
@@ -1232,10 +1233,10 @@ def _segment_executable(text: str) -> tuple:
     # final segment empty; falling back to the nearest resolved one keeps
     # `bash <(echo hi) <<EOF` pointing at `bash` rather than at nothing.
     _last: tuple = (None, [])
-    exe: Optional[str] = None
+    exe: str | None = None
     seg: list = []
     expect_executable = True
-    wrapper_ctx: Optional[str] = None
+    wrapper_ctx: str | None = None
     positional_skip = 0
     skip_flag_value = False
 
@@ -1252,8 +1253,7 @@ def _segment_executable(text: str) -> tuple:
             skip_flag_value = False
             continue
         if token.startswith("-"):
-            if (expect_executable and wrapper_ctx
-                    and token in _WRAPPER_VALUE_FLAGS.get(wrapper_ctx, frozenset())):
+            if expect_executable and wrapper_ctx and token in _WRAPPER_VALUE_FLAGS.get(wrapper_ctx, frozenset()):
                 skip_flag_value = True
             continue
         if expect_executable and token in _COMMAND_WRAPPERS:
@@ -1263,9 +1263,7 @@ def _segment_executable(text: str) -> tuple:
         if expect_executable and positional_skip > 0:
             positional_skip -= 1
             continue
-        if expect_executable and (
-            _WRAPPER_NUM_ARG_RE.match(token) or _ENV_ASSIGN_RE.match(token)
-        ):
+        if expect_executable and (_WRAPPER_NUM_ARG_RE.match(token) or _ENV_ASSIGN_RE.match(token)):
             continue
         if token.startswith("$") or "=" in token:
             expect_executable = False
@@ -1281,7 +1279,7 @@ def _segment_executable(text: str) -> tuple:
     return _last
 
 
-def _shell_c_payload_index(tokens: list, start: int) -> Optional[int]:
+def _shell_c_payload_index(tokens: list, start: int) -> int | None:
     """Index of the command string of a ``<shell> -c <payload>``, or None.
 
     *start* is the position just past the shell's own name. Scans that segment
@@ -1297,7 +1295,7 @@ def _shell_c_payload_index(tokens: list, start: int) -> Optional[int]:
     return None
 
 
-def _trap_payload_index(tokens: list, start: int) -> Optional[int]:
+def _trap_payload_index(tokens: list, start: int) -> int | None:
     """Index of ``trap``'s command-string operand, or None.
 
     *start* is the position just past ``trap`` itself. Scans that segment only,
@@ -1329,7 +1327,7 @@ def _trap_payload_index(tokens: list, start: int) -> Optional[int]:
     return None
 
 
-def _expand_exec_slot_var(token: str, assigned: dict) -> Optional[str]:
+def _expand_exec_slot_var(token: str, assigned: dict) -> str | None:
     """Expand a leading ``$NAME`` / ``${NAME}`` in an executable-slot *token*.
 
     Returns the expanded token, or None when nothing is known about the name —
@@ -1364,7 +1362,7 @@ def _expand_exec_slot_var(token: str, assigned: dict) -> Optional[str]:
         value = os.environ.get(name)
     if not value:
         return None
-    expanded = value + token[_m.end():]
+    expanded = value + token[_m.end() :]
     # A value carrying shell metacharacters would change the token's structure
     # (a second command, a redirect), and re-tokenising mid-scan is not this
     # function's job. Refuse rather than feed the scan a token that no longer
@@ -1399,10 +1397,8 @@ def _is_dangerous_executable(name: str) -> bool:
     """
     if name in _DANGEROUS_SHELL_COMMANDS:
         return True
-    return any(
-        name.startswith(_pref) and len(name) > len(_pref)
-        for _pref in _DANGEROUS_EXECUTABLE_PREFIXES
-    )
+    return any(name.startswith(_pref) and len(name) > len(_pref) for _pref in _DANGEROUS_EXECUTABLE_PREFIXES)
+
 
 def _expand_shell_c_payload(payload: str, *, interpreter_names: frozenset | None = None) -> list:
     """Tokenise a ``-c`` payload the same way the top-level command was.
@@ -1423,7 +1419,7 @@ def _expand_shell_c_payload(payload: str, *, interpreter_names: frozenset | None
     return _split_shell_separators(_parts, _scan)
 
 
-def _segment_flag_combo_hit(exe: Optional[str], tokens: list) -> bool:
+def _segment_flag_combo_hit(exe: str | None, tokens: list) -> bool:
     """True if *tokens* (one command segment) satisfy a combo for *exe*.
 
     Whole-token membership only — see the matching contract in
@@ -1467,7 +1463,7 @@ def _segment_flag_combo_hit(exe: Optional[str], tokens: list) -> bool:
     return any(combo <= vocab for combo in combos)
 
 
-def _overwrite_targets(exe: Optional[str], tokens: list) -> list:
+def _overwrite_targets(exe: str | None, tokens: list) -> list:
     """Files a segment's own ARGUMENTS name as overwrite destinations.
 
     The redirect gate sees ``echo '' > src/main.py`` because a ``>`` is present.
@@ -1561,8 +1557,7 @@ def _format_command_for_approval(command: str, limit: int = 1200) -> str:
     if len(command) <= limit:
         return command
     return (
-        command[:limit]
-        + f"\n      … [{len(command) - limit} more chars hidden — approve only if "
+        command[:limit] + f"\n      … [{len(command) - limit} more chars hidden — approve only if "
         f"the visible part is what you intend]"
     )
 
@@ -1570,7 +1565,17 @@ def _format_command_for_approval(command: str, limit: int = 1200) -> str:
 class ShellToolsMixin:
     """Mixin providing shell tool implementations for ToolRegistry."""
 
-    def _capture_bounded(self, proc, timeout: float, cap: int):
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry (and duck-typed test hosts) own the real
+    # values, so these are pure typing scaffolding.
+    _make_result: Any
+    _tool_ask_user: Any
+    _correct_bias_path: Any
+    config: Any
+    repo_root: str
+
+    def _capture_bounded(self, proc: Any, timeout: float, cap: int):
         """Drain a command's pipes to EOF, keeping only ``cap`` head + tail chars.
 
         The drain also ends as soon as the DIRECT CHILD has exited, even if a
@@ -1617,7 +1622,8 @@ class ShellToolsMixin:
                 _sel.register(_stream, _selectors.EVENT_READ)
                 _pending[_stream] = _capture
                 _decoders[_stream] = _io.IncrementalNewlineDecoder(
-                    _codecs.getincrementaldecoder("utf-8")("replace"), True,
+                    _codecs.getincrementaldecoder("utf-8")("replace"),
+                    True,
                 )
 
             def _pump(_wait: float) -> None:
@@ -1625,7 +1631,10 @@ class ShellToolsMixin:
                 for _key, _ in _sel.select(timeout=_wait):
                     _stream = _key.fileobj
                     try:
-                        _chunk = os.read(_stream.fileno(), _PIPE_READ_CHUNK)
+                        # fileobj is IO[bytes] at runtime (proc.stdout/stderr);
+                        # selectors still types it as fileobj (int | HasFileno).
+                        _fd = _stream if isinstance(_stream, int) else _stream.fileno()
+                        _chunk = os.read(_fd, _PIPE_READ_CHUNK)
                     except (OSError, ValueError) as exc:
                         logger.debug("bash: pipe read ended early: %s", exc)
                         _chunk = b""
@@ -1685,8 +1694,12 @@ class ShellToolsMixin:
         return _out, _err, "done"
 
     def _cancel_running_command(
-        self, proc, command: str, out_cap=None, err_cap=None,
-    ) -> "ToolResult":
+        self,
+        proc,
+        command: str,
+        out_cap=None,
+        err_cap=None,
+    ) -> ToolResult:
         """Tear down a command the user cancelled mid-run, and report it.
 
         The process is in its own session (``start_new_session=True``), so it is
@@ -1705,10 +1718,7 @@ class ShellToolsMixin:
 
         _partial = out_cap.text() if out_cap is not None else ""
         _partial_err = err_cap.text() if err_cap is not None else ""
-        _true_len = (
-            (out_cap.total if out_cap is not None else 0)
-            + (err_cap.total if err_cap is not None else 0)
-        )
+        _true_len = (out_cap.total if out_cap is not None else 0) + (err_cap.total if err_cap is not None else 0)
         try:
             # The child is its own session leader (Popen start_new_session=True),
             # so pgid == proc.pid. Kill the stored pid, NOT a re-resolved
@@ -1739,6 +1749,7 @@ class ShellToolsMixin:
             _parts.append(f"[stderr]\n{_partial_err}")
         if _parts:
             from ..config.thresholds import config as _thresholds
+
             _joined = "\n".join(_parts)
             _content = _truncate_bash_output(
                 _joined,
@@ -1767,6 +1778,7 @@ class ShellToolsMixin:
             # Even in environments without checkpoint infra (Design Chat etc.),
             # ask directly if running in an interactive terminal.
             import sys as _sys
+
             if _sys.stdin.isatty():
                 print()
                 print(f"  ⚠️  Command execution requested: {dangerous_names}")
@@ -1798,6 +1810,7 @@ class ShellToolsMixin:
             # Use LLM-based intent classifier to interpret the user's response.
             # This handles natural language variations and multi-language replies.
             from .._user_intent import UserApproval, classify_user_approval
+
             _verdict = classify_user_approval(_answer)
         except Exception as _exc:
             logger.debug("shell danger approval callback failed — denying: %s", _exc)
@@ -1806,9 +1819,12 @@ class ShellToolsMixin:
             return _verdict == UserApproval.APPROVED
 
     def _maybe_recover_pytest_missing_plugin(
-        self, command: str, stderr: str, original_command: str,
+        self,
+        command: str,
+        stderr: str,
+        original_command: str,
         timeout: int = 120,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Recover from pytest's "unrecognized arguments" for missing entry-point plugins.
 
         pytest aborts at core stage ("unrecognized arguments: --timeout=60") when an
@@ -1837,6 +1853,7 @@ class ShellToolsMixin:
         # A normal pytest failure (assertions, collection errors) is NOT a recovery
         # target — it has no "unrecognized arguments" line.
         from ..failure_context import _extract_missing_pytest_plugins
+
         offending_options, missing_packages = _extract_missing_pytest_plugins(stderr)
         if not offending_options:
             return None
@@ -1858,19 +1875,22 @@ class ShellToolsMixin:
         # metadata["answer"]. Recovery degrades gracefully on any exception (e.g.
         # checkpoint disabled / no callback) by treating it as a decline.
         try:
-            _resp = self._tool_ask_user({
-                "question": (
-                    f"pytest failed because these plugins are not installed: "
-                    f"{', '.join(missing_packages)}.\n"
-                    f"Install them and re-run the command?"
-                ),
-                "type": "yes_no",
-                "options": ["yes", "no"],
-                "reason": f"missing pytest plugins: {', '.join(missing_packages)}",
-                "default": "no",
-            })
+            _resp = self._tool_ask_user(
+                {
+                    "question": (
+                        f"pytest failed because these plugins are not installed: "
+                        f"{', '.join(missing_packages)}.\n"
+                        f"Install them and re-run the command?"
+                    ),
+                    "type": "yes_no",
+                    "options": ["yes", "no"],
+                    "reason": f"missing pytest plugins: {', '.join(missing_packages)}",
+                    "default": "no",
+                }
+            )
             _answer = (_resp.metadata or {}).get("answer", "no")
             from .._user_intent import UserApproval, classify_user_approval
+
             _approved = classify_user_approval(str(_answer)) == UserApproval.APPROVED
         except Exception:
             # ask_user unavailable (no checkpoint / callback error) → decline.
@@ -1890,6 +1910,7 @@ class ShellToolsMixin:
         # rewritten one — the plugins, once installed, make the original succeed.
         try:
             import sys as _sys
+
             # `pip` on PATH is not a given (this repo's runtime lacks it), and a
             # PATH `pip` may belong to a different interpreter than the one the
             # re-run will use. Install with the interpreter the ORIGINAL command
@@ -1901,8 +1922,10 @@ class ShellToolsMixin:
             else:
                 _pip_cmd = f"{_sys.executable} -m pip install " + shlex.join(missing_packages)
             _inst = _run_bounded_subprocess(
-                _pip_cmd, shell=True,
-                executable=_BASH_EXECUTABLE, cwd=self.repo_root,
+                _pip_cmd,
+                shell=True,
+                executable=_BASH_EXECUTABLE,
+                cwd=self.repo_root,
                 # Explicit network-install budget: the bare 120s default would
                 # kill a cold-cache / large-wheel download mid-flight and report
                 # a bogus "pip install failed".
@@ -1925,8 +1948,10 @@ class ShellToolsMixin:
                 }
             # Install succeeded → re-run the original command in the same repo_root.
             _rerun = _run_bounded_subprocess(
-                _apply_shell_shims(original_command), shell=True,
-                executable=_BASH_EXECUTABLE, cwd=self.repo_root,
+                _apply_shell_shims(original_command),
+                shell=True,
+                executable=_BASH_EXECUTABLE,
+                cwd=self.repo_root,
                 timeout=timeout,
                 env={**__import__("os").environ.copy()},
             )
@@ -1937,6 +1962,7 @@ class ShellToolsMixin:
                 _parts.append(f"[stderr]\n{_rerun.stderr}")
             _rerun_content = "\n".join(_parts) or "(no output)"
             from ..config.thresholds import config as _thresholds
+
             _rerun_content = _truncate_bash_output(_rerun_content, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS)
             return {
                 "_override": {
@@ -1964,7 +1990,7 @@ class ShellToolsMixin:
                 }
             }
 
-    def _tool_shell_exec(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_shell_exec(self, args: dict[str, Any]) -> ToolResult:
         # effective_cancel merges the agent-loop ESC event (whole-turn) with
         # any per-call scope this dispatch runs under (MCP wait_for timeout /
         # aborted parallel batch) — the dispatch-entry check must observe both.
@@ -2007,8 +2033,10 @@ class ShellToolsMixin:
         # literal. See _quoted_intervals().
         _qiv = _literal_intervals(command)
         if _PYTHON_CMD_RE.search(command):
+
             def _repl_py(m):
                 return "python3" if not _match_in_quotes(m.start(), _qiv) else m.group(0)
+
             fixed_cmd = _PYTHON_CMD_RE.sub(_repl_py, command)
             if fixed_cmd != command:
                 logger.info("bash: auto-corrected python -> python3: %.200s", fixed_cmd)
@@ -2023,8 +2051,10 @@ class ShellToolsMixin:
         # have neither, skipping the work entirely).
         if _CAT_A_RE.search(command):
             _qiv = _literal_intervals(command)
+
             def _repl_cat(m):
                 return "cat -vet" if not _match_in_quotes(m.start(), _qiv) else m.group(0)
+
             fixed_cmd = _CAT_A_RE.sub(_repl_cat, command)
             if fixed_cmd != command:
                 logger.info("bash: auto-corrected cat -A -> cat -vet: %.200s", fixed_cmd)
@@ -2044,9 +2074,7 @@ class ShellToolsMixin:
             _already_excluded = {m.group(1) for m in _FIND_EXCLUDED_RE.finditer(command)}
             _missing = [d for d in _FIND_NOISE_DIRS if d not in _already_excluded]
             if _missing:
-                _exclude_flags = " ".join(
-                    f'-not -path "./{d}/*"' for d in _missing
-                )
+                _exclude_flags = " ".join(f'-not -path "./{d}/*"' for d in _missing)
                 # find ... [existing flags] → find ... [existing flags] -not -path ...
                 # Insert before pipe/redirect (first | ; && ahead)
                 # \s* before [|;] to handle "2>/dev/null;echo" (no space before ;)
@@ -2059,8 +2087,8 @@ class ShellToolsMixin:
                 _insert_pos = _pipe_match.start() if _pipe_match else len(command)
 
                 # Split find command into [before][findcmd][after] segments.
-                _before = command[:_find_match.start()]
-                _findcmd = command[_find_match.start():_insert_pos]
+                _before = command[: _find_match.start()]
+                _findcmd = command[_find_match.start() : _insert_pos]
                 _after = command[_insert_pos:]
 
                 # ── -o (OR) expression parentheses correction ─────────────────
@@ -2075,8 +2103,8 @@ class ShellToolsMixin:
                 # so find recognizes them as separate tokens.
                 if _re.search(r"(^|\s)-o(\s|$)", _findcmd):
                     _kw_len = _find_match.end() - _find_match.start()
-                    _head = _findcmd[:_kw_len]   # "find "
-                    _rest = _findcmd[_kw_len:]   # "p -name A -o -name B"
+                    _head = _findcmd[:_kw_len]  # "find "
+                    _rest = _findcmd[_kw_len:]  # "p -name A -o -name B"
                     # Separate leading path operands from expression (first predicate -X / ( / !).
                     _pred = _re.search(r"(^|\s)([-(!])", _rest)
                     if _pred:
@@ -2097,7 +2125,7 @@ class ShellToolsMixin:
         # macOS BSD sort does not support -V (natural version sort).
         # Use python3 to split into numeric/text segments for natural sort.
         # Handles arbitrary formats (semver, mixed alpha-numeric, etc.).
-        _SORT_V_NATURAL_SCRIPT = (
+        _sort_v_natural_script = (
             "import sys,re;"
             "lines=sys.stdin.read().splitlines();"
             "lines.sort(key=lambda x:[int(s)if s.isdigit()"
@@ -2115,14 +2143,13 @@ class ShellToolsMixin:
                 if _match_in_quotes(m.start(), _qiv):
                     return m.group(0)
                 _a = (m.group(1) or "").strip()
-                _py = f'python3 -c "{_SORT_V_NATURAL_SCRIPT}"'
+                _py = f'python3 -c "{_sort_v_natural_script}"'
                 return f"cat {_a} | {_py}" if _a else _py
 
             fixed_cmd = _SORT_V_RE.sub(_repl_sort_v, command)
             if fixed_cmd != command:
                 logger.info("bash: auto-corrected sort -V -> python3: %.200s", fixed_cmd)
                 command = fixed_cmd
-
 
         # Scan a copy with heredoc BODIES blanked and newlines / subshell parens
         # turned into explicit separators; the string that EXECUTES stays
@@ -2155,7 +2182,7 @@ class ShellToolsMixin:
 
         dangerous_executables = set()
         expect_executable = True
-        segment_exe: Optional[str] = None  # executable of the segment being scanned
+        segment_exe: str | None = None  # executable of the segment being scanned
         # Per-segment token accumulator. The flag-combo check consults THIS,
         # not the raw command string: a combo is only meaningful once the
         # segment's own executable is known, and a raw-string regex cannot tell
@@ -2184,7 +2211,7 @@ class ShellToolsMixin:
         # opened it (its flag table), how many positional operands still precede
         # the real command, and whether the previous token was a flag whose value
         # is the next token.
-        wrapper_ctx: Optional[str] = None
+        wrapper_ctx: str | None = None
         positional_skip = 0
         skip_flag_value = False
         segment_is_piped_into = False
@@ -2229,9 +2256,11 @@ class ShellToolsMixin:
             if (
                 segment_has_procsub
                 and segment_exe is not None
-                and (segment_exe in _SHELL_INTERPRETERS
-                     or segment_exe in _STDIN_INTERPRETERS
-                     or segment_exe in ("source", "."))
+                and (
+                    segment_exe in _SHELL_INTERPRETERS
+                    or segment_exe in _STDIN_INTERPRETERS
+                    or segment_exe in ("source", ".")
+                )
                 and not any(_SHELL_C_FLAG_RE.match(t) for t in segment_tokens)
             ):
                 procsub_interpreters.add(segment_exe)
@@ -2292,10 +2321,7 @@ class ShellToolsMixin:
                     _op == "<"
                     and _glued.startswith("<<")
                     and _token_depth < _SHELL_C_MAX_DEPTH
-                    and (
-                        segment_exe in _SHELL_INTERPRETERS
-                        or segment_exe in _STDIN_INTERPRETERS
-                    )
+                    and (segment_exe in _SHELL_INTERPRETERS or segment_exe in _STDIN_INTERPRETERS)
                 ):
                     if len(_glued) > 2:
                         # Glued form `<<<word`. The payload is glued onto the
@@ -2317,8 +2343,8 @@ class ShellToolsMixin:
                         _nested = _expand_shell_c_payload(_tokens[_ti], interpreter_names=_SHELL_INTERPRETERS)
                         if _nested:
                             _repl = [";", *_nested, ";"]
-                            _tokens[_ti:_ti + 1] = _repl
-                            _depths[_ti:_ti + 1] = [_token_depth + 1] * len(_repl)
+                            _tokens[_ti : _ti + 1] = _repl
+                            _depths[_ti : _ti + 1] = [_token_depth + 1] * len(_repl)
                     continue
                 # ── process substitution `<(` — per-segment ──────────────────
                 # After normalisation `<(cmd)` becomes `< ; cmd ;` — the `(`
@@ -2394,9 +2420,9 @@ class ShellToolsMixin:
                 _forbidden = _FORBIDDEN_FLAGS.get(segment_exe or "")
                 if _forbidden and _matches_forbidden_flag(token, _forbidden):
                     return self._make_result(
-                        ok=False, content="",
-                        error=f"Flag '{token}' is not allowed for '{segment_exe}'. "
-                              f"Use apply_patch for file edits.",
+                        ok=False,
+                        content="",
+                        error=f"Flag '{token}' is not allowed for '{segment_exe}'. Use apply_patch for file edits.",
                     )
                 # A flag is never the executable, so it must not consume the
                 # expectation — `xargs -n1 rm` still has to reach `rm`.
@@ -2405,11 +2431,7 @@ class ShellToolsMixin:
                 # while still looking for the executable: once the segment has
                 # one, a `-u` belongs to that command and its value is an
                 # ordinary argument.
-                if (
-                    expect_executable
-                    and wrapper_ctx
-                    and token in _WRAPPER_VALUE_FLAGS.get(wrapper_ctx, frozenset())
-                ):
+                if expect_executable and wrapper_ctx and token in _WRAPPER_VALUE_FLAGS.get(wrapper_ctx, frozenset()):
                     skip_flag_value = True
                 continue
             if expect_executable and token in _COMMAND_WRAPPERS:
@@ -2418,8 +2440,7 @@ class ShellToolsMixin:
                 # `/usr/bin/sudo -u me rm` is the same rule as `sudo -u me rm`.
                 wrapper_ctx = Path(token).name
                 positional_skip = _WRAPPER_POSITIONAL_ARGS.get(wrapper_ctx, 0)
-                if (wrapper_ctx in _WRAPPER_SHELL_C_PAYLOAD
-                        and _token_depth < _SHELL_C_MAX_DEPTH):
+                if wrapper_ctx in _WRAPPER_SHELL_C_PAYLOAD and _token_depth < _SHELL_C_MAX_DEPTH:
                     # `runuser -c "rm -rf x"` / `script -c ...` / `flock f -c ...`
                     # hand their payload to a shell, exactly like `bash -c`. They
                     # cannot live in _SHELL_INTERPRETERS because a COMMAND_WRAPPERS
@@ -2430,10 +2451,8 @@ class ShellToolsMixin:
                         _nested = _expand_shell_c_payload(_tokens[_payload_at], interpreter_names=_SHELL_INTERPRETERS)
                         if _nested:
                             _repl = [";", *_nested, ";"]
-                            _tokens[_payload_at:_payload_at + 1] = _repl
-                            _depths[_payload_at:_payload_at + 1] = (
-                                [_token_depth + 1] * len(_repl)
-                            )
+                            _tokens[_payload_at : _payload_at + 1] = _repl
+                            _depths[_payload_at : _payload_at + 1] = [_token_depth + 1] * len(_repl)
                 continue
             if expect_executable and positional_skip > 0:
                 # `chroot /mnt rm -rf x` — the operand before the command is not
@@ -2441,8 +2460,8 @@ class ShellToolsMixin:
                 positional_skip -= 1
                 continue
             if expect_executable and (
-                _WRAPPER_NUM_ARG_RE.match(token)      # wrapper arg: `timeout 5s rm`
-                or _ENV_ASSIGN_RE.match(token)        # `FOO=bar rm ...`
+                _WRAPPER_NUM_ARG_RE.match(token)  # wrapper arg: `timeout 5s rm`
+                or _ENV_ASSIGN_RE.match(token)  # `FOO=bar rm ...`
             ):
                 if _ENV_ASSIGN_RE.match(token):
                     # Remember the value so a later `$NAME` in an executable
@@ -2481,7 +2500,9 @@ class ShellToolsMixin:
                     # `bash -c`, so the payload gets every rule this scan
                     # implements rather than a second, poorer copy of them.
                     _eval_end = _segment_end_index(_tokens, _ti)
-                    _nested = _expand_shell_c_payload(" ".join(_tokens[_ti:_eval_end]), interpreter_names=_SHELL_INTERPRETERS)
+                    _nested = _expand_shell_c_payload(
+                        " ".join(_tokens[_ti:_eval_end]), interpreter_names=_SHELL_INTERPRETERS
+                    )
                     if _nested:
                         _repl = [";", *_nested, ";"]
                         _tokens[_ti:_eval_end] = _repl
@@ -2497,14 +2518,13 @@ class ShellToolsMixin:
                     _trap_at = _trap_payload_index(_tokens, _ti)
                     if _trap_at is not None:
                         _nested = _expand_shell_c_payload(
-                            _tokens[_trap_at], interpreter_names=_SHELL_INTERPRETERS,
+                            _tokens[_trap_at],
+                            interpreter_names=_SHELL_INTERPRETERS,
                         )
                         if _nested:
                             _repl = [";", *_nested, ";"]
-                            _tokens[_trap_at:_trap_at + 1] = _repl
-                            _depths[_trap_at:_trap_at + 1] = (
-                                [_token_depth + 1] * len(_repl)
-                            )
+                            _tokens[_trap_at : _trap_at + 1] = _repl
+                            _depths[_trap_at : _trap_at + 1] = [_token_depth + 1] * len(_repl)
                 if (
                     (name in _SHELL_INTERPRETERS or name in _STDIN_INTERPRETERS)
                     and segment_is_piped_into
@@ -2537,14 +2557,13 @@ class ShellToolsMixin:
                             python_opaque_escape = True
                         for _cmd in _py_shell:
                             _nested_py = _expand_shell_c_payload(
-                                _cmd, interpreter_names=_SHELL_INTERPRETERS,
+                                _cmd,
+                                interpreter_names=_SHELL_INTERPRETERS,
                             )
                             if _nested_py:
                                 _repl = [";", *_nested_py, ";"]
                                 _tokens[_py_at:_py_at] = _repl
-                                _depths[_py_at:_py_at] = (
-                                    [_token_depth + 1] * len(_repl)
-                                )
+                                _depths[_py_at:_py_at] = [_token_depth + 1] * len(_repl)
                 if name in _SHELL_INTERPRETERS and _token_depth < _SHELL_C_MAX_DEPTH:
                     _payload_at = _shell_c_payload_index(_tokens, _ti)
                     if _payload_at is not None:
@@ -2554,10 +2573,8 @@ class ShellToolsMixin:
                             # this segment's executable slot, nor leak its own
                             # trailing state into what follows `bash -c "..."`.
                             _repl = [";", *_nested, ";"]
-                            _tokens[_payload_at:_payload_at + 1] = _repl
-                            _depths[_payload_at:_payload_at + 1] = (
-                                [_token_depth + 1] * len(_repl)
-                            )
+                            _tokens[_payload_at : _payload_at + 1] = _repl
+                            _depths[_payload_at : _payload_at + 1] = [_token_depth + 1] * len(_repl)
 
         _close_segment()  # the last segment ends without a trailing separator
 
@@ -2567,11 +2584,9 @@ class ShellToolsMixin:
             _approval = self._request_shell_danger_approval(_danger_str, command)
             if not _approval:
                 return self._make_result(
-                    ok=False, content="",
-                    error=(
-                        f"User denied execution of dangerous command(s): {_danger_str}. "
-                        f"Operation cancelled."
-                    ),
+                    ok=False,
+                    content="",
+                    error=(f"User denied execution of dangerous command(s): {_danger_str}. Operation cancelled."),
                 )
             logger.info("User approved dangerous command(s): %s", _danger_str)
 
@@ -2582,53 +2597,43 @@ class ShellToolsMixin:
         # scan, per segment, so the reason names the segment's real executable.
         _effect_reasons: list = []
         if flag_combo_exes:
-            _effect_reasons.append(
-                ", ".join(sorted(e for e in flag_combo_exes if e)) + " (dangerous flags)"
-            )
+            _effect_reasons.append(", ".join(sorted(e for e in flag_combo_exes if e)) + " (dangerous flags)")
         if piped_interpreters:
             _effect_reasons.append(
-                "pipes into " + ", ".join(sorted(piped_interpreters))
-                + " (the piped code is not visible to this check)"
+                "pipes into " + ", ".join(sorted(piped_interpreters)) + " (the piped code is not visible to this check)"
             )
         if procsub_interpreters:
             _effect_reasons.append(
-                "process substitution feeds " + ", ".join(sorted(procsub_interpreters))
+                "process substitution feeds "
+                + ", ".join(sorted(procsub_interpreters))
                 + " (the substitution output is not visible to this check)"
             )
         if python_destructive:
             _effect_reasons.append(
-                "python -c calls " + ", ".join(sorted(python_destructive))
-                + " (deletes files, same as rm)"
+                "python -c calls " + ", ".join(sorted(python_destructive)) + " (deletes files, same as rm)"
             )
         if python_opaque_escape:
             _effect_reasons.append(
-                "python -c hands a command it builds at runtime to the shell "
-                "(the command is not visible to this check)"
+                "python -c hands a command it builds at runtime to the shell (the command is not visible to this check)"
             )
         _truncated = _truncating_redirect_targets(redirect_targets, self.repo_root)
         if _truncated:
-            _effect_reasons.append(
-                "output redirection truncates " + ", ".join(sorted(set(_truncated)))
-            )
+            _effect_reasons.append("output redirection truncates " + ", ".join(sorted(set(_truncated))))
         # Same check, same scoping, for destinations named as arguments. Kept a
         # separate reason so the prompt says which act it is — "cp overwrites
         # src/main.py" is a different sentence from "redirection truncates" it,
         # and the user is being asked to recognise the command they got.
         _overwritten = _truncating_redirect_targets(overwrite_targets, self.repo_root)
         if _overwritten:
-            _effect_reasons.append(
-                "overwrites " + ", ".join(sorted(set(_overwritten)))
-            )
+            _effect_reasons.append("overwrites " + ", ".join(sorted(set(_overwritten))))
         if _effect_reasons:
             _danger_str = "; ".join(_effect_reasons)
             _approval = self._request_shell_danger_approval(_danger_str, command)
             if not _approval:
                 return self._make_result(
-                    ok=False, content="",
-                    error=(
-                        f"User denied execution of destructive operation: {_danger_str}. "
-                        f"Operation cancelled."
-                    ),
+                    ok=False,
+                    content="",
+                    error=(f"User denied execution of destructive operation: {_danger_str}. Operation cancelled."),
                 )
             logger.info("User approved destructive operation(s): %s", _danger_str)
 
@@ -2637,22 +2642,27 @@ class ShellToolsMixin:
 
         try:
             import os as _os
+
             _env = _os.environ.copy()
             _env.pop("MallocStackLogging", None)
             _env.pop("MallocStackLoggingDirectory", None)
 
             # Use Popen for non-blocking start — allows timeout→background transition
             proc = subprocess.Popen(
-                _apply_shell_shims(command), shell=True,
+                _apply_shell_shims(command),
+                shell=True,
                 executable=_BASH_EXECUTABLE,
-                cwd=self.repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=self.repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 # Decode tolerantly: commands like `head -c N` (cuts a multibyte
                 # char mid-sequence) or `cat -vet` (emits raw non-printing bytes)
                 # routinely produce non-UTF-8 output. Strict decoding would raise
                 # UnicodeDecodeError and surface as a spurious "Command execution
                 # failed", blocking the agent on otherwise-successful commands.
-                encoding="utf-8", errors="replace",
+                encoding="utf-8",
+                errors="replace",
                 # Create new process group so background kill can terminate children
                 start_new_session=True,
                 env=_env,
@@ -2674,8 +2684,11 @@ class ShellToolsMixin:
             # which hid this: the user gets their prompt back while the
             # subprocess keeps going, unowned.
             from ..config.thresholds import config as _thresholds
+
             _out_cap, _err_cap, _status = self._capture_bounded(
-                proc, timeout, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
+                proc,
+                timeout,
+                _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
             )
             if _status == "cancelled":
                 return self._cancel_running_command(proc, command, _out_cap, _err_cap)
@@ -2688,8 +2701,14 @@ class ShellToolsMixin:
                 # and rides the existing `_recovered_*` contract into the job's
                 # first drain. No excavation of CPython's private
                 # `_fileobj2output` any more — we own the buffer.
-                proc._recovered_stdout = _out_cap.text()
-                proc._recovered_stderr = _err_cap.text()
+                # Timeout → background transition: the process crosses into
+                # BackgroundJobManager ownership. Its contract reads
+                # ``_recovered_stdout/_recovered_stderr`` off the Popen via
+                # getattr (dynamic attributes, not part of Popen's type) —
+                # route through a local Any so pyright accepts the attrs.
+                _bg_proc: Any = proc
+                _bg_proc._recovered_stdout = _out_cap.text()
+                _bg_proc._recovered_stderr = _err_cap.text()
 
                 job_id = _bg_mgr.start(command, proc)
                 logger.info("bash: timed out, bg job=%s cmd=%.200s", job_id, command)
@@ -2713,13 +2732,15 @@ class ShellToolsMixin:
             # described by its real size instead of by the slice we kept.
             _true_len = len(content) + _out_cap.dropped + _err_cap.dropped
 
-            #── bash output size restriction ─────────────────────────────────────
+            # ── bash output size restriction ─────────────────────────────────────
             # Prevent context token explosion from large output (git diff, find, rg -r, etc.).
             # Limit managed as a single BASH_OUTPUT_MAX_CHARS threshold
             # (NO hardcoding — mismatch between threshold and actual cap would defeat tuning).
             # Head+tail preservation logic is encapsulated in _truncate_bash_output and tested.
             content = _truncate_bash_output(
-                content, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS, true_len=_true_len,
+                content,
+                _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
+                true_len=_true_len,
             )
 
             # rg/grep etc. return exit code 1 for "no match" (exit code 2 is the real error).
@@ -2729,7 +2750,11 @@ class ShellToolsMixin:
             #   - rg/grep --with-filename: exits abnormally after match due to internal error (SIGPIPE etc.)
             # stderr and exit code are included in content for LLM visibility.
             # If stdout is empty and exit code != 0, treat as a real failure.
-            ok = proc.returncode == 0 or (proc.returncode == 1 and not stderr) or (proc.returncode >= 128 and bool(stdout.strip()))
+            ok = (
+                proc.returncode == 0
+                or (proc.returncode == 1 and not stderr)
+                or (proc.returncode >= 128 and bool(stdout.strip()))
+            )
 
             # ── pytest missing-plugin recovery ────────────────────────────────
             # A non-zero exit with "unrecognized arguments" in stderr, for a pytest
@@ -2741,7 +2766,9 @@ class ShellToolsMixin:
             # genuine failure — a successful command never needs recovery.
             if not ok and stderr and "unrecognized arguments" in stderr:
                 _recovery = self._maybe_recover_pytest_missing_plugin(
-                    command=command, stderr=stderr, original_command=command,
+                    command=command,
+                    stderr=stderr,
+                    original_command=command,
                     timeout=timeout,
                 )
                 if _recovery is not None:
@@ -2760,12 +2787,15 @@ class ShellToolsMixin:
                     if "_append_hint" in _recovery:
                         content = content + "\n\n" + _recovery["_append_hint"]
 
-            return self._make_result(ok=ok, content=content, metadata={"returncode": proc.returncode, "background": False})
+            return self._make_result(
+                ok=ok, content=content, metadata={"returncode": proc.returncode, "background": False}
+            )
         except subprocess.TimeoutExpired:
             # Safety net: should not happen (Popen.wait timeout is handled above),
             # but keep as fallback for edge cases.
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Command timed out after {timeout}s",
                 metadata={"timeout": True},
             )
@@ -2780,32 +2810,34 @@ class ShellToolsMixin:
             self._bg_manager = _mgr
         return _mgr
 
-    def _tool_job(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_job(self, args: dict[str, Any]) -> ToolResult:
         """Manage background shell jobs: list, output, kill."""
         action = str(args.get("action", "")).strip().lower()
 
         if not action:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error="'action' is required. Choose: list, output, kill",
             )
 
-        _ACTIONS = {
+        _actions = {
             "list": self._job_list,
             "output": self._job_output,
             "kill": self._job_kill,
         }
 
-        handler = _ACTIONS.get(action)
+        handler = _actions.get(action)
         if handler is None:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Unknown action: '{action}'. Available: list, output, kill",
             )
 
         return handler(args)
 
-    def _job_list(self, args: dict[str, Any]) -> "ToolResult":
+    def _job_list(self, args: dict[str, Any]) -> ToolResult:
         """List all background jobs."""
         _bg_mgr = self._get_bg_manager()
         jobs = _bg_mgr.list_jobs(include_completed=True)
@@ -2827,9 +2859,7 @@ class ShellToolsMixin:
             # within the one-line budget.  Single line: newlines collapsed.
             if j.stdout and j.stderr:
                 _slice = 64
-                preview = (
-                    f"out: {j.stdout[-_slice:]} | err: {j.stderr[-_slice:]}"
-                ).replace("\n", "\\n")
+                preview = (f"out: {j.stdout[-_slice:]} | err: {j.stderr[-_slice:]}").replace("\n", "\\n")
             else:
                 preview = (j.stdout or j.stderr or "").replace("\n", "\\n")
             if preview:
@@ -2840,7 +2870,7 @@ class ShellToolsMixin:
 
         return self._make_result(ok=True, content="\n".join(lines))
 
-    def _job_output(self, args: dict[str, Any]) -> "ToolResult":
+    def _job_output(self, args: dict[str, Any]) -> ToolResult:
         """Show current output of a background job.
 
         If *wait_timeout* > 0, blocks until the job finishes or the
@@ -2851,7 +2881,8 @@ class ShellToolsMixin:
         job_id = str(args.get("job_id", "")).strip()
         if not job_id:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error="'job_id' is required for output action.",
             )
 
@@ -2876,9 +2907,7 @@ class ShellToolsMixin:
             # any per-call scope: an abandoned job wait returns at the next
             # poll tick instead of pinning the serial-turn thread.
             _cancel = effective_cancel(getattr(self.config, "cancel_event", None))
-            info = _bg_mgr.wait_for_completion(
-                job_id, timeout=wait_timeout, cancel_event=_cancel
-            )
+            info = _bg_mgr.wait_for_completion(job_id, timeout=wait_timeout, cancel_event=_cancel)
             if _cancel is not None and _cancel.is_set():
                 raise AgentCancelled("job wait cancelled by user") from None
         else:
@@ -2886,7 +2915,8 @@ class ShellToolsMixin:
 
         if info is None:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Job '{job_id}' not found. Use `job` with action='list' to see active jobs.",
             )
 
@@ -2910,18 +2940,21 @@ class ShellToolsMixin:
         # job that wrote 100 MB must not be reported as having lost the ~130 KB
         # the bounded capture happened to retain.
         from ..config.thresholds import config as _thresholds
+
         content = _truncate_bash_output(
-            content, _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
+            content,
+            _thresholds.tokens.BASH_OUTPUT_MAX_CHARS,
             true_len=info.stdout_total + info.stderr_total,
         )
         return self._make_result(ok=True, content=content)
 
-    def _job_kill(self, args: dict[str, Any]) -> "ToolResult":
+    def _job_kill(self, args: dict[str, Any]) -> ToolResult:
         """Kill a background job."""
         job_id = str(args.get("job_id", "")).strip()
         if not job_id:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error="'job_id' is required for kill action.",
             )
 
@@ -2929,8 +2962,8 @@ class ShellToolsMixin:
         status = _bg_mgr.kill(job_id)
         if status is None:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Job '{job_id}' not found. Use `job` with action='list' to see active jobs.",
             )
         return self._make_result(ok=True, content=f"Job '{job_id}' killed. Final status: {status}")
-

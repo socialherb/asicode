@@ -13,6 +13,7 @@ staleness contract and admission control.  These tests pin the contract:
 The tests stub tree-sitter_utils so they need no installed grammar, exactly
 like the P1 end-to-end tests in ``test_symbol_range_index.py``.
 """
+
 import os
 import time
 
@@ -41,9 +42,7 @@ def isolated_extract_cache():
 
 def _stub_tree_sitter(monkeypatch, symbols, calls, imports=None):
     """Stub tree_sitter_utils so the unit test needs no installed grammar."""
-    monkeypatch.setattr(
-        "external_llm.languages.tree_sitter_utils.is_available", lambda: True
-    )
+    monkeypatch.setattr("external_llm.languages.tree_sitter_utils.is_available", lambda: True)
     # tree= kwarg: _extract_non_python parses once and shares the tree (P5).
     monkeypatch.setattr(
         "external_llm.languages.tree_sitter_utils.find_all_symbols",
@@ -62,8 +61,10 @@ def _stub_tree_sitter(monkeypatch, symbols, calls, imports=None):
 def _snapshot(graph):
     """A hashable summary of a graph for bit-for-bit comparison across builds."""
     return (
-        frozenset((uid, node.name, node.qualname, node.kind, node.start_line, node.end_line)
-                  for uid, node in graph.symbols.items()),
+        frozenset(
+            (uid, node.name, node.qualname, node.kind, node.start_line, node.end_line)
+            for uid, node in graph.symbols.items()
+        ),
         tuple((e.caller, e.callee, e.file_path, e.line) for e in graph.call_edges),
         tuple((e.importer, e.imported, e.import_type) for e in graph.import_edges),
     )
@@ -213,6 +214,7 @@ def test_nonpython_reparse_file_refreshes_cache(tmp_path, monkeypatch):
 # P1 (2026-08-11): language-agnostic cache_stats + admitted-only "changed"
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_cache_stats_count_py_and_nonpy_walks(tmp_path, monkeypatch):
     """total covers both languages; hit+changed never exceeds total.
 
@@ -273,6 +275,7 @@ def test_nonpython_cap_overflow_reparse_not_counted_as_changed(tmp_path, monkeyp
 # P2 (2026-08-11): stat → cache lookup → READ ONLY ON MISS
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_nonpython_cache_hit_does_not_reparse(tmp_path, monkeypatch):
     """A cache-hit build must not re-extract the file (and so not re-read it).
 
@@ -306,6 +309,7 @@ def test_nonpython_cache_hit_does_not_reparse(tmp_path, monkeypatch):
 # P3 (2026-08-11): dedup'd same-name functions still capture calls in their span
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def test_duplicate_function_name_still_attributes_calls(tmp_path, monkeypatch):
     """A dedup'd (same-name) function must still capture calls in ITS span.
 
@@ -327,10 +331,7 @@ def test_duplicate_function_name_still_attributes_calls(tmp_path, monkeypatch):
         imports=[],
     )
     (tmp_path / "mod.ts").write_text(
-        "export function outer() {\n"
-        "  function dup() {}\n"
-        "  function dup() { helper(); }\n"
-        "}\n",
+        "export function outer() {\n  function dup() {}\n  function dup() { helper(); }\n}\n",
         encoding="utf-8",
     )
 

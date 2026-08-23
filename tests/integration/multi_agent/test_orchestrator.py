@@ -1,6 +1,7 @@
 """
 Integration tests for multi-agent orchestration.
 """
+
 import threading
 import time
 from typing import Any
@@ -37,13 +38,7 @@ class TestFileLockManager:
         """Test acquiring locks for relevant paths in tool arguments."""
         lock_manager = FileLockManager(temp_repo_root)
 
-        tool_args = {
-            "path": "sample.py",
-            "file_path": "utils.py",
-            "src": "old.py",
-            "dst": "new.py",
-            "other": "value"
-        }
+        tool_args = {"path": "sample.py", "file_path": "utils.py", "src": "old.py", "dst": "new.py", "other": "value"}
 
         locked_paths = lock_manager.acquire_relevant(tool_args)
 
@@ -51,8 +46,9 @@ class TestFileLockManager:
         # Check that each expected file is present in the locked paths
         expected_files = ["sample.py", "utils.py", "old.py", "new.py"]
         for expected_file in expected_files:
-            assert any(path.endswith(expected_file) for path in locked_paths), \
+            assert any(path.endswith(expected_file) for path in locked_paths), (
                 f"Expected file {expected_file} not found in locked paths: {locked_paths}"
+            )
         assert len(locked_paths) == 4
 
         # Clean up via release_all — the correct pairing for acquire_relevant().
@@ -151,7 +147,7 @@ class TestFileLockManager:
 
         inside: list[int] = []
         breach: list[bool] = []
-        w1_in_cs = threading.Event()      # set when w1 is inside critical section
+        w1_in_cs = threading.Event()  # set when w1 is inside critical section
         w2_will_block = threading.Event()  # set when w2 is about to block on acquire
         m1 = FileLockManager(temp_repo_root)
         m2 = FileLockManager(temp_repo_root)
@@ -231,7 +227,7 @@ class TestSubTaskSpec:
             description="Fix bug in calculator",
             priority=1,
             dependencies=["task-0"],
-            assigned_files=["sample.py"]
+            assigned_files=["sample.py"],
         )
 
         assert subtask.task_id == "task-1"
@@ -243,11 +239,7 @@ class TestSubTaskSpec:
 
     def test_subtask_spec_defaults(self):
         """Test subtask specification with defaults."""
-        subtask = SubTaskSpec(
-            task_id="task-1",
-            title="Simple task",
-            description="Simple task"
-        )
+        subtask = SubTaskSpec(task_id="task-1", title="Simple task", description="Simple task")
 
         assert subtask.task_id == "task-1"
         assert subtask.title == "Simple task"
@@ -264,7 +256,7 @@ class TestSubTaskSpec:
             description="Test task description",
             priority=2,
             dependencies=["task-0"],
-            assigned_files=["file1.py", "file2.py"]
+            assigned_files=["file1.py", "file2.py"],
         )
 
         # Check dataclass fields
@@ -283,14 +275,10 @@ class TestOrchestratorConfig:
     def test_orchestrator_config_creation(self):
         """Test creating orchestrator configuration."""
         from external_llm.agent.tool_registry import AgentConfig
+
         agent_config = AgentConfig(max_turns=10)
 
-        config = OrchestratorConfig(
-            max_subagents=3,
-            parallel=True,
-            agent_config=agent_config,
-            cancel_event=None
-        )
+        config = OrchestratorConfig(max_subagents=3, parallel=True, agent_config=agent_config, cancel_event=None)
 
         assert config.max_subagents == 3
         assert config.parallel is True
@@ -317,16 +305,14 @@ class TestOrchestratorAgent:
         mock_llm.get_provider_name.return_value = "openai"
 
         from external_llm.agent.tool_registry import AgentConfig
+
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
 
         orchestrator_config = OrchestratorConfig(max_subagents=2, agent_config=base_config)
 
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orchestrator_config,
-            model="test-model"
+            llm_client=mock_llm, registry=registry, orch_config=orchestrator_config, model="test-model"
         )
 
         assert orchestrator.llm_client == mock_llm
@@ -341,19 +327,17 @@ class TestOrchestratorAgent:
         mock_llm.get_provider_name.return_value = "openai"
 
         from external_llm.agent.tool_registry import AgentConfig
+
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
         orchestrator_config = OrchestratorConfig(max_subagents=2, agent_config=base_config)
 
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orchestrator_config,
-            model="test-model"
+            llm_client=mock_llm, registry=registry, orch_config=orchestrator_config, model="test-model"
         )
 
         # Mock the _decompose_task method
-        with patch.object(orchestrator, '_decompose_task') as mock_decompose:
+        with patch.object(orchestrator, "_decompose_task") as mock_decompose:
             mock_decompose.return_value = [
                 SubTaskSpec(
                     task_id="sub_1",
@@ -361,7 +345,7 @@ class TestOrchestratorAgent:
                     description="Fix indentation in sample.py",
                     assigned_files=["sample.py"],
                     priority=1,
-                    dependencies=[]
+                    dependencies=[],
                 ),
                 SubTaskSpec(
                     task_id="sub_2",
@@ -369,8 +353,8 @@ class TestOrchestratorAgent:
                     description="Add new method to Calculator",
                     assigned_files=["sample.py"],
                     priority=2,
-                    dependencies=["sub_1"]
-                )
+                    dependencies=["sub_1"],
+                ),
             ]
 
             subtasks = orchestrator._decompose_task("Fix calculator and add features")
@@ -386,22 +370,17 @@ class TestOrchestratorAgent:
         mock_llm.get_provider_name.return_value = "openai"
 
         from external_llm.agent.tool_registry import AgentConfig
+
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
         orchestrator_config = OrchestratorConfig(max_subagents=2, agent_config=base_config)
 
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orchestrator_config,
-            model="test-model"
+            llm_client=mock_llm, registry=registry, orch_config=orchestrator_config, model="test-model"
         )
 
         subtask = SubTaskSpec(
-            task_id="task-1",
-            title="Fix sample.py",
-            description="Fix sample.py",
-            assigned_files=["sample.py"]
+            task_id="task-1", title="Fix sample.py", description="Fix sample.py", assigned_files=["sample.py"]
         )
 
         # Mock subagent execution - _run_subagent returns AgentResult
@@ -410,7 +389,7 @@ class TestOrchestratorAgent:
         mock_result.turns = [Mock(), Mock(), Mock()]  # 3 turns
         mock_result.final_message = "Fixed indentation"
 
-        with patch.object(orchestrator, '_run_subagent') as mock_run_subagent:
+        with patch.object(orchestrator, "_run_subagent") as mock_run_subagent:
             mock_run_subagent.return_value = mock_result
 
             result = orchestrator._run_subagent(subtask, extra_turns=0)
@@ -424,47 +403,25 @@ class TestOrchestratorAgent:
         mock_llm.get_provider_name.return_value = "openai"
 
         from external_llm.agent.tool_registry import AgentConfig
+
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
         orchestrator_config = OrchestratorConfig(max_subagents=2, agent_config=base_config)
 
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orchestrator_config,
-            model="test-model"
+            llm_client=mock_llm, registry=registry, orch_config=orchestrator_config, model="test-model"
         )
 
         subtasks = [
-            SubTaskSpec(
-                task_id="task-1",
-                title="Task 1",
-                description="Task 1",
-                dependencies=[]
-            ),
-            SubTaskSpec(
-                task_id="task-2",
-                title="Task 2",
-                description="Task 2",
-                dependencies=["task-1"]
-            ),
-            SubTaskSpec(
-                task_id="task-3",
-                title="Task 3",
-                description="Task 3",
-                dependencies=["task-1"]
-            ),
-            SubTaskSpec(
-                task_id="task-4",
-                title="Task 4",
-                description="Task 4",
-                dependencies=["task-2", "task-3"]
-            )
+            SubTaskSpec(task_id="task-1", title="Task 1", description="Task 1", dependencies=[]),
+            SubTaskSpec(task_id="task-2", title="Task 2", description="Task 2", dependencies=["task-1"]),
+            SubTaskSpec(task_id="task-3", title="Task 3", description="Task 3", dependencies=["task-1"]),
+            SubTaskSpec(task_id="task-4", title="Task 4", description="Task 4", dependencies=["task-2", "task-3"]),
         ]
 
         # Test dependency-aware execution
         # Mock the _run_dependency_aware method to verify it receives correct subtasks
-        with patch.object(orchestrator, '_run_dependency_aware') as mock_run:
+        with patch.object(orchestrator, "_run_dependency_aware") as mock_run:
             mock_run.return_value = [Mock(), Mock(), Mock(), Mock()]
 
             # We'll just verify the method can be called with dependency tasks
@@ -479,29 +436,18 @@ class TestOrchestratorAgent:
         mock_llm.get_provider_name.return_value = "openai"
 
         from external_llm.agent.tool_registry import AgentConfig
+
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
-        orchestrator_config = OrchestratorConfig(
-            max_subagents=2,
-            parallel=True,
-            agent_config=base_config
-        )
+        orchestrator_config = OrchestratorConfig(max_subagents=2, parallel=True, agent_config=base_config)
 
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orchestrator_config,
-            model="test-model"
+            llm_client=mock_llm, registry=registry, orch_config=orchestrator_config, model="test-model"
         )
 
         # Create independent subtasks (no dependencies)
         subtasks = [
-            SubTaskSpec(
-                task_id=f"task-{i}",
-                title=f"Task {i}",
-                description=f"Task {i}",
-                dependencies=[]
-            )
+            SubTaskSpec(task_id=f"task-{i}", title=f"Task {i}", description=f"Task {i}", dependencies=[])
             for i in range(3)
         ]
 
@@ -510,17 +456,13 @@ class TestOrchestratorAgent:
         import time
 
         from external_llm.agent.agent_loop import AgentResult
+
         def mock_execute_subtask(*args, **kwargs):
-            subtask = args[0] if args else kwargs.get('subtask')
+            subtask = args[0] if args else kwargs.get("subtask")
             start = time.time()
             time.sleep(0.05)  # Simulate work
             execution_times.append(time.time() - start)
-            return AgentResult(
-                status="success",
-                turns=[],
-                final_message=f"Completed {subtask.task_id}",
-                metadata={}
-            )
+            return AgentResult(status="success", turns=[], final_message=f"Completed {subtask.task_id}", metadata={})
 
         with (
             patch.object(orchestrator, "_run_subagent", side_effect=mock_execute_subtask),
@@ -542,12 +484,7 @@ class TestOrchestratorAgent:
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
         orch_config = OrchestratorConfig(max_subagents=3, agent_config=base_config)
-        OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orch_config,
-            model="test-model"
-        )
+        OrchestratorAgent(llm_client=mock_llm, registry=registry, orch_config=orch_config, model="test-model")
 
         # OrchestratorResult holds subtask_results list
         result = OrchestratorResult(
@@ -573,41 +510,26 @@ class TestOrchestratorAgent:
         mock_llm.get_provider_name.return_value = "openai"
 
         from external_llm.agent.agent_loop import AgentResult
+
         base_config = AgentConfig(max_turns=5)
         registry = ToolRegistry(temp_repo_root, base_config)
         orch_config = OrchestratorConfig(max_subagents=2, agent_config=base_config)
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orch_config,
-            model="test-model"
+            llm_client=mock_llm, registry=registry, orch_config=orch_config, model="test-model"
         )
 
         # Create subtasks where one depends on another
         subtasks = [
+            SubTaskSpec(task_id="task-1", title="Task 1", description="Task 1", dependencies=[]),
             SubTaskSpec(
-                task_id="task-1",
-                title="Task 1",
-                description="Task 1",
-                dependencies=[]
+                task_id="task-2", title="Task 2", description="Task 2 (depends on task-1)", dependencies=["task-1"]
             ),
-            SubTaskSpec(
-                task_id="task-2",
-                title="Task 2",
-                description="Task 2 (depends on task-1)",
-                dependencies=["task-1"]
-            )
         ]
 
         # Mock execution: task-1 succeeds, task-2 also succeeds (simplified)
         def mock_execute_subtask(*args, **kwargs):
-            subtask = args[0] if args else kwargs.get('subtask')
-            return AgentResult(
-                status="success",
-                turns=[],
-                final_message=f"Completed {subtask.task_id}",
-                metadata={}
-            )
+            subtask = args[0] if args else kwargs.get("subtask")
+            return AgentResult(status="success", turns=[], final_message=f"Completed {subtask.task_id}", metadata={})
 
         with (
             patch.object(orchestrator, "_run_subagent", side_effect=mock_execute_subtask),
@@ -636,11 +558,7 @@ class TestOrchestratorAgent:
             callback_events.append((event_type, data.get("task_id", "")))
 
         orchestrator = OrchestratorAgent(
-            llm_client=mock_llm,
-            registry=registry,
-            orch_config=orch_config,
-            model="test-model",
-            callback=mock_callback
+            llm_client=mock_llm, registry=registry, orch_config=orch_config, model="test-model", callback=mock_callback
         )
 
         # Trigger some events via _cb method

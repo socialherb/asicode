@@ -1,4 +1,5 @@
 """Tests for multi-language call graph indexing (TS/JS via TSSemanticTracer)."""
+
 import textwrap
 
 import pytest

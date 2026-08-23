@@ -14,6 +14,7 @@ behavior).  These tests pin the remaining invariants:
 * a cancelled build leaves no index and no snapshot;
 * the per-file size gate still excludes giant files from the index.
 """
+
 import textwrap
 
 import pytest
@@ -60,16 +61,32 @@ def _graph_snapshot(idx):
         "nodes": {s: (n.file, n.line, n.kind) for s, n in sorted(idx._nodes.items())},
         "forward": {
             s: sorted(
-                (e.caller_symbol, e.caller_file, e.caller_line, e.callee_symbol,
-                 e.callee_display, e.callee_file, e.callee_line, e.confidence)
+                (
+                    e.caller_symbol,
+                    e.caller_file,
+                    e.caller_line,
+                    e.callee_symbol,
+                    e.callee_display,
+                    e.callee_file,
+                    e.callee_line,
+                    e.confidence,
+                )
                 for e in es
             )
             for s, es in sorted(idx._forward.items())
         },
         "reverse": {
             s: sorted(
-                (e.caller_symbol, e.caller_file, e.caller_line, e.callee_symbol,
-                 e.callee_display, e.callee_file, e.callee_line, e.confidence)
+                (
+                    e.caller_symbol,
+                    e.caller_file,
+                    e.caller_line,
+                    e.callee_symbol,
+                    e.callee_display,
+                    e.callee_file,
+                    e.callee_line,
+                    e.confidence,
+                )
                 for e in es
             )
             for s, es in sorted(idx._reverse.items())
@@ -77,8 +94,16 @@ def _graph_snapshot(idx):
         "file_nodes": {r: sorted(v) for r, v in sorted(idx._file_nodes.items())},
         "file_edges": {
             r: sorted(
-                (e.caller_symbol, e.caller_file, e.caller_line, e.callee_symbol,
-                 e.callee_display, e.callee_file, e.callee_line, e.confidence)
+                (
+                    e.caller_symbol,
+                    e.caller_file,
+                    e.caller_line,
+                    e.callee_symbol,
+                    e.callee_display,
+                    e.callee_file,
+                    e.callee_line,
+                    e.confidence,
+                )
                 for e in es
             )
             for r, es in sorted(idx._file_edges.items())
@@ -116,6 +141,7 @@ _FILES = {
 
 
 # ─── SSOT invariant: no CGI disk snapshot ever ────────────────────────────────
+
 
 def test_build_never_writes_call_graph_v1_json(tmp_path):
     """The removed CGI disk tier must stay gone: no build path (cold, warm,
@@ -155,6 +181,7 @@ def test_build_never_writes_call_graph_v1_json(tmp_path):
 
 # ─── warm in-process tier ─────────────────────────────────────────────────────
 
+
 def test_warm_rebuild_served_by_in_process_tier(tmp_path):
     repo = _make_repo(tmp_path, _FILES)
     idx = CallGraphIndexer(repo)
@@ -191,6 +218,7 @@ def test_cached_payload_not_polluted_by_callee_resolution(tmp_path):
 
 # ─── incremental interplay ────────────────────────────────────────────────────
 
+
 def test_invalidate_files_on_top_of_cached_build(tmp_path):
     repo = _make_repo(tmp_path, _FILES)
     idx1 = CallGraphIndexer(repo)
@@ -217,6 +245,7 @@ def test_invalidate_files_on_top_of_cached_build(tmp_path):
 
 
 # ─── cancel / gates ───────────────────────────────────────────────────────────
+
 
 def test_cancelled_build_leaves_no_index(tmp_path):
     import threading

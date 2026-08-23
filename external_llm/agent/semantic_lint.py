@@ -12,7 +12,6 @@ import os
 import subprocess
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +19,7 @@ logger = logging.getLogger(__name__)
 _RUFF_EXIT_OK = {0, 1}
 
 
-
-_RUFF_AVAILABLE: Optional[bool] = None
+_RUFF_AVAILABLE: bool | None = None
 
 
 def _check_ruff_available() -> bool:
@@ -52,7 +50,7 @@ def _check_ruff_available() -> bool:
 
 def ruff_findings(
     content: str,
-    path: Optional[str] = None,
+    path: str | None = None,
     select: str = "F401,F811,F821,F841",
 ) -> list[dict]:
     """Run ruff --select F... on content via stdin. Returns list of findings.
@@ -187,7 +185,7 @@ _FINDINGS_CACHE: "OrderedDict[tuple, list[dict]]" = OrderedDict()
 _FINDINGS_CACHE_MAX = 64
 
 
-def _findings_cache_lookup(key: tuple) -> Optional[list[dict]]:
+def _findings_cache_lookup(key: tuple) -> list[dict] | None:
     cached = _FINDINGS_CACHE.get(key)
     if cached is None:
         return None

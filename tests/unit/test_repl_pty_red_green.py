@@ -24,6 +24,7 @@ Test-pattern rules (hard-won):
   worker thread resolves prompt_toolkit's shared *default* AppSession, whose
   input/output are cached on first access -- reset them per test.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -43,8 +44,7 @@ import asi
 from external_llm.repl import repl_impl
 from tests.unit.pty_driver import PtySession
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX pty/termios required")
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX pty/termios required")
 
 pytest.importorskip("prompt_toolkit")
 
@@ -74,10 +74,18 @@ def _reset_app_session() -> None:
 
 
 _REPL_GLOBALS: ClassVar[tuple[str, ...]] = (
-    "_prompt_session", "_input_underline", "_prompt_history_path",
-    "_ctrlc_armed", "_next_prompt_suggestion", "_next_suggestion_gen",
-    "_auto_continue_state", "_auto_submit_gen", "_auto_countdown_active",
-    "_last_input_was_auto", "_completer_provider", "_completer_model",
+    "_prompt_session",
+    "_input_underline",
+    "_prompt_history_path",
+    "_ctrlc_armed",
+    "_next_prompt_suggestion",
+    "_next_suggestion_gen",
+    "_auto_continue_state",
+    "_auto_submit_gen",
+    "_auto_countdown_active",
+    "_last_input_was_auto",
+    "_completer_provider",
+    "_completer_model",
 )
 
 
@@ -196,8 +204,7 @@ class TestRunEscWatcher:
     def test_stop_event_exits_loop(self, tty):
         cancel = threading.Event()
         stop = threading.Event()
-        t = threading.Thread(
-            target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
+        t = threading.Thread(target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
         t.start()
         time.sleep(0.5)  # let it enter the select(0.3) loop at least once
         stop.set()
@@ -212,8 +219,7 @@ class TestRunEscWatcher:
         before = termios.tcgetattr(tty.slave_fd)
         cancel = threading.Event()
         stop = threading.Event()
-        t = threading.Thread(
-            target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
+        t = threading.Thread(target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
         t.start()
         time.sleep(0.2)  # raw mode is set at thread start
         tty.send(b"\x1b")
@@ -232,8 +238,7 @@ class TestRunEscWatcher:
         tty.activate()
         cancel = threading.Event()
         stop = threading.Event()
-        t = threading.Thread(
-            target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
+        t = threading.Thread(target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
         t.start()
         time.sleep(0.2)
         repl_impl._esc_watcher_pause.set()
@@ -256,8 +261,7 @@ class TestRunEscWatcher:
         cancel = threading.Event()
         cancel.set()
         stop = threading.Event()
-        t = threading.Thread(
-            target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
+        t = threading.Thread(target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
         t.start()
         t.join(timeout=3)
         assert not t.is_alive()
@@ -291,9 +295,7 @@ class TestRunEscWatcher:
         cancel = threading.Event()
         stop = threading.Event()
         with caplog.at_level(logging.DEBUG):
-            t = threading.Thread(
-                target=repl_impl._run_esc_watcher, args=(cancel, stop),
-                daemon=True)
+            t = threading.Thread(target=repl_impl._run_esc_watcher, args=(cancel, stop), daemon=True)
             t.start()
             time.sleep(0.2)
             stop.set()
@@ -310,12 +312,14 @@ class TestRunEscWatcher:
 class TestCliCheckpointCb:
     def test_numeric_option_answer(self, tty_stdin_only, capsys):
         tty_stdin_only.send(b"2\r")
-        out = repl_impl._cli_checkpoint_cb({
-            "question": "Which file?",
-            "options": ["a.py", "b.py"],
-            "default": "1",
-            "timeout": 30,
-        })
+        out = repl_impl._cli_checkpoint_cb(
+            {
+                "question": "Which file?",
+                "options": ["a.py", "b.py"],
+                "default": "1",
+                "timeout": 30,
+            }
+        )
         assert out == {"status": "answered", "answer": "b.py"}
         text = capsys.readouterr().out
         assert "User Checkpoint" in text
@@ -325,27 +329,23 @@ class TestCliCheckpointCb:
 
     def test_free_text_answer_with_options(self, tty_stdin_only, capsys):
         tty_stdin_only.send(b"just do it\r")
-        out = repl_impl._cli_checkpoint_cb({
-            "question": "q", "options": ["a", "b"], "default": "1", "timeout": 30})
+        out = repl_impl._cli_checkpoint_cb({"question": "q", "options": ["a", "b"], "default": "1", "timeout": 30})
         assert out == {"status": "answered", "answer": "just do it"}
         assert "(no option" not in capsys.readouterr().out
 
     def test_out_of_range_option_passthrough(self, tty_stdin_only, capsys):
         tty_stdin_only.send(b"9\r")
-        out = repl_impl._cli_checkpoint_cb({
-            "question": "q", "options": ["a", "b"], "default": "1", "timeout": 30})
+        out = repl_impl._cli_checkpoint_cb({"question": "q", "options": ["a", "b"], "default": "1", "timeout": 30})
         assert out["status"] == "answered"
         assert out["answer"] == "9"
         assert "(no option #9" in capsys.readouterr().out
 
     def test_empty_line_keeps_default(self, tty_stdin_only):
         tty_stdin_only.send(b"\r")
-        out = repl_impl._cli_checkpoint_cb(
-            {"question": "q", "default": "yes", "timeout": 30})
+        out = repl_impl._cli_checkpoint_cb({"question": "q", "default": "yes", "timeout": 30})
         assert out == {"status": "answered", "answer": "yes"}
 
-    def test_timeout_applies_default_with_milestones(self, tty_stdin_only,
-                                                     monkeypatch, capsys):
+    def test_timeout_applies_default_with_milestones(self, tty_stdin_only, monkeypatch, capsys):
         clock = {"n": 0}
         t0 = 1000.0
 
@@ -358,8 +358,7 @@ class TestCliCheckpointCb:
 
         monkeypatch.setattr(time, "monotonic", _fake_monotonic)
         monkeypatch.setattr(select_mod, "select", _no_input)
-        out = repl_impl._cli_checkpoint_cb(
-            {"question": "q", "default": "yes", "timeout": 65})
+        out = repl_impl._cli_checkpoint_cb({"question": "q", "default": "yes", "timeout": 65})
         assert out == {"status": "timeout", "answer": "yes"}
         text = capsys.readouterr().out
         # each loop iteration consumes two monotonic calls (deadline check +
@@ -369,8 +368,7 @@ class TestCliCheckpointCb:
 
     def test_invalid_timeout_falls_back_to_120(self, tty_stdin_only, capsys):
         tty_stdin_only.send(b"1\r")
-        out = repl_impl._cli_checkpoint_cb(
-            {"question": "q", "default": "d", "timeout": "abc"})
+        out = repl_impl._cli_checkpoint_cb({"question": "q", "default": "d", "timeout": "abc"})
         assert out == {"status": "answered", "answer": "1"}
         assert "(auto-applied in 120s)" in capsys.readouterr().out
 
@@ -382,8 +380,7 @@ class TestCliCheckpointCb:
         assert out["answer"] == "x"
         assert sp.stopped == 1 and sp.started == 1
 
-    def test_spinner_stop_and_start_failures_logged(self, tty_stdin_only,
-                                                    monkeypatch, caplog):
+    def test_spinner_stop_and_start_failures_logged(self, tty_stdin_only, monkeypatch, caplog):
         sp = _FakeSpinner(fail_stop=True, fail_start=True)
         monkeypatch.setattr(repl_impl, "_active_spinner_printer", sp)
         tty_stdin_only.send(b"x\r")
@@ -393,22 +390,19 @@ class TestCliCheckpointCb:
         assert "checkpoint: spinner stop failed" in caplog.text
         assert "checkpoint: spinner restart failed" in caplog.text
 
-    def test_termios_save_failure_continues(self, tty_stdin_only, monkeypatch,
-                                            caplog):
+    def test_termios_save_failure_continues(self, tty_stdin_only, monkeypatch, caplog):
         def _boom(*_a, **_k):
             raise OSError("no termios")
 
         monkeypatch.setattr(termios, "tcgetattr", _boom)
         tty_stdin_only.send(b"free\r")
         with caplog.at_level(logging.DEBUG):
-            out = repl_impl._cli_checkpoint_cb(
-                {"question": "q", "options": ["a"], "timeout": 10})
+            out = repl_impl._cli_checkpoint_cb({"question": "q", "options": ["a"], "timeout": 10})
         assert out["status"] == "answered"
         assert out["answer"] == "free"
         assert "checkpoint: terminal state save failed" in caplog.text
 
-    def test_termios_restore_failure_logged(self, tty_stdin_only, monkeypatch,
-                                            caplog):
+    def test_termios_restore_failure_logged(self, tty_stdin_only, monkeypatch, caplog):
         real = termios.tcsetattr
         calls = {"n": 0}
 
@@ -429,21 +423,17 @@ class TestCliCheckpointCb:
         fake = _FakeOutConsole()
         monkeypatch.setattr(asi, "_out_console", fake)
         tty_stdin_only.send(b"1\r")
-        out = repl_impl._cli_checkpoint_cb({
-            "question": "**bold** question", "options": ["a"], "default": "1"})
+        out = repl_impl._cli_checkpoint_cb({"question": "**bold** question", "options": ["a"], "default": "1"})
         assert out["answer"] == "a"
         assert len(fake.printed) == 1
         assert "User Checkpoint" in capsys.readouterr().out
 
-    def test_plain_text_question_when_rich_disabled(self, tty_stdin_only,
-                                                    monkeypatch, capsys):
+    def test_plain_text_question_when_rich_disabled(self, tty_stdin_only, monkeypatch, capsys):
         # A previous test may have created asi._out_console; force the plain
         # wrap_cjk render branch instead of the Rich markdown one.
         monkeypatch.setattr(repl_impl, "_RICH", False)
         tty_stdin_only.send(b"x\r")
-        out = repl_impl._cli_checkpoint_cb(
-            {"question": "a long question line that wraps\n\nblank gap",
-             "timeout": 10})
+        out = repl_impl._cli_checkpoint_cb({"question": "a long question line that wraps\n\nblank gap", "timeout": 10})
         assert out == {"status": "answered", "answer": "x"}
         text = capsys.readouterr().out
         assert "a long question line that wraps" in text

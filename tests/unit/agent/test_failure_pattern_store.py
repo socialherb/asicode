@@ -1,4 +1,5 @@
 """Tests for the per-repo persistent failure-pattern store."""
+
 from __future__ import annotations
 
 import os
@@ -43,6 +44,7 @@ def _reset_recall_counters():
 
 # ── record / count ───────────────────────────────────────────────────────────
 
+
 def test_record_increments_count(store):
     assert store.record("apply_patch", "patch context mismatch") >= 1
     assert store.effective_count("apply_patch", "patch context mismatch") == 1
@@ -58,6 +60,7 @@ def test_distinct_reasons_kept_separately(store):
 
 
 # ── persistence ──────────────────────────────────────────────────────────────
+
 
 def test_persists_across_instances(tmp_path):
     s1 = FailurePatternStore(tmp_path)
@@ -80,6 +83,7 @@ def test_corrupt_file_treated_as_empty(tmp_path):
 
 
 # ── recall ───────────────────────────────────────────────────────────────────
+
 
 def test_recall_silent_below_threshold(store):
     store.record("apply_patch", "context mismatch")
@@ -263,6 +267,7 @@ def test_recall_on_failure_never_raises(tmp_path):
 
 # ── decay ────────────────────────────────────────────────────────────────────
 
+
 def test_decay_weight_halves_over_half_life():
     now = 1_000_000.0
     assert _decay_weight(now, now) == pytest.approx(1.0)
@@ -288,6 +293,7 @@ def test_decay_reduces_effective_count(store, monkeypatch):
 
 # ── registry ─────────────────────────────────────────────────────────────────
 
+
 def test_get_store_caches_per_repo(tmp_path):
     a = get_store(tmp_path)
     b = get_store(tmp_path)
@@ -302,6 +308,7 @@ def test_disabled_store_is_noop(tmp_path):
 
 # ── bounded pruning ──────────────────────────────────────────────────────────
 
+
 def test_bounded_prune_on_save(tmp_path):
     s = FailurePatternStore(tmp_path)
     # Exceed the cap with low-count patterns.
@@ -314,6 +321,8 @@ def test_bounded_prune_on_save(tmp_path):
         s.record("keeper", "hot")
     top = {p["key"] for p in s.top_patterns(limit=5)}
     assert any("keeper" in k for k in top)
+
+
 def test_bounded_cap_enforced_when_all_patterns_stale(tmp_path):
     """The hard cap is enforced even when every pattern is a stale singleton
     (soft-prune keeps none of them).
@@ -328,6 +337,7 @@ def test_bounded_cap_enforced_when_all_patterns_stale(tmp_path):
     import json
 
     from external_llm.agent.failure_pattern_store import _MAX_PATTERNS
+
     s = FailurePatternStore(tmp_path)
     # Record more than the cap, all distinct single occurrences.
     for i in range(_MAX_PATTERNS + 30):
@@ -341,18 +351,15 @@ def test_bounded_cap_enforced_when_all_patterns_stale(tmp_path):
             v["last_seen"] = stale
         s._save(data, merge=False)
     # Read the persisted file directly, bypassing the in-memory cache.
-    raw = json.loads(
-        (tmp_path / ".asicode" / "failure_patterns.json").read_text("utf-8")
-    )
-    assert len(raw["patterns"]) <= _MAX_PATTERNS, (
-        f"store exceeded cap: {len(raw['patterns'])} > {_MAX_PATTERNS}"
-    )
+    raw = json.loads((tmp_path / ".asicode" / "failure_patterns.json").read_text("utf-8"))
+    assert len(raw["patterns"]) <= _MAX_PATTERNS, f"store exceeded cap: {len(raw['patterns'])} > {_MAX_PATTERNS}"
 
 
 # ── clear / drop (merge-on-write regression) ─────────────────────────────────
 # _save() merges disk data on top of in-memory data for cross-process safety.
 # clear()/drop() must bypass that merge (merge=False), otherwise the deleted
 # keys are silently resurrected from disk and the operation becomes a no-op.
+
 
 def test_clear_removes_all_patterns_from_disk(tmp_path):
     s = FailurePatternStore(tmp_path)
@@ -399,7 +406,7 @@ def test_drop_out_of_range_returns_false(tmp_path):
     s = FailurePatternStore(tmp_path)
     s.record("t", "r")
     s.flush()
-    assert s.drop(0) is None   # 1-based; 0 is invalid
+    assert s.drop(0) is None  # 1-based; 0 is invalid
     assert s.drop(99) is None  # out of range
     assert s.store_size() == 1  # unchanged
 
@@ -502,6 +509,7 @@ def test_drop_key_persists_across_instances(tmp_path):
 # These tests use drop_key() with an explicit key so they control exactly which
 # pattern is removed, regardless of decay-based ranking.
 
+
 def test_drop_key_preserves_pending_records(store):
     """drop_key() must not lose pending records when removing a different key."""
     store.record("committed", "reason_a")
@@ -516,9 +524,7 @@ def test_drop_key_preserves_pending_records(store):
 
     remaining = store.top_patterns(limit=10)
     remaining_keys = {p["key"] for p in remaining}
-    assert "pending::reason_b" in remaining_keys, (
-        f"pending record lost after drop_key(); keys={remaining_keys}"
-    )
+    assert "pending::reason_b" in remaining_keys, f"pending record lost after drop_key(); keys={remaining_keys}"
 
     # Disk view after explicit flush confirms the pending record wasn't lost.
     store.flush()
@@ -548,21 +554,18 @@ def test_drop_index_with_pending_does_not_lose_pending(store):
     assert removed is not None, "drop(1) should succeed"
 
     # high_priority should be the one removed (highest count).
-    assert removed[0] == "high_priority", (
-        f"drop(1) removed {removed} but expected high_priority"
-    )
+    assert removed[0] == "high_priority", f"drop(1) removed {removed} but expected high_priority"
 
     # The pending record should still be present.
     remaining = store.top_patterns(limit=10)
     remaining_keys = {p["key"] for p in remaining}
-    assert "pending::survivor" in remaining_keys, (
-        f"pending record lost after drop(1); remaining keys: {remaining_keys}"
-    )
+    assert "pending::survivor" in remaining_keys, f"pending record lost after drop(1); remaining keys: {remaining_keys}"
 
 
 # ── prune ─────────────────────────────────────────────────────────────────────
 # prune() is exposed via the REPL (/failure-patterns prune) but had no direct
 # unit tests — only the save-time auto-prune path was covered.
+
 
 def test_prune_removes_below_threshold_only(store):
     for _ in range(3):
@@ -657,8 +660,7 @@ def test_count_does_not_inflate_across_flush_boundaries(tmp_path):
 
     # Within decay tolerance (negligible within test time), must be ~total.
     assert abs(persisted - total) <= 1, (
-        f"persisted count {persisted} should approximate observations {total}; "
-        f"inflation likely due to baseline bug"
+        f"persisted count {persisted} should approximate observations {total}; inflation likely due to baseline bug"
     )
 
 
@@ -704,10 +706,7 @@ def test_count_preserved_across_recall_flush_boundary(tmp_path):
     persisted = s2.effective_count("tool", "reason")
 
     # With decay negligible (<1s), count should be ~5.
-    msg = (
-        f"expected >=4, got {persisted}; "
-        f"recall_for() baseline bug likely lost pending observations"
-    )
+    msg = f"expected >=4, got {persisted}; recall_for() baseline bug likely lost pending observations"
     assert persisted >= 4, msg
 
 
@@ -826,15 +825,23 @@ def test_decay_not_lost_by_delta_merge(tmp_path):
     # Seed disk with a 30-day-old entry (count=10, not yet decayed for today).
     s = FailurePatternStore(tmp_path)
     s._path.parent.mkdir(parents=True, exist_ok=True)
-    s._path.write_text(json.dumps({
-        "patterns": {
-            "tool::reason": {
-                "count": 10.0, "first_seen": old_ts, "last_seen": old_ts,
-                "tool": "tool", "reason": "reason",
+    s._path.write_text(
+        json.dumps(
+            {
+                "patterns": {
+                    "tool::reason": {
+                        "count": 10.0,
+                        "first_seen": old_ts,
+                        "last_seen": old_ts,
+                        "tool": "tool",
+                        "reason": "reason",
+                    }
+                },
+                "version": 1,
+                "updated": now,
             }
-        },
-        "version": 1, "updated": now,
-    }))
+        )
+    )
 
     # Fresh session: load → decay → observe → flush.
     s2 = FailurePatternStore(tmp_path)
@@ -845,10 +852,7 @@ def test_decay_not_lost_by_delta_merge(tmp_path):
     # Fresh read: count must reflect decay (10*w + 1 ≈ 1.5), not the raw 10.
     s3 = FailurePatternStore(tmp_path)
     c = s3.effective_count("tool", "reason")
-    assert 1 <= c <= 4, (
-        f"decay lost by delta merge: expected ~1.5, got {c}; "
-        f"disk likely retains pre-decay count"
-    )
+    assert 1 <= c <= 4, f"decay lost by delta merge: expected ~1.5, got {c}; disk likely retains pre-decay count"
 
 
 # ── cross-process decay merge (regression: P1) ──────────────────────────────
@@ -872,12 +876,10 @@ def test_cross_process_decay_preserves_other_process_increments(tmp_path):
     ts_old = now - 100
 
     disk_data = {
-        "tool::reason": {"count": 13, "last_seen": now, "first_seen": ts_old,
-                         "tool": "tool", "reason": "reason"},
+        "tool::reason": {"count": 13, "last_seen": now, "first_seen": ts_old, "tool": "tool", "reason": "reason"},
     }
     our_data = {
-        "tool::reason": {"count": 4, "last_seen": now, "first_seen": ts_old,
-                         "tool": "tool", "reason": "reason"},
+        "tool::reason": {"count": 4, "last_seen": now, "first_seen": ts_old, "tool": "tool", "reason": "reason"},
     }
 
     merged = s._merge_max(disk_data, our_data, baseline=baseline)
@@ -907,19 +909,15 @@ def test_cross_process_decay_single_process_unchanged(tmp_path):
 
     # disk / baseline match — single-process scenario
     disk_data = {
-        "tool::reason": {"count": 10, "last_seen": now, "first_seen": ts_old,
-                         "tool": "tool", "reason": "reason"},
+        "tool::reason": {"count": 10, "last_seen": now, "first_seen": ts_old, "tool": "tool", "reason": "reason"},
     }
     our_data = {
-        "tool::reason": {"count": 4, "last_seen": now, "first_seen": ts_old,
-                         "tool": "tool", "reason": "reason"},
+        "tool::reason": {"count": 4, "last_seen": now, "first_seen": ts_old, "tool": "tool", "reason": "reason"},
     }
 
     merged = s._merge_max(disk_data, our_data, baseline=baseline)
     merged_count = merged["tool::reason"]["count"]
-    assert merged_count == 4, (
-        f"single-process: expected 4 (decayed count preserved), got {merged_count}"
-    )
+    assert merged_count == 4, f"single-process: expected 4 (decayed count preserved), got {merged_count}"
 
 
 # ── cross-process write serialisation (regression: B-3) ─────────────────────
@@ -976,9 +974,7 @@ def test_concurrent_processes_same_key_no_lost_updates(tmp_path):
         "    s.record('stress_tool', 'boom')\n"
         "s.flush()\n"
     ) % n
-    procs = [
-        subprocess.Popen([sys.executable, "-c", script]) for _ in range(2)
-    ]
+    procs = [subprocess.Popen([sys.executable, "-c", script]) for _ in range(2)]
     for p in procs:
         assert p.wait(timeout=60) == 0, "recorder subprocess failed"
 
@@ -991,6 +987,7 @@ def test_concurrent_processes_same_key_no_lost_updates(tmp_path):
 
 
 # ── ① action-shaped recall advice ────────────────────────────────────────────
+
 
 def test_recall_advice_reflects_action(store):
     """The classifier's RecoveryAction must shape the advice, not a one-size generality."""
@@ -1034,6 +1031,7 @@ def test_recall_on_failure_forwards_action(tmp_path):
 
 
 # ── ② per-path breakdown ─────────────────────────────────────────────────────
+
 
 def test_record_accumulates_per_path_breakdown(store):
     store.record("edit_text", "file missing", path="a.py")
@@ -1099,6 +1097,7 @@ def test_merge_max_reconciles_paths_across_processes(tmp_path):
 
 
 # ── ③ recall efficacy counters ───────────────────────────────────────────────
+
 
 def _recurring_failure(tmp_path, session_key, tool="apply_patch", reason="patch context mismatch"):
     s = FailurePatternStore(tmp_path)

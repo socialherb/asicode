@@ -5,11 +5,11 @@ fragment-duplication / block-introducer guards, and the LLM JSON repair helper
 shared by the write tool mixins. This module imports nothing from the sibling
 ``write_tools_*`` modules — mixins depend on it, never the other way around.
 """
+
 from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 from ...common.indent_utils import (
     _file_indent_unit_from_logical,
@@ -41,9 +41,13 @@ _HAS_TS = True
 
 logger = logging.getLogger(__name__)
 
+
 def _find_block_end_line(
-    content: str, lang_str: str, anchor_lineno: int, lines: list[str],
-) -> Optional[int]:
+    content: str,
+    lang_str: str,
+    anchor_lineno: int,
+    lines: list[str],
+) -> int | None:
     """Return the inclusive 0-indexed END line of the block whose header sits
     at ``anchor_lineno``, or ``None`` if the anchor is NOT a block header.
 
@@ -75,18 +79,14 @@ def _find_block_end_line(
     """
     if anchor_lineno < 0 or anchor_lineno >= len(lines):
         return None
-    anchor_line = lines[anchor_lineno].rstrip('\n\r')
+    anchor_line = lines[anchor_lineno].rstrip("\n\r")
     stripped = anchor_line.strip()
     if not stripped:
         return None
     anchor_indent = len(anchor_line) - len(anchor_line.lstrip())
 
     # ── Strategy 1: tree-sitter (authoritative end_line) ─────────────────
-    if (
-        _HAS_TS
-        and lang_str in _TS_LANG_MODULE_MAP
-        and _ts_language_available(lang_str)
-    ):
+    if _HAS_TS and lang_str in _TS_LANG_MODULE_MAP and _ts_language_available(lang_str):
         # find_all_symbols degrades to [] internally when tree-sitter or the
         # grammar is unavailable (parse/query paths are guarded inside
         # tree_sitter_utils) — the call itself never raises, so no wrapper is
@@ -108,8 +108,18 @@ def _find_block_end_line(
     # ── Grammar-less fallbacks, per language family ──────────────────────
     is_py = lang_str == "python"
     is_brace = lang_str in (
-        "typescript", "javascript", "go", "java", "rust", "c", "cpp",
-        "c_sharp", "kotlin", "php", "swift", "scala",
+        "typescript",
+        "javascript",
+        "go",
+        "java",
+        "rust",
+        "c",
+        "cpp",
+        "c_sharp",
+        "kotlin",
+        "php",
+        "swift",
+        "scala",
     )
     if not is_py and not is_brace:
         return None
@@ -141,11 +151,13 @@ def _find_block_end_line(
         return min(end_0based, len(lines) - 1)
 
     # ── Strategy 3: Python indent (grammar unavailable) ──────────────────
-    is_block_header = bool(re.match(
-        r'^(async\s+def\s|def\s|class\s|if\s|for\s|while\s|with\s|'
-        r'try\s*:|elif\s|else\s*:|except\s|finally\s*:|match\s)',
-        stripped,
-    )) and stripped.endswith(':')
+    is_block_header = bool(
+        re.match(
+            r"^(async\s+def\s|def\s|class\s|if\s|for\s|while\s|with\s|"
+            r"try\s*:|elif\s|else\s*:|except\s|finally\s*:|match\s)",
+            stripped,
+        )
+    ) and stripped.endswith(":")
     if not is_block_header:
         return None
     for i in range(anchor_lineno + 1, len(lines)):
@@ -159,7 +171,8 @@ def _find_block_end_line(
 
 # ── Re-indent helper for replace_all + fallback ──────────────────────────
 
-def _reindent_to_match(new_string: str, matched_text: str, file_unit: Optional[int] = None) -> str:
+
+def _reindent_to_match(new_string: str, matched_text: str, file_unit: int | None = None) -> str:
     """Reindent *new_string* to match *matched_text*'s base indentation.
 
     Delegates to the canonical ``indent_utils.reindent_to_match`` for ALL cases
@@ -185,7 +198,7 @@ def _reindent_to_match(new_string: str, matched_text: str, file_unit: Optional[i
     return reindent_to_match(new_string, matched_text, file_unit=file_unit)
 
 
-def _detect_file_unit(content: str) -> Optional[int]:
+def _detect_file_unit(content: str) -> int | None:
     """Per-level indent width (chars) of the *destination file* content.
 
     Gives :func:`reindent_to_match` a file-wide unit hint so a flat, single-
@@ -205,9 +218,7 @@ def _detect_file_unit(content: str) -> Optional[int]:
     # non-Python content it transparently falls back to ``indent_unit``.
     # Tokenizer failures (TokenError / IndentationError / SyntaxError) are
     # handled inside indent_utils, so no wrapper is needed here.
-    return _file_indent_unit_from_logical(
-        content, detect_indent_char(content.split("\n"))
-    ) or None
+    return _file_indent_unit_from_logical(content, detect_indent_char(content.split("\n"))) or None
 
 
 def _leading_indent_width(text: str) -> int:
@@ -243,10 +254,26 @@ def _leading_indent_width(text: str) -> int:
 # Lines that carry no structural identity and must be excluded from BOTH the
 # numerator (matched lines) and denominator (total content lines), so a
 # snippet reusing only ``return`` / ``}`` / blank lines is not false-positived.
-_FRAGMENT_DUP_TRIVIAL = frozenset({
-    "", "{", "}", "(", ")", "[", "]", "pass", "return", "continue", "break",
-    "...", "else", "try", "finally", "end",
-})
+_FRAGMENT_DUP_TRIVIAL = frozenset(
+    {
+        "",
+        "{",
+        "}",
+        "(",
+        ")",
+        "[",
+        "]",
+        "pass",
+        "return",
+        "continue",
+        "break",
+        "...",
+        "else",
+        "try",
+        "finally",
+        "end",
+    }
+)
 # Minimum non-trivial content lines in the snippet before duplication is even
 # judged — below this the snippet is too small to carry structural identity.
 _FRAGMENT_DUP_MIN_LINES = 3
@@ -255,6 +282,7 @@ _FRAGMENT_DUP_MIN_LINES = 3
 _FRAGMENT_DUP_RATIO_THRESHOLD = 0.5
 # Half-window size around insert_idx scanned for existing code to compare.
 _FRAGMENT_DUP_WINDOW = 12
+
 
 def _detect_fragment_duplication(file_lines, insert_idx, snippet):
     """Detect whether ``snippet`` duplicates existing code around ``insert_idx``.
@@ -371,7 +399,7 @@ def _detect_enclosing_scope(file_lines, anchor_lineno):
             if stripped.startswith(hdr):
                 indent = len(line) - len(line.lstrip())
                 kind = "class" if hdr == "class " else "function"
-                name = stripped[len(hdr):].split("(", 1)[0].split(":", 1)[0].strip()
+                name = stripped[len(hdr) :].split("(", 1)[0].split(":", 1)[0].strip()
                 if innermost is None:
                     innermost = (kind, name, indent)
                 if indent == 0 and top_level is None:
@@ -442,7 +470,7 @@ def _check_block_introducer_nesting(new_content, insert_start_line, insert_end_l
                 # Access .lineno only on def/class nodes — not every child has it
                 # (e.g. `arguments`), and a stray AttributeError is swallowed by
                 # the broad except below, silently masking real violations.
-                _lineno0 = child.lineno - 1
+                _lineno0 = getattr(child, "lineno", 0) - 1
                 _introduced = insert_start_line <= _lineno0 < insert_end_line
                 if _introduced:
                     # Only flag nested-in-function for a PRE-EXISTING enclosing
@@ -457,12 +485,12 @@ def _check_block_introducer_nesting(new_content, insert_start_line, insert_end_l
                             _enclosing = _ename
                             break
                     if _enclosing is not None:
-                        _violations.append(("nested_in_function", child.name, _enclosing))
+                        _violations.append(("nested_in_function", getattr(child, "name", ""), _enclosing))
                     _end_lineno = getattr(child, "end_lineno", None)
                     if _end_lineno is not None and _end_lineno > insert_end_line:
-                        _violations.append(("swallowed_trailing_code", child.name, None))
+                        _violations.append(("swallowed_trailing_code", getattr(child, "name", ""), None))
             if _is_func:
-                _walk(child, [*func_stack, (child.name, _introduced)])
+                _walk(child, [*func_stack, (getattr(child, "name", ""), _introduced)])
             else:
                 _walk(child, func_stack)
 
@@ -494,7 +522,7 @@ def _check_block_introducer_nesting(new_content, insert_start_line, insert_end_l
 # ── Truncation diagnostics: identify the op/path that was being written ──
 
 
-def _extract_truncated_op_path(raw: str) -> Optional[str]:
+def _extract_truncated_op_path(raw: str) -> str | None:
     """Best-effort: identify the op/path being written when a ``write_plan``
     tool_call was truncated mid-stream.
 
@@ -513,10 +541,10 @@ def _extract_truncated_op_path(raw: str) -> Optional[str]:
     """
     n = len(raw)
     i = 0
-    pending_key: Optional[str] = None       # a key literal just followed by ':'
-    current_op: Optional[str] = None        # last seen "op" value (string)
-    last_snapshot: Optional[tuple] = None   # (op, path) of the most recent path
-    orphan_op: Optional[str] = None         # an op with no path emitted after it
+    pending_key: str | None = None  # a key literal just followed by ':'
+    current_op: str | None = None  # last seen "op" value (string)
+    last_snapshot: tuple | None = None  # (op, path) of the most recent path
+    orphan_op: str | None = None  # an op with no path emitted after it
     while i < n:
         ch = raw[i]
         if ch != '"':
@@ -541,7 +569,7 @@ def _extract_truncated_op_path(raw: str) -> Optional[str]:
                 break
             j += 1
         closed = j < n
-        value = raw[i + 1:j]
+        value = raw[i + 1 : j]
         if pending_key is not None:
             # This literal is the value for ``pending_key``.
             if pending_key == "op":
@@ -586,6 +614,7 @@ def _extract_truncated_op_path(raw: str) -> Optional[str]:
 
 # ── JSON repair for LLM-generated plan JSON ──────────────────────────────
 
+
 def _repair_plan_json(text: str) -> str:
     """Repair common JSON issues in LLM-generated plan strings.
 
@@ -598,7 +627,7 @@ def _repair_plan_json(text: str) -> str:
     - Unescaped newlines inside string values (LLM multi-line before/after)
     """
     # 1. Markdown fence
-    _m = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    _m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if _m:
         text = _m.group(1).strip()
 
@@ -613,14 +642,14 @@ def _repair_plan_json(text: str) -> str:
     #    The active quote char is remembered so a foreign quote inside a string
     #    (e.g. the ``'`` in ``"don't"``) does not toggle string state.
     _escaped: list[str] = []
-    _quote: Optional[str] = None  # active opening quote char, or None
+    _quote: str | None = None  # active opening quote char, or None
     _escape = False
     for ch in text:
         if _escape:
             _escaped.append(ch)
             _escape = False
             continue
-        if ch == '\\':
+        if ch == "\\":
             _escaped.append(ch)
             _escape = True
             continue
@@ -632,11 +661,11 @@ def _repair_plan_json(text: str) -> str:
             _quote = None
             _escaped.append(ch)
             continue
-        if _quote is not None and ch == '\n':
-            _escaped.append('\\n')
+        if _quote is not None and ch == "\n":
+            _escaped.append("\\n")
             continue
-        if _quote is not None and ch == '\r':
-            _escaped.append('\\r')  # CRLF: pair the \n escape so loads() succeeds
+        if _quote is not None and ch == "\r":
+            _escaped.append("\\r")  # CRLF: pair the \n escape so loads() succeeds
             continue
         _escaped.append(ch)
     text = "".join(_escaped)
@@ -660,7 +689,7 @@ def _repair_plan_json(text: str) -> str:
             _result.append(ch)
             _escape = False
             continue
-        if ch == '\\':
+        if ch == "\\":
             _result.append(ch)
             _escape = True
             continue
@@ -701,7 +730,7 @@ def _repair_plan_json(text: str) -> str:
             _seg.append(ch)
             _escape = False
             continue
-        if _in_str and ch == '\\':
+        if _in_str and ch == "\\":
             _seg.append(ch)
             _escape = True
             continue
@@ -721,15 +750,11 @@ def _repair_plan_json(text: str) -> str:
 
     def _fix_code_segment(seg: str) -> str:
         # Trailing commas before closing brackets
-        seg = re.sub(r',\s*([}\]])', r'\1', seg)
+        seg = re.sub(r",\s*([}\]])", r"\1", seg)
         # Unquoted keys (key: → "key":) at start of object / after comma
-        return re.sub(r'([\{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', seg)
+        return re.sub(r"([\{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:", r'\1"\2":', seg)
 
-    return "".join(
-        seg if is_str else _fix_code_segment(seg)
-        for is_str, seg in _segments
-    )
-
+    return "".join(seg if is_str else _fix_code_segment(seg) for is_str, seg in _segments)
 
 
 # ── repo file index for "File not found" path suggestions ────────────────

@@ -29,7 +29,8 @@ class TestPostInitDedup:
 
     def test_search_terms_dedup(self):
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             search_terms=["foo", "bar", "foo", "baz", "bar"],
         )
         assert r.search_terms == ["foo", "bar", "baz"]
@@ -40,7 +41,8 @@ class TestPostInitDedup:
 
     def test_target_files_dedup(self):
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             target_files=["a.py", "b.py", "a.py", "c.py"],
         )
         assert r.target_files == ["a.py", "b.py", "c.py"]
@@ -51,7 +53,8 @@ class TestPostInitDedup:
 
     def test_target_symbols_dedup(self):
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             target_symbols=["foo", "bar", "foo"],
         )
         assert r.target_symbols == ["foo", "bar"]
@@ -62,14 +65,15 @@ class TestPostInitDedup:
 
     def test_new_symbols_filter_invalid(self):
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             new_symbols=[
                 {"name": "valid_func", "kind": "function"},
                 {"name": "valid_class", "kind": "class", "parent": "Base"},
-                {},                 # empty dict → skip
-                {"name": ""},       # empty name → skip
-                "not_a_dict",       # string → skip
-                42,                  # int → skip
+                {},  # empty dict → skip
+                {"name": ""},  # empty name → skip
+                "not_a_dict",  # string → skip
+                42,  # int → skip
                 {"name": "valid_func"},  # duplicate name → skip
                 {"name": "another", "kind": "method"},
             ],
@@ -93,7 +97,8 @@ class TestPostInitDedup:
     def test_new_symbols_default_kind(self):
         """Missing kind defaults to 'function'."""
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             new_symbols=[{"name": "auto_func"}],
         )
         assert r.new_symbols[0]["kind"] == "function"
@@ -101,7 +106,8 @@ class TestPostInitDedup:
     def test_new_symbols_parent_none(self):
         """Missing parent becomes None."""
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             new_symbols=[{"name": "orphan"}],
         )
         assert r.new_symbols[0]["parent"] is None
@@ -112,7 +118,8 @@ class TestPostInitLaneHint:
 
     def test_lane_hint_normalized(self):
         r = IntentResult(
-            original_request="test", normalized_query="test",
+            original_request="test",
+            normalized_query="test",
             lane_hint="  READ_ONLY  ",
         )
         assert r.lane_hint == "read_only"
@@ -132,21 +139,24 @@ class TestIsReadOnly:
 
     def test_exploration_is_read_only(self):
         r = IntentResult(
-            original_request="explore", normalized_query="explore",
+            original_request="explore",
+            normalized_query="explore",
             intent_type="exploration",
         )
         assert r.is_read_only() is True
 
     def test_question_is_read_only(self):
         r = IntentResult(
-            original_request="question", normalized_query="question",
+            original_request="question",
+            normalized_query="question",
             intent_type="question",
         )
         assert r.is_read_only() is True
 
     def test_read_only_lane_hint(self):
         r = IntentResult(
-            original_request="check this", normalized_query="check this",
+            original_request="check this",
+            normalized_query="check this",
             intent_type="bugfix",
             lane_hint="read_only",
         )
@@ -154,7 +164,8 @@ class TestIsReadOnly:
 
     def test_bugfix_not_read_only(self):
         r = IntentResult(
-            original_request="fix bug", normalized_query="fix bug",
+            original_request="fix bug",
+            normalized_query="fix bug",
             intent_type="bugfix",
         )
         assert r.is_read_only() is False
@@ -165,56 +176,64 @@ class TestHasEditIntent:
 
     def test_bugfix_has_edit_intent(self):
         r = IntentResult(
-            original_request="fix", normalized_query="fix",
+            original_request="fix",
+            normalized_query="fix",
             intent_type="bugfix",
         )
         assert r.has_edit_intent() is True
 
     def test_feature_has_edit_intent(self):
         r = IntentResult(
-            original_request="add", normalized_query="add",
+            original_request="add",
+            normalized_query="add",
             intent_type="feature",
         )
         assert r.has_edit_intent() is True
 
     def test_refactor_has_edit_intent(self):
         r = IntentResult(
-            original_request="refactor", normalized_query="refactor",
+            original_request="refactor",
+            normalized_query="refactor",
             intent_type="refactor",
         )
         assert r.has_edit_intent() is True
 
     def test_modify_has_edit_intent(self):
         r = IntentResult(
-            original_request="modify", normalized_query="modify",
+            original_request="modify",
+            normalized_query="modify",
             intent_type="modify",
         )
         assert r.has_edit_intent() is True
 
     def test_extend_has_edit_intent(self):
         r = IntentResult(
-            original_request="extend", normalized_query="extend",
+            original_request="extend",
+            normalized_query="extend",
             intent_type="extend",
         )
         assert r.has_edit_intent() is True
 
     def test_create_has_edit_intent(self):
         r = IntentResult(
-            original_request="create", normalized_query="create",
+            original_request="create",
+            normalized_query="create",
             intent_type="create",
         )
         assert r.has_edit_intent() is True
 
     def test_exploration_has_no_edit_intent(self):
         r = IntentResult(
-            original_request="explore", normalized_query="explore",
+            original_request="explore",
+            normalized_query="explore",
             intent_type="exploration",
         )
         assert r.has_edit_intent() is False
 
     def test_question_has_no_edit_intent(self):
         r = IntentResult(
-            original_request="ask", normalized_query="ask",
+            original_request="ask",
+            normalized_query="ask",
             intent_type="question",
         )
         assert r.has_edit_intent() is False
@@ -225,7 +244,8 @@ class TestGetSpecHints:
 
     def test_with_target_files(self):
         r = IntentResult(
-            original_request="fix a.py", normalized_query="fix a.py",
+            original_request="fix a.py",
+            normalized_query="fix a.py",
             target_files=["a.py"],
         )
         hints = r.get_spec_hints()
@@ -233,7 +253,8 @@ class TestGetSpecHints:
 
     def test_with_new_files_in_spec_hints(self):
         r = IntentResult(
-            original_request="create", normalized_query="create",
+            original_request="create",
+            normalized_query="create",
             spec_hints={"new_files": ["new.py"]},
         )
         hints = r.get_spec_hints()
@@ -253,7 +274,8 @@ class TestGetSpecHints:
 
     def test_no_files(self):
         r = IntentResult(
-            original_request="just ask", normalized_query="just ask",
+            original_request="just ask",
+            normalized_query="just ask",
         )
         assert r.get_spec_hints() == {}
 
@@ -340,10 +362,12 @@ class TestFromDict:
         assert not hasattr(restored, "unknown_field")
 
     def test_from_dict_minimal(self):
-        restored = IntentResult.from_dict({
-            "original_request": "test",
-            "normalized_query": "test",
-        })
+        restored = IntentResult.from_dict(
+            {
+                "original_request": "test",
+                "normalized_query": "test",
+            }
+        )
         assert restored.original_request == "test"
         assert restored.normalized_query == "test"
         assert restored.scope_hint == Scope.SINGLE_FILE
@@ -403,15 +427,19 @@ class TestFromDictGuardSpec:
     def test_guard_spec_dict_rehydrates_full_ir(self):
         from external_llm.agent.guard_ir import GuardIR
 
-        restored = IntentResult.from_dict(self._base({
-            "compact": "if x is None: return",
-            "condition": {
-                "op": "Is",
-                "operands": ["x", "None"],
-                "attribute_pairs": [],
-            },
-            "control": "return",
-        }))
+        restored = IntentResult.from_dict(
+            self._base(
+                {
+                    "compact": "if x is None: return",
+                    "condition": {
+                        "op": "Is",
+                        "operands": ["x", "None"],
+                        "attribute_pairs": [],
+                    },
+                    "control": "return",
+                }
+            )
+        )
         assert isinstance(restored.guard_spec, GuardIR)
         assert restored.guard_spec.compact == "if x is None: return"
         assert restored.guard_spec.control == "return"
@@ -422,10 +450,14 @@ class TestFromDictGuardSpec:
     def test_guard_spec_without_condition(self):
         from external_llm.agent.guard_ir import GuardIR
 
-        restored = IntentResult.from_dict(self._base({
-            "compact": "if y: break",
-            "control": "break",
-        }))
+        restored = IntentResult.from_dict(
+            self._base(
+                {
+                    "compact": "if y: break",
+                    "control": "break",
+                }
+            )
+        )
         assert isinstance(restored.guard_spec, GuardIR)
         assert restored.guard_spec.condition is None
 
@@ -437,11 +469,13 @@ class TestFromDictGuardSpec:
         r = IntentResult(
             original_request="g",
             normalized_query="g",
-            guard_spec=IntentResult._guard_spec_from_dict({
-                "compact": "if x: return",
-                "condition": {"op": "Name", "operands": ["x"], "attribute_pairs": []},
-                "control": "return",
-            }),
+            guard_spec=IntentResult._guard_spec_from_dict(
+                {
+                    "compact": "if x: return",
+                    "condition": {"op": "Name", "operands": ["x"], "attribute_pairs": []},
+                    "control": "return",
+                }
+            ),
         )
         d = r.to_dict()
         restored = IntentResult.from_dict(d)

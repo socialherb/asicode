@@ -23,6 +23,7 @@ Stdlib only. This module sits at the bottom of the agent import graph
 (everything may import it; it imports nothing local), which is what makes
 it a safe shared home — sealed by the stdlib-only AST gate in the tests.
 """
+
 from __future__ import annotations
 
 import math
@@ -41,9 +42,7 @@ def bm25_idf(n_docs: int, df: int) -> float:
     return math.log((n_docs - df + 0.5) / (df + 0.5) + 1.0)
 
 
-def bm25_idf_map(
-    query_tokens: Iterable[str], df: Mapping[str, int], n_docs: int
-) -> dict[str, float]:
+def bm25_idf_map(query_tokens: Iterable[str], df: Mapping[str, int], n_docs: int) -> dict[str, float]:
     """Per-token IDF over the query tokens (dict form).
 
     IDF depends only on the term and corpus stats (df, n_docs) — never on
@@ -53,9 +52,7 @@ def bm25_idf_map(
     return {qt: bm25_idf(n_docs, df.get(qt, 0)) for qt in query_tokens}
 
 
-def bm25_idf_pairs(
-    query_tokens: Sequence[str], df: Mapping[str, int], n_docs: int
-) -> list[tuple[str, float]]:
+def bm25_idf_pairs(query_tokens: Sequence[str], df: Mapping[str, int], n_docs: int) -> list[tuple[str, float]]:
     """``(token, idf)`` pairs preserving query-token MULTIPLICITY.
 
     ``CodeTokenizer.tokenize`` does not deduplicate and the reference
@@ -118,9 +115,7 @@ def bm25_score(
     )
 
 
-def bm25_rank(
-    query_tokens: Sequence[str], tokenized_docs: Sequence[Sequence[str]]
-) -> list[float]:
+def bm25_rank(query_tokens: Sequence[str], tokenized_docs: Sequence[Sequence[str]]) -> list[float]:
     """Score a small in-memory corpus; one score per doc, input order.
 
     Owns the setup that ``symbol_search`` and ``read_tools`` each carried a
@@ -138,7 +133,4 @@ def bm25_rank(
     for qt in query_tokens:
         df[qt] = sum(1 for tc in doc_tc if qt in tc)
     q_pairs = bm25_idf_pairs(query_tokens, df, n_docs)
-    return [
-        bm25_score_pairs(q_pairs, doc_tc[i], doc_lens[i], avgdl)
-        for i in range(n_docs)
-    ]
+    return [bm25_score_pairs(q_pairs, doc_tc[i], doc_lens[i], avgdl) for i in range(n_docs)]

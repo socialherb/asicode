@@ -9,6 +9,7 @@ read whole README/requirements files to extract one paragraph / first 10 deps.
 Fixes: 1 MiB stat gate on the target embed (same budget as context_builder
 heads) + 64 KiB bounded heads for README/requirements.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -35,12 +36,8 @@ def test_enhanced_file_context_gates_oversized_target(tmp_path, monkeypatch):
 
 def test_project_metadata_reads_only_heads(tmp_path, monkeypatch):
     builder = SuperContextBuilder(str(tmp_path))
-    (tmp_path / "README.md").write_text(
-        "Hello world.\n\n" + ("rest of readme " * 200_000), encoding="utf-8"
-    )
-    (tmp_path / "requirements.txt").write_text(
-        "requests==2.31.0\n" + ("junk_dep==0.1\n" * 100_000), encoding="utf-8"
-    )
+    (tmp_path / "README.md").write_text("Hello world.\n\n" + ("rest of readme " * 200_000), encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("requests==2.31.0\n" + ("junk_dep==0.1\n" * 100_000), encoding="utf-8")
     monkeypatch.setattr(Path, "read_text", _boom)
 
     out = builder._build_project_metadata()

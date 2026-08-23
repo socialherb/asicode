@@ -17,6 +17,7 @@ rechecked. These tests pin the fix that detects unbalanced delimiters via the
 shared _count_delimiters helper (parity with providers.py DeepSeek and
 openai_client.py) and rewrites finish_reason to "truncated".
 """
+
 from __future__ import annotations
 
 import pytest
@@ -57,8 +58,7 @@ def _make_streaming_client(monkeypatch, events):
     return client
 
 
-_TOOLS = [{"name": "read_file", "description": "Read a file",
-           "parameters": {"type": "object", "properties": {}}}]
+_TOOLS = [{"name": "read_file", "description": "Read a file", "parameters": {"type": "object", "properties": {}}}]
 
 
 # ── B1: stop_reason normalization ───────────────────────────────────────────
@@ -79,14 +79,12 @@ def test_chat_with_tools_normalizes_max_tokens_finish_reason(monkeypatch):
     """Non-streaming chat_with_tools: stop_reason='max_tokens' → finish_reason='length'."""
     client = AnthropicClient(api_key="test")
     data = {
-        "content": [{"type": "tool_use", "id": "tu_1", "name": "read_file",
-                     "input": {"path": "x"}}],
+        "content": [{"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "x"}}],
         "stop_reason": "max_tokens",
         "usage": {"input_tokens": 5, "output_tokens": 3},
     }
     monkeypatch.setattr(client._session, "post", lambda *a, **k: _FakeJsonResponse(data))
-    resp = client.chat_with_tools([LLMMessage(role="user", content="hi")], _TOOLS,
-                                  model="claude-sonnet-4-20250514")
+    resp = client.chat_with_tools([LLMMessage(role="user", content="hi")], _TOOLS, model="claude-sonnet-4-20250514")
     assert resp.finish_reason == "length"
     assert resp.tool_calls  # partial tool call still surfaced; agent_loop clears it on 'length'
 
@@ -109,16 +107,12 @@ def test_chat_with_tools_streaming_normalizes_max_tokens(monkeypatch):
     events = [
         {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": "partial"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial"}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"},
-         "usage": {"output_tokens": 3}},
+        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 3}},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "length"
 
 
@@ -129,11 +123,9 @@ def test_chat_streaming_detects_truncated_curly_json(monkeypatch):
     """stop_reason='end_turn' with unbalanced ``{`` text → rewritten to 'truncated'."""
     events = [
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": '{"key": "v", "nested":'}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": '{"key": "v", "nested":'}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
     resp = client._chat_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
@@ -144,11 +136,9 @@ def test_chat_streaming_detects_truncated_square_json(monkeypatch):
     """stop_reason='end_turn' with unbalanced ``[`` text → rewritten to 'truncated'."""
     events = [
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": '[1, 2, 3, "four"'}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": '[1, 2, 3, "four"'}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
     resp = client._chat_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
@@ -159,11 +149,13 @@ def test_chat_streaming_keeps_balanced_json_end_turn(monkeypatch):
     """Balanced JSON-shaped text with stop_reason='end_turn' stays 'end_turn'."""
     events = [
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": '{"key": "v", "nested": {"a": 1}}'}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": '{"key": "v", "nested": {"a": 1}}'},
+        },
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
     resp = client._chat_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
@@ -174,11 +166,9 @@ def test_chat_streaming_plain_text_untouched(monkeypatch):
     """Non-JSON text (no leading {/[) is never flagged as truncated."""
     events = [
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": "just some prose {"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "just some prose {"}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
     resp = client._chat_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
@@ -192,19 +182,22 @@ def test_tool_streaming_drops_truncated_input_json(monkeypatch, caplog):
     """Unbalanced tool input_json (final delta dropped) → call dropped + 'truncated'."""
     events = [
         {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
-        {"type": "content_block_start", "index": 0,
-         "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": '{"path": "x"'}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path": "x"'},
+        },
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
     with caplog.at_level("WARNING", logger="external_llm.anthropic_client"):
-        resp = client._chat_with_tools_streaming(
-            "http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None
-        )
+        resp = client._chat_with_tools_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "truncated"
     assert resp.tool_calls == []  # partial args never executed
     assert "appear truncated" in caplog.text
@@ -213,18 +206,21 @@ def test_tool_streaming_drops_truncated_input_json(monkeypatch, caplog):
 def test_tool_streaming_keeps_balanced_unparseable_json_legacy(monkeypatch):
     """Balanced-but-unparseable input_json keeps legacy behavior: args={} + end_turn."""
     events = [
-        {"type": "content_block_start", "index": 0,
-         "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": '{"path": "x", }'}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path": "x", }'},
+        },
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "end_turn"
     assert len(resp.tool_calls) == 1
     assert resp.tool_calls[0].args == {}
@@ -233,18 +229,21 @@ def test_tool_streaming_keeps_balanced_unparseable_json_legacy(monkeypatch):
 def test_tool_streaming_keeps_valid_input_json(monkeypatch):
     """Well-formed tool input_json is appended normally; end_turn preserved."""
     events = [
-        {"type": "content_block_start", "index": 0,
-         "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": '{"path": "x"}'}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path": "x"}'},
+        },
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "end_turn"
     assert len(resp.tool_calls) == 1
     assert resp.tool_calls[0].args == {"path": "x"}
@@ -290,11 +289,9 @@ def test_chat_streaming_normalizes_max_tokens_message_delta(monkeypatch):
     """
     events = [
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": "partial answer"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "partial answer"}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"},
-         "usage": {"output_tokens": 3}},
+        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 3}},
     ]
     client = _make_streaming_client(monkeypatch, events)
     resp = client._chat_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
@@ -312,16 +309,12 @@ def test_tool_streaming_detects_truncated_text_content(monkeypatch):
     events = [
         {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "text_delta", "text": '{"results": [{"id": 1,'}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": '{"results": [{"id": 1,'}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "truncated"
 
 
@@ -337,18 +330,21 @@ def test_truncated_tool_json_does_not_override_length(monkeypatch):
     """
     events = [
         {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
-        {"type": "content_block_start", "index": 0,
-         "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"}},
-        {"type": "content_block_delta", "index": 0,
-         "delta": {"type": "input_json_delta", "partial_json": '{"path": "x"'}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu_1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path": "x"'},
+        },
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"},
-         "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 5}},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/messages", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "length"
     assert resp.tool_calls == []  # partial args withheld regardless of precedence
 
@@ -363,4 +359,5 @@ if __name__ == "__main__":
     import sys
 
     import pytest
+
     sys.exit(pytest.main([__file__, "-v"]))

@@ -31,8 +31,6 @@ require corroborating (e.g. cross-file) evidence before acting on them.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from external_llm.agent.config.thresholds import config as _cfg
 
 from ._dead_block_shared import (
@@ -61,8 +59,8 @@ def scan_dead_blocks(
     repo_root: str,
     file_paths: list[str],
     max_per_file: int = _cfg.counts.SCANNER_DEAD_BLOCK_MAX,
-    cluster_gap_tolerance: Optional[int] = None,
-    cross_file_referenced_names: Optional[set] = None,
+    cluster_gap_tolerance: int | None = None,
+    cross_file_referenced_names: set | None = None,
 ) -> list[DeadBlockCandidate]:
     """Scan files for clusters of unused module-level private symbols.
 
@@ -94,5 +92,5 @@ def scan_dead_blocks(
     if truncated:
         # Function attribute consumed by ScannerRegistry.run() (which resets
         # it via `del` before each invocation).
-        scan_dead_blocks._truncated = truncated
+        scan_dead_blocks._truncated = truncated  # type: ignore[attr-defined]  # dynamic attr consumed by ScannerRegistry.run()
     return candidates

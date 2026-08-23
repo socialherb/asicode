@@ -7,6 +7,7 @@ tests pin the NEW fail-fast contract (internal errors propagate instead of
 silently degrading) and the preserved graceful-degradation contracts
 (parse failures, out-of-range anchors, unavailable tree-sitter).
 """
+
 import json
 
 import pytest
@@ -19,6 +20,7 @@ from external_llm.common.indent_utils import (
 )
 
 # ── tree-sitter direct import (was: try/except Exception stub block) ────────
+
 
 def test_ts_names_are_direct_imports():
     """tree_sitter_utils imports only stdlib and guards the native library
@@ -33,6 +35,7 @@ def test_ts_names_are_direct_imports():
 
 
 # ── _reindent_to_match (was: except Exception -> return input unchanged) ────
+
 
 def test_reindent_to_match_identity_with_canonical():
     """Pure delegate: results are byte-identical to indent_utils.reindent_to_match."""
@@ -60,15 +63,14 @@ def test_reindent_to_match_fail_fast_on_internal_error(monkeypatch):
 
 # ── _detect_file_unit (was: suppress(Exception) around tokenizer path) ──────
 
+
 def test_detect_file_unit_identity_with_canonical_helpers():
     """Garbled content still degrades gracefully — the tokenizer path guards
     TokenError/IndentationError/SyntaxError internally, so the outer
     suppress(Exception) was redundant."""
     samples = ["x = 1\n", "x = '\n", "   \n\t\n", "def f(:\n    pass\n"]
     for src in samples:
-        expected = _file_indent_unit_from_logical(
-            src, detect_indent_char(src.split("\n"))
-        ) or None
+        expected = _file_indent_unit_from_logical(src, detect_indent_char(src.split("\n"))) or None
         assert core._detect_file_unit(src) == expected
 
 
@@ -85,6 +87,7 @@ def test_detect_file_unit_fail_fast_on_internal_error(monkeypatch):
 
 
 # ── _detect_fragment_duplication (was: suppress(Exception) around all) ──────
+
 
 def test_detect_fragment_duplication_none_for_fresh_snippet():
     """Non-duplicating snippet -> None (the pre-guard must never block)."""
@@ -103,6 +106,7 @@ def test_detect_fragment_duplication_detects_overlap():
 
 
 # ── _detect_enclosing_scope (was: suppress(Exception) around all) ───────────
+
 
 def test_detect_enclosing_scope_out_of_range_anchor_returns_defaults():
     """Out-of-range anchor degrades to the default dict (bounds check hoisted)."""
@@ -124,6 +128,7 @@ def test_detect_enclosing_scope_finds_innermost_and_top_level():
 
 # ── _check_block_introducer_nesting (was: except Exception -> return None) ───
 
+
 def test_block_introducer_nesting_parse_failure_returns_none():
     """Unparseable content is a DOCUMENTED None path (SyntaxError caught at
     parse time) — separate from the removed walk-failure wrapper."""
@@ -143,6 +148,7 @@ def test_block_introducer_nesting_clean_insert_returns_none():
 
 
 # ── _find_block_end_line: forced-fallback flag contract ─────────────────────
+
 
 def test_find_block_end_line_ts_forced_off_uses_indent_fallback(monkeypatch):
     """_HAS_TS stays a patchable module flag so the non-TS strategies remain
@@ -174,6 +180,7 @@ _BRACE_KNR_CONTENTS = {
     "typescript": "function f() {\n    let x = 1;\n}\nlet y = 1;\n",
 }
 
+
 @pytest.mark.parametrize("lang", sorted(_BRACE_KNR_CONTENTS))
 def test_find_block_end_line_kandr_matrix(lang, monkeypatch):
     """K&R ``header {`` — both strategies must agree on the block end (2)."""
@@ -192,6 +199,7 @@ _GO_ALLMAN_QUIRK_EXPECTED_NONE = (
     "gofmt enforces K&R braces, so Allman Go is non-idiomatic — pinned as "
     "the documented limitation."
 )
+
 
 @pytest.mark.parametrize("lang", sorted(_BRACE_KNR_CONTENTS))
 def test_find_block_end_line_allman_matrix(lang, monkeypatch):
@@ -221,26 +229,15 @@ def test_find_block_end_line_python_basic_both_modes(monkeypatch):
     ("label", "content", "lang", "ts_on", "ts_off"),
     [
         # (label, content, lang, expected with TS, expected without)
-        ("py header + trailing comment",
-         "def f():  # noqa: D103\n    pass\nx = 1\n", "python", 1, None),
-        ("py multi-line signature",
-         "def f(\n    a,\n) -> int:\n    pass\nx = 1\n", "python", 3, None),
-        ("py decorator anchor",
-         "@dec\ndef f():\n    pass\nx = 1\n", "python", 2, None),
-        ("c multi-line signature",
-         "void f(\n    int x) {\n    int y;\n}\nint z;\n", "c", 3, None),
-        ("kotlin string brace",
-         'fun a(): String {\n    val s = "}"\n    return s\n}\nval t = 1\n',
-         "kotlin", 3, 3),
-        ("kotlin comment brace",
-         "fun a(): String {  // }\n    val x = 1\n}\nval t = 1\n",
-         "kotlin", 2, 2),
-        ("c closing-brace else opener",
-         "} else {\n    int x;\n}\nint y;\n", "c", 2, 2),
-        ("c single-line closed block",
-         "if (x) { f(); }\nint y;\n", "c", None, None),
-        ("c plain line (no brace)",
-         "int y;\nvoid g() {\n}\n", "c", None, None),
+        ("py header + trailing comment", "def f():  # noqa: D103\n    pass\nx = 1\n", "python", 1, None),
+        ("py multi-line signature", "def f(\n    a,\n) -> int:\n    pass\nx = 1\n", "python", 3, None),
+        ("py decorator anchor", "@dec\ndef f():\n    pass\nx = 1\n", "python", 2, None),
+        ("c multi-line signature", "void f(\n    int x) {\n    int y;\n}\nint z;\n", "c", 3, None),
+        ("kotlin string brace", 'fun a(): String {\n    val s = "}"\n    return s\n}\nval t = 1\n', "kotlin", 3, 3),
+        ("kotlin comment brace", "fun a(): String {  // }\n    val x = 1\n}\nval t = 1\n", "kotlin", 2, 2),
+        ("c closing-brace else opener", "} else {\n    int x;\n}\nint y;\n", "c", 2, 2),
+        ("c single-line closed block", "if (x) { f(); }\nint y;\n", "c", None, None),
+        ("c plain line (no brace)", "int y;\nvoid g() {\n}\n", "c", None, None),
     ],
 )
 def test_find_block_end_line_special_shapes(label, content, lang, ts_on, ts_off, monkeypatch):
@@ -263,7 +260,8 @@ def test_find_block_end_line_brace_fallback_delegates_to_base_ssot(monkeypatch):
     calls: list[int] = []
     real = core.find_brace_block_end
     monkeypatch.setattr(
-        core, "find_brace_block_end",
+        core,
+        "find_brace_block_end",
         lambda c, o: (calls.append(o), real(c, o))[1],
     )
     content = 'fun a(): String {\n    val s = "}"\n    return s\n}\nval t = 1\n'
@@ -274,6 +272,7 @@ def test_find_block_end_line_brace_fallback_delegates_to_base_ssot(monkeypatch):
 
 
 # ── RED→GREEN gap coverage: edge branches not hit by the above ──────────────
+
 
 def test_find_block_end_line_out_of_range_and_blank_anchor():
     """Out-of-range and blank anchors degrade to None (bounds/blank guards)."""
@@ -357,7 +356,7 @@ class TestRepairPlanJsonGaps:
     CRs inside values, escape sequences, and single-quoted values."""
 
     def test_markdown_fence_extraction(self):
-        text = "```json\n{\"a\": 1, \"b\": [1, 2]}\n```"
+        text = '```json\n{"a": 1, "b": [1, 2]}\n```'
         out = core._repair_plan_json(text)
         assert json.loads(out) == {"a": 1, "b": [1, 2]}
 
@@ -388,6 +387,7 @@ class TestRepairPlanJsonGaps:
 
 
 # ── RED→GREEN gap coverage: final edge branches (round 32-7) ────────────────
+
 
 def test_find_block_end_line_unknown_language_returns_none():
     """A language outside the python/brace families degrades to None

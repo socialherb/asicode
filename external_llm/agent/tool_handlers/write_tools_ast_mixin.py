@@ -4,6 +4,7 @@
 ``write_tools.py``; recombined there via ``class WriteToolsMixin(...,
 WriteToolsAstMixin)``.
 """
+
 from __future__ import annotations
 
 import os
@@ -21,7 +22,22 @@ if TYPE_CHECKING:
 class WriteToolsAstMixin:
     """AST edit handler: edit_ast."""
 
-    def _tool_edit_ast(self, args: dict[str, Any]) -> "ToolResult":
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry.__init__ owns the real values, so these are pure
+    # typing scaffolding (no setattr, no __getattr__). Mirrors the docstring
+    # contracts in the sibling mixins (WriteToolsPatchMixin /
+    # WriteToolsEditMixin); keep all three in sync.
+    repo_root: str
+    _make_result: Any
+    _secure_path: Any
+    _suggest_missing_paths: Any
+    _refuse_foreign_leased: Any
+    _ast_fail_hint: Any
+    _record_text_edit: Any
+    _recover_args_from_raw: Any
+
+    def _tool_edit_ast(self, args: dict[str, Any]) -> ToolResult:
         """Apply typed AST operations to a Python file. Deterministic — no LLM call.
 
         Each op has a 'type' and type-specific parameters.
@@ -42,21 +58,12 @@ class WriteToolsAstMixin:
             _raw = args.get("__raw_arguments", "")
             if isinstance(_raw, str) and len(_raw) > 10:
                 _raw_hint = f" (raw args: {_raw[:120]})"
-            return self._make_result(
-                ok=False, content="",
-                error=f"'file_path' is required{_raw_hint}"
-            )
+            return self._make_result(ok=False, content="", error=f"'file_path' is required{_raw_hint}")
         if not ops_raw:
-            return self._make_result(
-                ok=False, content="",
-                error="'ops' is required"
-            )
+            return self._make_result(ok=False, content="", error="'ops' is required")
 
         if not isinstance(ops_raw, list) or not ops_raw:
-            return self._make_result(
-                ok=False, content="",
-                error="'ops' must be a non-empty list of operation dicts"
-            )
+            return self._make_result(ok=False, content="", error="'ops' must be a non-empty list of operation dicts")
 
         # Resolve file path
         sec = self._secure_path(file_path, confine=True)
@@ -64,7 +71,9 @@ class WriteToolsAstMixin:
             return self._make_result(ok=False, content="", error=f"Path blocked (outside repo): {file_path}")
         abs_path = str(sec)
         if not os.path.isfile(abs_path):
-            return self._make_result(ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}")
+            return self._make_result(
+                ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}"
+            )
 
         # Normalize to relative for output
         rel_path = os.path.relpath(abs_path, self.repo_root)
@@ -83,30 +92,24 @@ class WriteToolsAstMixin:
         try:
             source, _read_encoding = read_text_with_encoding_fallback(abs_path)
         except OSError:
-            return self._make_result(
-                ok=False, content="", error=f"Failed to read {file_path}: OSError"
-            )
+            return self._make_result(ok=False, content="", error=f"Failed to read {file_path}: OSError")
         if source is None:
-            return self._make_result(
-                ok=False, content="", error=f"Failed to read {file_path}: unsupported encoding"
-            )
+            return self._make_result(ok=False, content="", error=f"Failed to read {file_path}: unsupported encoding")
+        assert _read_encoding is not None  # read_text_with_encoding_fallback returns (None, None) together
 
         # Check language — Python only
         if LanguageId.from_path(file_path) is not LanguageId.PYTHON:
             return self._make_result(
-                ok=False, content="",
-                error=f"AST edit is only supported for Python files (not {file_path})"
+                ok=False, content="", error=f"AST edit is only supported for Python files (not {file_path})"
             )
 
         try:
             # Parse AST and validate syntax before applying
             import ast as _ast
+
             _ast.parse(source, filename=file_path)
         except SyntaxError as e:
-            return self._make_result(
-                ok=False, content="",
-                error=f"Syntax error in {file_path}: {e}"
-            )
+            return self._make_result(ok=False, content="", error=f"Syntax error in {file_path}: {e}")
 
         # Apply AST operations
         from .ast_op_executor import ASTOpExecutor
@@ -115,18 +118,28 @@ class WriteToolsAstMixin:
         symbol = str(args.get("symbol", "")).strip()
 
         # Normalize LLM-friendly field names to ASTOpExecutor's internal parameter names
-        _FIELD_ALIASES: dict[str, dict[str, str]] = {
+        _field_aliases: dict[str, dict[str, str]] = {
             "add_import": {"import_name": "import", "import_stmt": "import"},
-            "replace_expr": {"target": "old", "old_expr": "old", "old_text": "old", "new_expr": "new", "new_text": "new"},
+            "replace_expr": {
+                "target": "old",
+                "old_expr": "old",
+                "old_text": "old",
+                "new_expr": "new",
+                "new_text": "new",
+            },
             "add_guard": {"guard": "statement", "condition": "statement", "guard_stmt": "statement"},
             "delete_stmt": {"text_pattern": "pattern", "pattern_text": "pattern", "match": "pattern"},
             # NB: never alias the reserved op-discriminator key "type" here — it
             # would steal the op's own 'type' field. Use "annotation" for field_type.
             "add_class_field": {
-                "class": "class_name", "cls": "class_name",
-                "field": "field_name", "name": "field_name", "attr": "field_name",
+                "class": "class_name",
+                "cls": "class_name",
+                "field": "field_name",
+                "name": "field_name",
+                "attr": "field_name",
                 "annotation": "field_type",
-                "default": "field_default", "value": "field_default",
+                "default": "field_default",
+                "value": "field_default",
             },
             "remove_import_name": {"import_name": "name", "symbol": "name"},
             "list_append": {"list": "list_name", "target": "list_name"},
@@ -142,7 +155,7 @@ class WriteToolsAstMixin:
                     type_ = normalized.pop("op", None) or normalized.pop("action", "") or ""
                 normalized["type"] = type_
                 # Apply field name aliases for this op type
-                aliases = _FIELD_ALIASES.get(type_, {})
+                aliases = _field_aliases.get(type_, {})
                 for alias, canonical in aliases.items():
                     if alias in normalized and canonical not in normalized:
                         normalized[canonical] = normalized.pop(alias)
@@ -153,12 +166,11 @@ class WriteToolsAstMixin:
         if not result.success:
             failed_str = "; ".join(result.ops_failed) if result.ops_failed else "unknown"
             _hint = self._ast_fail_hint(source, ops_normalized, symbol)
-            error_msg = (
-                f"AST edit failed in {file_path}@{symbol or '(module)'}: "
-                f"{failed_str}{_hint}"
-            )
+            error_msg = f"AST edit failed in {file_path}@{symbol or '(module)'}: {failed_str}{_hint}"
             return self._make_result(
-                ok=False, content="", error=error_msg,
+                ok=False,
+                content="",
+                error=error_msg,
                 metadata={"near_match": bool(_hint)},
             )
 
@@ -170,7 +182,7 @@ class WriteToolsAstMixin:
                     "file_path": file_path,
                     "ops_applied": result.ops_applied,
                     "changed": False,
-                }
+                },
             )
 
         new_source = result.new_source
@@ -180,18 +192,20 @@ class WriteToolsAstMixin:
             compile_quiet(new_source, file_path, "exec")
         except SyntaxError as e:
             return self._make_result(
-                ok=False, content="",
-                error=f"AST edit produced invalid syntax in {file_path}: {e}"
+                ok=False, content="", error=f"AST edit produced invalid syntax in {file_path}: {e}"
             )
 
         # Generate diff for preview
         import difflib
-        diff_lines = list(difflib.unified_diff(
-            source.splitlines(keepends=True),
-            new_source.splitlines(keepends=True),
-            fromfile=f"a/{file_path}",
-            tofile=f"b/{file_path}",
-        ))
+
+        diff_lines = list(
+            difflib.unified_diff(
+                source.splitlines(keepends=True),
+                new_source.splitlines(keepends=True),
+                fromfile=f"a/{file_path}",
+                tofile=f"b/{file_path}",
+            )
+        )
         diff_text = "".join(diff_lines)
 
         if dry_run:
@@ -210,7 +224,7 @@ class WriteToolsAstMixin:
                     "diff_preview": diff_text[:25000],
                     "changed": True,
                     "dry_run": True,
-                }
+                },
             )
 
         # Write the file — same encoding it was read with (see read fallback
@@ -223,10 +237,7 @@ class WriteToolsAstMixin:
             _encoded_source = new_source.encode(_read_encoding)
             atomic_write_bytes(abs_path, _encoded_source)
         except (OSError, UnicodeEncodeError) as e:
-            return self._make_result(
-                ok=False, content="",
-                error=f"Failed to write {file_path}: {e}"
-            )
+            return self._make_result(ok=False, content="", error=f"Failed to write {file_path}: {e}")
 
         self._record_text_edit(file_path)
         return self._make_result(
@@ -245,5 +256,5 @@ class WriteToolsAstMixin:
                 "diff_preview": diff_text[:25000],
                 "changed": True,
                 "symbol": symbol,
-            }
+            },
         )

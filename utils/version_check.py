@@ -32,7 +32,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 __all__ = [
     "PACKAGE_NAME",
@@ -278,7 +278,7 @@ def is_newer(latest: str, current: str) -> bool:
 
 
 # ─── network fetch (pluggable for tests) ─────────────────────────────────────
-def _default_fetch(url: str, timeout: float) -> Optional[str]:
+def _default_fetch(url: str, timeout: float) -> str | None:
     """Query the PyPI JSON API and return the latest version string, or None.
 
     Uses the project's existing ``httpx`` dependency (sync client). Any error —
@@ -300,10 +300,7 @@ def _default_fetch(url: str, timeout: float) -> Optional[str]:
 
 # ─── notice formatting ───────────────────────────────────────────────────────
 def _format_notice(latest: str, current: str) -> str:
-    return (
-        f"[{PACKAGE_NAME}] update available: {latest} (current: {current})"
-        f" · pip install --upgrade {PACKAGE_NAME}"
-    )
+    return f"[{PACKAGE_NAME}] update available: {latest} (current: {current}) · pip install --upgrade {PACKAGE_NAME}"
 
 
 # ─── handle & entry point ────────────────────────────────────────────────────
@@ -319,16 +316,16 @@ class UpdateCheckHandle:
     __slots__ = ("_current", "_notice", "_thread")
 
     def __init__(self, current: str) -> None:
-        self._thread: Optional[threading.Thread] = None
-        self._notice: Optional[str] = None
+        self._thread: threading.Thread | None = None
+        self._notice: str | None = None
         self._current: str = current
 
     @property
-    def notice(self) -> Optional[str]:
+    def notice(self) -> str | None:
         """Notice string if a newer version is already known (cached); else None."""
         return self._notice
 
-    def collect(self, wait_s: float = 0.0) -> Optional[str]:
+    def collect(self, wait_s: float = 0.0) -> str | None:
         """Optionally wait for the background fetch, then return the notice.
 
         ``wait_s=0`` is fully non-blocking: it returns the cached notice
@@ -350,7 +347,7 @@ class UpdateCheckHandle:
         return self._notice
 
 
-def _bg_fetch(current: str, fetcher: Callable[[str, float], Optional[str]]) -> None:
+def _bg_fetch(current: str, fetcher: Callable[[str, float], str | None]) -> None:
     """Daemon-thread body: attempt a fetch, then refresh the cache.
 
     Always records ``last_check_ts`` (the *attempt* time) so the interval gate
@@ -388,9 +385,9 @@ def _bg_fetch(current: str, fetcher: Callable[[str, float], Optional[str]]) -> N
 def start_update_check(
     *,
     interval_hours: float = _DEFAULT_INTERVAL_HOURS,
-    current_version: Optional[str] = None,
-    fetcher: Optional[Callable[[str, float], Optional[str]]] = None,
-    now_ts: Optional[float] = None,
+    current_version: str | None = None,
+    fetcher: Callable[[str, float], str | None] | None = None,
+    now_ts: float | None = None,
 ) -> UpdateCheckHandle:
     """Start a (possibly skipped) background update check; return a handle.
 

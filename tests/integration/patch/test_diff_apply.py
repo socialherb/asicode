@@ -1,6 +1,7 @@
 """
 Integration tests for diff application system.
 """
+
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from tests.integration.helpers import git_add_and_commit
 # Helper to call apply_patch with the correct signature and wrap result
 def _apply(patch_text, repo_root, file_path_hint=None):
     from diff_apply import apply_patch
+
     ok, msg, reason, meta = apply_patch(repo_root, patch_text, file_path_hint)
     return {"success": ok, "message": msg, "reason": reason, "meta": meta}
 
@@ -211,6 +213,7 @@ class TestDiffApply:
         """Test synthesizing a patch from file changes."""
         try:
             from diff_apply import synthesize_patch
+
             synthesize_available = True
         except ImportError:
             synthesize_available = False

@@ -21,6 +21,7 @@ line keeps the literal 2-space indent and stays aligned at col 6.
 These are source-contract tests (text parse) — they verify the wiring exists
 without importing asi (which has heavy import-time side effects).
 """
+
 import re
 import textwrap
 
@@ -42,7 +43,9 @@ def _get_compact_insights_source() -> str:
             start = i
             break
     if start is None:
-        pytest.fail("_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression")
+        pytest.fail(
+            "_compact_insights_interactive not found in repl_impl.py — update this test or restore the symbol; silent skip would mask the regression"
+        )
     body = [lines[start]]
     for j in range(start + 1, len(lines)):
         ln = lines[j]
@@ -95,14 +98,12 @@ class TestCompactMessageAlignment:
         for cols in (60, 80, 100, 120):
             console_w = max(40, cols - margin * 2)
             filled = textwrap.fill(
-                msg, width=console_w,
-                initial_indent="  ", subsequent_indent="  ",
+                msg,
+                width=console_w,
+                initial_indent="  ",
+                subsequent_indent="  ",
             )
-            text_cols = {
-                len(" " * margin + ln) - len((" " * margin + ln).lstrip(" "))
-                for ln in filled.split("\n")
-            }
+            text_cols = {len(" " * margin + ln) - len((" " * margin + ln).lstrip(" ")) for ln in filled.split("\n")}
             assert text_cols == {6}, (
-                f"cols={cols}: wrapped lines start at columns {text_cols}, "
-                "expected all at col 6 (margin 4 + literal 2)"
+                f"cols={cols}: wrapped lines start at columns {text_cols}, expected all at col 6 (margin 4 + literal 2)"
             )

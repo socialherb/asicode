@@ -3,6 +3,7 @@
 Focuses on symbol detection and API contracts that don't require
 external toolchains (go, tsc, kotlinc, javac).
 """
+
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -24,6 +25,7 @@ from external_llm.languages.tree_sitter_utils import SyntaxErrorNode
 from external_llm.languages.typescript_provider import TypeScriptSyntaxProvider
 
 # ── GoSyntaxProvider ──────────────────────────────────────────────────────────
+
 
 class TestGoProvider:
     @pytest.fixture
@@ -85,9 +87,9 @@ class TestGoProvider:
     def test_find_top_level_definitions(self, provider):
         content = (
             "package main\n\n"
-            "func hello() string {\n    return \"hi\"\n}\n\n"
+            'func hello() string {\n    return "hi"\n}\n\n'
             "type User struct {\n    Name string\n}\n\n"
-            "func (u *User) Greet() string {\n    return \"hi\"\n}\n"
+            'func (u *User) Greet() string {\n    return "hi"\n}\n'
         )
         results = provider._find_top_level_definitions_regex(content)
         names = {r[0] for r in results}
@@ -99,8 +101,8 @@ class TestGoProvider:
         content = (
             "package main\n\n"
             "type User struct {\n    Name string\n}\n\n"
-            "func (u *User) Greet() string {\n    return \"hi\"\n}\n"
-            "func (u *User) Bye() string {\n    return \"bye\"\n}\n"
+            'func (u *User) Greet() string {\n    return "hi"\n}\n'
+            'func (u *User) Bye() string {\n    return "bye"\n}\n'
         )
         methods = provider._find_all_class_methods_regex(content)["User"]
         names = {m[0] for m in methods}
@@ -108,10 +110,7 @@ class TestGoProvider:
         assert "Bye" in names, f"Bye missing: {names}"
 
     def test_find_symbol_body_range(self, provider):
-        content = (
-            "package main\n\n"
-            "func hello() string {\n    return \"hi\"\n}\n"
-        )
+        content = 'package main\n\nfunc hello() string {\n    return "hi"\n}\n'
         body = provider._find_symbol_body_range_regex(content, "hello")
         assert body is not None, "body should not be None"
         assert body[0] >= 1, f"body start valid: {body}"
@@ -126,6 +125,7 @@ class TestGoProvider:
 
 
 # ── TypeScriptSyntaxProvider ──────────────────────────────────────────────────
+
 
 class TestTypeScriptProvider:
     @pytest.fixture
@@ -171,8 +171,7 @@ class TestTypeScriptProvider:
         from unittest.mock import patch
 
         # get_symbol_patterns path (used by _find_symbol_regex / ripgrep outline)
-        pats = [p for p in provider.get_symbol_patterns("function")
-                if "const" not in p.regex and "let" not in p.regex]
+        pats = [p for p in provider.get_symbol_patterns("function") if "const" not in p.regex and "let" not in p.regex]
         for p in pats:
             rx = _re.compile(p.regex.format(name="genSeq"))
             assert rx.search("function* genSeq() {") is not None, p.regex
@@ -182,8 +181,7 @@ class TestTypeScriptProvider:
 
         # Hardcoded top-level-definitions regex
         out = provider._find_top_level_definitions_regex(
-            "export function* genSeq() {\n  yield 1;\n}\n\n"
-            "async function* stream(): AsyncGenerator<string> {\n}\n"
+            "export function* genSeq() {\n  yield 1;\n}\n\nasync function* stream(): AsyncGenerator<string> {\n}\n"
         )
         names = [r[0] for r in out]
         assert "genSeq" in names, names
@@ -215,10 +213,9 @@ class TestTypeScriptProvider:
 
     def test_test_command_vitest_detected(self, provider, tmp_path):
         import json
+
         pkg = tmp_path / "package.json"
-        pkg.write_text(json.dumps({
-            "devDependencies": {"vitest": "^1.0.0"}
-        }))
+        pkg.write_text(json.dumps({"devDependencies": {"vitest": "^1.0.0"}}))
         cmd = provider.get_test_command(str(tmp_path))
         assert "vitest" in " ".join(cmd)
 
@@ -259,6 +256,7 @@ class TestTypeScriptProvider:
 
 
 # ── JavaScriptSyntaxProvider ──────────────────────────────────────────────────
+
 
 class TestJavaScriptProvider:
     @pytest.fixture
@@ -301,6 +299,7 @@ class TestJavaScriptProvider:
 
 # ── KotlinSyntaxProvider ──────────────────────────────────────────────────────
 
+
 class TestKotlinProvider:
     @pytest.fixture
     def provider(self):
@@ -322,8 +321,8 @@ class TestKotlinProvider:
     def test_find_top_level_definitions(self, provider):
         content = (
             "package com.example\n\n"
-            "class Greeter(val name: String) {\n    fun greet() = \"hi\"\n}\n\n"
-            "fun helper() {\n    println(\"help\")\n}\n"
+            'class Greeter(val name: String) {\n    fun greet() = "hi"\n}\n\n'
+            'fun helper() {\n    println("help")\n}\n'
             "interface Speaker {\n    fun speak()\n}\n"
         )
         results = provider._find_top_level_definitions_regex(content)
@@ -335,8 +334,8 @@ class TestKotlinProvider:
     def test_find_class_methods(self, provider):
         content = (
             "class Greeter(val name: String) {\n"
-            "    fun greet(): String {\n        return \"hi\"\n    }\n"
-            "    fun bye(): String {\n        return \"bye\"\n    }\n"
+            '    fun greet(): String {\n        return "hi"\n    }\n'
+            '    fun bye(): String {\n        return "bye"\n    }\n'
             "}\n"
         )
         methods = provider._find_class_methods_regex(content, "Greeter")
@@ -345,7 +344,7 @@ class TestKotlinProvider:
         assert "bye" in names, f"bye missing: {names}"
 
     def test_find_symbol_body_range(self, provider):
-        content = "fun helper() {\n    println(\"hi\")\n}\n"
+        content = 'fun helper() {\n    println("hi")\n}\n'
         body = provider._find_symbol_body_range_regex(content, "helper")
         assert body is not None, "body should not be None"
         assert body[0] >= 1, f"body start valid: {body}"
@@ -365,9 +364,7 @@ class TestKotlinProvider:
             calls.append(cmd)
             return SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
 
-        monkeypatch.setattr(
-            "external_llm.languages.kotlin_provider.subprocess.run", _fake_run
-        )
+        monkeypatch.setattr("external_llm.languages.kotlin_provider.subprocess.run", _fake_run)
         return calls
 
     def test_validate_syntax_broken_skips_kotlinc(self, provider, monkeypatch):
@@ -376,9 +373,7 @@ class TestKotlinProvider:
         def _boom(*a, **k):
             raise AssertionError("kotlinc must not be spawned for tree-sitter-visible errors")
 
-        monkeypatch.setattr(
-            "external_llm.languages.kotlin_provider.subprocess.run", _boom
-        )
+        monkeypatch.setattr("external_llm.languages.kotlin_provider.subprocess.run", _boom)
         result = provider._validate_syntax_impl("Broken.kt", "fun alpha( {\n    return 1\n}\n")
         assert result.ok is False
 
@@ -387,15 +382,11 @@ class TestKotlinProvider:
         def _boom(*a, **k):
             raise AssertionError("must not spawn kotlinc")
 
-        monkeypatch.setattr(
-            "external_llm.languages.kotlin_provider.subprocess.run", _boom
-        )
+        monkeypatch.setattr("external_llm.languages.kotlin_provider.subprocess.run", _boom)
         result = provider._validate_syntax_impl("Broken.kt", "fun alpha( {\n    return 1\n}\n")
         assert result.ok is False
 
-    def test_validate_syntax_broken_rejects_even_if_tempfile_fails(
-        self, provider, monkeypatch
-    ):
+    def test_validate_syntax_broken_rejects_even_if_tempfile_fails(self, provider, monkeypatch):
         # Fail-open contract only applies to CLEAN code: if the temp-file
         # plumbing fails, broken content must still be rejected by the
         # prefilter rather than waved through as ok=True.
@@ -408,9 +399,7 @@ class TestKotlinProvider:
         assert result.ok is False
         assert calls == []
 
-    def test_validate_syntax_valid_invokes_kotlinc_with_jvm_flags(
-        self, provider, monkeypatch
-    ):
+    def test_validate_syntax_valid_invokes_kotlinc_with_jvm_flags(self, provider, monkeypatch):
         # tree-sitter-clean content still gets the authoritative kotlinc pass —
         # the prefilter must NOT skip the JVM for valid code.
         calls = self._capture_run(monkeypatch, rc=0)
@@ -422,9 +411,7 @@ class TestKotlinProvider:
         assert "-J-XX:+UseSerialGC" in calls[0]
         assert "-J-Xverify:none" in calls[0]
 
-    def test_validate_syntax_semantic_error_still_invokes_kotlinc(
-        self, provider, monkeypatch
-    ):
+    def test_validate_syntax_semantic_error_still_invokes_kotlinc(self, provider, monkeypatch):
         # An unresolved reference is SEMANTICALLY broken but syntactically
         # clean — tree-sitter sees nothing, so kotlinc must still run and its
         # diagnostic must survive the prefilter untouched.
@@ -433,16 +420,12 @@ class TestKotlinProvider:
             rc=1,
             stderr="Bad.kt:1:21: error: unresolved reference: undefinedSymbol\n",
         )
-        result = provider._validate_syntax_impl(
-            "Bad.kt", "fun main() { val x = undefinedSymbol }\n"
-        )
+        result = provider._validate_syntax_impl("Bad.kt", "fun main() { val x = undefinedSymbol }\n")
         assert result.ok is False
         assert len(calls) == 1
         assert any("unresolved reference" in e.message for e in (result.errors or []))
 
-    def test_validate_syntax_ts_unavailable_falls_through_to_kotlinc(
-        self, provider, monkeypatch
-    ):
+    def test_validate_syntax_ts_unavailable_falls_through_to_kotlinc(self, provider, monkeypatch):
         # When tree-sitter cannot answer (grammar missing), the prefilter is
         # silent and kotlinc remains the sole authority.
         calls = self._capture_run(monkeypatch, rc=0)
@@ -468,6 +451,7 @@ class TestKotlinProvider:
 
 
 # ── JavaSyntaxProvider ────────────────────────────────────────────────────────
+
 
 class TestJavaProvider:
     @pytest.fixture
@@ -521,6 +505,7 @@ class TestJavaProvider:
 
 # ── BashSyntaxProvider ────────────────────────────────────────────────────────
 
+
 class TestBashProvider:
     """Bash provider — regex + AST symbol detection (no toolchain assumed)."""
 
@@ -550,9 +535,9 @@ class TestBashProvider:
 
     def test_validate_syntax_via_tree_sitter(self, provider):
         # No bundled toolchain, but tree-sitter gates structural errors.
-        broken = provider.validate_syntax("foo.sh", "if [ -z \"$x\" then\n  echo hi\nfi")
+        broken = provider.validate_syntax("foo.sh", 'if [ -z "$x" then\n  echo hi\nfi')
         assert broken.ok is False, "malformed bash must be rejected by the gate"
-        valid = provider.validate_syntax("foo.sh", "if [ -z \"$x\" ]; then echo hi; fi")
+        valid = provider.validate_syntax("foo.sh", 'if [ -z "$x" ]; then echo hi; fi')
         assert valid.ok is True
         assert valid.language == LanguageId.BASH
 
@@ -575,75 +560,94 @@ class TestBashProvider:
 # All five providers now delegate to base.find_brace_block_end, so each must
 # pass the SAME literal/comment/fallback contract that c_provider already had.
 
+
 class TestFindBlockEndSharedSSOT:
     """Every brace-delimited C-family provider shares one brace scanner."""
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_brace_in_string_does_not_corrupt_depth(self, provider_cls):
         # Pre-fix (naive): the '}' inside the string ended the block on line 2.
-        src = "void f() {\n    s = \"}\";\n}\n"          # close on line 3
+        src = 'void f() {\n    s = "}";\n}\n'  # close on line 3
         end = provider_cls._find_block_end(src, src.index("void"))
         assert end == 3, f"{provider_cls.__name__}: {end}"
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_brace_in_block_comment_does_not_corrupt_depth(self, provider_cls):
-        src = "void f() {\n    /* } */\n}\n"             # close on line 3
+        src = "void f() {\n    /* } */\n}\n"  # close on line 3
         end = provider_cls._find_block_end(src, src.index("void"))
         assert end == 3, f"{provider_cls.__name__}: {end}"
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_brace_in_line_comment_does_not_corrupt_depth(self, provider_cls):
-        src = "void f() {\n    // {\n}\n"                # close on line 3
+        src = "void f() {\n    // {\n}\n"  # close on line 3
         end = provider_cls._find_block_end(src, src.index("void"))
         assert end == 3, f"{provider_cls.__name__}: {end}"
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_typescript_template_literal_braces_skipped(self, provider_cls):
         # Template literal `${...}` braces must not affect depth. (Primary TS
         # concern; the shared scanner handles backticks for all.)
-        src = "void f() {\n    x = `${a.b}`;\n}\n"       # close on line 3
+        src = "void f() {\n    x = `${a.b}`;\n}\n"  # close on line 3
         end = provider_cls._find_block_end(src, src.index("void"))
         assert end == 3, f"{provider_cls.__name__}: {end}"
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_unterminated_block_fallback_is_start_line(self, provider_cls):
         # Regression for bug 2b: the old fallback was `+ 21` (start + 20). The
         # correct conservative fallback is the start line itself.
-        src = "void f() {\n    bar()\n"                  # no closing brace
+        src = "void f() {\n    bar()\n"  # no closing brace
         end = provider_cls._find_block_end(src, src.index("void"))
         assert end == 1, f"{provider_cls.__name__}: expected start line 1, got {end}"
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_multiline_backtick_literal_newlines_counted(self, provider_cls):
         # Bug #1 regression: old line-based scanner under-counted newlines inside
         # backtick/template literals, returning line 4 instead of 6 for a 3-line block.
@@ -651,30 +655,38 @@ class TestFindBlockEndSharedSSOT:
         end = provider_cls._find_block_end(src, src.index("{"))
         assert end == 6, f"{provider_cls.__name__}: expected 6, got {end}"
 
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_go_raw_string_backslash_does_not_escape_backtick(self, provider_cls):
         # Bug #2 regression: Go raw strings have NO escape sequences. A backslash
         # before the closing backtick (e.g. `C:\`) must NOT swallow the backtick.
         # Only GoSyntaxProvider actually uses raw strings, but the shared scanner
         # must handle it correctly for all.
-        src = 'package main\nfunc f() {\n    s := `C:\\`\n}\n'
+        src = "package main\nfunc f() {\n    s := `C:\\`\n}\n"
         end = provider_cls._find_block_end(src, src.index("{"))
         assert end == 4, f"{provider_cls.__name__}: expected 4, got {end}"
 
-    @pytest.mark.xfail(reason="Known limitation: backtick always escapes=False "
-                              "(Go compat) — TS escaped backtick inside template "
-                              "literal may close prematurely. See _find_closing_brace docstring.")
-    @pytest.mark.parametrize("provider_cls", [
-        GoSyntaxProvider,
-        JavaSyntaxProvider,
-        KotlinSyntaxProvider,
-        TypeScriptSyntaxProvider,
-    ])
+    @pytest.mark.xfail(
+        reason="Known limitation: backtick always escapes=False "
+        "(Go compat) — TS escaped backtick inside template "
+        "literal may close prematurely. See _find_closing_brace docstring."
+    )
+    @pytest.mark.parametrize(
+        "provider_cls",
+        [
+            GoSyntaxProvider,
+            JavaSyntaxProvider,
+            KotlinSyntaxProvider,
+            TypeScriptSyntaxProvider,
+        ],
+    )
     def test_ts_escaped_backtick_premature_close(self, provider_cls):
         # TS template literal with escaped backtick (\`) — the shared scanner
         # treats backtick as escapes=False (Go raw string compat), so the \`
@@ -693,6 +705,7 @@ class TestFindBlockEndSharedSSOT:
 # served the regex-fallback *class-body* range (slicing the class body to scan for
 # methods), while _find_block_end served *method-body* ranges. Both now share the
 # same quote/comment-aware scan via base.find_brace_block_end_offset.
+
 
 class TestFindBlockEndOffsetSharedSSOT:
     """The class-body range brace scanner shares the literal/comment skip."""
@@ -728,7 +741,7 @@ class TestFindBlockEndOffsetSharedSSOT:
     @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
     def test_unterminated_fallback_is_len_content(self, provider_cls):
         # Conservative fallback: len(content) (whole tail), matching prior behaviour.
-        src = "class A {\n    void f() {\n        x = 1\n"   # no closing braces
+        src = "class A {\n    void f() {\n        x = 1\n"  # no closing braces
         start = src.index("{")
         end = provider_cls._find_block_end_offset(src, start)
         assert end == len(src), f"{provider_cls.__name__}: expected {len(src)}, got {end}"
@@ -738,6 +751,7 @@ class TestFindBlockEndOffsetSharedSSOT:
         # The per-provider method must delegate to the shared base function —
         # guards against a future copy-paste re-divergence.
         from external_llm.languages.base import find_brace_block_end_offset
+
         src = 'class A {\n    String s = "}";\n    void real() {}\n}\n'
         start = src.index("{")
         direct = find_brace_block_end_offset(src, start)
@@ -747,7 +761,7 @@ class TestFindBlockEndOffsetSharedSSOT:
     @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
     def test_multiline_backtick_literal_offset(self, provider_cls):
         # Bug #1: multi-line backtick literals must not truncate the class body.
-        src = 'class A {\n    String s = `hello\n    world`;\n    void real() {}\n}\n'
+        src = "class A {\n    String s = `hello\n    world`;\n    void real() {}\n}\n"
         start = src.index("{")
         end = provider_cls._find_block_end_offset(src, start)
         body = src[start:end]
@@ -756,7 +770,7 @@ class TestFindBlockEndOffsetSharedSSOT:
     @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
     def test_raw_string_backslash_backtick_offset(self, provider_cls):
         # Bug #2: raw string backslash before backtick must not break the scanner.
-        src = 'class A {\n    String s = `C:\\`;\n    void real() {}\n}\n'
+        src = "class A {\n    String s = `C:\\`;\n    void real() {}\n}\n"
         start = src.index("{")
         end = provider_cls._find_block_end_offset(src, start)
         body = src[start:end]
@@ -813,11 +827,13 @@ def test_no_naive_brace_counting_in_block_extent_consumers():
 # Fix: _consume_char_or_lifetime validates the char-literal element grammar; a
 # lifetime (no closing tick) consumes only the tick so its braces scan normally.
 
+
 class TestBraceScannerRustLifetimes:
     """Rust lifetimes must not be mistaken for char literals."""
 
     def test_lifetime_does_not_swallow_opening_brace(self):
         from external_llm.languages.base import find_brace_block_end, net_brace_count
+
         src = "struct Parser<'a> {\n    input: &'a str,\n}\n"
         # Pre-fix: net_brace_count == -1 (opening brace swallowed between ticks).
         assert net_brace_count(src) == 0
@@ -826,18 +842,21 @@ class TestBraceScannerRustLifetimes:
 
     def test_two_lifetimes(self):
         from external_llm.languages.base import find_brace_block_end, net_brace_count
+
         src = "impl<'a, 'b> Foo<'a> {\n    x: &'b str,\n}\n"
         assert net_brace_count(src) == 0
         assert find_brace_block_end(src, src.index("{")) == 3
 
     def test_static_lifetime_with_inner_block(self):
         from external_llm.languages.base import find_brace_block_end, net_brace_count
-        src = "fn f() {\n    let x: &'static str = \"hi\";\n}\n"
+
+        src = 'fn f() {\n    let x: &\'static str = "hi";\n}\n'
         assert net_brace_count(src) == 0
         assert find_brace_block_end(src, src.index("{")) == 3
 
     def test_lifetime_in_return_type(self):
         from external_llm.languages.base import find_brace_block_end, net_brace_count
+
         src = "fn add<'a>(x: &'a i32) -> &'a i32 {\n    x\n}\n"
         assert net_brace_count(src) == 0
         assert find_brace_block_end(src, src.index("{")) == 3
@@ -848,6 +867,7 @@ class TestBraceScannerRustLifetimes:
         # literals as lifetimes. A brace-shaped char literal ('{', '}') is the
         # critical regression guard.
         from external_llm.languages.base import net_brace_count
+
         for lit in ("'a'", "'\\n'", "'\\''", "'\\u{41}'", "'\\x7b'", "'{'", "'}'"):
             src = "fn f() {\n    let c = " + lit + ";\n}\n"
             assert net_brace_count(src) == 0, f"char literal {lit!r} mis-scanned"
@@ -856,6 +876,7 @@ class TestBraceScannerRustLifetimes:
         # 'a + 'b — two lifetimes with no intervening closing tick. Each tick must
         # be consumed independently; the '{' of the block must count.
         from external_llm.languages.base import find_brace_block_end, net_brace_count
+
         src = "fn f<'a,'b>() {\n    let _ = 'a;\n    let _ = 'b;\n}\n"
         assert net_brace_count(src) == 0
         assert find_brace_block_end(src, src.index("{")) == 4
@@ -865,6 +886,7 @@ class TestBraceScannerRustLifetimes:
         # the old _skip_quoted_literal path (the lifetime fix shares the same core
         # via _iter_brace_tokens). Braces inside char literals are still skipped.
         from external_llm.languages.base import net_brace_count
+
         for lit in ("'a'", "'\\n'", "'}'", "'{'"):
             src = "int f() {\n    char c = " + lit + ";\n}\n"
             assert net_brace_count(src) == 0, f"C char literal {lit!r} mis-scanned"
@@ -874,11 +896,11 @@ class TestBraceScannerRustLifetimes:
         # (_iter_brace_tokens). A balanced-with-lifetime region must report net 0
         # AND a valid matching-close offset simultaneously.
         from external_llm.languages.base import _find_closing_brace, net_brace_count
+
         src = "struct P<'a> {\n    x: &'a str,\n}\n"
         assert net_brace_count(src) == 0
         close = _find_closing_brace(src, src.index("{"))
         assert close != -1 and src[close] == "}"
-
 
 
 class TestBraceScannerCSharpVerbatimStrings:
@@ -959,7 +981,9 @@ class TestBraceScannerCSharpVerbatimStrings:
         src = 'var a = """has { brace } here""";\nvoid f() {\n}\n'
         assert net_brace_count(src) == 0
 
+
 # ── tree_sitter_syntax_fallback (B2: language-parser fallback contract) ──────
+
 
 class TestTreeSitterSyntaxFallback:
     """Direct coverage for the tree-sitter fallback gate (previously 0 tests).
@@ -978,8 +1002,7 @@ class TestTreeSitterSyntaxFallback:
             "external_llm.languages.tree_sitter_utils.find_error_nodes",
             lambda *a, **k: None,
         )
-        r = tree_sitter_syntax_fallback(
-            "fun a( { return 1 }\n", LanguageId.KOTLIN, "X.kt")
+        r = tree_sitter_syntax_fallback("fun a( { return 1 }\n", LanguageId.KOTLIN, "X.kt")
         assert r.ok is True
         assert r.errors == []
 
@@ -988,33 +1011,28 @@ class TestTreeSitterSyntaxFallback:
             "external_llm.languages.tree_sitter_utils.find_error_nodes",
             lambda *a, **k: [],
         )
-        r = tree_sitter_syntax_fallback(
-            "fun a() { return 1 }\n", LanguageId.KOTLIN, "X.kt")
+        r = tree_sitter_syntax_fallback("fun a() { return 1 }\n", LanguageId.KOTLIN, "X.kt")
         assert r.ok is True
 
     def test_error_nodes_reported_one_based(self, monkeypatch):
         """0-based SyntaxErrorNode positions become 1-based SyntaxError_."""
         monkeypatch.setattr(
             "external_llm.languages.tree_sitter_utils.find_error_nodes",
-            lambda *a, **k: [SyntaxErrorNode(
-                kind="ERROR", missing_token="", line=2, column=3)],
+            lambda *a, **k: [SyntaxErrorNode(kind="ERROR", missing_token="", line=2, column=3)],
         )
-        r = tree_sitter_syntax_fallback(
-            "fun a() {\n  val x = \n}\n", LanguageId.KOTLIN, "X.kt")
+        r = tree_sitter_syntax_fallback("fun a() {\n  val x = \n}\n", LanguageId.KOTLIN, "X.kt")
         assert r.ok is False
         assert len(r.errors) == 1
-        assert r.errors[0].line == 3   # 0-based 2 -> 1-based 3
-        assert r.errors[0].col == 4    # 0-based 3 -> 1-based 4
+        assert r.errors[0].line == 3  # 0-based 2 -> 1-based 3
+        assert r.errors[0].col == 4  # 0-based 3 -> 1-based 4
         assert "tree-sitter" in r.errors[0].message
 
     def test_missing_token_surfaces_expected_message(self, monkeypatch):
         monkeypatch.setattr(
             "external_llm.languages.tree_sitter_utils.find_error_nodes",
-            lambda *a, **k: [SyntaxErrorNode(
-                kind="MISSING", missing_token=")", line=0, column=0)],
+            lambda *a, **k: [SyntaxErrorNode(kind="MISSING", missing_token=")", line=0, column=0)],
         )
-        r = tree_sitter_syntax_fallback(
-            "fun main( }\n", LanguageId.KOTLIN, "X.kt")
+        r = tree_sitter_syntax_fallback("fun main( }\n", LanguageId.KOTLIN, "X.kt")
         assert r.ok is False
         assert "expected ')'" in r.errors[0].message
 
@@ -1028,7 +1046,9 @@ class TestTreeSitterSyntaxFallback:
         tree_sitter_syntax_fallback("x", LanguageId.TYPESCRIPT, "comp.tsx")
         assert seen["lang"] == "tsx"
 
+
 # ── Shared regex scaffold: SyntaxProvider._iter_symbol_matches ────────────────
+
 
 class TestIterSymbolMatches:
     """Contract of the shared ``_iter_symbol_matches`` regex fallback scaffold."""
@@ -1063,6 +1083,7 @@ class TestIterSymbolMatches:
 
 # ── Line-index SSOT: build_line_index / line_at_offset / line_index_at_offset ─
 
+
 class TestLineIndexHelpers:
     """P1: the regex fallbacks replaced per-match ``content[:off].count("\\n")``
     (O(n) each) with a precomputed newline-offset index + bisect (O(log n)).
@@ -1078,8 +1099,7 @@ class TestLineIndexHelpers:
         rng = random.Random(7)
         for _ in range(50):
             lines = [
-                "".join(rng.choice("abc def{}()") for _ in range(rng.randint(0, 30)))
-                for _ in range(rng.randint(1, 40))
+                "".join(rng.choice("abc def{}()") for _ in range(rng.randint(0, 30))) for _ in range(rng.randint(1, 40))
             ]
             content = "\n".join(lines)
             nl = build_line_index(content)

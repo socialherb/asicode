@@ -5,6 +5,7 @@ spam bug: background compress is best-effort, so a persistent helper-model
 auth/quota problem must (a) NOT surface the provider's raw logger.error every
 turn, and (b) notify the user ONCE per failure class per session.
 """
+
 import logging
 from unittest import mock
 
@@ -135,6 +136,7 @@ class TestCompressOldTurnsRoutesNotice:
         # Call the real compress_old_turns via the concrete class that has it.
         # SessionCompressionContext is the concrete subclass; instantiate minimally.
         from external_llm.agent.context_manager import SessionCompressionContext
+
         ctx = SessionCompressionContext.__new__(SessionCompressionContext)
         # compress_old_turns uses self._cfg.compression.MIN_RECENT_TURNS_KEEP
         ctx._cfg = mock.MagicMock()
@@ -142,8 +144,11 @@ class TestCompressOldTurnsRoutesNotice:
 
         notifies = []
         ctx.compress_old_turns(
-            session, llm_client, "deepseek-v4-flash",
-            recent_keep=4, notify=notifies.append,
+            session,
+            llm_client,
+            "deepseek-v4-flash",
+            recent_keep=4,
+            notify=notifies.append,
         )
         # First call: one user-facing notice routed via notify
         assert len(notifies) == 1
@@ -153,8 +158,11 @@ class TestCompressOldTurnsRoutesNotice:
         # Second call (same session, same failure class): once-latch suppresses
         notifies2 = []
         ctx.compress_old_turns(
-            session, llm_client, "deepseek-v4-flash",
-            recent_keep=4, notify=notifies2.append,
+            session,
+            llm_client,
+            "deepseek-v4-flash",
+            recent_keep=4,
+            notify=notifies2.append,
         )
         assert notifies2 == [], "once-latch must suppress repeated same-class failures"
 

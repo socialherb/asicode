@@ -16,6 +16,7 @@ syntax error for valid code) over the LIVE provider registry rather than a
 hardcoded list, so a newly added provider that reintroduces the pattern fails
 here instead of shipping.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -27,21 +28,16 @@ from external_llm.languages.base import LanguageId
 
 # (LanguageId, filename, syntactically-broken source, valid source)
 CASES = [
-    (LanguageId.JAVASCRIPT, "x.js",
-     "function a( {\n  return 1;\n}\n",
-     "function a() {\n  return 1;\n}\n"),
-    (LanguageId.TYPESCRIPT, "x.ts",
-     "function a( {\n  return 1;\n}\n",
-     "function a(): number {\n  return 1;\n}\n"),
-    (LanguageId.GO, "x.go",
-     "package main\nfunc a( {\n\treturn 1\n}\n",
-     "package main\n\nfunc a() int {\n\treturn 1\n}\n"),
-    (LanguageId.JAVA, "X.java",
-     "class A { void a( { } }\n",
-     "class A { void a() { } }\n"),
-    (LanguageId.KOTLIN, "X.kt",
-     "fun a( { return 1 }\n",
-     "fun a(): Int { return 1 }\n"),
+    (LanguageId.JAVASCRIPT, "x.js", "function a( {\n  return 1;\n}\n", "function a() {\n  return 1;\n}\n"),
+    (LanguageId.TYPESCRIPT, "x.ts", "function a( {\n  return 1;\n}\n", "function a(): number {\n  return 1;\n}\n"),
+    (
+        LanguageId.GO,
+        "x.go",
+        "package main\nfunc a( {\n\treturn 1\n}\n",
+        "package main\n\nfunc a() int {\n\treturn 1\n}\n",
+    ),
+    (LanguageId.JAVA, "X.java", "class A { void a( { } }\n", "class A { void a() { } }\n"),
+    (LanguageId.KOTLIN, "X.kt", "fun a( { return 1 }\n", "fun a(): Int { return 1 }\n"),
 ]
 
 FAILURES = [
@@ -106,17 +102,12 @@ def test_toolchain_failure_does_not_reject_valid_source(lang, path, _broken, val
 @pytest.mark.parametrize("lang,path,broken,valid", CASES)
 def test_absence_and_failure_agree(lang, path, broken, valid):
     """Absence was always handled correctly; failure must match it exactly."""
-    absent = [
-        _validate_with_failing_subprocess(lang, path, src, FileNotFoundError("gone"))
-        for src in (broken, valid)
-    ]
+    absent = [_validate_with_failing_subprocess(lang, path, src, FileNotFoundError("gone")) for src in (broken, valid)]
     failed = [
         _validate_with_failing_subprocess(lang, path, src, subprocess.TimeoutExpired("t", 10))
         for src in (broken, valid)
     ]
-    assert absent == failed, (
-        f"{lang.value}: tool-absent {absent} diverges from tool-failed {failed}"
-    )
+    assert absent == failed, f"{lang.value}: tool-absent {absent} diverges from tool-failed {failed}"
 
 
 # ── the semantic half: a check that did not run must not answer "clean" ────
@@ -179,9 +170,7 @@ def test_semantic_skip_is_not_reported_as_checked(lang, name, exc, tmp_path):
         "which is indistinguishable from a clean verdict"
     )
     assert result.skip_reason, f"{lang.value}: skip carries no reason for the model"
-    assert result.ok is True, (
-        f"{lang.value}: an unavailable semantic checker must stay non-blocking"
-    )
+    assert result.ok is True, f"{lang.value}: an unavailable semantic checker must stay non-blocking"
     assert result.errors == []
 
 

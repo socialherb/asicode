@@ -8,6 +8,7 @@ field that the analysis scanners (vulture/cross_file_refs/broken_contract/
 dead_block) query against.  This is barrier (1) of the CGI/RG dual-build merge:
 once RG's snapshot carries these fields, CGI can consume it as SSOT.
 """
+
 import ast
 import shutil
 import tempfile
@@ -43,6 +44,7 @@ def _edge(visitor: GraphVisitor, callee: str) -> list:
 
 # ── Canonical attribution spec (mirrors CallGraphIndexer._parse_call) ─────────
 
+
 def test_plain_call_canonical_fields():
     v = _visit("""\
         def top():
@@ -65,7 +67,7 @@ def test_self_call_qualified_canonical_and_bare_legacy():
     """)
     (e,) = _edge(v, "foo")  # legacy callee stays BARE (scanner contract)
     assert e.callee == "foo"
-    assert e.callee_symbol == "A.foo"      # CGI convention: qualified
+    assert e.callee_symbol == "A.foo"  # CGI convention: qualified
     assert e.callee_display == "self.foo"  # CGI convention: dotted display
     assert e.confidence == 0.85
 
@@ -86,8 +88,8 @@ def test_cls_call_matches_cgi_attr_only():
                 pass
     """)
     (e,) = _edge(v, "build")
-    assert e.callee == "build"            # legacy bare
-    assert e.callee_symbol == "build"     # CGI: attr-only for cls.
+    assert e.callee == "build"  # legacy bare
+    assert e.callee_symbol == "build"  # CGI: attr-only for cls.
     assert e.callee_display == "cls.build"
     assert e.confidence == 0.5
 
@@ -99,9 +101,9 @@ def test_obj_call_attr_only_canonical():
             a.foo()
             mod.helper()
     """)
-    (e,) = _edge(v, "a.foo")              # legacy callee keeps the dotted receiver
+    (e,) = _edge(v, "a.foo")  # legacy callee keeps the dotted receiver
     assert e.callee == "a.foo"
-    assert e.callee_symbol == "foo"       # canonical drops the receiver (CGI rule)
+    assert e.callee_symbol == "foo"  # canonical drops the receiver (CGI rule)
     assert e.callee_display == "a.foo"
     assert e.confidence == 0.5
     (e2,) = _edge(v, "mod.helper")
@@ -123,7 +125,7 @@ def test_nested_function_self_call_low_confidence():
     """)
     (e,) = [c for c in v.calls if c.callee_display == "self.foo"]
     assert e.callee == "foo"
-    assert e.callee_symbol == "foo"       # attr-only, NOT "A.foo"
+    assert e.callee_symbol == "foo"  # attr-only, NOT "A.foo"
     assert e.confidence == 0.5
 
 
@@ -157,10 +159,11 @@ def test_nested_class_qualifies_with_bare_immediate_name():
             def top_method(self):
                 self.helper()
     """)
-    triples = {(e.callee_symbol, e.callee_display, e.confidence)
-               for e in v.calls if e.callee_display.startswith("self.")}
+    triples = {
+        (e.callee_symbol, e.callee_display, e.confidence) for e in v.calls if e.callee_display.startswith("self.")
+    }
     assert triples == {
-        ("Inner.bar", "self.bar", 0.85),        # nested class → bare "Inner"
+        ("Inner.bar", "self.bar", 0.85),  # nested class → bare "Inner"
         ("Inner.helper", "self.helper", 0.85),  # nested class → bare "Inner"
         ("Outer.helper", "self.helper", 0.85),  # top-level class → bare "Outer"
     }
@@ -189,27 +192,37 @@ def test_nested_class_cross_worker_parity():
 
     # CGI side: real _extract_file class_names BFS (bare ClassDef.name)
     class_names: dict[int, str] = {}
-    func_nodes = [n for n in ast.walk(tree)
-                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    func_nodes = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     class_names[id(child)] = node.name
     cgi = CallGraphIndexer(".")._collect_calls(func_nodes, "mod.py", class_names)
-    cgi_triples = {(e.callee_symbol, e.callee_display, round(e.confidence, 2))
-                   for e in cgi if e.callee_display.startswith("self.")}
+    cgi_triples = {
+        (e.callee_symbol, e.callee_display, round(e.confidence, 2)) for e in cgi if e.callee_display.startswith("self.")
+    }
 
     # RG side
     rg = _visit(fixture)
-    rg_triples = {(e.callee_symbol, e.callee_display, round(e.confidence, 2))
-                  for e in rg.calls if e.callee_display.startswith("self.")}
-
-    assert rg_triples == cgi_triples == {
-        ("Inner.bar", "self.bar", 0.85),
-        ("Outer.helper", "self.helper", 0.85),
+    rg_triples = {
+        (e.callee_symbol, e.callee_display, round(e.confidence, 2))
+        for e in rg.calls
+        if e.callee_display.startswith("self.")
     }
+
+    assert (
+        rg_triples
+        == cgi_triples
+        == {
+            ("Inner.bar", "self.bar", 0.85),
+            ("Outer.helper", "self.helper", 0.85),
+        }
+    )
+
+
 # ── Legacy behavior pinned ────────────────────────────────────────────────────
+
 
 def test_legacy_queries_unchanged():
     """get_callees/get_callers still resolve through the bare ``callee`` field."""
@@ -228,6 +241,7 @@ def test_legacy_queries_unchanged():
 
 
 # ── Snapshot round-trip ───────────────────────────────────────────────────────
+
 
 def test_snapshot_roundtrip_keeps_canonical_fields():
     v = _visit("""\
@@ -303,7 +317,7 @@ def test_cgi_parity_canonical_attribution():
     assert rg_triples == cgi_triples
     assert cgi_triples == {
         ("helper", "helper", 0.9),
-        ("A", "A", 0.9),          # the `a = A()` constructor call
+        ("A", "A", 0.9),  # the `a = A()` constructor call
         ("A.foo", "self.foo", 0.85),
         ("foo", "a.foo", 0.5),
         ("helper", "mod.helper", 0.5),
@@ -311,6 +325,7 @@ def test_cgi_parity_canonical_attribution():
 
 
 # ── Unsupported-form fallback (P2, 2026-08-12) ─────────────────────────────────
+
 
 def test_unsupported_form_fallback_low_confidence_and_marked():
     """Chained/dynamic call forms must NOT outrank resolved calls: the legacy

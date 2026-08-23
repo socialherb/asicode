@@ -38,9 +38,11 @@ def _scan() -> set[str]:
     """
     try:
         result = subprocess.run(
-            ["ruff", "check", "--no-cache", "--select=PLR2004",
-             "--output-format=concise", "."],
-            capture_output=True, text=True, cwd=REPO, timeout=300,
+            ["ruff", "check", "--no-cache", "--select=PLR2004", "--output-format=concise", "."],
+            capture_output=True,
+            text=True,
+            cwd=REPO,
+            timeout=300,
             check=False,
         )
     except subprocess.TimeoutExpired:

@@ -5,6 +5,7 @@ request strings from service.py; macOS /var vs /private/var), and an
 uncanonalized key let one repo occupy 2+ entries of the 8-entry cache — the
 same bug the file-index cache was fixed for, now shared via canonical_repo_key.
 """
+
 from __future__ import annotations
 
 from pathlib import Path

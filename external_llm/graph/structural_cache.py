@@ -86,6 +86,7 @@ def _current_schema_version() -> int:
         _schema_version = _acc
     return _schema_version
 
+
 CACHE_FILENAME = "structural_graph_v1.json"
 
 

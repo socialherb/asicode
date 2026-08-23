@@ -1,6 +1,7 @@
 """
 Integration tests for AgentLoop.
 """
+
 from unittest.mock import Mock, patch
 
 from external_llm.agent.agent_loop import AgentResult
@@ -16,8 +17,7 @@ def _numeric_token_fields(resp):
     as status="error" plus a spurious rollback, and hiding whatever the test was
     actually asserting.
     """
-    for _f in ("prompt_tokens", "completion_tokens",
-               "cache_read_input_tokens", "cache_creation_input_tokens"):
+    for _f in ("prompt_tokens", "completion_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
         if not isinstance(getattr(resp, _f, None), int):
             setattr(resp, _f, 0)
     return resp
@@ -108,11 +108,7 @@ def test_agent_loop_with_tool_calls(agent_loop, mock_llm_client, temp_repo_root)
     # Mock first LLM response with tool call
     mock_response1 = Mock()
     mock_response1.content = ""
-    mock_response1.tool_calls = [{
-        "id": "call_1",
-        "name": "find_symbol",
-        "args": {"name": "hello"}
-    }]
+    mock_response1.tool_calls = [{"id": "call_1", "name": "find_symbol", "args": {"name": "hello"}}]
     mock_response1.prompt_tokens = 150
     mock_response1.completion_tokens = 80
     mock_response1.raw_response = None
@@ -133,7 +129,7 @@ def test_agent_loop_with_tool_calls(agent_loop, mock_llm_client, temp_repo_root)
     _responses(mock_llm_client, mock_response1, mock_response2)
 
     # Mock tool dispatch
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         mock_dispatch.return_value = ToolResult(ok=True, content="File content")
         result = agent_loop.run("Read sample.py file")
 
@@ -155,13 +151,15 @@ def test_agent_loop_max_turns(agent_loop, mock_llm_client):
     # Mock LLM response that always calls a tool (infinite loop)
     mock_response = Mock()
     mock_response.content = ""
-    mock_response.tool_calls = [{
-        "id": "call_1",
-        # git_status was retired from the registry; an unregistered name is
-        # skipped before dispatch, so no turn would ever be recorded.
-        "name": "bash",
-        "args": {"command": "git status"}
-    }]
+    mock_response.tool_calls = [
+        {
+            "id": "call_1",
+            # git_status was retired from the registry; an unregistered name is
+            # skipped before dispatch, so no turn would ever be recorded.
+            "name": "bash",
+            "args": {"command": "git status"},
+        }
+    ]
     mock_response.prompt_tokens = 100
     mock_response.completion_tokens = 50
     mock_response.raw_response = None
@@ -175,7 +173,7 @@ def test_agent_loop_max_turns(agent_loop, mock_llm_client):
     agent_loop.config.max_turns = 3
 
     # Mock tool dispatch
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         mock_dispatch.return_value = ToolResult(ok=True, content="OK")
         result = agent_loop.run("Test request")
 
@@ -196,11 +194,7 @@ def test_agent_loop_has_no_planning_phase(agent_loop, mock_llm_client):
     # Mock first LLM response with a tool call
     mock_response1 = Mock()
     mock_response1.content = ""
-    mock_response1.tool_calls = [{
-        "id": "call_1",
-        "name": "find_symbol",
-        "args": {"name": "hello"}
-    }]
+    mock_response1.tool_calls = [{"id": "call_1", "name": "find_symbol", "args": {"name": "hello"}}]
     mock_response1.prompt_tokens = 100
     mock_response1.completion_tokens = 50
     mock_response1.raw_response = None
@@ -215,7 +209,7 @@ def test_agent_loop_has_no_planning_phase(agent_loop, mock_llm_client):
 
     _responses(mock_llm_client, mock_response1, mock_response2)
 
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         mock_dispatch.return_value = ToolResult(ok=True, content="File content")
         result = agent_loop.run("Test request with planning")
 
@@ -240,11 +234,7 @@ def test_agent_loop_with_self_review(agent_loop, mock_llm_client, sample_patch):
     # Mock execution response with patch
     mock_patch_response = Mock()
     mock_patch_response.content = ""
-    mock_patch_response.tool_calls = [{
-        "id": "call_1",
-        "name": "apply_patch",
-        "args": {"patch": sample_patch}
-    }]
+    mock_patch_response.tool_calls = [{"id": "call_1", "name": "apply_patch", "args": {"patch": sample_patch}}]
     mock_patch_response.prompt_tokens = 100
     mock_patch_response.completion_tokens = 50
     mock_patch_response.raw_response = None
@@ -264,18 +254,24 @@ def test_agent_loop_with_self_review(agent_loop, mock_llm_client, sample_patch):
     _responses(mock_llm_client, mock_patch_response, mock_review_response)
 
     # Mock successful patch application and git_diff
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch, \
-         patch.object(agent_loop.registry, '_applied_patches', [sample_patch]):
+    with (
+        patch.object(agent_loop.registry, "dispatch") as mock_dispatch,
+        patch.object(agent_loop.registry, "_applied_patches", [sample_patch]),
+    ):
         # Create a side effect that returns appropriate results
         call_count = 0
+
         def dispatch_side_effect(tool, args):
             nonlocal call_count
             call_count += 1
             if tool == "apply_patch":
                 return ToolResult(ok=True, content="Patch applied successfully")
             if tool == "git_diff":
-                return ToolResult(ok=True, content="diff --git a/sample.py b/sample.py\n@@ -1,7 +1,10 @@\n+Some changes")
+                return ToolResult(
+                    ok=True, content="diff --git a/sample.py b/sample.py\n@@ -1,7 +1,10 @@\n+Some changes"
+                )
             return ToolResult(ok=True, content="OK")
+
         mock_dispatch.side_effect = dispatch_side_effect
         result = agent_loop.run("Apply patch with review")
 
@@ -297,11 +293,7 @@ def test_agent_loop_with_tdd_cycle(agent_loop, mock_llm_client, sample_patch):
     # Mock response with patch
     mock_response = Mock()
     mock_response.content = ""
-    mock_response.tool_calls = [{
-        "id": "call_1",
-        "name": "apply_patch",
-        "args": {"patch": sample_patch}
-    }]
+    mock_response.tool_calls = [{"id": "call_1", "name": "apply_patch", "args": {"patch": sample_patch}}]
     mock_response.prompt_tokens = 100
     mock_response.completion_tokens = 50
     mock_response.raw_response = None
@@ -309,10 +301,11 @@ def test_agent_loop_with_tdd_cycle(agent_loop, mock_llm_client, sample_patch):
     mock_llm_client.chat_with_tools.return_value = _numeric_token_fields(mock_response)
 
     # Mock successful patch application
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         # First call: apply_patch
         # Second call: run_tests (auto-triggered by TDD)
-        _dispatch_results(mock_dispatch,
+        _dispatch_results(
+            mock_dispatch,
             ToolResult(ok=True, content="Patch applied"),
             ToolResult(ok=True, content="Tests passed"),
         )
@@ -355,11 +348,7 @@ def test_agent_loop_context_trimming(agent_loop, mock_llm_client):
     for i in range(3):
         mock_response = Mock()
         mock_response.content = ""
-        mock_response.tool_calls = [{
-            "id": f"call_{i}",
-            "name": "git_status",
-            "args": {}
-        }]
+        mock_response.tool_calls = [{"id": f"call_{i}", "name": "git_status", "args": {}}]
         mock_response.prompt_tokens = 100
         mock_response.completion_tokens = 50
         mock_response.raw_response = None
@@ -380,7 +369,7 @@ def test_agent_loop_context_trimming(agent_loop, mock_llm_client):
     mock_llm_client.chat_with_tools.side_effect = mock_responses
 
     # Mock tool results
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         mock_dispatch.return_value = ToolResult(ok=True, content="OK")
         result = agent_loop.run("Test context trimming")
 
@@ -402,21 +391,9 @@ def test_agent_loop_parallel_tool_execution(agent_loop, mock_llm_client):
     mock_response = Mock()
     mock_response.content = ""
     mock_response.tool_calls = [
-        {
-            "id": "call_1",
-            "name": "find_symbol",
-            "args": {"name": "hello"}
-        },
-        {
-            "id": "call_2",
-            "name": "grep",
-            "args": {"pattern": "hello"}
-        },
-        {
-            "id": "call_3",
-            "name": "get_project_info",
-            "args": {}
-        }
+        {"id": "call_1", "name": "find_symbol", "args": {"name": "hello"}},
+        {"id": "call_2", "name": "grep", "args": {"pattern": "hello"}},
+        {"id": "call_3", "name": "get_project_info", "args": {}},
     ]
     mock_response.prompt_tokens = 100
     mock_response.completion_tokens = 50
@@ -433,11 +410,11 @@ def test_agent_loop_parallel_tool_execution(agent_loop, mock_llm_client):
     _responses(mock_llm_client, mock_response, mock_final_response)
 
     # Mock parallel dispatch
-    with patch.object(agent_loop.registry, 'dispatch_parallel') as mock_parallel:
+    with patch.object(agent_loop.registry, "dispatch_parallel") as mock_parallel:
         mock_parallel.return_value = [
             ToolResult(ok=True, content="File content"),
             ToolResult(ok=True, content="Git status"),
-            ToolResult(ok=True, content="Project info")
+            ToolResult(ok=True, content="Project info"),
         ]
         result = agent_loop.run("Test parallel tools")
 
@@ -470,11 +447,7 @@ def test_agent_loop_auto_observation(agent_loop, mock_llm_client, sample_patch):
     # Mock LLM response with patch (no final LLM turn needed due to early-exit)
     mock_response = Mock()
     mock_response.content = ""
-    mock_response.tool_calls = [{
-        "id": "call_1",
-        "name": "apply_patch",
-        "args": {"patch": sample_patch}
-    }]
+    mock_response.tool_calls = [{"id": "call_1", "name": "apply_patch", "args": {"patch": sample_patch}}]
     mock_response.prompt_tokens = 100
     mock_response.completion_tokens = 50
     mock_response.raw_response = None
@@ -513,11 +486,9 @@ def test_agent_loop_auto_repair_apply_patch_hunk_only(agent_loop, mock_llm_clien
 
     mock_response = Mock()
     mock_response.content = ""
-    mock_response.tool_calls = [{
-        "id": "call_1",
-        "name": "apply_patch",
-        "args": {"patch": hunk_only_patch, "path": "sample.py"}
-    }]
+    mock_response.tool_calls = [
+        {"id": "call_1", "name": "apply_patch", "args": {"patch": hunk_only_patch, "path": "sample.py"}}
+    ]
     mock_response.prompt_tokens = 100
     mock_response.completion_tokens = 50
     mock_response.raw_response = None
@@ -537,6 +508,7 @@ def test_agent_loop_auto_repair_apply_patch_hunk_only(agent_loop, mock_llm_clien
     # Mock tool dispatch: first call fails (hunk-only without headers),
     # second call succeeds after auto-repair wrap
     call_counts = {"apply_patch": 0}
+
     def dispatch_side_effect(tool, args):
         call_counts[tool] = call_counts.get(tool, 0) + 1
         if tool == "apply_patch":
@@ -553,7 +525,7 @@ def test_agent_loop_auto_repair_apply_patch_hunk_only(agent_loop, mock_llm_clien
         # Other tools not used
         return ToolResult(ok=True, content="")
 
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         mock_dispatch.side_effect = dispatch_side_effect
         result = agent_loop.run("Test auto-repair hunk-only")
 
@@ -588,11 +560,13 @@ def test_agent_loop_auto_repair_missing_path_no_retry(agent_loop, mock_llm_clien
 
     mock_response = Mock()
     mock_response.content = ""
-    mock_response.tool_calls = [{
-        "id": "call_1",
-        "name": "apply_patch",
-        "args": {"patch": hunk_only_patch}  # Missing path
-    }]
+    mock_response.tool_calls = [
+        {
+            "id": "call_1",
+            "name": "apply_patch",
+            "args": {"patch": hunk_only_patch},  # Missing path
+        }
+    ]
     mock_response.prompt_tokens = 100
     mock_response.completion_tokens = 50
     mock_response.raw_response = None
@@ -610,6 +584,7 @@ def test_agent_loop_auto_repair_missing_path_no_retry(agent_loop, mock_llm_clien
     _responses(mock_llm_client, mock_response, mock_final_response)
 
     call_counts = {"apply_patch": 0}
+
     def dispatch_side_effect(tool, args):
         call_counts[tool] = call_counts.get(tool, 0) + 1
         if tool == "apply_patch":
@@ -617,7 +592,7 @@ def test_agent_loop_auto_repair_missing_path_no_retry(agent_loop, mock_llm_clien
             return ToolResult(ok=False, content="", error="patch fragment without header")
         return ToolResult(ok=True, content="")
 
-    with patch.object(agent_loop.registry, 'dispatch') as mock_dispatch:
+    with patch.object(agent_loop.registry, "dispatch") as mock_dispatch:
         mock_dispatch.side_effect = dispatch_side_effect
         result = agent_loop.run("Test auto-repair missing path")
 

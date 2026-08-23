@@ -26,7 +26,7 @@ def normalize_patch_text(p: str) -> str:
     if p is None:
         return ""
     s = str(p)
-    s = s.replace('\r\n', '\n').replace('\r', '\n')
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
 
     # Trim ONLY newlines around the patch (keep spaces/tabs intact)
     s = s.strip("\n")
@@ -84,7 +84,7 @@ def _normalize_git_output(s: str) -> str:
     if s is None:
         return ""
     out = str(s)
-    out = out.replace('\r\n', '\n').replace('\r', '\n')
+    out = out.replace("\r\n", "\n").replace("\r", "\n")
     out = out.strip()
     if len(out) > 32000:
         out = out[:32000] + "\n...[truncated]..."

@@ -15,6 +15,7 @@ Covers regressions fixed in this change:
 
 No network: every HTTP call is stubbed via ``monkeypatch`` on ``httpx.Client``.
 """
+
 from __future__ import annotations
 
 import json
@@ -125,14 +126,14 @@ def _stub_dns(monkeypatch):
     monkeypatch ``wst.socket.getaddrinfo`` themselves (later patches win).
     """
     monkeypatch.setattr(
-        wst.socket, "getaddrinfo",
-        lambda host, port, *a, **k: [
-            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))
-        ],
+        wst.socket,
+        "getaddrinfo",
+        lambda host, port, *a, **k: [(wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))],
     )
 
 
 # ── _DDGResultParser ────────────────────────────────────────────────────
+
 
 def test_ddg_parser_keeps_title_only_result():
     """A result with a title but no snippet must survive (was silently dropped)."""
@@ -158,7 +159,7 @@ def test_ddg_parser_keeps_leading_result_without_snippet_when_next_starts():
     p.close()
     titles = [r["title"] for r in p.results]
     assert titles == ["First", "Second"]
-    assert p.results[0]["snippet"] == ""   # no snippet ever appeared for "First"
+    assert p.results[0]["snippet"] == ""  # no snippet ever appeared for "First"
     assert p.results[1]["snippet"] == "second snip"
 
 
@@ -191,10 +192,7 @@ def test_ddg_parser_respects_max_results():
 
 
 def test_ddg_parser_decodes_uddg_redirect():
-    html = (
-        '<a class="result__a" '
-        'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Freal.example.com%2Fpath">T</a>'
-    )
+    html = '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Freal.example.com%2Fpath">T</a>'
     p = _DDGResultParser(max_results=5)
     p.feed(html)
     p.close()
@@ -202,6 +200,7 @@ def test_ddg_parser_decodes_uddg_redirect():
 
 
 # ── _HTMLTextExtractor ──────────────────────────────────────────────────
+
 
 def test_html_extractor_preserves_paragraph_structure():
     """Block boundaries become newlines — NOT a single run-on line (regression)."""
@@ -314,9 +313,7 @@ def test_html_extractor_skips_when_text_equals_url():
 
 def test_html_extractor_dedups_repeated_link():
     # Header/footer nav repeats the same (text, url); emit the URL only once.
-    out = _extract_linked(
-        '<a href="https://x.com/a">Home</a> mid <a href="https://x.com/a">Home</a>'
-    )
+    out = _extract_linked('<a href="https://x.com/a">Home</a> mid <a href="https://x.com/a">Home</a>')
     assert out.count("(https://x.com/a)") == 1
 
 
@@ -342,6 +339,7 @@ def test_html_extractor_ignores_link_inside_script():
 
 # ── _searx_host_port ────────────────────────────────────────────────────
 
+
 def test_searx_host_port_explicit():
     assert _searx_host_port("http://localhost:8080") == "8080"
     assert _searx_host_port("https://searx.example.com:9999") == "9999"
@@ -354,6 +352,7 @@ def test_searx_host_port_defaults_when_missing():
 
 
 # ── _tool_web_fetch (HTTP stubbed) ──────────────────────────────────────
+
 
 class _FakeStreamResponse:
     """Wraps httpx.Response so it works inside a ``client.stream()`` context.
@@ -406,6 +405,7 @@ def _html_response(text: str, ctype: str = "text/html; charset=utf-8") -> httpx.
 
 # ── web_fetch SSRF guard ─────────────────────────────────────────────────
 
+
 def test_ssrf_guard_blocks_loopback_ips():
     for host in ("127.0.0.1", "127.0.0.2", "127.8.8.8", "::1"):
         with pytest.raises(wst._SSRFBlockedError):
@@ -414,9 +414,19 @@ def test_ssrf_guard_blocks_loopback_ips():
 
 def test_ssrf_guard_blocks_private_link_local_and_special_ips():
     for host in (
-        "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.1",
-        "169.254.169.254", "fe80::1", "fc00::1", "fd12:3456::1",
-        "0.0.0.0", "::", "224.0.0.1", "ff02::1", "240.0.0.1",
+        "10.1.2.3",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.0.1",
+        "169.254.169.254",
+        "fe80::1",
+        "fc00::1",
+        "fd12:3456::1",
+        "0.0.0.0",
+        "::",
+        "224.0.0.1",
+        "ff02::1",
+        "240.0.0.1",
     ):
         with pytest.raises(wst._SSRFBlockedError):
             wst._assert_public_fetch_host(host)
@@ -434,10 +444,9 @@ def test_ssrf_guard_unwraps_ipv4_mapped_ipv6():
 
 def test_ssrf_guard_blocks_hostname_resolving_to_private(monkeypatch):
     monkeypatch.setattr(
-        wst.socket, "getaddrinfo",
-        lambda host, port, *a, **k: [
-            (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("127.0.0.1", port or 0))
-        ],
+        wst.socket,
+        "getaddrinfo",
+        lambda host, port, *a, **k: [(wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("127.0.0.1", port or 0))],
     )
     with pytest.raises(wst._SSRFBlockedError):
         wst._assert_public_fetch_host("internal.example.com")
@@ -445,7 +454,8 @@ def test_ssrf_guard_blocks_hostname_resolving_to_private(monkeypatch):
 
 def test_ssrf_guard_blocks_mixed_resolution_any_private_hit(monkeypatch):
     monkeypatch.setattr(
-        wst.socket, "getaddrinfo",
+        wst.socket,
+        "getaddrinfo",
         lambda host, port, *a, **k: [
             (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0)),
             (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("10.0.0.9", port or 0)),
@@ -457,7 +467,8 @@ def test_ssrf_guard_blocks_mixed_resolution_any_private_hit(monkeypatch):
 
 def test_ssrf_guard_allows_public_hostname(monkeypatch):
     monkeypatch.setattr(
-        wst.socket, "getaddrinfo",
+        wst.socket,
+        "getaddrinfo",
         lambda host, port, *a, **k: [
             (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0)),
             (wst.socket.AF_INET, wst.socket.SOCK_STREAM, 6, "", ("93.184.216.35", port or 0)),
@@ -469,6 +480,7 @@ def test_ssrf_guard_allows_public_hostname(monkeypatch):
 def test_ssrf_guard_passes_resolution_failure(monkeypatch):
     def _fail(host, port, *a, **k):
         raise wst.socket.gaierror("Name or service not known")
+
     monkeypatch.setattr(wst.socket, "getaddrinfo", _fail)
     wst._assert_public_fetch_host("no-such-host.invalid")  # must not raise
 
@@ -484,6 +496,7 @@ def test_ssrf_request_hook_rejects_private_hop():
     class _FakeReq:
         def __init__(self, host):
             self.url = type("_FakeURL", (), {"host": host})()
+
     with pytest.raises(wst._SSRFBlockedError):
         wst._ssrf_request_hook(_FakeReq("::1"))
     wst._ssrf_request_hook(_FakeReq("example.com"))  # must not raise (autouse DNS stub)
@@ -562,8 +575,10 @@ def test_web_fetch_403_hints_browser_action(monkeypatch):
 def test_web_fetch_json_pretty_printed(monkeypatch):
     host = _Host()
     resp = httpx.Response(
-        200, request=httpx.Request("GET", "https://example.com"),
-        headers={"content-type": "application/json"}, text='{"b": 2, "a": 1}',
+        200,
+        request=httpx.Request("GET", "https://example.com"),
+        headers={"content-type": "application/json"},
+        text='{"b": 2, "a": 1}',
     )
     _stub_fetch(monkeypatch, resp)
     res = host._tool_web_fetch({"url": "https://example.com"})
@@ -577,11 +592,20 @@ def test_web_fetch_language_env_passed_to_searxng(monkeypatch):
     captured = {}
 
     class _CapClient:
-        def __enter__(self): return self
-        def __exit__(self, *e): return False
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            return False
+
         def get(self, url, params=None, headers=None):
             captured["params"] = params
-            return httpx.Response(200, request=httpx.Request("GET", url), headers={"content-type": "application/json"}, text='{"results": []}')
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                headers={"content-type": "application/json"},
+                text='{"results": []}',
+            )
 
     monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: _CapClient())
     host = _Host()
@@ -590,6 +614,7 @@ def test_web_fetch_language_env_passed_to_searxng(monkeypatch):
 
 
 # ── SearXNG: all-engines-unresponsive surfaced, not silently swallowed ───
+
 
 class _SearxStubClient:
     """Stub httpx.Client for _search_searxng (GET → canned JSON body)."""
@@ -669,22 +694,23 @@ def test_searxng_results_present_ignore_unresponsive(monkeypatch):
 
 # ── Naver browser fallback: gating + structured mapping + wiring ─────────
 
+
 def test_should_try_naver_korean_by_default(monkeypatch):
     """Default policy: the browser Naver fallback fires on Hangul queries only."""
     monkeypatch.delenv("ASICODE_NAVER_FALLBACK", raising=False)
     host = _Host()
     # A Hangul-containing string is required here — this asserts Hangul detection,
     # so it cannot be an English string. Uses a neutral generic phrase.
-    assert host._should_try_naver("서울의 관광지")          # Hangul → yes
-    assert not host._should_try_naver("python asyncio")   # Latin-only → no
+    assert host._should_try_naver("서울의 관광지")  # Hangul → yes
+    assert not host._should_try_naver("python asyncio")  # Latin-only → no
 
 
 def test_should_try_naver_env_modes(monkeypatch):
     host = _Host()
     monkeypatch.setenv("ASICODE_NAVER_FALLBACK", "off")
-    assert not host._should_try_naver("서울의 관광지")       # opt-out wins over Hangul
+    assert not host._should_try_naver("서울의 관광지")  # opt-out wins over Hangul
     monkeypatch.setenv("ASICODE_NAVER_FALLBACK", "always")
-    assert host._should_try_naver("python asyncio")       # always, even Latin
+    assert host._should_try_naver("python asyncio")  # always, even Latin
     monkeypatch.setenv("ASICODE_NAVER_FALLBACK", "korean")
     assert host._should_try_naver("서울") and not host._should_try_naver("tokyo")
 
@@ -693,7 +719,11 @@ def test_search_naver_browser_maps_and_filters(monkeypatch):
     """Maps JS output → {title,url,snippet}, drops junk (empty title / non-http
     url / non-dict), and honours max_results."""
     raw = [
-        {"title": "Seoul Tourist Attractions Guide", "url": "https://example.com/seoul", "snippet": "Top places to visit in Seoul"},
+        {
+            "title": "Seoul Tourist Attractions Guide",
+            "url": "https://example.com/seoul",
+            "snippet": "Top places to visit in Seoul",
+        },
         {"title": "", "url": "https://example.com/no-title", "snippet": "drop: empty title"},
         {"title": "bad scheme", "url": "ftp://bad", "snippet": "drop: non-http url"},
         "not-a-dict",
@@ -730,8 +760,8 @@ def test_search_web_falls_back_to_naver_when_others_empty(monkeypatch):
     monkeypatch.delenv("SEARXNG_BASE_URL", raising=False)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     host = _Host()
-    host._has_docker_or_colima = lambda: False          # no SearXNG auto-setup backend
-    host._search_duckduckgo = lambda q, n: []           # DDG: genuine empty
+    host._has_docker_or_colima = lambda: False  # no SearXNG auto-setup backend
+    host._search_duckduckgo = lambda q, n: []  # DDG: genuine empty
     naver_calls = {"n": 0}
 
     def _naver(q, n):
@@ -741,7 +771,7 @@ def test_search_web_falls_back_to_naver_when_others_empty(monkeypatch):
     host._search_naver_browser = _naver
     res = host._tool_search_web({"query": "Seoul tourist attractions"})
     assert res["ok"]
-    assert naver_calls["n"] == 1                          # Naver was reached
+    assert naver_calls["n"] == 1  # Naver was reached
     assert "Seoul attractions result" in res["content"]
     assert res["metadata"]["result_count"] == 1
 
@@ -761,10 +791,11 @@ def test_search_web_skips_naver_for_latin_query(monkeypatch):
 
     host._search_naver_browser = _boom
     res = host._tool_search_web({"query": "python asyncio"})
-    assert res["metadata"]["result_count"] == 0          # no results, no browser spin
+    assert res["metadata"]["result_count"] == 0  # no results, no browser spin
 
 
 # ── _http_request_with_retry: status-code retry ─────────────────────────
+
 
 class _SequenceClient:
     """Returns canned responses in order; records how many requests were made."""
@@ -793,9 +824,7 @@ def test_retry_after_seconds_parses_delta_capped_and_absent():
     # absent header falls back to the caller default
     assert wst._retry_after_seconds(_resp(429), 1.5) == 1.5
     # an HTTP-date in the past floors to 0 (no negative sleep)
-    past = wst._retry_after_seconds(
-        _resp(429, headers={"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}), 1.5
-    )
+    past = wst._retry_after_seconds(_resp(429, headers={"retry-after": "Wed, 21 Oct 2015 07:28:00 GMT"}), 1.5)
     assert past == 0.0
 
 
@@ -803,10 +832,12 @@ def test_http_retry_retries_on_429_then_succeeds(monkeypatch):
     """A transient 429 must be retried and the later success returned."""
     sleeps = []
     monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
-    client = _SequenceClient([
-        _resp(429, headers={"retry-after": "0"}),  # rate-limited, retry immediately
-        _resp(200, text="ok"),                      # success on retry
-    ])
+    client = _SequenceClient(
+        [
+            _resp(429, headers={"retry-after": "0"}),  # rate-limited, retry immediately
+            _resp(200, text="ok"),  # success on retry
+        ]
+    )
     resp = wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/")
     assert resp.status_code == 200
     assert client.calls == 2
@@ -836,15 +867,18 @@ def test_http_retry_honours_retry_after_for_wait(monkeypatch):
     """The Retry-After hint (not the default backoff) is used as the wait."""
     sleeps = []
     monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
-    client = _SequenceClient([
-        _resp(429, headers={"retry-after": "7"}),
-        _resp(200, text="ok"),
-    ])
+    client = _SequenceClient(
+        [
+            _resp(429, headers={"retry-after": "7"}),
+            _resp(200, text="ok"),
+        ]
+    )
     wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/", backoff=1.5)
     assert sleeps == [7.0]
 
 
 # ── connect-error fail-fast + session circuit breaker ────────────────────
+
 
 class _RaisingClient:
     """httpx.Client stub whose get/post raise a fixed exception; counts calls."""
@@ -870,8 +904,8 @@ def test_http_retry_does_not_retry_connect_errors(monkeypatch):
     client = _RaisingClient(httpx.ConnectTimeout("timed out"))
     with pytest.raises(httpx.ConnectTimeout):
         wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/", retries=3)
-    assert client.calls == 1   # single attempt, no retry
-    assert sleeps == []        # no backoff
+    assert client.calls == 1  # single attempt, no retry
+    assert sleeps == []  # no backoff
 
 
 def test_http_retry_still_retries_read_timeout(monkeypatch):
@@ -888,7 +922,7 @@ def test_http_retry_still_retries_read_timeout(monkeypatch):
 
     resp = wst.WebSearchToolsMixin._http_request_with_retry(_C(), "GET", "https://x/", retries=2)
     assert resp.status_code == 200
-    assert calls["n"] == 2     # retried once
+    assert calls["n"] == 2  # retried once
 
 
 def test_connect_failure_trips_breaker_and_skips_backend(monkeypatch):
@@ -902,7 +936,7 @@ def test_connect_failure_trips_breaker_and_skips_backend(monkeypatch):
     monkeypatch.delenv("SEARXNG_BASE_URL", raising=False)
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     host = _Host()
-    host._has_docker_or_colima = lambda: False   # backends = [DuckDuckGo] (Latin → no Naver)
+    host._has_docker_or_colima = lambda: False  # backends = [DuckDuckGo] (Latin → no Naver)
     ddg_calls = {"n": 0}
 
     def _ddg(q, n):
@@ -910,11 +944,11 @@ def test_connect_failure_trips_breaker_and_skips_backend(monkeypatch):
         raise httpx.ConnectTimeout("timed out")
 
     host._search_duckduckgo = _ddg
-    host._tool_search_web({"query": "python asyncio"})       # 1st: connect-fails → trips
+    host._tool_search_web({"query": "python asyncio"})  # 1st: connect-fails → trips
     assert ddg_calls["n"] == 1
     assert host._backend_in_cooldown("DuckDuckGo")
-    host._tool_search_web({"query": "python asyncio"})       # 2nd: skipped
-    assert ddg_calls["n"] == 1                                # NOT called again
+    host._tool_search_web({"query": "python asyncio"})  # 2nd: skipped
+    assert ddg_calls["n"] == 1  # NOT called again
 
 
 def test_read_error_does_not_trip_breaker(monkeypatch):
@@ -928,15 +962,17 @@ def test_read_error_does_not_trip_breaker(monkeypatch):
     host._has_docker_or_colima = lambda: False
     host._search_duckduckgo = lambda q, n: (_ for _ in ()).throw(RuntimeError("anomaly"))
     host._tool_search_web({"query": "python asyncio"})
-    assert not host._backend_in_cooldown("DuckDuckGo")        # not tripped
+    assert not host._backend_in_cooldown("DuckDuckGo")  # not tripped
 
 
 def test_backend_cooldown_expires(monkeypatch):
     """An expired cooldown entry is evicted so the backend is retried."""
     host = _Host()
     wst.WebSearchToolsMixin._backend_cooldown["DuckDuckGo"] = 0.0  # deadline in the past
-    assert not host._backend_in_cooldown("DuckDuckGo")            # expired → False
+    assert not host._backend_in_cooldown("DuckDuckGo")  # expired → False
     assert "DuckDuckGo" not in wst.WebSearchToolsMixin._backend_cooldown  # and evicted
+
+
 def test_parallel_merge_probes_breaker_once_per_backend(monkeypatch):
     """Regression: the parallel-merge path (_run_tier_parallel) used to call
     _backend_in_cooldown TWICE per backend — once in the runnable listcomp and once
@@ -959,16 +995,17 @@ def test_parallel_merge_probes_breaker_once_per_backend(monkeypatch):
 
     backends = [
         ("A", lambda: [{"t": "1"}]),
-        ("B", lambda: [{"t": "2"}]),   # in cooldown → skipped, never submitted
+        ("B", lambda: [{"t": "2"}]),  # in cooldown → skipped, never submitted
         ("C", lambda: [{"t": "3"}]),
     ]
     collected, _errors, _connect_failed = host._run_tier_parallel(backends, deadline=2.0)
 
-    assert probes["n"] == 3                       # exactly once per backend (was 6)
-    assert {name for name, _ in collected} == {"A", "C"}   # B was skipped
+    assert probes["n"] == 3  # exactly once per backend (was 6)
+    assert {name for name, _ in collected} == {"A", "C"}  # B was skipped
 
 
 # ── DuckDuckGo anomaly detection + close() flush ────────────────────────
+
 
 class _DDGStubClient:
     """Stub httpx.Client for _search_duckduckgo (handles POST only)."""
@@ -1015,7 +1052,7 @@ def test_body_is_block_wall_heuristic():
 def test_block_wall_scan_is_bounded():
     """Only a bounded prefix is scanned, so the check stays O(1) in page size."""
     body = ("x" * (wst._BLOCK_WALL_SCAN_CHARS + 100)) + "captcha"
-    assert not wst._body_is_block_wall(body)          # marker past the window
+    assert not wst._body_is_block_wall(body)  # marker past the window
     assert wst._body_is_block_wall("captcha" + body)  # marker inside it
 
 
@@ -1139,7 +1176,7 @@ def test_fetch_challenge_page_needs_both_signals():
 
 
 def test_loose_markers_stay_out_of_the_fetch_path():
-    """"captcha" / "rate limit" must never reach the ungated web_fetch check.
+    """ "captcha" / "rate limit" must never reach the ungated web_fetch check.
 
     They are ordinary words in pages ABOUT those topics; _body_is_block_wall is
     only safe with them because the search path gates on zero parsed results.
@@ -1184,8 +1221,15 @@ def test_fetch_headers_carry_the_full_browser_fingerprint():
     re-creates that fingerprint, so the set is asserted whole.
     """
     required = {
-        "Accept", "Accept-Language", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-        "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site", "Sec-Fetch-User",
+        "Accept",
+        "Accept-Language",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "Sec-Fetch-Dest",
+        "Sec-Fetch-Mode",
+        "Sec-Fetch-Site",
+        "Sec-Fetch-User",
         "Upgrade-Insecure-Requests",
     }
     assert required <= set(wst._BROWSER_FETCH_HEADERS)
@@ -1198,8 +1242,9 @@ def test_client_hint_version_matches_the_user_agent():
     major while the client hint advertises another is a contradiction no real
     browser produces, which is the very signature these headers exist to avoid."""
     ua_major = re.search(r"Chrome/(\d+)", wst._BROWSER_UA).group(1)
-    hint_majors = set(re.findall(r'"Chromium";v="(\d+)"|"Google Chrome";v="(\d+)"',
-                                 wst._BROWSER_FETCH_HEADERS["sec-ch-ua"]))
+    hint_majors = set(
+        re.findall(r'"Chromium";v="(\d+)"|"Google Chrome";v="(\d+)"', wst._BROWSER_FETCH_HEADERS["sec-ch-ua"])
+    )
     hint_majors = {v for pair in hint_majors for v in pair if v}
     assert hint_majors == {ua_major}, f"UA says Chrome/{ua_major}, sec-ch-ua says {hint_majors}"
 
@@ -1228,10 +1273,7 @@ def test_ddg_search_raises_on_anomaly_page(monkeypatch):
 
     The detector is now the chain-common ``_guard_block_wall``, so the message is
     generic — it must still name the engine that produced the wall."""
-    anomaly = (
-        "<html><body><h2>If this error persists, we have detected "
-        "an anomaly in your requests.</h2></body></html>"
-    )
+    anomaly = "<html><body><h2>If this error persists, we have detected an anomaly in your requests.</h2></body></html>"
     monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: _DDGStubClient(anomaly))
     host = _Host()
 
@@ -1296,6 +1338,8 @@ def test_web_fetch_allows_normal_content_length(monkeypatch):
     res = host._tool_web_fetch({"url": "https://x/page"})
     assert res["ok"], res
     assert "hello world" in res["content"]
+
+
 def test_web_fetch_rejects_streaming_exceeding_byte_cap(monkeypatch):
     """A chunked response (no Content-Length) that exceeds the byte cap during
     streaming must be refused, preventing OOM on unbounded chunked responses."""
@@ -1333,15 +1377,12 @@ def test_sniff_html_encoding_meta_charset_attribute():
 
 
 def test_sniff_html_encoding_meta_http_equiv():
-    body = (
-        b'<html><head><meta http-equiv="Content-Type" '
-        b'content="text/html; charset=cp949"></head></html>'
-    )
+    body = b'<html><head><meta http-equiv="Content-Type" content="text/html; charset=cp949"></head></html>'
     assert wst._sniff_html_encoding(body).lower() == "cp949"
 
 
 def test_sniff_html_encoding_none_when_absent():
-    body = b'<html><head><title>no charset</title></head></html>'
+    body = b"<html><head><title>no charset</title></head></html>"
     assert wst._sniff_html_encoding(body) is None
 
 
@@ -1371,14 +1412,13 @@ def test_web_fetch_meta_charset_euckr_not_mangled(monkeypatch):
     Korean legacy pages were replace-decoded into mojibake."""
     host = _Host()
     korean = "안녕하세요 세계"
-    body = (
-        f'<html><head><meta charset="euc-kr"></head>'
-        f'<body><p>{korean}</p></body></html>'
-    ).encode("euc-kr")
+    body = (f'<html><head><meta charset="euc-kr"></head><body><p>{korean}</p></body></html>').encode("euc-kr")
     # Content-Type deliberately carries NO charset → header path yields None.
     resp = httpx.Response(
-        200, request=httpx.Request("GET", "https://x/"),
-        headers={"content-type": "text/html"}, content=body,
+        200,
+        request=httpx.Request("GET", "https://x/"),
+        headers={"content-type": "text/html"},
+        content=body,
     )
     _stub_fetch(monkeypatch, resp)
     res = host._tool_web_fetch({"url": "https://example.com"})
@@ -1391,8 +1431,10 @@ def test_web_fetch_header_charset_overrides_meta(monkeypatch):
     host = _Host()
     body = b'<html><head><meta charset="euc-kr"></head><body>plain ascii</body></html>'
     resp = httpx.Response(
-        200, request=httpx.Request("GET", "https://x/"),
-        headers={"content-type": "text/html; charset=utf-8"}, content=body,
+        200,
+        request=httpx.Request("GET", "https://x/"),
+        headers={"content-type": "text/html; charset=utf-8"},
+        content=body,
     )
     _stub_fetch(monkeypatch, resp)
     res = host._tool_web_fetch({"url": "https://example.com"})
@@ -1404,8 +1446,10 @@ def test_web_fetch_rejects_binary_pdf(monkeypatch):
     """A PDF must be rejected with a clean error, not decode-mangled into context."""
     host = _Host()
     resp = httpx.Response(
-        200, request=httpx.Request("GET", "https://x/doc.pdf"),
-        headers={"content-type": "application/pdf"}, content=b"%PDF-1.4\n%\xe2\xe3\xcf\xd3",
+        200,
+        request=httpx.Request("GET", "https://x/doc.pdf"),
+        headers={"content-type": "application/pdf"},
+        content=b"%PDF-1.4\n%\xe2\xe3\xcf\xd3",
     )
     _stub_fetch(monkeypatch, resp)
     res = host._tool_web_fetch({"url": "https://example.com/doc.pdf"})
@@ -1418,8 +1462,10 @@ def test_web_fetch_rejects_binary_image(monkeypatch):
     """An image Content-Type is rejected as binary too."""
     host = _Host()
     resp = httpx.Response(
-        200, request=httpx.Request("GET", "https://x/img.png"),
-        headers={"content-type": "image/png"}, content=b"\x89PNG\r\n\x1a\n",
+        200,
+        request=httpx.Request("GET", "https://x/img.png"),
+        headers={"content-type": "image/png"},
+        content=b"\x89PNG\r\n\x1a\n",
     )
     _stub_fetch(monkeypatch, resp)
     res = host._tool_web_fetch({"url": "https://example.com/img.png"})
@@ -1483,19 +1529,21 @@ def test_web_fetch_retries_on_429_then_succeeds(monkeypatch):
     sleeps = []
     monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
 
-    client = _FetchRetryClient([
-        httpx.Response(
-            429,
-            request=httpx.Request("GET", "https://x/rate"),
-            headers={"retry-after": "0", "content-type": "text/plain"},
-        ),
-        httpx.Response(
-            200,
-            request=httpx.Request("GET", "https://x/rate"),
-            headers={"content-type": "text/plain; charset=utf-8"},
-            text="finally ok",
-        ),
-    ])
+    client = _FetchRetryClient(
+        [
+            httpx.Response(
+                429,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"retry-after": "0", "content-type": "text/plain"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"content-type": "text/plain; charset=utf-8"},
+                text="finally ok",
+            ),
+        ]
+    )
     monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: client)
     host = _Host()
     res = host._tool_web_fetch({"url": "https://x/rate"})
@@ -1559,19 +1607,16 @@ def test_search_web_prefers_brave_over_ddg_when_key_set(monkeypatch):
 
     order: list[str] = []
     monkeypatch.setattr(
-        _Host, "_search_brave",
+        _Host,
+        "_search_brave",
         lambda self, q, m, k: order.append("brave") or [{"title": "t", "url": "u", "snippet": "s"}],
     )
-    monkeypatch.setattr(
-        _Host, "_search_duckduckgo", lambda self, q, m: order.append("ddg") or []
-    )
+    monkeypatch.setattr(_Host, "_search_duckduckgo", lambda self, q, m: order.append("ddg") or [])
 
     host = _Host()
     res = host._tool_search_web({"query": "test"})
     assert res["ok"], res.get("error")
-    assert order == ["brave"], (
-        f"Brave must be tried first when BRAVE_API_KEY is set; got order={order}"
-    )
+    assert order == ["brave"], f"Brave must be tried first when BRAVE_API_KEY is set; got order={order}"
 
 
 def test_search_web_excludes_ddg_from_default_chain(monkeypatch):
@@ -1592,7 +1637,7 @@ def test_search_web_excludes_ddg_from_default_chain(monkeypatch):
 
     monkeypatch.setattr(_Host, "_search_duckduckgo", _boom)
     res = _Host()._tool_search_web({"query": "test"})
-    assert res["metadata"]["result_count"] == 0   # Startpage stubbed empty; nothing else runs
+    assert res["metadata"]["result_count"] == 0  # Startpage stubbed empty; nothing else runs
 
 
 def test_search_web_includes_ddg_when_opted_in(monkeypatch):
@@ -1604,7 +1649,8 @@ def test_search_web_includes_ddg_when_opted_in(monkeypatch):
 
     order: list[str] = []
     monkeypatch.setattr(
-        _Host, "_search_duckduckgo",
+        _Host,
+        "_search_duckduckgo",
         lambda self, q, m: order.append("ddg") or [{"title": "t", "url": "u", "snippet": "s"}],
     )
     res = _Host()._tool_search_web({"query": "test"})
@@ -1615,7 +1661,7 @@ def test_search_web_includes_ddg_when_opted_in(monkeypatch):
 def test_should_try_ddg_env_modes(monkeypatch):
     host = _Host()
     monkeypatch.delenv("ASICODE_DDG_FALLBACK", raising=False)
-    assert host._should_try_ddg() is False              # default: off
+    assert host._should_try_ddg() is False  # default: off
     for on in ("on", "always", "1", "true", "ON", " on "):
         monkeypatch.setenv("ASICODE_DDG_FALLBACK", on)
         assert host._should_try_ddg() is True, on
@@ -1640,10 +1686,10 @@ def test_block_wall_trips_breaker(monkeypatch):
 
     monkeypatch.setattr(_Host, "_search_startpage", _walled)
     host = _Host()
-    host._tool_search_web({"query": "test"})          # 1st: walls → trips breaker
+    host._tool_search_web({"query": "test"})  # 1st: walls → trips breaker
     assert calls["n"] == 1
     assert host._backend_in_cooldown("Startpage")
-    host._tool_search_web({"query": "test"})          # 2nd: skipped entirely
+    host._tool_search_web({"query": "test"})  # 2nd: skipped entirely
     assert calls["n"] == 1, "walled backend was asked again despite the breaker"
 
 
@@ -1723,7 +1769,7 @@ def test_startpage_parser_strips_control_chars():
 def test_startpage_parser_keeps_result_without_snippet():
     """A title with no following <p class="description"> must still be emitted
     (same three-site flush contract as the DDG parser)."""
-    only_title = _SP_RESULT.split("<style data-emotion=\"css 1507v2l\"", maxsplit=1)[0]
+    only_title = _SP_RESULT.split('<style data-emotion="css 1507v2l"', maxsplit=1)[0]
     p = wst._StartpageResultParser(max_results=5)
     p.feed(only_title)
     p.close()
@@ -1759,9 +1805,7 @@ def test_flush_and_state_init_live_in_base_ssot():
     attr helpers are pinned above."""
     base = wst._ResultParserBase
     for parser in (wst._DDGResultParser, wst._StartpageResultParser):
-        assert "_flush" not in vars(parser), (
-            f"{parser.__name__}._flush shadows the base SSOT — delete it and inherit"
-        )
+        assert "_flush" not in vars(parser), f"{parser.__name__}._flush shadows the base SSOT — delete it and inherit"
         assert parser._flush is base._flush
     # The common state must come from the base constructor, not per-parser copies.
     for parser in (wst._DDGResultParser, wst._StartpageResultParser):
@@ -1785,7 +1829,7 @@ def test_flush_required_fields_per_engine():
     sp = wst._StartpageResultParser(max_results=5)
     sp.feed('<a class="result-title">Title without href</a>')
     sp.close()
-    assert len(sp.results) == 0     # no destination -> not usable
+    assert len(sp.results) == 0  # no destination -> not usable
 
 
 def test_has_class_matches_whole_tokens_only():
@@ -1794,8 +1838,8 @@ def test_has_class_matches_whole_tokens_only():
     attrs = [("class", "result-title result-link css-1bggj8v")]
     assert wst._ResultParserBase._has_class(attrs, "result-title")
     assert wst._ResultParserBase._has_class(attrs, "result-link")
-    assert not wst._ResultParserBase._has_class(attrs, "result")       # prefix, not a token
-    assert not wst._ResultParserBase._has_class(attrs, "result-tit")   # partial token
+    assert not wst._ResultParserBase._has_class(attrs, "result")  # prefix, not a token
+    assert not wst._ResultParserBase._has_class(attrs, "result-tit")  # partial token
     assert not wst._ResultParserBase._has_class([], "result-title")
 
 
@@ -1839,7 +1883,8 @@ def test_search_startpage_raises_on_block_wall(monkeypatch):
 def test_search_startpage_empty_page_is_a_genuine_miss(monkeypatch):
     """No results and no wall markers → honest empty list, no exception."""
     monkeypatch.setattr(
-        wst.httpx, "Client",
+        wst.httpx,
+        "Client",
         lambda *a, **k: _StartpageStubClient("<html><body><p>No results.</p></body></html>"),
     )
     assert _real_search_startpage(_Host(), "zzzq unlikely", 5) == []
@@ -1853,7 +1898,8 @@ def test_search_web_tries_startpage_first(monkeypatch):
 
     order: list[str] = []
     monkeypatch.setattr(
-        _Host, "_search_startpage",
+        _Host,
+        "_search_startpage",
         lambda self, q, m: order.append("startpage") or [{"title": "t", "url": "u", "snippet": "s"}],
     )
     monkeypatch.setattr(_Host, "_search_brave", lambda self, q, m, k: order.append("brave") or [])
@@ -1876,16 +1922,18 @@ def test_tier1_queries_searxng_and_startpage_together(monkeypatch):
 
     ran: list[str] = []
     monkeypatch.setattr(
-        _Host, "_search_searxng",
-        lambda self, q, m, u: ran.append("searxng") or [
-            {"title": "from searxng", "url": "https://a.example/x", "snippet": "s"}
-        ],
+        _Host,
+        "_search_searxng",
+        lambda self, q, m, u: (
+            ran.append("searxng") or [{"title": "from searxng", "url": "https://a.example/x", "snippet": "s"}]
+        ),
     )
     monkeypatch.setattr(
-        _Host, "_search_startpage",
-        lambda self, q, m: ran.append("startpage") or [
-            {"title": "from startpage", "url": "https://b.example/y", "snippet": "s"}
-        ],
+        _Host,
+        "_search_startpage",
+        lambda self, q, m: (
+            ran.append("startpage") or [{"title": "from startpage", "url": "https://b.example/y", "snippet": "s"}]
+        ),
     )
 
     res = _Host()._tool_search_web({"query": "test"})
@@ -1902,7 +1950,8 @@ def test_tier2_not_reached_when_tier1_returns_results(monkeypatch):
     monkeypatch.setenv("ASICODE_DDG_FALLBACK", "on")
     monkeypatch.setattr(_Host, "_has_docker_or_colima", lambda self: False)
     monkeypatch.setattr(
-        _Host, "_search_startpage",
+        _Host,
+        "_search_startpage",
         lambda self, q, m: [{"title": "t", "url": "https://x.example/1", "snippet": "s"}],
     )
 
@@ -1923,7 +1972,8 @@ def test_tier2_reached_when_tier1_empty(monkeypatch):
     monkeypatch.setattr(_Host, "_has_docker_or_colima", lambda self: False)
     monkeypatch.setattr(_Host, "_search_startpage", lambda self, q, m: [])
     monkeypatch.setattr(
-        _Host, "_search_brave",
+        _Host,
+        "_search_brave",
         lambda self, q, m, k: [{"title": "brave hit", "url": "https://b.example/1", "snippet": "s"}],
     )
     res = _Host()._tool_search_web({"query": "test"})
@@ -1947,7 +1997,8 @@ def test_tier1_deadline_returns_partial_instead_of_waiting(monkeypatch):
 
     monkeypatch.setattr(_Host, "_search_searxng", _slow)
     monkeypatch.setattr(
-        _Host, "_search_startpage",
+        _Host,
+        "_search_startpage",
         lambda self, q, m: [{"title": "fast", "url": "https://fast.example/1", "snippet": ""}],
     )
 
@@ -1973,7 +2024,8 @@ def test_search_web_defers_searxng_autosetup_behind_startpage(monkeypatch):
 
     monkeypatch.setattr(_Host, "_setup_and_search_searxng", _must_not_prompt)
     monkeypatch.setattr(
-        _Host, "_search_startpage",
+        _Host,
+        "_search_startpage",
         lambda self, q, m: [{"title": "t", "url": "u", "snippet": "s"}],
     )
 
@@ -1984,15 +2036,16 @@ def test_search_web_defers_searxng_autosetup_behind_startpage(monkeypatch):
 
 # ── Result merging ──────────────────────────────────────────────────────
 
+
 def test_normalize_url_ignores_cosmetic_differences():
     n = wst._normalize_result_url
     base = n("https://example.com/path")
-    assert n("http://example.com/path") == base          # scheme
-    assert n("https://www.example.com/path") == base     # www.
-    assert n("https://EXAMPLE.com/path") == base         # host case
-    assert n("https://example.com/path/") == base        # trailing slash
-    assert n("https://example.com/path#frag") == base    # fragment
-    assert n("https://example.com:443/path") == base     # default port
+    assert n("http://example.com/path") == base  # scheme
+    assert n("https://www.example.com/path") == base  # www.
+    assert n("https://EXAMPLE.com/path") == base  # host case
+    assert n("https://example.com/path/") == base  # trailing slash
+    assert n("https://example.com/path#frag") == base  # fragment
+    assert n("https://example.com:443/path") == base  # default port
 
 
 def test_normalize_url_keeps_meaningful_query():
@@ -2014,13 +2067,19 @@ def test_merge_ranks_cross_backend_agreement_first():
     shared = "https://agreed.example/doc"
     merged = wst._merge_search_results(
         [
-            ("SearXNG", [
-                {"title": "solo top", "url": "https://solo.example/a", "snippet": ""},
-                {"title": "agreed", "url": shared, "snippet": "short"},
-            ]),
-            ("Startpage", [
-                {"title": "agreed (fuller title)", "url": shared + "/", "snippet": "a longer snippet"},
-            ]),
+            (
+                "SearXNG",
+                [
+                    {"title": "solo top", "url": "https://solo.example/a", "snippet": ""},
+                    {"title": "agreed", "url": shared, "snippet": "short"},
+                ],
+            ),
+            (
+                "Startpage",
+                [
+                    {"title": "agreed (fuller title)", "url": shared + "/", "snippet": "a longer snippet"},
+                ],
+            ),
         ],
         max_results=5,
     )
@@ -2047,12 +2106,17 @@ def test_merge_preserves_backend_order_within_same_agreement():
 
 def test_merge_drops_untitled_and_respects_max_results():
     merged = wst._merge_search_results(
-        [("X", [
-            {"title": "", "url": "https://no-title.example/1", "snippet": "s"},
-            {"title": "ok1", "url": "https://a.example/1", "snippet": ""},
-            {"title": "ok2", "url": "https://b.example/1", "snippet": ""},
-            {"title": "ok3", "url": "https://c.example/1", "snippet": ""},
-        ])],
+        [
+            (
+                "X",
+                [
+                    {"title": "", "url": "https://no-title.example/1", "snippet": "s"},
+                    {"title": "ok1", "url": "https://a.example/1", "snippet": ""},
+                    {"title": "ok2", "url": "https://b.example/1", "snippet": ""},
+                    {"title": "ok3", "url": "https://c.example/1", "snippet": ""},
+                ],
+            )
+        ],
         max_results=2,
     )
     assert [r["title"] for r in merged] == ["ok1", "ok2"]
@@ -2061,9 +2125,7 @@ def test_merge_drops_untitled_and_respects_max_results():
 def test_merge_handles_empty_and_urlless_input():
     assert wst._merge_search_results([], max_results=5) == []
     assert wst._merge_search_results([("X", [])], max_results=5) == []
-    assert wst._merge_search_results(
-        [("X", [{"title": "t", "url": "", "snippet": "s"}])], max_results=5
-    ) == []
+    assert wst._merge_search_results([("X", [{"title": "t", "url": "", "snippet": "s"}])], max_results=5) == []
 
 
 def test_consensus_is_surfaced_only_when_more_than_one_source(monkeypatch):
@@ -2082,6 +2144,7 @@ def test_consensus_is_surfaced_only_when_more_than_one_source(monkeypatch):
 
 # ── SearXNG engine curation ─────────────────────────────────────────────
 
+
 def test_searxng_engines_default_is_the_curated_list(monkeypatch):
     monkeypatch.delenv("ASICODE_SEARXNG_ENGINES", raising=False)
     assert _Host()._searxng_engines() == wst._SEARXNG_DEFAULT_ENGINES
@@ -2092,11 +2155,11 @@ def test_searxng_engines_env_override_and_category_escape(monkeypatch):
     tunable without a release — including all the way back to SearXNG's own
     category selection."""
     monkeypatch.setenv("ASICODE_SEARXNG_ENGINES", "bing, mojeek ,, yandex ")
-    assert _Host()._searxng_engines() == "bing,mojeek,yandex"   # spaces/empties normalised
+    assert _Host()._searxng_engines() == "bing,mojeek,yandex"  # spaces/empties normalised
     monkeypatch.setenv("ASICODE_SEARXNG_ENGINES", "category")
-    assert _Host()._searxng_engines() == ""                      # "" == use the category
+    assert _Host()._searxng_engines() == ""  # "" == use the category
     monkeypatch.setenv("ASICODE_SEARXNG_ENGINES", "CATEGORY")
-    assert _Host()._searxng_engines() == ""                      # case-insensitive
+    assert _Host()._searxng_engines() == ""  # case-insensitive
     monkeypatch.setenv("ASICODE_SEARXNG_ENGINES", "   ")
     assert _Host()._searxng_engines() == wst._SEARXNG_DEFAULT_ENGINES  # blank → default
 
@@ -2126,8 +2189,12 @@ def test_search_searxng_sends_engines_not_category(monkeypatch):
     seen: dict = {}
 
     class _C:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
         def get(self, url, params=None, headers=None):
             seen.update(params or {})
             return httpx.Response(200, request=httpx.Request("GET", url), json={"results": []})
@@ -2143,8 +2210,12 @@ def test_search_searxng_category_escape_restores_categories(monkeypatch):
     seen: dict = {}
 
     class _C:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
         def get(self, url, params=None, headers=None):
             seen.update(params or {})
             return httpx.Response(200, request=httpx.Request("GET", url), json={"results": []})
@@ -2158,6 +2229,7 @@ def test_search_searxng_category_escape_restores_categories(monkeypatch):
 
 # ── SearXNG image freshness ─────────────────────────────────────────────
 
+
 @pytest.fixture(autouse=True)
 def _reset_staleness_check():
     """The once-per-process guard is class state — isolate it between tests."""
@@ -2169,6 +2241,7 @@ def _reset_staleness_check():
 def _proc(stdout="", rc=0):
     class _P:
         returncode = rc
+
     p = _P()
     p.stdout = stdout
     return p
@@ -2180,7 +2253,7 @@ def test_image_age_parses_docker_nanosecond_timestamp(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
     created = datetime.now(timezone.utc) - timedelta(days=42)
-    stamp = created.strftime("%Y-%m-%dT%H:%M:%S") + ".762521632Z"   # 9 fractional digits
+    stamp = created.strftime("%Y-%m-%dT%H:%M:%S") + ".762521632Z"  # 9 fractional digits
     monkeypatch.setattr(wst.shutil, "which", lambda _: "/usr/bin/docker")
     monkeypatch.setattr(wst.subprocess, "run", lambda *a, **k: _proc(stamp))
     age = _Host()._searxng_image_age_days()
@@ -2190,12 +2263,12 @@ def test_image_age_parses_docker_nanosecond_timestamp(monkeypatch):
 
 def test_image_age_none_when_docker_or_image_absent(monkeypatch):
     monkeypatch.setattr(wst.shutil, "which", lambda _: None)
-    assert _Host()._searxng_image_age_days() is None          # no docker
+    assert _Host()._searxng_image_age_days() is None  # no docker
     monkeypatch.setattr(wst.shutil, "which", lambda _: "/usr/bin/docker")
     monkeypatch.setattr(wst.subprocess, "run", lambda *a, **k: _proc("", rc=1))
-    assert _Host()._searxng_image_age_days() is None          # image not pulled
+    assert _Host()._searxng_image_age_days() is None  # image not pulled
     monkeypatch.setattr(wst.subprocess, "run", lambda *a, **k: _proc("not-a-timestamp"))
-    assert _Host()._searxng_image_age_days() is None          # unparseable
+    assert _Host()._searxng_image_age_days() is None  # unparseable
 
 
 def test_stale_notice_fires_only_past_threshold(tmp_path, monkeypatch):
@@ -2219,8 +2292,8 @@ def test_stale_notice_is_rate_limited_across_processes(tmp_path, monkeypatch):
     monkeypatch.setattr(_Host, "repo_root", str(tmp_path), raising=False)
     monkeypatch.setattr(_Host, "_searxng_image_age_days", lambda self: 45.0)
 
-    assert _Host()._stale_searxng_image_notice() is not None      # first: notified
-    wst.WebSearchToolsMixin._searxng_staleness_checked = False    # simulate a new process
+    assert _Host()._stale_searxng_image_notice() is not None  # first: notified
+    wst.WebSearchToolsMixin._searxng_staleness_checked = False  # simulate a new process
     assert _Host()._stale_searxng_image_notice() is None, "state file did not suppress the repeat"
 
     state = tmp_path / ".asicode" / "searxng_image_check.json"
@@ -2281,7 +2354,8 @@ def test_stale_notice_survives_a_walled_search_path(tmp_path, monkeypatch):
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.setattr(_Host, "_searxng_image_age_days", lambda self: 45.0)
     monkeypatch.setattr(
-        _Host, "_search_searxng",
+        _Host,
+        "_search_searxng",
         lambda self, q, m, u: [{"title": "t", "url": "https://x.example/1", "snippet": "s"}],
     )
     monkeypatch.setattr(_Host, "_search_startpage", lambda self, q, m: [])
@@ -2312,7 +2386,8 @@ def test_no_notice_when_searxng_not_configured(tmp_path, monkeypatch):
     monkeypatch.delenv("BRAVE_API_KEY", raising=False)
     monkeypatch.setattr(_Host, "_has_docker_or_colima", lambda self: False)
     monkeypatch.setattr(
-        _Host, "_search_startpage",
+        _Host,
+        "_search_startpage",
         lambda self, q, m: [{"title": "t", "url": "https://x.example/1", "snippet": "s"}],
     )
     monkeypatch.setattr(_Host, "_searxng_image_age_days", lambda self: 999.0)
@@ -2321,6 +2396,7 @@ def test_no_notice_when_searxng_not_configured(tmp_path, monkeypatch):
 
 
 # ── SearXNG Checkpoint: concurrency ─────────────────────────────────────
+
 
 class _AnswerResult:
     """Minimal stand-in for the ToolResult returned by _tool_ask_user."""
@@ -2337,7 +2413,7 @@ def _run_concurrently(fn, n=2, timeout=10):
     out: list = [None] * n
 
     def worker(i):
-        ready.wait()          # release all threads at the same instant
+        ready.wait()  # release all threads at the same instant
         out[i] = fn()
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
@@ -2364,7 +2440,7 @@ def test_concurrent_start_prompt_is_issued_once(monkeypatch):
     def _ask(args):
         with guard:
             prompts.append(args["question"])
-        time.sleep(0.3)       # hold the check→write window open, as a real prompt does
+        time.sleep(0.3)  # hold the check→write window open, as a real prompt does
         return _AnswerResult("yes")
 
     monkeypatch.setattr(host, "_tool_ask_user", _ask, raising=False)
@@ -2454,9 +2530,7 @@ def test_concurrent_start_searxng_never_overlaps(monkeypatch):
     monkeypatch.setattr(_Host, "_start_searxng_locked", _body, raising=False)
     _run_concurrently(host._start_searxng)
 
-    assert concurrent["max"] == 1, (
-        f"{concurrent['max']} concurrent _start_searxng bodies — docker run can race itself"
-    )
+    assert concurrent["max"] == 1, f"{concurrent['max']} concurrent _start_searxng bodies — docker run can race itself"
 
 
 def test_searxng_setup_lock_is_shared_and_reentrant():
@@ -2484,8 +2558,7 @@ def test_web_fetch_truncation_length_excludes_marker(monkeypatch):
     assert res["ok"]
     assert "TRUNCATED" in res["content"]
     assert res["metadata"]["length"] == 1000, (
-        "length must reflect real content (max_chars), not include the marker — "
-        f"got {res['metadata']['length']}"
+        f"length must reflect real content (max_chars), not include the marker — got {res['metadata']['length']}"
     )
 
 
@@ -2682,7 +2755,8 @@ def test_startpage_browser_route_reports_its_own_wall(monkeypatch):
     """If the browser route is ALSO walled it must raise, not return an empty list
     that the chain would read as an honest 'nothing matched'."""
     monkeypatch.setattr(
-        _Host, "_render_and_eval",
+        _Host,
+        "_render_and_eval",
         lambda self, url, js, **kw: "<html><body>Verification required</body></html>",
         raising=False,
     )
@@ -2774,9 +2848,7 @@ def test_parse_exa_skips_untitled_results():
 
 
 def test_parse_exa_respects_max_results():
-    payload = "\n---\n\n".join(
-        f"Title: T{i}\nURL: https://example.com/{i}\nHighlights:\nbody {i}\n" for i in range(10)
-    )
+    payload = "\n---\n\n".join(f"Title: T{i}\nURL: https://example.com/{i}\nHighlights:\nbody {i}\n" for i in range(10))
     assert len(wst._parse_exa_results(payload, 3)) == 3
 
 
@@ -2871,8 +2943,7 @@ def test_search_exa_quota_refusal_is_a_wall(monkeypatch):
     assert len(stub.calls) == 1, "a daily quota must not be re-asked 1.5s later"
 
 
-@pytest.mark.parametrize("value,expected", [("off", False), ("0", False), ("no", False),
-                                            ("", True), ("on", True)])
+@pytest.mark.parametrize("value,expected", [("off", False), ("0", False), ("no", False), ("", True), ("on", True)])
 def test_exa_opt_out_switch(monkeypatch, value, expected):
     monkeypatch.setenv(wst._EXA_ENV, value)
     assert wst.WebSearchToolsMixin._should_try_exa() is expected
@@ -2884,18 +2955,18 @@ def test_tier1_includes_exa(monkeypatch):
     monkeypatch.setattr(_Host, "_has_docker_or_colima", lambda self: False)
     called: list[str] = []
     monkeypatch.setattr(
-        _Host, "_search_startpage",
+        _Host,
+        "_search_startpage",
         lambda self, q, m: called.append("startpage") or [{"title": "sp", "url": "https://a/", "snippet": "s"}],
     )
     monkeypatch.setattr(
-        _Host, "_search_exa",
+        _Host,
+        "_search_exa",
         lambda self, q, m: called.append("exa") or [{"title": "exa", "url": "https://b/", "excerpt": "e"}],
     )
 
     res = _Host()._tool_search_web({"query": "test"})
-    assert sorted(called) == ["exa", "startpage"], (
-        "Startpage answering must not short-circuit Exa — tier 1 merges"
-    )
+    assert sorted(called) == ["exa", "startpage"], "Startpage answering must not short-circuit Exa — tier 1 merges"
     assert "https://b/" in res["content"]
 
 
@@ -2907,14 +2978,20 @@ def test_tier1_includes_exa(monkeypatch):
 def test_excerpt_supersedes_snippet_and_carries_date():
     res = _Host()._format_search_results(
         "q",
-        [{"title": "T", "url": "https://x/", "snippet": "short serp line",
-          "excerpt": "the real page text", "published": "2026-07-28T22:50:35.095Z", "sources": "Exa"}],
+        [
+            {
+                "title": "T",
+                "url": "https://x/",
+                "snippet": "short serp line",
+                "excerpt": "the real page text",
+                "published": "2026-07-28T22:50:35.095Z",
+                "sources": "Exa",
+            }
+        ],
         ["Exa"],
     )
     assert "the real page text" in res["content"]
-    assert "short serp line" not in res["content"], (
-        "printing both spends tokens twice on the same result"
-    )
+    assert "short serp line" not in res["content"], "printing both spends tokens twice on the same result"
     assert "Published: 2026-07-28" in res["content"]
 
 
@@ -3028,12 +3105,26 @@ def test_relevance_breaks_the_tie_that_backend_order_used_to_decide():
     """The reported defect, minimised: two #0 results, one of them junk."""
     per_backend = [
         # Listed FIRST — under the old key this won on first_backend alone.
-        ("SearXNG", [{"title": "The R Project for Statistical Computing",
-                      "url": "https://www.r-project.org/",
-                      "snippet": "R is a free software environment for statistical computing"}]),
-        ("Exa", [{"title": "r/LocalLLaMA",
-                  "url": "https://www.reddit.com/r/LocalLLaMA/",
-                  "excerpt": "LocalLLaMA subreddit discussing DeepSeek and local models"}]),
+        (
+            "SearXNG",
+            [
+                {
+                    "title": "The R Project for Statistical Computing",
+                    "url": "https://www.r-project.org/",
+                    "snippet": "R is a free software environment for statistical computing",
+                }
+            ],
+        ),
+        (
+            "Exa",
+            [
+                {
+                    "title": "r/LocalLLaMA",
+                    "url": "https://www.reddit.com/r/LocalLLaMA/",
+                    "excerpt": "LocalLLaMA subreddit discussing DeepSeek and local models",
+                }
+            ],
+        ),
     ]
     query = "r/LocalLLaMA DeepSeek reddit thread"
 
@@ -3057,9 +3148,17 @@ def test_relevance_does_not_override_cross_backend_agreement():
     agreed = {"title": "Result", "url": "https://agreed.example/", "snippet": "generic"}
     per_backend = [
         ("SearXNG", [agreed]),
-        ("Exa", [agreed, {"title": "postgres index only scan visibility map",
-                          "url": "https://solo.example/postgres-index-only-scan-visibility-map",
-                          "excerpt": "postgres index only scan visibility map"}]),
+        (
+            "Exa",
+            [
+                agreed,
+                {
+                    "title": "postgres index only scan visibility map",
+                    "url": "https://solo.example/postgres-index-only-scan-visibility-map",
+                    "excerpt": "postgres index only scan visibility map",
+                },
+            ],
+        ),
     ]
     top = wst._merge_search_results(per_backend, 5, "postgres index only scan visibility map")[0]
     assert top["url"] == "https://agreed.example/"
@@ -3074,11 +3173,17 @@ def test_relevance_does_not_override_engine_position():
     engine ranked #0 keeps beating one it ranked #1.
     """
     per_backend = [
-        ("Exa", [
-            {"title": "Generic overview page", "url": "https://a.example/", "excerpt": "overview"},
-            {"title": "postgres index only scan visibility map",
-             "url": "https://b.example/", "excerpt": "postgres index only scan visibility map"},
-        ]),
+        (
+            "Exa",
+            [
+                {"title": "Generic overview page", "url": "https://a.example/", "excerpt": "overview"},
+                {
+                    "title": "postgres index only scan visibility map",
+                    "url": "https://b.example/",
+                    "excerpt": "postgres index only scan visibility map",
+                },
+            ],
+        ),
     ]
     assert _merge_top_url(per_backend, "postgres index only scan visibility map") == "https://a.example/"
 
@@ -3116,10 +3221,20 @@ def test_relevance_scores_korean_queries():
     every candidate 0.0, and the junk result wins on backend order.
     """
     per_backend = [
-        ("SearXNG", [{"title": "Unrelated page", "url": "https://junk.example/",
-                      "snippet": "nothing to do with the question"}]),
-        ("Exa", [{"title": "전세 사기 대처 방법 정리",
-                  "url": "https://ko.example/guide", "excerpt": "전세 사기 피해 대처 절차"}]),
+        (
+            "SearXNG",
+            [{"title": "Unrelated page", "url": "https://junk.example/", "snippet": "nothing to do with the question"}],
+        ),
+        (
+            "Exa",
+            [
+                {
+                    "title": "전세 사기 대처 방법 정리",
+                    "url": "https://ko.example/guide",
+                    "excerpt": "전세 사기 피해 대처 절차",
+                }
+            ],
+        ),
     ]
     assert _merge_top_url(per_backend, "전세 사기 대처 방법") == "https://ko.example/guide"
 
@@ -3136,9 +3251,12 @@ def test_relevance_tokens_keep_hangul_and_do_not_split_camel_case():
 def test_url_contributes_relevance():
     """The URL often names what the title omits (reddit.com/r/LocalLLaMA)."""
     assert "localllama" in wst._url_text("https://www.reddit.com/r/LocalLLaMA/rising/").lower()
-    assert "index only scans" in wst._url_text(
-        "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
-    ).replace("-", " ").lower()
+    assert (
+        "index only scans"
+        in wst._url_text("https://www.postgresql.org/docs/current/indexes-index-only-scans.html")
+        .replace("-", " ")
+        .lower()
+    )
 
     per_backend = [
         ("SearXNG", [{"title": "Untitled", "url": "https://a.example/", "snippet": ""}]),
@@ -3150,9 +3268,7 @@ def test_url_contributes_relevance():
 
 def test_relevance_is_not_leaked_into_results():
     """`relevance` is internal bookkeeping, not part of the tool's output shape."""
-    merged = wst._merge_search_results(
-        [("Exa", [{"title": "T", "url": "https://x/", "excerpt": "body"}])], 5, "body"
-    )
+    merged = wst._merge_search_results([("Exa", [{"title": "T", "url": "https://x/", "excerpt": "body"}])], 5, "body")
     assert "relevance" not in merged[0]
 
 
@@ -3166,6 +3282,7 @@ def test_relevance_scores_empty_inputs_safely():
 # Regression: the tool-layer retry sleeps were raw ``time.sleep``, so ESC was
 # unresponsive for up to the 30s Retry-After cap (the client-layer backoff was
 # made cancelable in the same change family; the tool layer lagged behind).
+
 
 def test_live_cancel_event_absent_and_present():
     """``_live_cancel_event`` must be None on duck-typed hosts without a config
@@ -3186,9 +3303,7 @@ def test_http_retry_cancel_already_set_aborts_before_any_request():
     ce.set()
     client = _SequenceClient([_resp(200, text="ok")])
     with pytest.raises(wst.AgentCancelled):
-        wst.WebSearchToolsMixin._http_request_with_retry(
-            client, "GET", "https://x/", cancel_event=ce
-        )
+        wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/", cancel_event=ce)
     assert client.calls == 0
 
 
@@ -3203,14 +3318,14 @@ def test_http_retry_cancel_mid_backoff_aborts_retry():
 
     t = threading.Thread(target=_late_set, daemon=True)
     t.start()
-    client = _SequenceClient([
-        _resp(429, headers={"retry-after": "30"}),
-        _resp(200, text="ok"),
-    ])
+    client = _SequenceClient(
+        [
+            _resp(429, headers={"retry-after": "30"}),
+            _resp(200, text="ok"),
+        ]
+    )
     with pytest.raises(wst.AgentCancelled):
-        wst.WebSearchToolsMixin._http_request_with_retry(
-            client, "GET", "https://x/", cancel_event=ce
-        )
+        wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/", cancel_event=ce)
     t.join(timeout=5)
     assert client.calls == 1  # no retry after the interrupt
 
@@ -3237,9 +3352,7 @@ def test_http_retry_cancel_mid_transient_backoff_aborts_retry():
 
     c = _C()
     with pytest.raises(wst.AgentCancelled):
-        wst.WebSearchToolsMixin._http_request_with_retry(
-            c, "GET", "https://x/", retries=3, cancel_event=ce
-        )
+        wst.WebSearchToolsMixin._http_request_with_retry(c, "GET", "https://x/", retries=3, cancel_event=ce)
     t.join(timeout=5)
     assert c.calls == 1
 
@@ -3294,7 +3407,9 @@ def test_http_retry_observes_per_call_scope_through_live_cancel_event():
     client = _SequenceClient([_resp(429, headers={"retry-after": "30"})])
     with call_cancel_scope(scope_ev), pytest.raises(wst.AgentCancelled):
         wst.WebSearchToolsMixin._http_request_with_retry(
-            client, "GET", "https://x/",
+            client,
+            "GET",
+            "https://x/",
             # The production call sites pass self._live_cancel_event(); the
             # composite it yields under a scope is what must trip the backoff.
             cancel_event=_HostWithRetry._live_cancel_event(_HostWithRetry),
@@ -3308,10 +3423,12 @@ def test_http_retry_no_cancel_event_keeps_legacy_plain_sleep(monkeypatch):
     unaffected."""
     sleeps = []
     monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
-    client = _SequenceClient([
-        _resp(429, headers={"retry-after": "0"}),
-        _resp(200, text="ok"),
-    ])
+    client = _SequenceClient(
+        [
+            _resp(429, headers={"retry-after": "0"}),
+            _resp(200, text="ok"),
+        ]
+    )
     resp = wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/")
     assert resp.status_code == 200
     assert client.calls == 2
@@ -3344,19 +3461,21 @@ def test_web_fetch_cancel_mid_backoff_aborts(monkeypatch):
 
     t = threading.Thread(target=_late_set, daemon=True)
     t.start()
-    client = _FetchRetryClient([
-        httpx.Response(
-            429,
-            request=httpx.Request("GET", "https://x/rate"),
-            headers={"retry-after": "30", "content-type": "text/plain"},
-        ),
-        httpx.Response(
-            200,
-            request=httpx.Request("GET", "https://x/rate"),
-            headers={"content-type": "text/plain; charset=utf-8"},
-            text="finally ok",
-        ),
-    ])
+    client = _FetchRetryClient(
+        [
+            httpx.Response(
+                429,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"retry-after": "30", "content-type": "text/plain"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"content-type": "text/plain; charset=utf-8"},
+                text="finally ok",
+            ),
+        ]
+    )
     monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: client)
     import types
 
@@ -3406,9 +3525,7 @@ def test_run_tier_parallel_worker_observes_caller_scope():
     host = _Host()  # no config: the forwarded scope is the only possible source
     scope_ev = threading.Event()
     with call_cancel_scope(scope_ev):
-        per_backend, errors, connect_failed = host._run_tier_parallel(
-            [("Fake", _backend)], deadline=5.0
-        )
+        per_backend, errors, connect_failed = host._run_tier_parallel([("Fake", _backend)], deadline=5.0)
 
     assert seen["scope"] is scope_ev
     # A None-result backend is dropped, not collected — no other observable.
@@ -3436,8 +3553,7 @@ def test_run_tier_parallel_abandoned_scope_aborts_worker_backoff():
     with call_cancel_scope(scope_ev), pytest.raises(wst.AgentCancelled):
         host._run_tier_parallel([("Fake", _backend)], deadline=10.0)
     assert time.monotonic() - t0 < 4.0, (
-        "abandoned tier worker slept its backoff out — the per-call scope "
-        "never reached the worker thread"
+        "abandoned tier worker slept its backoff out — the per-call scope never reached the worker thread"
     )
 
 
@@ -3458,8 +3574,10 @@ class _JsonGetClient:
 
     def get(self, url, params=None, headers=None):
         return httpx.Response(
-            200, request=httpx.Request("GET", url),
-            headers={"content-type": "application/json"}, text=self._body,
+            200,
+            request=httpx.Request("GET", url),
+            headers={"content-type": "application/json"},
+            text=self._body,
         )
 
 
@@ -3473,7 +3591,8 @@ def test_search_brave_null_web_returns_empty(monkeypatch):
 def test_search_searxng_null_results_returns_empty(monkeypatch):
     """SearXNG "results": null must yield [] (empty unresponsive → not infra)."""
     monkeypatch.setattr(
-        wst.httpx, "Client",
+        wst.httpx,
+        "Client",
         lambda *a, **k: _JsonGetClient('{"results": null, "unresponsive_engines": []}'),
     )
     host = _Host()

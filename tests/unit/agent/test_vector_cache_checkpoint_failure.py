@@ -12,6 +12,7 @@ fsync'd BEFORE the rename (rename atomicity != data durability; the metadata
 leg already fsyncs), and a vanished cache dir must degrade to a logged skip
 instead of escaping ``clear()``.
 """
+
 from __future__ import annotations
 
 import os

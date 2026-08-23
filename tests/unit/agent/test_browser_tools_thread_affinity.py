@@ -12,6 +12,7 @@ already-exited) worker raised:
 The fix pins every Playwright call to one dedicated single-thread executor.
 These tests lock in that affinity without requiring Playwright/Chromium.
 """
+
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -90,10 +91,12 @@ def test_browser_action_serializes_concurrent_calls(monkeypatch):
     host._browser_navigate = _slow_navigate  # type: ignore[method-assign]
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(
-            lambda _: host._tool_browser_action({"action": "navigate", "url": "http://x"}),
-            range(20),
-        ))
+        list(
+            pool.map(
+                lambda _: host._tool_browser_action({"action": "navigate", "url": "http://x"}),
+                range(20),
+            )
+        )
 
     assert max_active == 1, f"calls overlapped: max_active={max_active}"
 
@@ -107,6 +110,7 @@ def test_real_browser_navigates_across_caller_threads():
 
     Without the fix this raises 'cannot switch to a different thread'.
     """
+
     class _RealHost(BrowserActionToolsMixin):
         repo_root = "."
 
@@ -118,12 +122,12 @@ def test_real_browser_navigates_across_caller_threads():
 
     try:
         with ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(
-                lambda _: host._tool_browser_action(
-                    {"action": "navigate", "url": data_url, "timeout": 8000}
-                ),
-                range(6),
-            ))
+            results = list(
+                pool.map(
+                    lambda _: host._tool_browser_action({"action": "navigate", "url": data_url, "timeout": 8000}),
+                    range(6),
+                )
+            )
         assert all(r["ok"] for r in results), [r["error"] for r in results if not r["ok"]]
     finally:
         host._tool_browser_action({"action": "close"})

@@ -1,4 +1,5 @@
 """Tests for external_llm/analysis/unused_import_scanner.py."""
+
 from __future__ import annotations
 
 import tempfile
@@ -57,7 +58,7 @@ def test_used_import_not_flagged():
     candidates = scan_unused_imports(repo_root="", file_paths=[src])
     symbols = {c.symbol_name for c in candidates}
     assert "os" not in symbols  # used
-    assert "sys" in symbols     # unused
+    assert "sys" in symbols  # unused
     Path(src).unlink()
 
 
@@ -87,7 +88,7 @@ def test_aliased_import():
     candidates = scan_unused_imports(repo_root="", file_paths=[src])
     symbols = {c.symbol_name for c in candidates}
     assert "np" not in symbols  # used via alias
-    assert "pd" in symbols      # unused alias
+    assert "pd" in symbols  # unused alias
     Path(src).unlink()
 
 
@@ -102,7 +103,7 @@ def test_from_import_alias():
     candidates = scan_unused_imports(repo_root="", file_paths=[src])
     symbols = {c.symbol_name for c in candidates}
     assert "dt" not in symbols  # used via alias
-    assert "td" in symbols      # unused alias
+    assert "td" in symbols  # unused alias
     Path(src).unlink()
 
 
@@ -121,7 +122,7 @@ def test_future_import_skipped():
     candidates = scan_unused_imports(repo_root="", file_paths=[src])
     symbols = {c.symbol_name for c in candidates}
     assert "annotations" not in symbols  # __future__ is skipped
-    assert "os" in symbols               # still detected as unused
+    assert "os" in symbols  # still detected as unused
     Path(src).unlink()
 
 
@@ -213,7 +214,7 @@ def test_multiple_from_same_module():
     """)
     candidates = scan_unused_imports(repo_root="", file_paths=[src])
     symbols = {c.symbol_name for c in candidates}
-    assert "join" not in symbols   # used
+    assert "join" not in symbols  # used
     # "exists" or "isfile" may appear as unused
     assert symbols, "at least one import should be flagged as unused"
     Path(src).unlink()
@@ -247,6 +248,7 @@ def test_non_py_file_skipped():
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as tmp:
         tmp.write("import os\n")
     from external_llm.agent.scanner_registry import get_registry
+
     reg = get_registry()
     result = reg.run("unused_import_scanner", file_paths=[tmp.name])
     assert not result.candidates_raw, f"Expected 0 candidates, got {len(result.candidates_raw)}"
@@ -344,6 +346,7 @@ def test_extract_all_names_dynamic():
 def test_collect_load_names_ignores_import_lines():
     """_collect_load_names excludes names from import lines."""
     import ast
+
     tree = ast.parse("import os\nimport sys\n")
     used = _collect_load_names(tree)
     assert "os" not in used
@@ -353,6 +356,7 @@ def test_collect_load_names_ignores_import_lines():
 def test_collect_load_names_finds_usage():
     """_collect_load_names finds Name nodes in Load context."""
     import ast
+
     tree = ast.parse("import os\nx = os.getcwd()\n")
     used = _collect_load_names(tree)
     assert "os" in used
@@ -372,9 +376,7 @@ def test_string_annotation_forward_ref_not_flagged():
     try:
         results = scan_unused_imports(repo_root="", file_paths=[path])
         flagged = {c.symbol_name for c in results}
-        assert "Callable" not in flagged, (
-            f"Callable should not be flagged — it is used in -> 'Callable', got {flagged}"
-        )
+        assert "Callable" not in flagged, f"Callable should not be flagged — it is used in -> 'Callable', got {flagged}"
         assert "Optional" not in flagged, (
             f"Optional should not be flagged — it is used in x: 'Optional[Resolver]', got {flagged}"
         )
@@ -420,9 +422,7 @@ def test_cast_string_arg_not_flagged():
     try:
         results = scan_unused_imports(repo_root="", file_paths=[path])
         flagged = {c.symbol_name for c in results}
-        assert "Alpha" not in flagged, (
-            f"Alpha should not be flagged — used in cast('Alpha', ...), got {flagged}"
-        )
+        assert "Alpha" not in flagged, f"Alpha should not be flagged — used in cast('Alpha', ...), got {flagged}"
     finally:
         Path(path).unlink(missing_ok=True)
 
@@ -442,12 +442,8 @@ def test_typevar_bound_string_not_flagged():
     try:
         results = scan_unused_imports(repo_root="", file_paths=[path])
         flagged = {c.symbol_name for c in results}
-        assert "Beta" not in flagged, (
-            f"Beta should not be flagged — used as TypeVar bound, got {flagged}"
-        )
-        assert "Gamma" not in flagged, (
-            f"Gamma should not be flagged — used as TypeVar constraint, got {flagged}"
-        )
+        assert "Beta" not in flagged, f"Beta should not be flagged — used as TypeVar bound, got {flagged}"
+        assert "Gamma" not in flagged, f"Gamma should not be flagged — used as TypeVar constraint, got {flagged}"
     finally:
         Path(path).unlink(missing_ok=True)
 
@@ -465,9 +461,7 @@ def test_unrelated_string_does_not_mask_unused():
     try:
         results = scan_unused_imports(repo_root="", file_paths=[path])
         flagged = {c.symbol_name for c in results}
-        assert "Delta" in flagged, (
-            f"Delta SHOULD be flagged — print('Delta ...') is not a type use, got {flagged}"
-        )
+        assert "Delta" in flagged, f"Delta SHOULD be flagged — print('Delta ...') is not a type use, got {flagged}"
     finally:
         Path(path).unlink(missing_ok=True)
 
@@ -508,9 +502,7 @@ def test_typealias_value_does_not_mask_unrelated_string_var():
     try:
         results = scan_unused_imports(repo_root="", file_paths=[path])
         flagged = {c.symbol_name for c in results}
-        assert "FailurePatternStore" in flagged, (
-            f"plain str var must NOT mask unused import, got {flagged}"
-        )
+        assert "FailurePatternStore" in flagged, f"plain str var must NOT mask unused import, got {flagged}"
     finally:
         Path(path).unlink(missing_ok=True)
 
@@ -521,8 +513,10 @@ def test_pep695_type_statement_string_not_flagged():
     not be flagged.  Skipped on Python < 3.12 where the ``type`` statement is a
     syntax error."""
     import sys
+
     if sys.version_info < (3, 12):
         import pytest
+
         pytest.skip("PEP 695 type statement requires Python 3.12+")
     source = textwrap.dedent("""\
         from external_llm.agent.failure_pattern_store import FailurePatternStore
@@ -556,13 +550,15 @@ def test_analysis_cache_hot_run_matches_cold(tmp_path):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "mod.py").write_text(textwrap.dedent("""\
+    (repo / "mod.py").write_text(
+        textwrap.dedent("""\
         import os
         import sys
 
         def f():
             return os.getcwd()
-    """))
+    """)
+    )
     cache_path = _uic_cache_path(str(repo))
     assert not os.path.exists(cache_path)
 
@@ -570,9 +566,7 @@ def test_analysis_cache_hot_run_matches_cold(tmp_path):
     assert os.path.exists(cache_path), "cold run must persist the analysis cache"
     second = scan_unused_imports(repo_root=str(repo), file_paths=["mod.py"])
     assert _uic_sig(first) == _uic_sig(second)
-    assert [c.symbol_name for c in second] == ["sys"], (
-        "sys is unused; os is used by f()"
-    )
+    assert [c.symbol_name for c in second] == ["sys"], "sys is unused; os is used by f()"
 
 
 def test_analysis_cache_invalidates_on_edit(tmp_path):

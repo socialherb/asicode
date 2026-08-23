@@ -10,6 +10,7 @@ Covers three fixes (see asi.py):
      full disk) — the API key already lives in os.environ for the session.
   3. ``_restart_cli`` must NOT crash if ``os.execv`` fails — degrade gracefully.
 """
+
 from __future__ import annotations
 
 import json
@@ -43,7 +44,8 @@ class TestConfigPathSubdirInvariant:
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(
             ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
-            cwd=root, check=True,
+            cwd=root,
+            check=True,
         )
         return root, subdir
 
@@ -86,8 +88,7 @@ class TestConfigPathSubdirInvariant:
         # run_repl writes through the same _terminal_config_path(repo_root).
         # _terminal_config_path returns None without a real TTY on stdin, so
         # simulate one (the None case is a separate fallback, not this invariant).
-        with patch("asi.sys.stdin.fileno", return_value=0), \
-             patch("asi.os.ttyname", return_value="/dev/ttys999"):
+        with patch("asi.sys.stdin.fileno", return_value=0), patch("asi.os.ttyname", return_value="/dev/ttys999"):
             cfg_main = _terminal_config_path(repo_root)
         assert cfg_main is not None
         assert cfg_main.startswith(repo_root)  # toplevel, not subdir

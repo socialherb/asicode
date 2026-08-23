@@ -16,6 +16,7 @@ identical to the GNU original (``tac``/``nproc``/``shuf``/``gtimeout``/
 explanatory error stub instead — aliasing them to BSD tools would silently
 corrupt output.
 """
+
 import os
 import shutil
 import subprocess
@@ -34,14 +35,18 @@ def _run(cmd, env=None):
     """Run *cmd* through the shim + bash, exactly like the bash tool."""
     p = subprocess.run(
         _apply_shell_shims(cmd),
-        shell=True, executable=_BASH,
-        capture_output=True, text=True, env=env,
+        shell=True,
+        executable=_BASH,
+        capture_output=True,
+        text=True,
+        env=env,
         check=False,
     )
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 
 # ── (1) prelude is prepended & is itself silent ──────────────────────────────
+
 
 def test_prelude_prepended():
     out = _apply_shell_shims("echo hi")
@@ -53,14 +58,18 @@ def test_prelude_prepended():
 def test_prelude_alone_is_silent():
     # The function definition must produce no stdout/stderr on its own.
     p = subprocess.run(
-        _SHELL_SHIM_PRELUDE, shell=True, executable=_BASH,
-        capture_output=True, text=True,
+        _SHELL_SHIM_PRELUDE,
+        shell=True,
+        executable=_BASH,
+        capture_output=True,
+        text=True,
         check=False,
     )
     assert p.stdout == "" and p.stderr == ""
 
 
 # ── (2) functional behaviour — passes on macOS (shim) AND Linux (real timeout)
+
 
 @pytest.mark.slow
 def test_normal_completion():
@@ -84,7 +93,7 @@ def test_timeout_returns_124():
         "never defined, so this would assert on GNU coreutils' usage output "
         "instead of on the shim — measured there as rc=125 with only "
         "\"Try 'timeout --help' for more information.\" on stderr, no "
-        "\"missing operand\" line at all. Pinning another project's message "
+        '"missing operand" line at all. Pinning another project\'s message '
         "format buys no coverage of ours, so skip rather than branch."
     ),
 )
@@ -112,19 +121,23 @@ def test_pipe_and_redirection_preserved():
 # agent reads as a pass. Every shape below is one an LLM emits routinely; they
 # hold for real GNU coreutils too, so this table is not shim-only.
 
+
 @pytest.mark.slow
-@pytest.mark.parametrize("invocation", [
-    "timeout -k 2 5 echo hi",
-    "timeout -k2 5 echo hi",
-    "timeout --kill-after=2 5 echo hi",
-    "timeout -s KILL 5 echo hi",
-    "timeout -s TERM 5 echo hi",
-    "timeout --signal=KILL 5 echo hi",
-    "timeout --preserve-status 5 echo hi",
-    "timeout --foreground 5 echo hi",
-    "timeout -k 2 -s KILL 5 echo hi",
-    "timeout 5s echo hi",  # GNU duration suffix, no option
-])
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "timeout -k 2 5 echo hi",
+        "timeout -k2 5 echo hi",
+        "timeout --kill-after=2 5 echo hi",
+        "timeout -s KILL 5 echo hi",
+        "timeout -s TERM 5 echo hi",
+        "timeout --signal=KILL 5 echo hi",
+        "timeout --preserve-status 5 echo hi",
+        "timeout --foreground 5 echo hi",
+        "timeout -k 2 -s KILL 5 echo hi",
+        "timeout 5s echo hi",  # GNU duration suffix, no option
+    ],
+)
 def test_option_forms_still_run_the_command(invocation):
     rc, out, err = _run(invocation)
     assert out == "hi", f"{invocation!r} did not run the command (stderr: {err!r})"
@@ -168,9 +181,7 @@ def test_kill_after_escalates_to_sigkill():
     import time as _time
 
     _start = _time.monotonic()
-    rc, _, _ = _run(
-        "timeout -k 1 1 bash -c 'trap \"\" TERM; sleep 30'"
-    )
+    rc, _, _ = _run("timeout -k 1 1 bash -c 'trap \"\" TERM; sleep 30'")
     _elapsed = _time.monotonic() - _start
     assert rc == 124
     # 1 s TERM grace + 1 s KILL grace + reap slack; the pre-fix orphan held the
@@ -181,23 +192,23 @@ def test_kill_after_escalates_to_sigkill():
 @pytest.mark.slow
 def test_option_forms_survive_a_pipeline():
     """The regression's real-world shape: an option form heading a pipeline."""
-    rc, out, _ = _run(
-        "timeout -k 2 5 bash -c 'echo line1; echo line2' 2>&1 | tail -1"
-    )
+    rc, out, _ = _run("timeout -k 2 5 bash -c 'echo line1; echo line2' 2>&1 | tail -1")
     assert rc == 0
     assert out == "line2"
 
 
 # ── (3) no-op when a real `timeout` exists (Linux / coreutils) ───────────────
 
+
 def test_shim_does_not_shadow_real_timeout():
     """When `timeout` is on PATH, the shim must NOT define its function, so the
     real binary is used instead. Verified by planting a fake `timeout`."""
     import tempfile
+
     d = tempfile.mkdtemp()
     fake = os.path.join(d, "timeout")
     with open(fake, "w") as f:
-        f.write("#!/bin/bash\necho FAKE-TIMEOUT \"$@\"\n")
+        f.write('#!/bin/bash\necho FAKE-TIMEOUT "$@"\n')
     os.chmod(fake, 0o755)
     try:
         env = dict(os.environ)
@@ -213,6 +224,7 @@ def test_shim_does_not_shadow_real_timeout():
 # ── (4) extended shims: tac / nproc / shuf / gtimeout ────────────────────────
 # These have identical semantics to the GNU originals, so the functional tests
 # pass regardless of whether the shim or the real binary is active on the host.
+
 
 def test_tac_reverses_lines():
     rc, out, _ = _run("printf '1\\n2\\n3\\n' | tac")
@@ -255,6 +267,7 @@ def test_gtimeout_returns_124():
 # semantics would silently corrupt output), so the shim emits a clear install
 # hint and returns 127. Skipped on hosts that happen to have the real tool.
 
+
 @pytest.mark.skipif(shutil.which("gsed") is not None, reason="real gsed present")
 def test_gsed_stub_when_absent():
     rc, _, err = _run("gsed s/x/y/")
@@ -270,6 +283,7 @@ def test_gstat_stub_when_absent():
 
 
 # ── (6) structural: every shim is guarded by `command -v` (no-op on Linux) ───
+
 
 def test_all_shims_guarded_by_command_v():
     """Each shim must be wrapped in `if ! command -v <name>` so the whole
@@ -315,7 +329,10 @@ def _widened_prelude() -> str:
 def test_timeout_reports_124_even_when_the_watchdog_outlives_its_kill(name):
     rc = subprocess.run(
         _widened_prelude() + f"\n{name} 1 sleep 5",
-        shell=True, executable=_BASH, capture_output=True, text=True,
+        shell=True,
+        executable=_BASH,
+        capture_output=True,
+        text=True,
         check=False,
     ).returncode
     assert rc == 124, (

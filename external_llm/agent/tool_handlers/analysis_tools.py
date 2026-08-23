@@ -6,7 +6,7 @@ import contextlib
 import logging
 import os
 from collections import deque
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from ...analysis.scan_walk import SCAN_FILE_CAP, walk_scan_files
 from ...languages import LanguageId
@@ -21,7 +21,19 @@ logger = logging.getLogger(__name__)
 class AnalysisToolsMixin:
     """Mixin providing analysis/exploration tool implementations for ToolRegistry."""
 
-    def _tool_get_project_info(self, args: dict[str, Any]) -> "ToolResult":
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry (and duck-typed test hosts) own the real
+    # values, so these are pure typing scaffolding.
+    #   _make_result — ToolRegistry._make_result(**kwargs) -> ToolResult
+    #   _call_graph  — live call graph (GraphFacade | CallGraphIndexer | None),
+    #                  host-provided; may be absent (getattr guards below)
+    #   repo_root    — repository root path (str)
+    _make_result: Any
+    _call_graph: Any
+    repo_root: str
+
+    def _tool_get_project_info(self, args: dict[str, Any]) -> ToolResult:
         try:
             from external_llm.project_analyzer import ProjectAnalyzer
 
@@ -72,7 +84,7 @@ class AnalysisToolsMixin:
             logger.warning("get_project_info failed: %s", e)
             return self._make_result(ok=True, content=f"Project info unavailable: {e}")
 
-    def _tool_analyze_change_impact(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_analyze_change_impact(self, args: dict[str, Any]) -> ToolResult:
         """Analyze impact of changing a symbol using graph traversal."""
         symbol = str(args.get("symbol", "")).strip()
         file_path = str(args.get("file_path", "")).strip() or None
@@ -143,6 +155,9 @@ class AnalysisToolsMixin:
                 lines.append("\n### Callees (none found)")
 
             # 3. Importers (reverse dependencies)
+            # sym_file is bound below only when include_importers is true;
+            # pre-bind so the guarded read at the end stays type-safe.
+            sym_file: str | None = None
             if include_importers:
                 # Get the file where this symbol is defined
                 sym_file = (
@@ -212,7 +227,7 @@ class AnalysisToolsMixin:
             )
         return out
 
-    def _tool_run_structural_scan(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_run_structural_scan(self, args: dict[str, Any]) -> ToolResult:
         """Run structural analysis scanner(s) from ScannerRegistry."""
         scanner_name = str(args.get("scanner", "")).strip()
         scan_path = str(args.get("path", "")).strip() or None
@@ -327,7 +342,7 @@ class AnalysisToolsMixin:
         # beyond the cap would otherwise judge that symbol dead — the same
         # soundness union the structural gate applies (2026-08-11).  Absent
         # graph or empty py list → plain scan list (standalone behavior).
-        _cross_refs: Optional[set] = None
+        _cross_refs: set | None = None
         try:
             from external_llm.analysis.cross_file_refs import (
                 compute_cross_file_referenced_names_light,
@@ -535,7 +550,7 @@ class AnalysisToolsMixin:
     # _tool_analyze_insertion_point and _pick_best_insertion_line removed:
     # Python-only analysis tools; LLM deciding placement directly is more efficient
 
-    def _tool_query_dependency_graph(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_query_dependency_graph(self, args: dict[str, Any]) -> ToolResult:
         """Query the repository dependency/call graph with BFS traversal.
 
         Modes:
@@ -581,7 +596,7 @@ class AnalysisToolsMixin:
             ok=False, content="", error=f"Unknown mode: {mode}. Supported: importers, path, reachable, subgraph"
         )
 
-    def _query_subgraph(self, file_path: str, limit: int) -> "ToolResult":
+    def _query_subgraph(self, file_path: str, limit: int) -> ToolResult:
         """List all symbols in a file with their edges."""
         lines: list[str] = [f"## Subgraph for `{file_path}`"]
         metadata: dict[str, Any] = {"mode": "subgraph", "file_path": file_path}
@@ -654,7 +669,7 @@ class AnalysisToolsMixin:
 
         return self._make_result(ok=True, content="\n".join(lines), metadata=metadata)
 
-    def _query_transitive_importers(self, file_path: str, max_depth: int, limit: int) -> "ToolResult":
+    def _query_transitive_importers(self, file_path: str, max_depth: int, limit: int) -> ToolResult:
         """BFS from a file to find all transitive importers."""
         lines: list[str] = [f"## Transitive importers for `{file_path}`"]
         metadata: dict[str, Any] = {"mode": "importers", "source": file_path, "max_depth": max_depth}
@@ -700,7 +715,7 @@ class AnalysisToolsMixin:
 
         return self._make_result(ok=True, content="\n".join(lines), metadata=metadata)
 
-    def _query_reachable(self, source_symbol: str, direction: str, max_depth: int, limit: int) -> "ToolResult":
+    def _query_reachable(self, source_symbol: str, direction: str, max_depth: int, limit: int) -> ToolResult:
         """BFS from a symbol to find all symbols reachable in the given direction."""
         dir_label = "upstream (callers)" if direction == "upstream" else "downstream (callees)"
         lines: list[str] = [f"## Reachable symbols from `{source_symbol}` ({dir_label})"]
@@ -769,7 +784,7 @@ class AnalysisToolsMixin:
 
     def _query_symbol_path(
         self, source_sym: str, target_sym: str, direction: str, max_depth: int, limit: int
-    ) -> "ToolResult":
+    ) -> ToolResult:
         """BFS shortest-path between two symbols."""
         lines: list[str] = [f"## Path from `{source_sym}` → `{target_sym}`"]
         metadata: dict[str, Any] = {

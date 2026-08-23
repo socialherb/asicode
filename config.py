@@ -4,6 +4,7 @@ Centralized configuration for asicode.
 All environment variables are documented and loaded here.
 Other modules should import from this module instead of calling os.getenv directly.
 """
+
 from __future__ import annotations
 
 import logging
@@ -61,9 +62,7 @@ PATCH_DUMP: Path = Path(os.getenv("ASICODE_PATCH_DUMP", "/tmp/asicode.last.clean
 # ASICODE_RUNS_DIR -- directory for run artifacts
 #   If set: use as-is (absolute or relative to CWD)
 #   If unset: .asicode/runs relative to the config module location (repo root)
-ASICODE_RUNS_DIR: str = os.getenv("ASICODE_RUNS_DIR", "").strip() or str(
-    Path(__file__).parent / ".asicode" / "runs"
-)
+ASICODE_RUNS_DIR: str = os.getenv("ASICODE_RUNS_DIR", "").strip() or str(Path(__file__).parent / ".asicode" / "runs")
 
 # ============================================================
 # Mode flags
@@ -102,9 +101,7 @@ BENCH_SNIPPET_MAX_BYTES: int = _env_int("ASICODE_BENCH_SNIPPET_MAX_BYTES", 20000
 # ============================================================
 # Allowed absolute repo root prefixes (comma-separated, e.g. /home/dev/projects,/var/repos)
 _allowed_raw = os.getenv("ASICODE_ALLOWED_REPO_ROOTS", "").strip()
-ALLOWED_REPO_ROOTS: list[str] = [
-    p.strip() for p in _allowed_raw.split(",") if p.strip()
-] if _allowed_raw else []
+ALLOWED_REPO_ROOTS: list[str] = [p.strip() for p in _allowed_raw.split(",") if p.strip()] if _allowed_raw else []
 
 # ============================================================
 # External LLM

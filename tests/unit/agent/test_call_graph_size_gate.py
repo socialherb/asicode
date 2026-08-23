@@ -16,6 +16,7 @@ is what bounds the peak. Verified against this repo: 796 walked .py and 41
 walked .ts/.js, zero of them over either cap — the gate costs nothing here and
 only excludes the generated class it was sized for.
 """
+
 import pathlib
 
 import pytest

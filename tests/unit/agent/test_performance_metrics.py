@@ -37,9 +37,7 @@ class TestToolMetricsAggregation:
         # running counters (12h+ runs would otherwise leak RAM and make
         # avg/summary O(n)).
         m = ToolMetrics(name="read_file")
-        assert not hasattr(m, "execution_times"), (
-            "ToolMetrics must not retain a per-call execution_times list"
-        )
+        assert not hasattr(m, "execution_times"), "ToolMetrics must not retain a per-call execution_times list"
 
     def test_running_aggregation_matches_manual_stats(self):
         m = ToolMetrics(name="read_file")
@@ -130,9 +128,9 @@ class TestCacheOutcomeThreeState:
         # tool must read 0/0 while the read tool records normally — proving the
         # write tool is no longer dragged into the per-tool cache stats.
         c = PerformanceCollector()
-        c.record_tool_call("edit_text", 0.05, cache_hit=None)   # non-cacheable
+        c.record_tool_call("edit_text", 0.05, cache_hit=None)  # non-cacheable
         c.record_tool_call("edit_text", 0.05, cache_hit=None)
-        c.record_tool_call("read_file", 0.01, cache_hit=True)   # cacheable hit
+        c.record_tool_call("read_file", 0.01, cache_hit=True)  # cacheable hit
         c.record_tool_call("read_file", 0.01, cache_hit=False)  # cacheable miss
         et = c.tool_metrics["edit_text"]
         rf = c.tool_metrics["read_file"]
@@ -154,8 +152,8 @@ class TestCacheOutcomeThreeState:
         # A cacheable tool with a real 0% (1 miss, 0 hits) must ship 0.0; a
         # never-probed tool (0/0) must ship None. The two are NOT the same signal.
         c = PerformanceCollector()
-        c.record_tool_call("read_file", 0.01, cache_hit=False)   # real miss → 0.0
-        c.record_tool_call("apply_patch", 0.1, cache_hit=None)    # never probed → None
+        c.record_tool_call("read_file", 0.01, cache_hit=False)  # real miss → 0.0
+        c.record_tool_call("apply_patch", 0.1, cache_hit=None)  # never probed → None
         s = c.get_summary()["tool_metrics"]
         assert s["read_file"]["cache_hit_rate"] == 0.0
         assert s["apply_patch"]["cache_hit_rate"] is None
@@ -179,14 +177,18 @@ class TestIsResultCacheableProbeGuard:
         from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
         repo = Path(tmp_path)
-        for c in (["git", "init", "-q"], ["git", "config", "user.email", "t@t.com"],
-                  ["git", "config", "user.name", "t"]):
+        for c in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@t.com"],
+            ["git", "config", "user.name", "t"],
+        ):
             subprocess.run(c, cwd=str(repo), capture_output=True, check=False)
         (repo / "f.txt").write_text("x\n")
         subprocess.run(["git", "add", "f.txt"], cwd=str(repo), capture_output=True, check=False)
         subprocess.run(["git", "commit", "-qm", "b"], cwd=str(repo), capture_output=True, check=False)
         cfg = AgentConfig(
-            max_turns=1, rag_enabled=False,
+            max_turns=1,
+            rag_enabled=False,
             tool_result_cache_enabled=cache_enabled,
         )
         return ToolRegistry(str(repo), cfg)
@@ -247,10 +249,10 @@ class TestToolFailureRecording:
         # how often. record_tool_call(failed=not result.ok) at the two record
         # sites feeds this; get_summary() must expose it.
         c = PerformanceCollector()
-        c.record_tool_call("apply_patch", 0.2, failed=True)   # rolled-back write
+        c.record_tool_call("apply_patch", 0.2, failed=True)  # rolled-back write
         c.record_tool_call("apply_patch", 0.1, failed=False)
         c.record_tool_call("read_file", 0.01, failed=False)
-        c.record_tool_call("read_file", 0.02, failed=True)    # missing file
+        c.record_tool_call("read_file", 0.02, failed=True)  # missing file
         summary = c.get_summary()
         ap = summary["tool_metrics"]["apply_patch"]
         rf = summary["tool_metrics"]["read_file"]
@@ -294,8 +296,8 @@ class TestRecentFailureRate:
         s = c.get_summary()["tool_metrics"]["read_file"]
         assert s["failures"] == 20 and s["total_calls"] == 1020
         assert abs(s["failure_rate"] - 20 / 1020) < 1e-9  # cumulative, diluted
-        assert s["recent_calls"] == 30          # capped at the window
-        assert s["recent_failures"] == 20       # all recent calls failed
+        assert s["recent_calls"] == 30  # capped at the window
+        assert s["recent_failures"] == 20  # all recent calls failed
         assert abs(s["recent_failure_rate"] - 20 / 30) < 1e-9
         # The gate fires (recent ≥ 0.50) where cumulative never would.
         ft = c.get_summary()["failing_tools"]
@@ -313,9 +315,9 @@ class TestRecentFailureRate:
         for _ in range(35):  # > window(30) of recoveries — pushes failures out
             c.record_tool_call("bash", 0.01, failed=False)
         s = c.get_summary()["tool_metrics"]["bash"]
-        assert s["failures"] == 40          # cumulative survives
-        assert s["recent_calls"] == 30      # capped
-        assert s["recent_failures"] == 0    # all evicted
+        assert s["failures"] == 40  # cumulative survives
+        assert s["recent_calls"] == 30  # capped
+        assert s["recent_failures"] == 0  # all evicted
         assert s["recent_failure_rate"] == 0.0
         assert c.get_summary()["failing_tools"] == []  # recovered → not flagged
 
@@ -343,7 +345,10 @@ class TestRecentFailureRate:
 
 def _window_cap():
     from external_llm.agent.config.thresholds import config as _cfg
+
     return _cfg.scores.TOOL_FAILURE_RATE_WINDOW
+
+
 class TestThreadSafety:
     def test_concurrent_record_and_summary_no_error_and_consistent(self):
         # Concurrent record_tool_call vs get_summary must not raise and must
@@ -356,9 +361,7 @@ class TestThreadSafety:
             try:
                 i = 0
                 while not stop.is_set():
-                    c.record_tool_call(
-                        "read_file", 0.001 * (i % 5 + 1), cache_hit=(i % 2 == 0)
-                    )
+                    c.record_tool_call("read_file", 0.001 * (i % 5 + 1), cache_hit=(i % 2 == 0))
                     i += 1
             except Exception as e:
                 errors.append(e)
@@ -423,7 +426,8 @@ def _make_loop_unification(tmp_path):
 
     repo = Path(tmp_path)
     for c in (
-        ["git", "init", "-q"], ["git", "config", "user.email", "t@t.com"],
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@t.com"],
         ["git", "config", "user.name", "t"],
     ):
         subprocess.run(c, cwd=str(repo), capture_output=True, check=False)
@@ -484,12 +488,8 @@ class TestCollectorUnification:
         """
         reset_global_collector()
         loop = _make_loop_unification(tmp_path)
-        loop.performance_collector.record_llm_call(
-            prompt_tokens=120, completion_tokens=40, execution_time_ms=800
-        )
-        get_global_collector().record_llm_call(
-            prompt_tokens=120, completion_tokens=40, execution_time_ms=800
-        )
+        loop.performance_collector.record_llm_call(prompt_tokens=120, completion_tokens=40, execution_time_ms=800)
+        get_global_collector().record_llm_call(prompt_tokens=120, completion_tokens=40, execution_time_ms=800)
         # Per-loop summary sees its own LLM call
         pl = loop.performance_collector.get_summary()["llm_metrics"]
         assert pl["calls"] == 1
@@ -727,7 +727,7 @@ class TestTopFailingTools:
             "apply_patch": {"failures": 3, "total_calls": 4, "failure_rate": 0.75},
             "edit_text": {"failures": 2, "total_calls": 4, "failure_rate": 0.50},
             "read_file": {"failures": 2, "total_calls": 2, "failure_rate": 1.0},  # < min_calls(3)
-            "bash": {"failures": 1, "total_calls": 4, "failure_rate": 0.25},     # < threshold(0.5)
+            "bash": {"failures": 1, "total_calls": 4, "failure_rate": 0.25},  # < threshold(0.5)
         }
         out = top_failing_tools(metrics, threshold=0.5, min_calls=3)
         names = [t["name"] for t in out]
@@ -758,17 +758,25 @@ class TestTopFailingTools:
         #   → recent_failure_rate 1.0 → MUST be flagged.
         metrics = {
             "recovered": {
-                "failures": 500, "total_calls": 1000, "failure_rate": 0.5,
-                "recent_calls": 30, "recent_failures": 0, "recent_failure_rate": 0.0,
+                "failures": 500,
+                "total_calls": 1000,
+                "failure_rate": 0.5,
+                "recent_calls": 30,
+                "recent_failures": 0,
+                "recent_failure_rate": 0.0,
             },
             "just_broke": {
-                "failures": 20, "total_calls": 1020, "failure_rate": 0.0196,
-                "recent_calls": 30, "recent_failures": 20, "recent_failure_rate": 0.667,
+                "failures": 20,
+                "total_calls": 1020,
+                "failure_rate": 0.0196,
+                "recent_calls": 30,
+                "recent_failures": 20,
+                "recent_failure_rate": 0.667,
             },
         }
         out = top_failing_tools(metrics, threshold=0.5, min_calls=3)
         names = [t["name"] for t in out]
-        assert names == ["just_broke"]          # recovered excluded despite cum 0.5
+        assert names == ["just_broke"]  # recovered excluded despite cum 0.5
         assert out[0]["recent_failure_rate"] == 0.667
         # The entry still carries the cumulative rate for display context.
         assert out[0]["failure_rate"] == 0.0196
@@ -778,17 +786,17 @@ class TestTopFailingTools:
         # summary, and warn_failing_tools() all read ONE computation.
         c = PerformanceCollector()
         for _ in range(3):
-            c.record_tool_call("apply_patch", 0.1, failed=True)   # 3/3 = 100%
+            c.record_tool_call("apply_patch", 0.1, failed=True)  # 3/3 = 100%
         for _ in range(2):
-            c.record_tool_call("read_file", 0.01, failed=False)   # healthy
-        c.record_tool_call("edit_text", 0.05, failed=True)        # 1/1 (below min_calls)
+            c.record_tool_call("read_file", 0.01, failed=False)  # healthy
+        c.record_tool_call("edit_text", 0.05, failed=True)  # 1/1 (below min_calls)
         summary = c.get_summary()
         ft = summary["failing_tools"]
         assert len(ft) == 1
         assert ft[0]["name"] == "apply_patch"
         assert ft[0]["failures"] == 3 and ft[0]["total_calls"] == 3
-        assert ft[0]["failure_rate"] == 1.0          # cumulative (display)
-        assert ft[0]["recent_failure_rate"] == 1.0   # the gate field is shipped
+        assert ft[0]["failure_rate"] == 1.0  # cumulative (display)
+        assert ft[0]["recent_failure_rate"] == 1.0  # the gate field is shipped
         assert ft[0]["recent_calls"] == 3 and ft[0]["recent_failures"] == 3
 
 
@@ -809,10 +817,10 @@ class TestWarnFailingTools:
         calls = []
         failing = {"failing_tools": [{"name": "bash", "failures": 3, "total_calls": 3, "failure_rate": 1.0}]}
         healthy = {"failing_tools": []}
-        warn_failing_tools(failing, log=calls.append)      # warn
-        warn_failing_tools(failing, log=calls.append)      # dedup
-        warn_failing_tools(healthy, log=calls.append)      # recovers -> re-arm
-        warn_failing_tools(failing, log=calls.append)      # regression -> warn AGAIN
+        warn_failing_tools(failing, log=calls.append)  # warn
+        warn_failing_tools(failing, log=calls.append)  # dedup
+        warn_failing_tools(healthy, log=calls.append)  # recovers -> re-arm
+        warn_failing_tools(failing, log=calls.append)  # regression -> warn AGAIN
         assert len(calls) == 2
 
     def test_no_warn_when_summary_has_no_failing_tools(self):
@@ -825,10 +833,12 @@ class TestWarnFailingTools:
     def test_multiple_distinct_tools_each_warned(self):
         _reset_warned_failing_tools()
         calls = []
-        s = {"failing_tools": [
-            {"name": "apply_patch", "failures": 3, "total_calls": 4, "failure_rate": 0.75},
-            {"name": "edit_text", "failures": 2, "total_calls": 4, "failure_rate": 0.50},
-        ]}
+        s = {
+            "failing_tools": [
+                {"name": "apply_patch", "failures": 3, "total_calls": 4, "failure_rate": 0.75},
+                {"name": "edit_text", "failures": 2, "total_calls": 4, "failure_rate": 0.50},
+            ]
+        }
         assert warn_failing_tools(s, log=calls.append) == 2
         assert len(calls) == 2
 
@@ -837,18 +847,28 @@ class TestWarnFailingTools:
         # the gate) and the windowed count, not the diluted lifetime average.
         _reset_warned_failing_tools()
         calls = []
-        s = {"failing_tools": [{
-            "name": "read_file", "failures": 20, "total_calls": 1020,
-            "failure_rate": 0.0196,
-            "recent_calls": 30, "recent_failures": 20, "recent_failure_rate": 0.667,
-        }]}
+        s = {
+            "failing_tools": [
+                {
+                    "name": "read_file",
+                    "failures": 20,
+                    "total_calls": 1020,
+                    "failure_rate": 0.0196,
+                    "recent_calls": 30,
+                    "recent_failures": 20,
+                    "recent_failure_rate": 0.667,
+                }
+            ]
+        }
         warn_failing_tools(s, log=calls.append)
         assert len(calls) == 1
         msg = calls[0]
         assert "recent" in msg
         assert "read_file" in msg
-        assert "20/30" in msg          # windowed count, not 20/1020
-        assert "67%" in msg            # recent rate, not 2%
+        assert "20/30" in msg  # windowed count, not 20/1020
+        assert "67%" in msg  # recent rate, not 2%
+
+
 # ── LLM-side symmetry: LLMMetrics carries the SAME recent_failure_rate live-health
 #    signal as ToolMetrics, plus top_failing_llm() / warn_failing_llm() mirrors.
 #    A provider that just started rate-limiting / 5xx-ing must trip the gate within
@@ -871,7 +891,7 @@ class TestRecentFailureRateLLM:
             c.record_llm_call(provider="ollama", prompt_tokens=10, failed=True)
         s = c.get_summary()["llm_metrics"]
         assert s["calls"] == 1020 and s["failures"] == 20
-        assert abs(s["failure_rate"] - 20 / 1020) < 1e-9   # cumulative, diluted
+        assert abs(s["failure_rate"] - 20 / 1020) < 1e-9  # cumulative, diluted
         assert s["recent_calls"] == 30
         assert s["recent_failures"] == 20
         assert abs(s["recent_failure_rate"] - 20 / 30) < 1e-9
@@ -886,9 +906,9 @@ class TestRecentFailureRateLLM:
         for _ in range(35):  # pushes the early failures out of the window
             c.record_llm_call(failed=False)
         s = c.get_summary()["llm_metrics"]
-        assert s["failures"] == 40          # cumulative survives
-        assert s["recent_calls"] == 30      # capped
-        assert s["recent_failures"] == 0    # all evicted
+        assert s["failures"] == 40  # cumulative survives
+        assert s["recent_calls"] == 30  # capped
+        assert s["recent_failures"] == 0  # all evicted
         assert s["recent_failure_rate"] == 0.0
         assert c.get_summary()["failing_llm"] == []  # recovered → not flagged
 
@@ -908,33 +928,41 @@ class TestRecentFailureRateLLM:
 
 class TestTopFailingLLM:
     def _summary(self, **kw):
-        base = {"calls": 0, "failures": 0, "failure_rate": 0.0,
-                "recent_calls": 0, "recent_failures": 0, "recent_failure_rate": 0.0}
+        base = {
+            "calls": 0,
+            "failures": 0,
+            "failure_rate": 0.0,
+            "recent_calls": 0,
+            "recent_failures": 0,
+            "recent_failure_rate": 0.0,
+        }
         base.update(kw)
         # top_failing_llm now iterates a PER-PROVIDER dict (summary['llm_providers']),
         # so the fixture wraps one provider's metrics under its provider key.
         return {"ollama": base}
 
     def test_trips_when_recent_rate_at_threshold(self):
-        s = self._summary(calls=10, failures=6, failure_rate=0.6,
-                          recent_calls=10, recent_failures=6, recent_failure_rate=0.6)
+        s = self._summary(
+            calls=10, failures=6, failure_rate=0.6, recent_calls=10, recent_failures=6, recent_failure_rate=0.6
+        )
         out = top_failing_llm(s, threshold=0.50, min_calls=3)
         assert len(out) == 1 and out[0]["name"] == "ollama"
         assert out[0]["recent_failure_rate"] == 0.6
 
     def test_below_threshold_returns_empty(self):
-        s = self._summary(calls=10, failures=2, failure_rate=0.2,
-                          recent_calls=10, recent_failures=2, recent_failure_rate=0.2)
+        s = self._summary(
+            calls=10, failures=2, failure_rate=0.2, recent_calls=10, recent_failures=2, recent_failure_rate=0.2
+        )
         assert top_failing_llm(s, threshold=0.50, min_calls=3) == []
 
     def test_below_min_calls_returns_empty(self):
-        s = self._summary(calls=2, failures=2, failure_rate=1.0,
-                          recent_calls=2, recent_failures=2, recent_failure_rate=1.0)
+        s = self._summary(
+            calls=2, failures=2, failure_rate=1.0, recent_calls=2, recent_failures=2, recent_failure_rate=1.0
+        )
         assert top_failing_llm(s, threshold=0.50, min_calls=3) == []
 
     def test_no_failures_returns_empty(self):
-        s = self._summary(calls=10, failures=0,
-                          recent_calls=10, recent_failures=0, recent_failure_rate=0.0)
+        s = self._summary(calls=10, failures=0, recent_calls=10, recent_failures=0, recent_failure_rate=0.0)
         assert top_failing_llm(s, threshold=0.50, min_calls=3) == []
 
     def test_falls_back_to_cumulative_when_recent_absent(self):
@@ -951,16 +979,27 @@ class TestTopFailingLLM:
         out = top_failing_llm(s, threshold=0.50, min_calls=3)
         assert [e["name"] for e in out] == ["ollama"]
 
-
     def test_only_failing_provider_flagged_among_many(self):
         # THE dilution guard (pure-function level): a healthy + a failing provider in
         # one breakdown — only the failing one is returned, sorted first by
         # recent_failure_rate desc. A single aggregate stream would have merged them.
         s = {
-            "ollama": {"calls": 490, "failures": 0, "failure_rate": 0.0,
-                       "recent_calls": 30, "recent_failures": 0, "recent_failure_rate": 0.0},
-            "zai": {"calls": 20, "failures": 20, "failure_rate": 1.0,
-                    "recent_calls": 20, "recent_failures": 20, "recent_failure_rate": 1.0},
+            "ollama": {
+                "calls": 490,
+                "failures": 0,
+                "failure_rate": 0.0,
+                "recent_calls": 30,
+                "recent_failures": 0,
+                "recent_failure_rate": 0.0,
+            },
+            "zai": {
+                "calls": 20,
+                "failures": 20,
+                "failure_rate": 1.0,
+                "recent_calls": 20,
+                "recent_failures": 20,
+                "recent_failure_rate": 1.0,
+            },
         }
         out = top_failing_llm(s, threshold=0.50, min_calls=3)
         assert [e["name"] for e in out] == ["zai"]
@@ -1031,12 +1070,19 @@ class TestLLMPerProviderIsolation:
 
 class TestWarnFailingLLM:
     def _s(self, rate=0.667, recent_failures=20, recent_calls=30, calls=1020, failures=20):
-        return {"failing_llm": [{
-            "name": "llm", "calls": calls, "failures": failures,
-            "failure_rate": failures / calls,
-            "recent_calls": recent_calls, "recent_failures": recent_failures,
-            "recent_failure_rate": rate,
-        }]}
+        return {
+            "failing_llm": [
+                {
+                    "name": "llm",
+                    "calls": calls,
+                    "failures": failures,
+                    "failure_rate": failures / calls,
+                    "recent_calls": recent_calls,
+                    "recent_failures": recent_failures,
+                    "recent_failure_rate": rate,
+                }
+            ]
+        }
 
     def test_warns_once_then_dedups(self):
         _reset_warned_failing_llm()
@@ -1051,10 +1097,10 @@ class TestWarnFailingLLM:
         calls = []
         failing = self._s()
         healthy = {"failing_llm": []}
-        warn_failing_llm(failing, log=calls.append)     # warn
-        warn_failing_llm(failing, log=calls.append)     # dedup
-        warn_failing_llm(healthy, log=calls.append)     # recover -> re-arm
-        warn_failing_llm(failing, log=calls.append)     # regression -> warn AGAIN
+        warn_failing_llm(failing, log=calls.append)  # warn
+        warn_failing_llm(failing, log=calls.append)  # dedup
+        warn_failing_llm(healthy, log=calls.append)  # recover -> re-arm
+        warn_failing_llm(failing, log=calls.append)  # regression -> warn AGAIN
         assert len(calls) == 2
 
     def test_no_warn_when_healthy(self):
@@ -1067,13 +1113,12 @@ class TestWarnFailingLLM:
     def test_warn_message_reports_recent_rate(self):
         _reset_warned_failing_llm()
         calls = []
-        warn_failing_llm(self._s(rate=0.667, recent_failures=20, recent_calls=30),
-                         log=calls.append)
+        warn_failing_llm(self._s(rate=0.667, recent_failures=20, recent_calls=30), log=calls.append)
         assert len(calls) == 1
         msg = calls[0]
         assert "LLM provider" in msg
-        assert "20/30" in msg            # windowed count
-        assert "67%" in msg              # recent rate, not the diluted cumulative %
+        assert "20/30" in msg  # windowed count
+        assert "67%" in msg  # recent rate, not the diluted cumulative %
 
     def test_llm_dedup_independent_of_tool_dedup(self):
         # Tool and LLM warn state are SEPARATE sets — tripping/re-arming one must not
@@ -1082,8 +1127,7 @@ class TestWarnFailingLLM:
         _reset_warned_failing_tools()
         _reset_warned_failing_llm()
         tool_calls, llm_calls = [], []
-        tool_s = {"failing_tools": [{"name": "bash", "failures": 3, "total_calls": 3,
-                                     "failure_rate": 1.0}]}
+        tool_s = {"failing_tools": [{"name": "bash", "failures": 3, "total_calls": 3, "failure_rate": 1.0}]}
         assert warn_failing_tools(tool_s, log=tool_calls.append) == 1
         assert warn_failing_llm(self._s(), log=llm_calls.append) == 1
         assert len(tool_calls) == 1 and len(llm_calls) == 1
@@ -1144,14 +1188,15 @@ class TestLatencyPercentile:
         # flood with slow; p95 must climb (a uniform lifetime sample would stay
         # diluted near the fast bulk).
         from external_llm.agent.config.thresholds import config as _cfg
+
         cap = _cfg.scores.LATENCY_SAMPLE_WINDOW
         m = ToolMetrics(name="t")
         for _ in range(cap):
-            m.record(1.0)          # fill the window with fast calls
+            m.record(1.0)  # fill the window with fast calls
         # Evict every fast sample with slow ones
         for _ in range(cap):
             m.record(1000.0)
-        assert m.percentile(95) >= 1000.0   # window is now all-slow
+        assert m.percentile(95) >= 1000.0  # window is now all-slow
         # Constant memory: never more than cap samples retained
         assert len(m._latency_samples) == cap
 
@@ -1166,16 +1211,17 @@ class TestLatencyDeltaCache:
 
     def _window_cap(self):
         from external_llm.agent.config.thresholds import config as _cfg
+
         return _cfg.scores.LATENCY_SAMPLE_WINDOW
 
     def test_mirror_stays_sorted_and_same_length_after_eviction(self):
         m = ToolMetrics(name="t")
         cap = self._window_cap()
-        for v in (3.0, 1.0, 2.0, 5.0, 4.0):      # unsorted input order
+        for v in (3.0, 1.0, 2.0, 5.0, 4.0):  # unsorted input order
             m.record(v)
         assert m._latency_sorted == [1.0, 2.0, 3.0, 4.0, 5.0]
         assert len(m._latency_sorted) == len(m._latency_samples)
-        for _ in range(cap * 2):                 # force eviction rollover
+        for _ in range(cap * 2):  # force eviction rollover
             m.record(7.0)
         assert len(m._latency_samples) == cap
         assert len(m._latency_sorted) == cap
@@ -1186,13 +1232,14 @@ class TestLatencyDeltaCache:
         from collections import deque
 
         from external_llm.agent.performance_metrics import _percentiles
+
         m = ToolMetrics(name="t")
         cap = self._window_cap()
-        for _ in range(cap):                     # fill the window with fast
+        for _ in range(cap):  # fill the window with fast
             m.record(1.0)
-        for _ in range(cap // 2):                # flood with slow → eviction mid-stream
+        for _ in range(cap // 2):  # flood with slow → eviction mid-stream
             m.record(1000.0)
-        for pcts in ((50,), (95,), (50, 95)):    # every read == reference sort path
+        for pcts in ((50,), (95,), (50, 95)):  # every read == reference sort path
             assert m.percentiles(pcts) == _percentiles(deque(m._latency_samples), pcts)
         # summary emit must agree too (seconds → ms conversion)
         c = PerformanceCollector()
@@ -1210,6 +1257,7 @@ class TestLatencyDeltaCache:
         from collections import deque
 
         from external_llm.agent.performance_metrics import _percentiles
+
         c = PerformanceCollector()
         cap = self._window_cap()
         for _ in range(cap):
@@ -1236,10 +1284,10 @@ class TestLatencyDeltaCache:
         cap = self._window_cap()
         for _ in range(cap):
             m.record(5.0)
-        m.record(3.0)                            # window full → evicts one 5.0
+        m.record(3.0)  # window full → evicts one 5.0
         assert m._latency_sorted == [3.0] + [5.0] * (cap - 1)
         assert Counter(m._latency_sorted) == Counter(m._latency_samples)
-        m.record(3.0)                            # second 3.0 → evicts the next 5.0
+        m.record(3.0)  # second 3.0 → evicts the next 5.0
         assert m._latency_sorted == [3.0, 3.0] + [5.0] * (cap - 2)
         assert Counter(m._latency_sorted) == Counter(m._latency_samples)
 
@@ -1254,14 +1302,12 @@ class TestLLMLatencyPercentile:
             c.record_llm_call(provider="ollama", execution_time_ms=float(v))
         s = c.get_summary()
         prov = s["llm_providers"]["ollama"]
-        assert prov["p50_ms"] == 10.0          # median
+        assert prov["p50_ms"] == 10.0  # median
         # Linear-interpolation p95 over [10,10,10,10,200]: k=4*0.95=3.8 → between
         # idx3(10) and idx4(200) = 10 + 190*0.8 = 162. Strictly above the median,
         # reflecting the tail without equalling the raw max.
         assert prov["p50_ms"] < prov["p95_ms"] < 200.0
         assert prov["p95_ms"] == pytest.approx(162.0)
-
-
 
     def test_no_llm_calls_yields_no_aggregate_latency(self):
         c = PerformanceCollector()
@@ -1281,7 +1327,7 @@ class TestLatencyInToolSummary:
             c.record_tool_call("grep", execution_time=v)
         s = c.get_summary()
         entry = s["tool_metrics"]["grep"]
-        assert entry["p50_ms"] == 30.0         # median of 5 → 0.030s * 1000
+        assert entry["p50_ms"] == 30.0  # median of 5 → 0.030s * 1000
         # Linear-interpolation p95: k=4*0.95=3.8 → between idx3(0.040) and
         # idx4(0.100) = 0.040 + 0.060*0.8 = 0.088s → 88ms.
         assert entry["p95_ms"] == pytest.approx(88.0)
@@ -1326,7 +1372,7 @@ class TestLatencySuccessOnly:
         m.record(5.0)
         m.record(5.0)
         m.record(5.0)
-        m.record(30000.0, failed=True)   # slow-fail — excluded
+        m.record(30000.0, failed=True)  # slow-fail — excluded
         assert m.percentile(95) == 5.0
         assert len(m._latency_samples) == 3
 
@@ -1335,7 +1381,7 @@ class TestLatencySuccessOnly:
         c = PerformanceCollector()
         c.record_tool_call("grep", execution_time=0.005, failed=False)
         c.record_tool_call("grep", execution_time=0.005, failed=False)
-        c.record_tool_call("grep", execution_time=30.0, failed=True)   # timeout
+        c.record_tool_call("grep", execution_time=30.0, failed=True)  # timeout
         s = c.get_summary()
         e = s["tool_metrics"]["grep"]
         # Only the two 5ms successes are in the window → p95 = 5ms.
@@ -1350,8 +1396,8 @@ class TestLatencySuccessOnly:
         # slow. The fast-fails must NOT flood the window and drag p95 down.
         m = ToolMetrics(name="t")
         for _ in range(24):
-            m.record(0.1, failed=True)   # 24 fast-fails — excluded
-        m.record(200.0)                  # the ONE real completion
+            m.record(0.1, failed=True)  # 24 fast-fails — excluded
+        m.record(200.0)  # the ONE real completion
         # window is [200] → p95=200.0. Without the gate the 24 fast-fails push
         # this single real completion below the 95th rank (24/25 = 96% are
         # 0.1ms fails) and p95 would read ~0.1 — hiding that real calls take
@@ -1386,8 +1432,6 @@ class TestLatencySuccessOnly:
         # Cumulative avg STILL includes the failed call's time (honest), proving
         # only the latency window is gated.
         assert prov["avg_time_ms_per_call"] == pytest.approx(1005.0)
-
-
 
 
 class TestTopSlowTools:
@@ -1495,6 +1539,7 @@ class TestWarnSlowTools:
     def test_warns_new_tool_then_dedups(self):
         _reset_warned_slow_tools()
         calls = []
+
         def log(msg):
             calls.append(msg)
 
@@ -1513,6 +1558,7 @@ class TestWarnSlowTools:
     def test_re_arm_on_recovery(self):
         _reset_warned_slow_tools()
         calls = []
+
         def log(msg):
             calls.append(msg)
 
@@ -1533,8 +1579,10 @@ class TestWarnSlowTools:
     def test_no_warn_when_summary_has_no_slow_tools(self):
         _reset_warned_slow_tools()
         calls = []
+
         def log(msg):
             calls.append(msg)
+
         assert warn_slow_tools({}, log=log) == 0
         assert warn_slow_tools({"slow_tools": []}, log=log) == 0
         assert len(calls) == 0
@@ -1546,6 +1594,7 @@ class TestWarnSlowLLM:
     def test_warns_new_provider_then_dedups(self):
         _reset_warned_slow_llm()
         calls = []
+
         def log(msg):
             calls.append(msg)
 
@@ -1564,6 +1613,7 @@ class TestWarnSlowLLM:
     def test_re_arm_on_recovery(self):
         _reset_warned_slow_llm()
         calls = []
+
         def log(msg):
             calls.append(msg)
 
@@ -1581,8 +1631,10 @@ class TestWarnSlowLLM:
     def test_no_warn_when_empty(self):
         _reset_warned_slow_llm()
         calls = []
+
         def log(msg):
             calls.append(msg)
+
         assert warn_slow_llm({}, log=log) == 0
         assert warn_slow_llm({"slow_llm": []}, log=log) == 0
         assert len(calls) == 0
@@ -1636,6 +1688,7 @@ class TestSlowToolsInSummary:
 
         import external_llm.agent.performance_metrics as _pm
         from external_llm.agent.config.thresholds import config as _cfg
+
         c = PerformanceCollector()
         for _ in range(10):
             c.record_tool_call("moderate_tool", 10.0, failed=False)  # 10000ms p95
@@ -1656,6 +1709,7 @@ class TestSlowToolsInSummary:
 
         import external_llm.agent.performance_metrics as _pm
         from external_llm.agent.config.thresholds import config as _cfg
+
         c = PerformanceCollector()
         for _ in range(10):
             c.record_llm_call("moderate_provider", 0, 0, execution_time_ms=50000.0, failed=False)
@@ -1669,4 +1723,3 @@ class TestSlowToolsInSummary:
         with patch.object(_pm, "_threshold_config", new_config):
             summary_after = c.get_summary()
         assert summary_after["slow_llm"] == []
-

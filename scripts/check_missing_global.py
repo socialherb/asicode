@@ -96,8 +96,19 @@ REPO = Path(__file__).resolve().parent.parent
 # Directories that hold no first-party source.  tests/ IS scanned: a test that
 # silently fails to set module state asserts nothing, and the measured baseline
 # over tests/ is zero.
-SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".mypy_cache",
-             ".pytest_cache", ".ruff_cache", "build", "dist", ".asicode"}
+SKIP_DIRS = {
+    "__pycache__",
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "build",
+    "dist",
+    ".asicode",
+}
 
 
 def _resolve_scan_paths(args: list[str]) -> list[str] | None:
@@ -144,9 +155,7 @@ def _record_assignment_targets(node, record) -> None:
             for sub in ast.walk(target):
                 if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
                     record(sub.id, sub.lineno)
-    elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and isinstance(
-        node.target, ast.Name
-    ):
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name):
         record(node.target.id, node.lineno)
 
 
@@ -205,10 +214,7 @@ def _reads_name(fn, name: str) -> bool:
         return False
 
     body = fn.body if isinstance(fn.body, list) else [fn.body]
-    return any(
-        (isinstance(s, ast.Name) and isinstance(s.ctx, ast.Load) and s.id == name) or walk(s)
-        for s in body
-    )
+    return any((isinstance(s, ast.Name) and isinstance(s.ctx, ast.Load) and s.id == name) or walk(s) for s in body)
 
 
 def _function_scopes(table, out):
@@ -258,9 +264,11 @@ def _violations_in(source: str, filename: str) -> list[tuple[int, str, str, str]
             # already bound to an enclosing scope.
             if sym.is_declared_global() or sym.is_free() or not sym.is_local():
                 continue
-            shape = ("read-then-write — also an UnboundLocalError (ruff F823)"
-                     if _reads_name(node, name)
-                     else "write-only — silently discarded, invisible to ruff")
+            shape = (
+                "read-then-write — also an UnboundLocalError (ruff F823)"
+                if _reads_name(node, name)
+                else "write-only — silently discarded, invisible to ruff"
+            )
             out.append((lineno, fname, name, shape))
     return sorted(out)
 
@@ -277,8 +285,10 @@ def main() -> int:
             findings.append(f"  {rel}:{lineno}  in {func}()  assigns {name!r}\n      {shape}")
 
     if not findings:
-        print("✅ No function assigns a module-level global without declaring it "
-              "(0 tolerated — this gate has no baseline)")
+        print(
+            "✅ No function assigns a module-level global without declaring it "
+            "(0 tolerated — this gate has no baseline)"
+        )
         return 0
 
     print(f"❌ {len(findings)} undeclared write(s) to a module-level global:\n")

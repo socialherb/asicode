@@ -12,6 +12,7 @@ Locks the flake8 semantics the P3-1/P3-2 implementation initially got wrong
     prose — the first implementation regex-scanned the whole comment, so
     "# noqa: E501 …mentions F401…" wrongly suppressed F401.
 """
+
 import textwrap
 
 from external_llm.analysis.unused_import_scanner import (
@@ -21,6 +22,7 @@ from external_llm.analysis.unused_import_scanner import (
 )
 
 # ─── _has_noqa_comment: basic formats ────────────────────────────────────────
+
 
 def test_no_comment_at_all():
     assert not _has_noqa_comment("import os")
@@ -54,6 +56,7 @@ def test_codes_none_matches_any_noqa():
 
 # ─── the two verification-caught regressions ─────────────────────────────────
 
+
 def test_bare_noqa_suppresses_every_code():
     # flake8 semantics: a directive with no code list suppresses everything.
     assert _has_noqa_comment("import os  # noqa", {"F401"})
@@ -70,13 +73,12 @@ def test_code_mentioned_in_prose_does_not_match():
 
 
 def test_descriptive_suffix_after_matching_code_still_matches():
-    assert _has_noqa_comment(
-        "from mod import X  # noqa: F401 — barrel re-export", {"F401"})
-    assert _has_noqa_comment(
-        "from mod import X  # noqa: F401, F841 — barrel re-export", {"F841"})
+    assert _has_noqa_comment("from mod import X  # noqa: F401 — barrel re-export", {"F401"})
+    assert _has_noqa_comment("from mod import X  # noqa: F401, F841 — barrel re-export", {"F841"})
 
 
 # ─── _import_block_has_noqa: multi-line imports ──────────────────────────────
+
 
 def test_block_noqa_on_open_paren_line():
     lines = [
@@ -99,9 +101,11 @@ def test_block_without_noqa():
 
 # ─── scan_unused_imports end-to-end ──────────────────────────────────────────
 
+
 def test_scan_respects_noqa_but_flags_genuine_unused(tmp_path):
     f = tmp_path / "mod.py"
-    f.write_text(textwrap.dedent("""\
+    f.write_text(
+        textwrap.dedent("""\
         import os
         import sys  # noqa: F401
         import json  # noqa
@@ -110,9 +114,9 @@ def test_scan_respects_noqa_but_flags_genuine_unused(tmp_path):
             beta,
         )
         import shutil  # noqa: E501 hint text mentions F401 accidentally
-    """))
-    res = scan_unused_imports(
-        repo_root=str(tmp_path), file_paths=[str(f)], max_per_file=100)
+    """)
+    )
+    res = scan_unused_imports(repo_root=str(tmp_path), file_paths=[str(f)], max_per_file=100)
     flagged = sorted(c.symbol_name for c in res)
     # Suppressed: sys (exact code), json (bare noqa), alpha/beta (block noqa).
     # Flagged: os (no noqa), shutil (E501 only — prose F401 must not count).

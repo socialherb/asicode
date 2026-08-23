@@ -10,6 +10,7 @@ Covers:
     native) while bare vendor slugs keep native pricing (no shadowing).
   - env-var service creation (create_service_from_env / intelligent variant).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -20,34 +21,42 @@ from external_llm.openai_client import OpenAIClient, OpenRouterClient
 
 # ── detect_cloud_provider / _norm ────────────────────────────────────────────
 
-@pytest.mark.parametrize("model,expected", [
-    # OpenRouter routing prefix → openrouter (both colon and slash forms)
-    ("openrouter/deepseek/deepseek-v4-flash", "openrouter"),
-    ("openrouter:deepseek/deepseek-v4-flash", "openrouter"),
-    ("openrouter:anthropic/claude-sonnet-4-6", "openrouter"),
-    # Bare vendor slug (no openrouter prefix) → native provider (BY DESIGN)
-    ("deepseek/deepseek-v4-flash", "deepseek"),
-    ("deepseek-v4-flash", "deepseek"),
-    ("glm-5.2", "zai"),
-    ("claude-sonnet-4-6", "anthropic"),
-    # Unknown / ollama
-    ("some-unknown-model", None),
-])
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        # OpenRouter routing prefix → openrouter (both colon and slash forms)
+        ("openrouter/deepseek/deepseek-v4-flash", "openrouter"),
+        ("openrouter:deepseek/deepseek-v4-flash", "openrouter"),
+        ("openrouter:anthropic/claude-sonnet-4-6", "openrouter"),
+        # Bare vendor slug (no openrouter prefix) → native provider (BY DESIGN)
+        ("deepseek/deepseek-v4-flash", "deepseek"),
+        ("deepseek-v4-flash", "deepseek"),
+        ("glm-5.2", "zai"),
+        ("claude-sonnet-4-6", "anthropic"),
+        # Unknown / ollama
+        ("some-unknown-model", None),
+    ],
+)
 def test_detect_cloud_provider(model, expected):
     assert detect_cloud_provider(model) == expected
 
 
-@pytest.mark.parametrize("inp,expected", [
-    ("openrouter:deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4-flash"),
-    ("openrouter/deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4-flash"),
-    ("ollama:gemma4:e2b", "gemma4:e2b"),
-    ("deepseek-v4-flash", "deepseek-v4-flash"),
-])
+@pytest.mark.parametrize(
+    "inp,expected",
+    [
+        ("openrouter:deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4-flash"),
+        ("openrouter/deepseek/deepseek-v4-flash", "openrouter/deepseek/deepseek-v4-flash"),
+        ("ollama:gemma4:e2b", "gemma4:e2b"),
+        ("deepseek-v4-flash", "deepseek-v4-flash"),
+    ],
+)
 def test_norm_openrouter_forms(inp, expected):
     assert _norm(inp) == expected
 
 
 # ── create_llm_client factory ────────────────────────────────────────────────
+
 
 def test_factory_creates_openrouter_client():
     c = create_llm_client("openrouter", "sk-or-test")
@@ -64,12 +73,16 @@ def test_factory_rejects_unknown_provider():
 
 # ── OpenRouterClient internals ───────────────────────────────────────────────
 
-@pytest.mark.parametrize("inp,expected", [
-    ("openrouter/deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash"),
-    ("deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash"),
-    ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
-    ("", ""),
-])
+
+@pytest.mark.parametrize(
+    "inp,expected",
+    [
+        ("openrouter/deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash"),
+        ("deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash"),
+        ("anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
+        ("", ""),
+    ],
+)
 def test_strip_internal_prefix(inp, expected):
     assert OpenRouterClient._strip_internal_prefix(inp) == expected
 
@@ -85,13 +98,16 @@ def test_provider_preference_from_env(monkeypatch):
     assert OpenRouterClient._provider_preference() is None
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("deny", "deny"),
-    ("DENY", "deny"),
-    ("  deny  ", "deny"),
-    ("allow", "allow"),
-    ("Allow ", "allow"),
-])
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("deny", "deny"),
+        ("DENY", "deny"),
+        ("  deny  ", "deny"),
+        ("allow", "allow"),
+        ("Allow ", "allow"),
+    ],
+)
 def test_provider_preference_data_collection(monkeypatch, raw, expected):
     monkeypatch.delenv("OPENROUTER_PROVIDER_ORDER", raising=False)
     monkeypatch.setenv("OPENROUTER_DATA_COLLECTION", raw)
@@ -156,10 +172,7 @@ def test_log_cache_handles_various_inputs(caplog):
     OpenRouterClient._log_cache(None)
     OpenRouterClient._log_cache({})
     OpenRouterClient._log_cache({"usage": {}})
-    OpenRouterClient._log_cache({
-        "usage": {"prompt_tokens": 10000,
-                  "prompt_tokens_details": {"cached_tokens": 8500}}
-    })
+    OpenRouterClient._log_cache({"usage": {"prompt_tokens": 10000, "prompt_tokens_details": {"cached_tokens": 8500}}})
 
 
 def test_log_cache_usage_null_is_treated_as_missing(caplog):
@@ -171,19 +184,23 @@ def test_log_cache_usage_null_is_treated_as_missing(caplog):
 
 # ── Cost estimation ──────────────────────────────────────────────────────────
 
+
 def test_openrouter_slug_gets_openrouter_pricing():
     from external_llm.agent._shared_utils import _get_rates
+
     assert _get_rates("openrouter", "deepseek/deepseek-v4-flash") == (0.09, 0.18)
 
 
 def test_native_deepseek_not_shadowed_by_openrouter():
     """Bare deepseek-v4-flash must keep native ($0.14/$0.28), not OpenRouter rate."""
     from external_llm.agent._shared_utils import _get_rates
+
     assert _get_rates("deepseek", "deepseek-v4-flash") == (0.14, 0.28)
 
 
 def test_openrouter_cheaper_than_native():
     from external_llm.agent._shared_utils import estimate_cost
+
     or_cost = estimate_cost("openrouter", 1_000_000, 1_000_000, "deepseek/deepseek-v4-flash")
     native = estimate_cost("deepseek", 1_000_000, 1_000_000, "deepseek-v4-flash")
     assert or_cost < native
@@ -192,11 +209,13 @@ def test_openrouter_cheaper_than_native():
 
 # ── Service creation from env ────────────────────────────────────────────────
 
+
 def test_create_service_from_env_openrouter(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openrouter")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setenv("EXTERNAL_LLM_MODEL", "deepseek/deepseek-v4-flash")
     from external_llm.service import create_service_from_env
+
     svc = create_service_from_env()
     assert svc is not None
     assert svc.provider == "openrouter"
@@ -208,6 +227,7 @@ def test_create_service_missing_key_returns_none(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openrouter")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     from external_llm.service import create_service_from_env
+
     assert create_service_from_env() is None
 
 
@@ -216,6 +236,7 @@ def test_create_intelligent_service_explicit_key(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_MODEL", "deepseek/deepseek-v4-flash")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     from external_llm.intelligent_service import create_intelligent_service_from_env
+
     svc = create_intelligent_service_from_env(api_key="sk-or-explicit")
     assert svc is not None
     assert svc.provider == "openrouter"
@@ -226,6 +247,7 @@ def test_create_service_from_env_explicit_api_key_wins(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openrouter")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-env-should-lose")
     from external_llm.service import create_service_from_env
+
     svc = create_service_from_env(api_key="sk-explicit")
     assert svc is not None
     assert svc.provider == "openrouter"
@@ -238,6 +260,7 @@ def test_create_service_from_env_api_key_param_rescues_missing_env(monkeypatch):
     monkeypatch.setenv("EXTERNAL_LLM_PROVIDER", "openrouter")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     from external_llm.service import create_service_from_env
+
     assert create_service_from_env() is None
     svc = create_service_from_env(api_key="sk-explicit")
     assert svc is not None

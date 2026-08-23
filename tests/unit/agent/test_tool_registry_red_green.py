@@ -11,6 +11,7 @@ No source changes were needed; every branch below is reachable through a
 legitimate configuration or a patched collaborator (same technique the
 existing tool_registry tests use for sub-classifiers).
 """
+
 from __future__ import annotations
 
 import builtins
@@ -40,6 +41,7 @@ from external_llm.languages import LanguageId, LanguageRegistry
 def _raise(exc):
     def _fn(*_a, **_k):
         raise exc
+
     return _fn
 
 
@@ -55,8 +57,13 @@ def _clear_bash_cache():
 @pytest.fixture
 def cfg():
     return AgentConfig(
-        max_turns=5, run_tests=False, run_lint=False, auto_test_on_patch=False,
-        self_review_enabled=False, rag_enabled=False, vector_cache_enabled=False,
+        max_turns=5,
+        run_tests=False,
+        run_lint=False,
+        auto_test_on_patch=False,
+        self_review_enabled=False,
+        rag_enabled=False,
+        vector_cache_enabled=False,
         parallel_tool_execution_enabled=True,
         tool_result_cache_enabled=False,
     )
@@ -69,6 +76,7 @@ def reg(cfg, tmp_path):
 
 
 # ── module-level helpers ────────────────────────────────────────────────────
+
 
 class TestModuleLevelHelpers:
     def test_semantic_outcome_checked_property(self):
@@ -110,6 +118,7 @@ class TestModuleLevelHelpers:
 
 # ── construction ────────────────────────────────────────────────────────────
 
+
 class TestConstruction:
     def test_init_with_agent_profile_logs(self, cfg, tmp_path):
         cfg.agent_profile = SimpleNamespace(name="prof")
@@ -117,11 +126,13 @@ class TestConstruction:
 
     def test_make_tool_result_cache_constructor_raises(self, reg, monkeypatch):
         import external_llm.agent.tool_result_cache as trc
+
         monkeypatch.setattr(trc, "ToolResultCache", lambda *a, **k: _raise(RuntimeError("boom"))())
         assert reg._make_tool_result_cache(AgentConfig(tool_result_cache_enabled=True)) is None
 
 
 # ── run-checkpoint gates ────────────────────────────────────────────────────
+
 
 class TestCheckpointGates:
     def test_checkpoint_before_write_missing_gate_rebuilds(self, reg):
@@ -152,6 +163,7 @@ class TestCheckpointGates:
 
 # ── semantic turn coalescing drain ──────────────────────────────────────────
 
+
 def _patch_lang_registry(monkeypatch, fake_reg):
     monkeypatch.setattr(LanguageRegistry, "instance", staticmethod(lambda: fake_reg))
 
@@ -178,6 +190,7 @@ class TestSemanticTurnDrain:
     def test_drain_pool_submit_runtime_error_falls_back_inline(self, reg, monkeypatch):
         def ok_batch(paths):
             return {p: SimpleNamespace(checked=True, skip_reason="", errors=[]) for p in paths}
+
         prov_a = SimpleNamespace(
             capabilities=lambda: SimpleNamespace(has_semantic_validator=True),
             validate_semantics_batch=ok_batch,
@@ -188,9 +201,7 @@ class TestSemanticTurnDrain:
         )
         fake_reg = SimpleNamespace(get=lambda p: {"/a.py": prov_a, "/b.ts": prov_b}[p])
         _patch_lang_registry(monkeypatch, fake_reg)
-        monkeypatch.setattr(
-            tr_mod, "shared_pool", SimpleNamespace(submit=_raise(RuntimeError("pool down")))
-        )
+        monkeypatch.setattr(tr_mod, "shared_pool", SimpleNamespace(submit=_raise(RuntimeError("pool down"))))
         reg.begin_semantic_turn()
         reg.defer_semantic_check("/a.py")
         reg.defer_semantic_check("/b.ts")
@@ -207,11 +218,11 @@ class TestSemanticTurnDrain:
             def result(self, timeout=None):
                 raise FutureTimeoutError("poll timeout")
 
-        monkeypatch.setattr(
-            tr_mod, "shared_pool", SimpleNamespace(submit=lambda fn, *a, **k: _TimeoutFuture())
-        )
+        monkeypatch.setattr(tr_mod, "shared_pool", SimpleNamespace(submit=lambda fn, *a, **k: _TimeoutFuture()))
+
         def ok_batch(paths):
             return {p: SimpleNamespace(checked=True, skip_reason="", errors=[]) for p in paths}
+
         prov_a = SimpleNamespace(
             capabilities=lambda: SimpleNamespace(has_semantic_validator=True),
             validate_semantics_batch=ok_batch,
@@ -249,11 +260,13 @@ class TestSemanticTurnDrain:
 
 # ── cache invalidation exception paths ──────────────────────────────────────
 
+
 def _patch_invalidation_modules(monkeypatch):
     import external_llm.agent._shared_utils as su
     import external_llm.agent.symbol_search as ss
     import external_llm.agent.tool_handlers.write_tools as wt
     import external_llm.common.repo_files as rf
+
     return su, ss, rf, wt
 
 
@@ -293,6 +306,7 @@ class TestInvalidationExceptions:
 
 # ── bash classifiers ────────────────────────────────────────────────────────
 
+
 class TestBashClassifierExtras:
     def test_has_redirect_quoted_redirect_is_not_mutation(self):
         assert ToolRegistry._has_redirect_outside_quotes('echo "a>b"') is False
@@ -308,11 +322,13 @@ class TestBashClassifierExtras:
 
     def test_parse_bash_tree_bootstrap_exception(self, monkeypatch):
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(tsu, "is_available", _raise(RuntimeError("ts broken")))
         assert ToolRegistry._parse_bash_tree("echo hi") is None
 
     def test_parse_bash_tree_parser_none(self, monkeypatch):
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(tsu, "is_available", lambda: True)
         monkeypatch.setattr(tsu, "get_parser", lambda lang: None)
         assert ToolRegistry._parse_bash_tree("echo hi") is None
@@ -327,6 +343,7 @@ class TestBashClassifierExtras:
 
 # ── mutation / serial classification ────────────────────────────────────────
 
+
 class TestMutationSerial:
     def test_tool_call_is_serial_job_kill(self, reg):
         assert reg._tool_call_is_serial("job", {"action": "kill"}) is True
@@ -339,6 +356,7 @@ class TestMutationSerial:
 
 # ── _repair_verify_failure (argument-mismatch auto-repair) ──────────────────
 
+
 class _RepairEnv:
     """Configurable stand-ins for _repair_verify_failure's collaborators.
 
@@ -347,9 +365,20 @@ class _RepairEnv:
     all-files re-verify gate at the tail behaves deterministically.
     """
 
-    def __init__(self, monkeypatch, tmp_path, *, strategy_ops=None, val_ok_after=False,
-                 classifier_raises=False, atomic_raises=False, open_raises=False,
-                 provider=None, classify=FailureType.ARGUMENT_MISMATCH, file_exists=True):
+    def __init__(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        strategy_ops=None,
+        val_ok_after=False,
+        classifier_raises=False,
+        atomic_raises=False,
+        open_raises=False,
+        provider=None,
+        classify=FailureType.ARGUMENT_MISMATCH,
+        file_exists=True,
+    ):
         self.monkeypatch = monkeypatch
         self.writes: list[tuple[str, str]] = []
         self.val_ok_after = val_ok_after
@@ -379,7 +408,10 @@ class _RepairEnv:
         def _cc(lang):
             if classifier_raises:
                 raise ValueError("no classifier")
-            return SimpleNamespace(classify=lambda errors: classify)
+            return SimpleNamespace(
+                classify=lambda errors: classify,
+                classify_typed=lambda errors: SimpleNamespace(type=classify, symbol="", fix_hint=None),
+            )
 
         monkeypatch.setattr(fc_mod, "create_failure_classifier", _cc)
 
@@ -389,7 +421,7 @@ class _RepairEnv:
             if strategy_ops is None:
                 return SimpleNamespace(get=lambda ftype: None)
             ops = [SimpleNamespace(payload=op) for op in strategy_ops]
-            return SimpleNamespace(get=lambda ftype: (lambda code, verr, clf: ops))
+            return SimpleNamespace(get=lambda ftype: lambda code, verr, clf: ops)
 
         monkeypatch.setattr(rr_mod, "RepairRegistry", _rr)
 
@@ -468,7 +500,8 @@ class TestRepairVerifyFailure:
 
     def test_repair_verify_atomic_write_oserror(self, reg, tmp_path, monkeypatch):
         env = _RepairEnv(
-            monkeypatch, tmp_path,
+            monkeypatch,
+            tmp_path,
             strategy_ops=[{"__raw_code__": "x = 1\n"}],
             atomic_raises=True,
         )
@@ -477,7 +510,8 @@ class TestRepairVerifyFailure:
 
     def test_repair_verify_success_reverifies_all(self, reg, tmp_path, monkeypatch):
         env = _RepairEnv(
-            monkeypatch, tmp_path,
+            monkeypatch,
+            tmp_path,
             strategy_ops=[{"__raw_code__": "x = 1\n"}],
             val_ok_after=True,
         )
@@ -486,7 +520,8 @@ class TestRepairVerifyFailure:
 
     def test_repair_verify_reverify_fail_restores(self, reg, tmp_path, monkeypatch):
         env = _RepairEnv(
-            monkeypatch, tmp_path,
+            monkeypatch,
+            tmp_path,
             strategy_ops=[{"__raw_code__": "x = 1\n"}],
         )  # val_ok_after=False → re-verify keeps failing
         assert self._call(reg, env) is False
@@ -495,10 +530,20 @@ class TestRepairVerifyFailure:
 
 # ── _should_soft_fail_verify ────────────────────────────────────────────────
 
+
 class _SoftFailEnv:
-    def __init__(self, monkeypatch, tmp_path, *, classify=FailureType.SYNTAX_ERROR,
-                 classifier_raises=False, orig_valid=True, validator_raises=False,
-                 with_provider=True, detail_path=True):
+    def __init__(
+        self,
+        monkeypatch,
+        tmp_path,
+        *,
+        classify=FailureType.SYNTAX_ERROR,
+        classifier_raises=False,
+        orig_valid=True,
+        validator_raises=False,
+        with_provider=True,
+        detail_path=True,
+    ):
         self.orig_valid = orig_valid
         self.validator_raises = validator_raises
         if with_provider:
@@ -517,7 +562,10 @@ class _SoftFailEnv:
         def _cc(lang):
             if classifier_raises:
                 raise ValueError("no classifier")
-            return SimpleNamespace(classify=lambda errors: classify)
+            return SimpleNamespace(
+                classify=lambda errors: classify,
+                classify_typed=lambda errors: SimpleNamespace(type=classify, symbol="", fix_hint=None),
+            )
 
         monkeypatch.setattr(fc_mod, "create_failure_classifier", _cc)
         self.path = str(tmp_path / "m.py")
@@ -569,37 +617,45 @@ class TestShouldSoftFailVerify:
 
 # ── _auto_repair_indent ─────────────────────────────────────────────────────
 
+
 class TestAutoRepairIndent:
     def test_auto_repair_skips_unsupported_op_types(self):
-        out = ToolRegistry._auto_repair_indent(
-            "a = 1\n", [{"type": "insert_before", "anchor": "a", "content": "b"}]
-        )
+        out = ToolRegistry._auto_repair_indent("a = 1\n", [{"type": "insert_before", "anchor": "a", "content": "b"}])
         assert out is None
 
     def test_auto_repair_anchor_missing(self):
-        assert ToolRegistry._auto_repair_indent(
-            "a = 1\n", [{"type": "replace", "anchor": "zzz", "content": "x"}]
-        ) is None
+        assert (
+            ToolRegistry._auto_repair_indent("a = 1\n", [{"type": "replace", "anchor": "zzz", "content": "x"}]) is None
+        )
 
     def test_auto_repair_midline_anchor_skipped(self):
-        assert ToolRegistry._auto_repair_indent(
-            "def f():\n    pass\n",
-            [{"type": "replace", "anchor": "f():", "content": "g():\n    pass"}],
-        ) is None
+        assert (
+            ToolRegistry._auto_repair_indent(
+                "def f():\n    pass\n",
+                [{"type": "replace", "anchor": "f():", "content": "g():\n    pass"}],
+            )
+            is None
+        )
 
     def test_auto_repair_reindent_none_skipped(self, monkeypatch):
         monkeypatch.setattr(tr_mod, "reindent_text", lambda *a, **k: None)
-        assert ToolRegistry._auto_repair_indent(
-            "def f():\n    pass\n",
-            [{"type": "replace", "anchor": "pass", "content": "x = 1"}],
-        ) is None
+        assert (
+            ToolRegistry._auto_repair_indent(
+                "def f():\n    pass\n",
+                [{"type": "replace", "anchor": "pass", "content": "x = 1"}],
+            )
+            is None
+        )
 
     def test_auto_repair_insert_after_reindent_none_skipped(self, monkeypatch):
         monkeypatch.setattr(tr_mod, "reindent_text", lambda *a, **k: None)
-        assert ToolRegistry._auto_repair_indent(
-            "x = 1\n",
-            [{"type": "insert_after", "anchor": "x = 1", "content": "y = 2"}],
-        ) is None
+        assert (
+            ToolRegistry._auto_repair_indent(
+                "x = 1\n",
+                [{"type": "insert_after", "anchor": "x = 1", "content": "y = 2"}],
+            )
+            is None
+        )
 
     def test_auto_repair_replace_success(self):
         content = "class A:\n    def m(self):\n        pass\n"
@@ -625,11 +681,10 @@ class TestAutoRepairIndent:
 
 # ── _after_write_success exceptional paths ──────────────────────────────────
 
+
 class TestAfterWriteSuccess:
     def test_after_write_success_checkpoint_metadata_raises(self, reg, monkeypatch):
-        monkeypatch.setattr(
-            ToolRegistry, "run_checkpoint_id", property(lambda self: _raise(RuntimeError("cp boom"))())
-        )
+        monkeypatch.setattr(ToolRegistry, "run_checkpoint_id", property(lambda self: _raise(RuntimeError("cp boom"))()))
         reg._after_write_success("bash", {"command": "rm f"}, ToolResult(ok=True), {})
 
     def test_after_write_success_snapshot_raises(self, reg, monkeypatch):
@@ -644,9 +699,7 @@ class TestAfterWriteSuccess:
         assert res.metadata["semantic_repaired"] == 2
 
     def test_after_write_success_semantic_repair_raises(self, reg, monkeypatch):
-        monkeypatch.setattr(
-            reg._safety_manager, "auto_repair_semantic", _raise(RuntimeError("sem boom"))
-        )
+        monkeypatch.setattr(reg._safety_manager, "auto_repair_semantic", _raise(RuntimeError("sem boom")))
         snap = {os.path.join(reg.repo_root, "a.py"): "x = 1\n"}
         reg._after_write_success(
             "edit_text", {"file_path": "a.py"}, ToolResult(ok=True), snap
@@ -660,11 +713,13 @@ class TestAfterWriteSuccess:
 
     def test_after_write_success_git_cache_raises(self, reg, monkeypatch):
         import external_llm.agent.agent_context_manager as acm
+
         monkeypatch.setattr(acm, "_clear_git_cache", _raise(RuntimeError("git boom")))
         reg._after_write_success("bash", {"command": "rm f"}, ToolResult(ok=True), {})
 
 
 # ── dispatch edge paths ─────────────────────────────────────────────────────
+
 
 class TestDispatchEdges:
     def test_dispatch_non_dict_args(self, reg):
@@ -679,9 +734,7 @@ class TestDispatchEdges:
         assert not res.ok and "cancelled" in (res.error or "").lower()
 
     def test_dispatch_profile_blocked_tool(self, reg):
-        reg._agent_profile = SimpleNamespace(
-            name="restricted", blocked_tools={"read_file"}, allowed_tools=None
-        )
+        reg._agent_profile = SimpleNamespace(name="restricted", blocked_tools={"read_file"}, allowed_tools=None)
         res = reg.dispatch("read_file", {"path": "a.py"})
         assert not res.ok and "blocked" in (res.error or "")
         assert res.metadata.get("blocked") == "agent_profile"
@@ -697,9 +750,7 @@ class TestDispatchEdges:
             acquire_relevant=lambda args, tool: ["a.py"],
             release_all=lambda paths: released.append(paths),
         )
-        res = reg.dispatch(
-            "edit_text", {"file_path": "a.py", "old_string": "x = 1", "new_string": "x = 2"}
-        )
+        res = reg.dispatch("edit_text", {"file_path": "a.py", "old_string": "x = 1", "new_string": "x = 2"})
         assert res.ok
         assert released == [["a.py"]]
 
@@ -710,6 +761,7 @@ class TestDispatchEdges:
 
 
 # ── write-verify cascade (dispatch-level rollback) ──────────────────────────
+
 
 def _broken_edit_args():
     return {"path": "m.py", "operations": [{"type": "replace", "anchor": "return 1", "content": "return 1 +"}]}
@@ -774,6 +826,7 @@ class TestDispatchWriteSafetyCascade:
 
 # ── dispatch_parallel ───────────────────────────────────────────────────────
 
+
 class TestDispatchParallelFallbacks:
     def test_parallel_empty_or_single_batch(self, reg):
         assert reg.dispatch_parallel([]) == []
@@ -782,44 +835,55 @@ class TestDispatchParallelFallbacks:
 
     def test_parallel_disabled_falls_back_sequential(self, reg):
         reg.config.parallel_tool_execution_enabled = False
-        res = reg.dispatch_parallel([
-            {"tool": "read_file", "args": {"path": "nope1.py"}},
-            {"tool": "read_file", "args": {"path": "nope2.py"}},
-        ])
+        res = reg.dispatch_parallel(
+            [
+                {"tool": "read_file", "args": {"path": "nope1.py"}},
+                {"tool": "read_file", "args": {"path": "nope2.py"}},
+            ]
+        )
         assert len(res) == 2
 
     def test_parallel_write_tool_falls_back_sequential(self, reg):
-        res = reg.dispatch_parallel([
-            {"tool": "read_file", "args": {"path": "nope.py"}},
-            {"tool": "edit_text", "args": {"file_path": "a.py", "old_string": "x = 1", "new_string": "x = 2"}},
-        ])
+        res = reg.dispatch_parallel(
+            [
+                {"tool": "read_file", "args": {"path": "nope.py"}},
+                {"tool": "edit_text", "args": {"file_path": "a.py", "old_string": "x = 1", "new_string": "x = 2"}},
+            ]
+        )
         assert len(res) == 2 and res[0].ok is False
 
     def test_parallel_serial_tool_falls_back_sequential(self, reg):
-        res = reg.dispatch_parallel([
-            {"tool": "read_file", "args": {"path": "nope.py"}},
-            {"tool": "job", "args": {"action": "kill", "job_id": "nope"}},
-        ])
+        res = reg.dispatch_parallel(
+            [
+                {"tool": "read_file", "args": {"path": "nope.py"}},
+                {"tool": "job", "args": {"action": "kill", "job_id": "nope"}},
+            ]
+        )
         assert len(res) == 2
 
     def test_parallel_real_pool_success(self, reg):
-        res = reg.dispatch_parallel([
-            {"tool": "read_file", "args": {"path": "nope1.py"}},
-            {"tool": "read_file", "args": {"path": "nope2.py"}},
-        ])
+        res = reg.dispatch_parallel(
+            [
+                {"tool": "read_file", "args": {"path": "nope1.py"}},
+                {"tool": "read_file", "args": {"path": "nope2.py"}},
+            ]
+        )
         assert len(res) == 2 and not res[0].ok and not res[1].ok
 
     def test_parallel_exception_wrapped(self, reg, monkeypatch):
         monkeypatch.setattr(reg, "dispatch", lambda tool_name, args: _raise(RuntimeError("boom"))())
-        res = reg.dispatch_parallel([
-            {"tool": "read_file", "args": {"path": "nope1.py"}},
-            {"tool": "grep", "args": {"pattern": "x"}},
-        ])
+        res = reg.dispatch_parallel(
+            [
+                {"tool": "read_file", "args": {"path": "nope1.py"}},
+                {"tool": "grep", "args": {"pattern": "x"}},
+            ]
+        )
         assert len(res) == 2
         assert all("Parallel execution error" in (r.error or "") for r in res)
 
 
 # ── schema/name variants ────────────────────────────────────────────────────
+
 
 class TestToolNameVariants:
     def test_get_tool_names_variants(self, reg):
@@ -863,6 +927,7 @@ class TestBiasPathExtras:
 
 
 # ── _secure_path ────────────────────────────────────────────────────────────
+
 
 class TestSecurePathExtras:
     def test_secure_path_resolve_failure_none(self, reg, monkeypatch):

@@ -6,6 +6,7 @@ caller (MCP ``wait_for`` timeout, aborted ``dispatch_parallel`` batch) sets a
 per-call scope event the poll never saw, so the rg/grep process group kept
 walking the tree unowned up to the 120 s bound.
 """
+
 from __future__ import annotations
 
 import threading
@@ -82,7 +83,10 @@ def test_search_cancelled_mid_run_when_scope_set(host):
     t0 = time.monotonic()
     with call_cancel_scope(scope_ev), pytest.raises(SearchCancelled):
         host._run_search_bounded(
-            ["sh", "-c", "echo one; sleep 10"], host.repo_root, 60, 100,
+            ["sh", "-c", "echo one; sleep 10"],
+            host.repo_root,
+            60,
+            100,
             cancelled=host._search_cancel_requested,
         )
     assert time.monotonic() - t0 < 5.0, "mid-run abandon must not wait out the child"

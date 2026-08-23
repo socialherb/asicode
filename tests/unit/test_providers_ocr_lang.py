@@ -13,6 +13,7 @@ These tests inject fake ``pytesseract`` / ``PIL`` modules via ``sys.modules``
 so they run even when the real libraries (and the ``tesseract`` binary) are
 absent.
 """
+
 from __future__ import annotations
 
 import base64

@@ -9,6 +9,7 @@ Design properties under test (see module docstring):
 Per repo convention, imports are deferred to test bodies where convenient and
 ``monkeypatch.setenv`` is used to redirect the cache to a temp file.
 """
+
 from __future__ import annotations
 
 import json
@@ -164,9 +165,7 @@ def test_overdue_starts_background_thread(monkeypatch, tmp_path):
 
     from utils.version_check import start_update_check
 
-    handle = start_update_check(
-        current_version="0.2.6", fetcher=fake_fetcher, now_ts=time.time()
-    )
+    handle = start_update_check(current_version="0.2.6", fetcher=fake_fetcher, now_ts=time.time())
     assert handle._thread is not None
     # Give the daemon thread a moment to finish its (fake, instant) fetch.
     notice = handle.collect(wait_s=2.0)
@@ -286,9 +285,7 @@ def test_start_never_raises_on_bad_env(monkeypatch, tmp_path):
     from utils.version_check import start_update_check
 
     # Should not raise regardless of the IO situation (fail-open contract).
-    handle = start_update_check(
-        current_version="0.2.6", fetcher=lambda *_: "9.9.9", now_ts=time.time()
-    )
+    handle = start_update_check(current_version="0.2.6", fetcher=lambda *_: "9.9.9", now_ts=time.time())
     handle._thread.join(timeout=2.0)
     # collect must also never raise.
     assert handle.collect(wait_s=0.0) is None or isinstance(handle.collect(wait_s=0.0), str)
@@ -327,9 +324,7 @@ def test_uninstalled_sentinel_skips_check(tmp_path, monkeypatch):
     from utils.version_check import start_update_check
 
     fetched = []
-    handle = start_update_check(
-        current_version="0.0.0", fetcher=lambda *_: fetched.append(1) or "9.9.9"
-    )
+    handle = start_update_check(current_version="0.0.0", fetcher=lambda *_: fetched.append(1) or "9.9.9")
     assert handle.notice is None
     assert handle._thread is None  # fetch not even started
     assert handle.collect(wait_s=0.5) is None
@@ -358,9 +353,7 @@ def test_editable_install_skips_check(tmp_path, monkeypatch):
     monkeypatch.setattr(vc, "_is_editable_install", lambda: True)
 
     fetched = []
-    handle = vc.start_update_check(
-        current_version="0.2.6", fetcher=lambda *_: fetched.append(1) or "9.9.9"
-    )
+    handle = vc.start_update_check(current_version="0.2.6", fetcher=lambda *_: fetched.append(1) or "9.9.9")
     assert handle.notice is None
     assert handle._thread is None  # fetch not started
     assert handle.collect(wait_s=0.5) is None
@@ -402,9 +395,7 @@ def test_is_editable_install_parses_direct_url(monkeypatch):
             return None
 
     def _with(payload):
-        monkeypatch.setattr(
-            _meta, "distributions", lambda: [_FakeDist("asicode", payload)]
-        )
+        monkeypatch.setattr(_meta, "distributions", lambda: [_FakeDist("asicode", payload)])
         # Call the real detection logic directly (the autouse fixture replaces
         # the _is_editable_install wrapper with a constant).
         return vc._has_editable_distribution(vc.PACKAGE_NAME)
@@ -474,21 +465,15 @@ def test_editable_not_fooled_by_egginfo_shadowing(tmp_path, monkeypatch):
     repo_root.mkdir()
     egg_info = repo_root / f"{pkg}.egg-info"
     egg_info.mkdir()
-    (egg_info / "PKG-INFO").write_text(
-        f"Metadata-Version: 2.1\nName: {pkg}\nVersion: 0.0.0\n"
-    )
+    (egg_info / "PKG-INFO").write_text(f"Metadata-Version: 2.1\nName: {pkg}\nVersion: 0.0.0\n")
 
     # real editable *.dist-info in site-packages — carries direct_url.json
     site_dir = tmp_path / "site"
     site_dir.mkdir()
     dist_info = site_dir / f"{pkg}-0.2.10.dist-info"
     dist_info.mkdir()
-    (dist_info / "PKG-INFO").write_text(
-        f"Metadata-Version: 2.1\nName: {pkg}\nVersion: 0.2.10\n"
-    )
-    (dist_info / "direct_url.json").write_text(
-        _json.dumps({"url": repo_root.as_uri(), "dir_info": {"editable": True}})
-    )
+    (dist_info / "PKG-INFO").write_text(f"Metadata-Version: 2.1\nName: {pkg}\nVersion: 0.2.10\n")
+    (dist_info / "direct_url.json").write_text(_json.dumps({"url": repo_root.as_uri(), "dir_info": {"editable": True}}))
 
     # Mirror asi.py sys.path ordering: repo root first (egg-info wins first-match),
     # site-packages second (holds the editable dist-info).
@@ -522,9 +507,9 @@ class TestEditableResolutionCaching:
         # Seed a hit for the current version → _is_editable_install must NOT be
         # called. We monkeypatch it to raise to PROVE the cached value is used.
         _set_cache(
-            monkeypatch, tmp_path,
-            {"editable": True, "editable_version": "0.2.6",
-             "latest": "9.9.9", "last_check_ts": time.time()},
+            monkeypatch,
+            tmp_path,
+            {"editable": True, "editable_version": "0.2.6", "latest": "9.9.9", "last_check_ts": time.time()},
         )
         import utils.version_check as vc
 
@@ -533,7 +518,8 @@ class TestEditableResolutionCaching:
 
         monkeypatch.setattr(vc, "_is_editable_install", _must_not_scan)
         handle = vc.start_update_check(
-            current_version="0.2.6", fetcher=lambda *_: None,
+            current_version="0.2.6",
+            fetcher=lambda *_: None,
         )
         # editable=True (cached) → skip: no notice, no fetch thread.
         assert handle.notice is None
@@ -543,7 +529,8 @@ class TestEditableResolutionCaching:
         # Cached for an OLD version → the new version must miss, recompute via
         # the (monkeypatched) scan, and persist the fresh value.
         path = _set_cache(
-            monkeypatch, tmp_path,
+            monkeypatch,
+            tmp_path,
             {"editable": True, "editable_version": "0.2.5"},
         )
         import utils.version_check as vc
@@ -588,13 +575,15 @@ class TestEditableResolutionCaching:
         # editable memo and forcing a re-scan next launch. It now
         # read-merge-writes so the memo survives a fetch.
         path = _set_cache(
-            monkeypatch, tmp_path,
+            monkeypatch,
+            tmp_path,
             {"editable": False, "editable_version": "0.2.6", "last_check_ts": 0},
         )
         import utils.version_check as vc
 
         handle = vc.start_update_check(
-            current_version="0.2.6", fetcher=lambda *_: "1.0.0",
+            current_version="0.2.6",
+            fetcher=lambda *_: "1.0.0",
         )
         assert handle._thread is not None  # last_check_ts 0 → overdue → fetch
         handle._thread.join(timeout=2.0)

@@ -138,35 +138,43 @@ class TestClassifyUserApproval:
     def test_judge_fn_approved(self):
         def judge(prompt: str) -> str:
             return "approved"
+
         assert classify_user_approval("yes!", judge) == UserApproval.APPROVED
 
     def test_judge_fn_denied(self):
         def judge(prompt: str) -> str:
             return "denied"
+
         assert classify_user_approval("no!", judge) == UserApproval.DENIED
 
     def test_judge_fn_ambiguous(self):
         def judge(prompt: str) -> str:
             return "something else"
+
         assert classify_user_approval("hmm", judge) == UserApproval.AMBIGUOUS
 
     def test_judge_fn_strips_whitespace(self):
         def judge(prompt: str) -> str:
             return "  approved  "
+
         assert classify_user_approval("ok", judge) == UserApproval.APPROVED
 
     def test_judge_fn_exception_falls_back_to_heuristic(self):
         """When judge_fn raises, fall back to heuristic."""
+
         def broken_judge(prompt: str) -> str:
             raise RuntimeError("LLM unavailable")
+
         # falls back to heuristic → "yes" is approved
         response = "yes"
         assert classify_user_approval(response, broken_judge) == UserApproval.APPROVED
 
     def test_judge_fn_exception_with_ambiguous_heuristic(self):
         """When judge_fn raises and heuristic doesn't match → AMBIGUOUS."""
+
         def broken_judge(prompt: str) -> str:
             raise RuntimeError("LLM unavailable")
+
         assert classify_user_approval("maybe later", broken_judge) == UserApproval.AMBIGUOUS
 
     def test_judge_fn_prompt_format(self):

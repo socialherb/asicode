@@ -30,11 +30,7 @@ _DEFAULT_SKIP_PARTS = {"tests", "__pycache__"}
 def prod_py_files(root: Path, skip_parts: set[str] | None = None) -> list[Path]:
     """All ``*.py`` files under ``root`` excluding test/cache directories."""
     skip = _DEFAULT_SKIP_PARTS if skip_parts is None else skip_parts
-    return sorted(
-        p
-        for p in root.rglob("*.py")
-        if not any(part in skip for part in p.parts)
-    )
+    return sorted(p for p in root.rglob("*.py") if not any(part in skip for part in p.parts))
 
 
 def _subprocess_aliases(tree: ast.AST) -> set[str]:
@@ -56,11 +52,7 @@ def _subprocess_aliases(tree: ast.AST) -> set[str]:
                         if alias not in aliases:
                             aliases.add(alias)
                             changed = True
-            elif (
-                isinstance(node, ast.Assign)
-                and isinstance(node.value, ast.Name)
-                and node.value.id in aliases
-            ):
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in aliases:
                 # _sp = subprocess  (value may itself be an alias, e.g. b = a)
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id not in aliases:
@@ -152,12 +144,24 @@ def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]):
 
 
 def _assigned_var(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> str | None:
-    """Name the Popen call is assigned to (``proc = subprocess.Popen(...)``), if any."""
+    """Name the Popen call is assigned to (``proc = subprocess.Popen(...)``), if any.
+
+    Accepts both plain assignment (``proc = Popen(...)``) and annotated
+    assignment (``proc: Popen[str] = Popen(...)`` — the pyright-driven typing
+    pattern used in tool_handlers/read_tools.py). The annotation form parses
+    as an :class:`ast.AnnAssign`, not :class:`ast.Assign`; ignoring it would
+    false-positive on a call that IS bound.
+    """
     parent = parents.get(node)
-    if isinstance(parent, ast.Assign) and parent.value is node and len(parent.targets) == 1:
-        target = parent.targets[0]
-        if isinstance(target, ast.Name):
-            return target.id
+    if (
+        isinstance(parent, ast.Assign)
+        and parent.value is node
+        and len(parent.targets) == 1
+        and isinstance(parent.targets[0], ast.Name)
+    ):
+        return parent.targets[0].id
+    if isinstance(parent, ast.AnnAssign) and parent.value is node and isinstance(parent.target, ast.Name):
+        return parent.target.id
     return None
 
 
@@ -203,9 +207,7 @@ def popen_unbounded(tree: ast.AST) -> list[tuple[ast.Call, int, str]]:
             hits.append((node, node.lineno, "Popen with PIPE not assigned to a name (and no enclosing scope)"))
             continue
         if not _bounded_in_scope(fn, var):
-            hits.append(
-                (node, node.lineno, f"proc '{var}' has no wait/communicate(timeout=) nor handoff in scope")
-            )
+            hits.append((node, node.lineno, f"proc '{var}' has no wait/communicate(timeout=) nor handoff in scope"))
     return hits
 
 
@@ -226,6 +228,7 @@ def detector_self_tests() -> None:
     on the (clean) production trees, so this pins each detector's behaviour on
     synthetic violations AND safe forms.
     """
+
     def hits(src: str) -> dict[str, list]:
         return all_violations(ast.parse(src))
 
@@ -239,23 +242,40 @@ def detector_self_tests() -> None:
     assert len(hits("import subprocess\n_sp = subprocess\n_sp.check_output(['x'], timeout=5)\n")["run"]) == 0
     assert len(hits("import subprocess\na = subprocess\nb = a\nb.run(['x'])\n")["run"]) == 1
     # Popen: plain wait() fires, wait(timeout=) quiet, handoff quiet, DEVNULL/splat exempt
-    assert len(hits(
-        "import subprocess\n"
-        "proc = subprocess.Popen(['x'], stdout=subprocess.PIPE)\n"
-        "proc.wait()\n"
-    )["popen"]) == 1
-    assert hits(
-        "import subprocess\n"
-        "proc = subprocess.Popen(['x'], stdout=subprocess.PIPE)\n"
-        "proc.wait(timeout=5)\n"
-    )["popen"] == []
-    assert hits(
-        "import subprocess\n"
-        "proc = subprocess.Popen(['x'], stdout=subprocess.PIPE)\n"
-        "capture(proc, timeout=5)\n"
-    )["popen"] == []
+    assert (
+        len(hits("import subprocess\nproc = subprocess.Popen(['x'], stdout=subprocess.PIPE)\nproc.wait()\n")["popen"])
+        == 1
+    )
+    assert (
+        hits("import subprocess\nproc = subprocess.Popen(['x'], stdout=subprocess.PIPE)\nproc.wait(timeout=5)\n")[
+            "popen"
+        ]
+        == []
+    )
+    assert (
+        hits("import subprocess\nproc = subprocess.Popen(['x'], stdout=subprocess.PIPE)\ncapture(proc, timeout=5)\n")[
+            "popen"
+        ]
+        == []
+    )
     assert hits("import subprocess\nsubprocess.Popen(['x'], stdout=subprocess.DEVNULL)\n")["popen"] == []
     assert hits("import subprocess\nproc = subprocess.Popen(['x'], **_kw)\n")["popen"] == []
+    # Annotated assignment (AnnAssign): the pyright typing pattern must be
+    # recognised as a binding — unbound annotated form still fires.
+    assert (
+        hits(
+            "import subprocess\nproc: subprocess.Popen[str] = subprocess.Popen(['x'], stdout=subprocess.PIPE)\nproc.wait(timeout=5)\n"
+        )["popen"]
+        == []
+    )
+    assert (
+        len(
+            hits("import subprocess\nproc: subprocess.Popen[str] = subprocess.Popen(['x'], stdout=subprocess.PIPE)\n")[
+                "popen"
+            ]
+        )
+        == 1
+    )
     # os.popen/os.system banned
     assert len(hits("import os\nos.system('git status')\n")["os"]) == 1
     assert len(hits("import os\nos.popen('ls')\n")["os"]) == 1

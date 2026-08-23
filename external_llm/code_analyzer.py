@@ -8,13 +8,13 @@ Analyzes Python code to extract:
 - Dependencies (imports and calls)
 - Code patterns
 """
+
 from __future__ import annotations
 
 import ast
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FunctionInfo:
     """Information about a function"""
+
     name: str
     args: list[str]
-    return_type: Optional[str] = None
-    docstring: Optional[str] = None
+    return_type: str | None = None
+    docstring: str | None = None
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
     is_async: bool = False
@@ -39,10 +40,11 @@ class FunctionInfo:
 @dataclass
 class ClassInfo:
     """Information about a class"""
+
     name: str
     bases: list[str]
     methods: list[FunctionInfo] = field(default_factory=list)
-    docstring: Optional[str] = None
+    docstring: str | None = None
     line_number: int = 0
     decorators: list[str] = field(default_factory=list)
 
@@ -50,20 +52,22 @@ class ClassInfo:
 @dataclass
 class ImportInfo:
     """Information about an import"""
+
     module: str
     names: list[str] = field(default_factory=list)
-    alias: Optional[str] = None
+    alias: str | None = None
 
 
 @dataclass
 class CodeAnalysis:
     """Complete analysis of a Python file"""
+
     functions: list[FunctionInfo] = field(default_factory=list)
     classes: list[ClassInfo] = field(default_factory=list)
     imports: list[ImportInfo] = field(default_factory=list)
     global_vars: dict[str, str] = field(default_factory=dict)
     calls: set[str] = field(default_factory=set)  # Functions called
-    module_docstring: Optional[str] = None
+    module_docstring: str | None = None
 
 
 class CodeAnalyzer:
@@ -74,7 +78,7 @@ class CodeAnalyzer:
     types, dependencies, and patterns.
     """
 
-    def analyze_file(self, file_path: Path) -> Optional[CodeAnalysis]:
+    def analyze_file(self, file_path: Path) -> CodeAnalysis | None:
         """
         Analyze a Python file
 
@@ -85,7 +89,7 @@ class CodeAnalyzer:
             CodeAnalysis or None if parse fails
         """
         try:
-            content = file_path.read_text(encoding='utf-8')
+            content = file_path.read_text(encoding="utf-8")
             tree = ast.parse(content, filename=str(file_path))
             return self._analyze_ast(tree)
         except Exception as e:
@@ -124,10 +128,12 @@ class CodeAnalyzer:
             # Imports
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    analysis.imports.append(ImportInfo(
-                        module=alias.name,
-                        alias=alias.asname,
-                    ))
+                    analysis.imports.append(
+                        ImportInfo(
+                            module=alias.name,
+                            alias=alias.asname,
+                        )
+                    )
 
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
@@ -143,10 +149,12 @@ class CodeAnalyzer:
                 if node.level:
                     module = "." * node.level + module
                 names = [alias.name for alias in node.names]
-                analysis.imports.append(ImportInfo(
-                    module=module,
-                    names=names,
-                ))
+                analysis.imports.append(
+                    ImportInfo(
+                        module=module,
+                        names=names,
+                    )
+                )
 
             # Function calls
             elif isinstance(node, ast.Call):
@@ -297,7 +305,7 @@ class CodeAnalyzer:
             decorators=decorators,
         )
 
-    def _get_call_name(self, node: ast.Call) -> Optional[str]:
+    def _get_call_name(self, node: ast.Call) -> str | None:
         """Get the name of a function call"""
         if isinstance(node.func, ast.Name):
             return node.func.id
@@ -346,10 +354,10 @@ class CodeAnalyzer:
 
         # Docstring (first line only)
         if func.docstring:
-            first_line = func.docstring.split('\n')[0].strip()
+            first_line = func.docstring.split("\n")[0].strip()
             lines.append(f'    """{first_line}"""')
 
-        return '\n'.join(lines)
+        return "\n".join(lines)
 
     def format_class_signature(self, cls: ClassInfo) -> str:
         """Format class signature"""
@@ -359,14 +367,14 @@ class CodeAnalyzer:
 
         # Class definition
         if cls.bases:
-            bases_str = ', '.join(cls.bases)
+            bases_str = ", ".join(cls.bases)
             lines.append(f"class {cls.name}({bases_str}):")
         else:
             lines.append(f"class {cls.name}:")
 
         # Docstring
         if cls.docstring:
-            first_line = cls.docstring.split('\n')[0].strip()
+            first_line = cls.docstring.split("\n")[0].strip()
             lines.append(f'    """{first_line}"""')
 
         # Methods (just signatures)
@@ -375,10 +383,7 @@ class CodeAnalyzer:
             for method in cls.methods[:5]:  # Show first 5 methods
                 method_sig = self.format_function_signature(method)
                 # Indent
-                indented = '\n'.join('    ' + line for line in method_sig.split('\n'))
+                indented = "\n".join("    " + line for line in method_sig.split("\n"))
                 lines.append(indented)
 
-        return '\n'.join(lines)
-
-
-
+        return "\n".join(lines)

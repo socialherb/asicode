@@ -5,19 +5,25 @@ LibCST provides format-preserving CST transformations for Python.
 Enables precise node manipulation without losing comments, whitespace,
 or formatting.
 """
+
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any
+
+# Late-bind contract: None when libcst is absent, real module/classes when
+# present. All access is guarded by _LIBCST_AVAILABLE; Any keeps the lazy-import
+# slots usable as type expressions (P45 vector_cache pattern).
+_cst: Any = None
+MetadataWrapper: Any = None
+PositionProvider: Any = None
 
 try:
     import libcst as _cst
     from libcst.metadata import MetadataWrapper, PositionProvider
+
     _LIBCST_AVAILABLE = True
 except ImportError:
-    _cst = None  # type: ignore[assignment]
-    MetadataWrapper = None  # type: ignore[assignment,misc]
-    PositionProvider = None  # type: ignore[assignment,misc]
     _LIBCST_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -43,7 +49,7 @@ def parse_module(source: str):
         return None
 
 
-def find_symbol_range(source: str, symbol_name: str) -> Optional[tuple[int, int]]:
+def find_symbol_range(source: str, symbol_name: str) -> tuple[int, int] | None:
     """Find ``(start_line, end_line)`` of a top-level symbol using LibCST.
 
     Lines are 1-indexed.  Returns None if the symbol is not found or
@@ -69,7 +75,7 @@ def find_symbol_range(source: str, symbol_name: str) -> Optional[tuple[int, int]
         class _Finder(_cst.CSTVisitor):
             METADATA_DEPENDENCIES = (PositionProvider,)  # noqa: V107 — libcst MetadataWrapper contract
 
-            def visit_FunctionDef(self, node: _cst.FunctionDef) -> bool:
+            def visit_FunctionDef(self, node: Any) -> bool:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
                 if result:
                     return False
                 if node.name.value == bare:
@@ -82,7 +88,7 @@ def find_symbol_range(source: str, symbol_name: str) -> Optional[tuple[int, int]
                         logger.debug("find_symbol_range: metadata lookup failed for %r: %s", bare, e)
                 return False  # don't descend
 
-            def visit_ClassDef(self, node: _cst.ClassDef) -> bool:
+            def visit_ClassDef(self, node: Any) -> bool:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
                 if result:
                     return False
                 if node.name.value == bare:
@@ -97,7 +103,7 @@ def find_symbol_range(source: str, symbol_name: str) -> Optional[tuple[int, int]
                 # If looking for Class.method, descend into matching class
                 if parent_class is not None and node.name.value == parent_class:
                     # Look for method in class body
-                    for stmt in node.body.body if hasattr(node.body, 'body') else []:
+                    for stmt in node.body.body if hasattr(node.body, "body") else []:
                         if isinstance(stmt, _cst.FunctionDef) and stmt.name.value == bare:
                             try:
                                 pos = self.get_metadata(PositionProvider, stmt)
@@ -120,4 +126,3 @@ def find_symbol_range(source: str, symbol_name: str) -> Optional[tuple[int, int]
 # _get_node_line_range removed — LibCST nodes do not carry lineno attributes.
 # Use _resolve_position_map() + CodeRange instead, or the higher-level
 # find_symbol_range() which handles this internally.
-

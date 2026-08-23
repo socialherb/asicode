@@ -6,6 +6,7 @@ answers "smallest-span function containing this line" in O(log n + nesting
 depth).  These tests pin the exact pre-P1 semantics against a reference
 implementation of the old linear scan.
 """
+
 import textwrap
 
 from external_llm.graph.repository_graph import RepositoryGraph, _SymbolRangeIndex
@@ -25,11 +26,11 @@ def _linear_find(line, sym_ranges):
 RANGES = [
     ("f0", 1, 5),
     ("f1", 7, 12),
-    ("f2", 8, 9),       # nested in f1
+    ("f2", 8, 9),  # nested in f1
     ("f3", 20, 40),
-    ("f4", 22, 25),     # nested in f3; same start as f5, smaller span
-    ("f5", 22, 30),     # nested in f3; same start as f4, larger span
-    ("f6", 50, 50),     # single-line function
+    ("f4", 22, 25),  # nested in f3; same start as f5, smaller span
+    ("f5", 22, 30),  # nested in f3; same start as f4, larger span
+    ("f6", 50, 50),  # single-line function
     ("f7", 55, 60),
     ("f8", 70, 100),
 ]
@@ -53,18 +54,18 @@ def test_input_order_independent():
 
 def test_nested_functions_innermost_wins():
     idx = _SymbolRangeIndex([("outer", 1, 10), ("inner", 3, 6)])
-    assert idx.find(2) == "outer"   # outer body, outside inner
-    assert idx.find(4) == "inner"   # inner body
-    assert idx.find(6) == "inner"   # inner end line (inclusive)
+    assert idx.find(2) == "outer"  # outer body, outside inner
+    assert idx.find(4) == "inner"  # inner body
+    assert idx.find(6) == "inner"  # inner end line (inclusive)
     assert idx.find(8) == "outer"
-    assert idx.find(1) == "outer"   # outer start line (inclusive)
+    assert idx.find(1) == "outer"  # outer start line (inclusive)
     assert idx.find(10) == "outer"  # outer end line (inclusive)
 
 
 def test_sibling_functions_do_not_bleed_into_gaps():
     idx = _SymbolRangeIndex([("a", 1, 3), ("b", 5, 7)])
     assert idx.find(1) == "a"
-    assert idx.find(4) == ""        # gap between siblings
+    assert idx.find(4) == ""  # gap between siblings
     assert idx.find(5) == "b"
     assert idx.find(8) == ""
 
@@ -98,11 +99,10 @@ def test_unsorted_input_is_sorted_internally():
 # End-to-end: _process_file_ripgrep caller attribution uses the index
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _stub_tree_sitter(monkeypatch, symbols, calls):
     """Stub tree_sitter_utils so the unit test needs no installed grammar."""
-    monkeypatch.setattr(
-        "external_llm.languages.tree_sitter_utils.is_available", lambda: True
-    )
+    monkeypatch.setattr("external_llm.languages.tree_sitter_utils.is_available", lambda: True)
     # tree= kwarg: _extract_non_python parses once and shares the tree (P5).
     monkeypatch.setattr(
         "external_llm.languages.tree_sitter_utils.find_all_symbols",
@@ -124,14 +124,17 @@ def test_ripgrep_path_attributes_calls_to_innermost_function(tmp_path, monkeypat
         symbols=[("outer", "function", 1, 10), ("inner", "function", 3, 6)],
         calls=[("helper", 4), ("helper", 2)],
     )
-    (tmp_path / "mod.ts").write_text(textwrap.dedent("""\
+    (tmp_path / "mod.ts").write_text(
+        textwrap.dedent("""\
         export function outer() {
           doWork();
           export function inner() {
             doWork();
           }
         }
-        """), encoding="utf-8")
+        """),
+        encoding="utf-8",
+    )
     g = RepositoryGraph(str(tmp_path))
     g.build()
     assert {s.name for s in g.symbols.values()} == {"outer", "inner"}

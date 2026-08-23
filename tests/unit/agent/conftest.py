@@ -21,6 +21,7 @@ def _reset_context_overrides():
     make a clean-flush test in another unexpectedly write).
     """
     import external_llm.agent.context_budget as _cb
+
     _cb._context_window_overrides.clear()
     _cb._override_meta.clear()
     _cb._override_dirty = False

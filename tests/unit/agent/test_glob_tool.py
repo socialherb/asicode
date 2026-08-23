@@ -5,6 +5,7 @@ which leaves the repo boundary, returns unbounded output, and cannot be
 result-cached. That only holds if the pattern semantics are the ones every
 model already assumes, so the translator is pinned separately from the tool.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -17,33 +18,36 @@ from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
 
 class TestGlobToRegex:
-    @pytest.mark.parametrize("pattern,path,expected", [
-        # `*` must not cross a separator — the reason fnmatch.translate is unusable
-        ("src/*.py", "src/a.py", True),
-        ("src/*.py", "src/pkg/a.py", False),
-        ("*.py", "a.py", True),
-        ("*.py", "a.txt", False),
-        # `**` spans directories; `**/x` must also match a bare `x`
-        ("src/**/*.py", "src/a.py", True),
-        ("src/**/*.py", "src/pkg/deep/a.py", True),
-        ("**/*.ts", "a.ts", True),
-        ("**/*.ts", "x/y/a.ts", True),
-        ("**/*.ts", "a.tsx", False),
-        # single-char and classes
-        ("a?.py", "ab.py", True),
-        ("a?.py", "a/b.py", False),
-        ("[abc].py", "b.py", True),
-        ("[abc].py", "d.py", False),
-        ("[!abc].py", "d.py", True),
-        ("[!abc].py", "a.py", False),
-        # anchored at both ends
-        ("test_*.py", "xtest_a.py", False),
-        ("test_*.py", "test_a.pyc", False),
-        # regex metacharacters in the pattern are literals
-        ("a.b.py", "a.b.py", True),
-        ("a.b.py", "axbxpy", False),
-        ("v1+2.txt", "v1+2.txt", True),
-    ])
+    @pytest.mark.parametrize(
+        "pattern,path,expected",
+        [
+            # `*` must not cross a separator — the reason fnmatch.translate is unusable
+            ("src/*.py", "src/a.py", True),
+            ("src/*.py", "src/pkg/a.py", False),
+            ("*.py", "a.py", True),
+            ("*.py", "a.txt", False),
+            # `**` spans directories; `**/x` must also match a bare `x`
+            ("src/**/*.py", "src/a.py", True),
+            ("src/**/*.py", "src/pkg/deep/a.py", True),
+            ("**/*.ts", "a.ts", True),
+            ("**/*.ts", "x/y/a.ts", True),
+            ("**/*.ts", "a.tsx", False),
+            # single-char and classes
+            ("a?.py", "ab.py", True),
+            ("a?.py", "a/b.py", False),
+            ("[abc].py", "b.py", True),
+            ("[abc].py", "d.py", False),
+            ("[!abc].py", "d.py", True),
+            ("[!abc].py", "a.py", False),
+            # anchored at both ends
+            ("test_*.py", "xtest_a.py", False),
+            ("test_*.py", "test_a.pyc", False),
+            # regex metacharacters in the pattern are literals
+            ("a.b.py", "a.b.py", True),
+            ("a.b.py", "axbxpy", False),
+            ("v1+2.txt", "v1+2.txt", True),
+        ],
+    )
     def test_matching(self, pattern: str, path: str, expected: bool):
         assert bool(_glob_to_regex(pattern).match(path)) is expected
 
@@ -51,10 +55,13 @@ class TestGlobToRegex:
         """Must not raise — an LLM will eventually send this."""
         assert _glob_to_regex("a[bc.py").match("a[bc.py")
 
-    @pytest.mark.parametrize("pattern", [
-        "[z-a]*.py",   # reversed range
-        "[9-0].py",    # reversed digit range
-    ])
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "[z-a]*.py",  # reversed range
+            "[9-0].py",  # reversed digit range
+        ],
+    )
     def test_invalid_class_raises_value_error(self, pattern: str):
         """A broken class must surface as ValueError in glob coordinates, not
         as a raw re.error naming positions inside the translated regex."""
@@ -93,6 +100,7 @@ class TestGlobToRegex:
         reinterpreted as a Python 3.13+ nested set (FutureWarning today, silent
         semantics change in a future Python)."""
         import warnings
+
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             rx = _glob_to_regex("[[]")
@@ -107,6 +115,7 @@ class TestGlobToRegex:
         """`[a&&b]` is the class {a, &, b} in glob terms — the `&&` must not be
         reinterpreted as the Python 3.13+ set-intersection operator."""
         import warnings
+
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             rx = _glob_to_regex("[a&&b]")
@@ -119,8 +128,7 @@ class TestGlobToRegex:
 
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
-    for rel in ("a.py", "b.txt", "src/c.py", "src/deep/d.py",
-                "tests/test_e.py", "한글파일.py"):
+    for rel in ("a.py", "b.txt", "src/c.py", "src/deep/d.py", "tests/test_e.py", "한글파일.py"):
         p = tmp_path / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("x = 1\n")
@@ -135,11 +143,7 @@ def _registry(repo: Path) -> ToolRegistry:
 
 
 def _paths(result) -> set[str]:
-    return {
-        line.strip().split("  (")[0]
-        for line in (result.content or "").splitlines()[1:]
-        if line.strip()
-    }
+    return {line.strip().split("  (")[0] for line in (result.content or "").splitlines()[1:] if line.strip()}
 
 
 class TestGlobTool:
@@ -147,7 +151,11 @@ class TestGlobTool:
         result = _registry(repo).dispatch("glob", {"pattern": "*.py"})
         assert result.ok
         assert _paths(result) == {
-            "a.py", "src/c.py", "src/deep/d.py", "tests/test_e.py", "한글파일.py",
+            "a.py",
+            "src/c.py",
+            "src/deep/d.py",
+            "tests/test_e.py",
+            "한글파일.py",
         }
 
     def test_pattern_with_separator_matches_full_path(self, repo: Path):
@@ -207,6 +215,7 @@ class TestGlobTool:
         """'What did I just touch?' is the question a glob usually stands in for."""
         import os
         import time
+
         now = time.time()
         # Back-date every match, not just some: files left at creation time
         # would interleave and make the assertion about nothing.
@@ -214,10 +223,7 @@ class TestGlobTool:
         for i, rel in enumerate(order):
             os.utime(repo / rel, (now - i * 3600, now - i * 3600))
         result = _registry(repo).dispatch("glob", {"pattern": "*.py"})
-        listed = [
-            line.strip().split("  (")[0]
-            for line in result.content.splitlines()[1:] if line.strip()
-        ]
+        listed = [line.strip().split("  (")[0] for line in result.content.splitlines()[1:] if line.strip()]
         assert listed == order
 
     def test_works_outside_a_git_checkout(self, tmp_path: Path):
@@ -232,6 +238,7 @@ class TestGlobTool:
 class TestGlobRegistration:
     def test_exposed_to_the_model(self):
         from external_llm.agent.tool_schemas import AGENT_TOOL_SCHEMAS
+
         names = {s.get("function", s).get("name") for s in AGENT_TOOL_SCHEMAS}
         assert "glob" in names
 
@@ -246,4 +253,3 @@ class TestGlobRegistration:
         assert reg._extract_read_scope_paths("glob", {"pattern": "*.py"}) is None
         scoped = reg._extract_read_scope_paths("glob", {"pattern": "*.py", "path": "src"})
         assert scoped is not None and len(scoped) == 1
-

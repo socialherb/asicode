@@ -36,6 +36,7 @@ def _apply(engine, tmp_path, name: str, original: str, new_code: str):
 # SP-B1: decorated-symbol replacement must not duplicate decorators
 # ---------------------------------------------------------------------------
 
+
 class TestDecoratorBoundary:
     def test_decorated_function_no_duplicate(self, engine, tmp_path):
         original = """
@@ -173,6 +174,7 @@ class TestDecoratorBoundary:
 # Regression guards: plain (undecorated) behavior unchanged
 # ---------------------------------------------------------------------------
 
+
 class TestPlainSymbolReplacement:
     def test_plain_function_replaced(self, engine, tmp_path):
         original = """
@@ -221,6 +223,7 @@ class TestPlainSymbolReplacement:
 # apply_semantic_patch guard rails (branch coverage)
 # ---------------------------------------------------------------------------
 
+
 class TestApplyGuardRails:
     def test_empty_new_code_returns_none(self, engine, tmp_path):
         _write(tmp_path, "sample.py", "def foo():\n    pass\n")
@@ -233,50 +236,39 @@ class TestApplyGuardRails:
     def test_non_def_class_body_returns_none(self, engine, tmp_path):
         # body[0] is an assignment, not def/class/async def -> fall-through None
         _write(tmp_path, "sample.py", "def foo():\n    pass\n")
-        result = engine.apply_semantic_patch(
-            file_path="sample.py", new_code="X = 1\n"
-        )
+        result = engine.apply_semantic_patch(file_path="sample.py", new_code="X = 1\n")
         assert result is None
 
     def test_syntax_error_new_code_returns_none(self, engine, tmp_path):
         _write(tmp_path, "sample.py", "def foo():\n    pass\n")
         # unparseable -> ast.parse raises inside try -> None
-        assert engine.apply_semantic_patch(
-            file_path="sample.py", new_code="def (:\n"
-        ) is None
+        assert engine.apply_semantic_patch(file_path="sample.py", new_code="def (:\n") is None
 
     def test_symbol_not_found_returns_none(self, engine, tmp_path):
         _write(tmp_path, "sample.py", "def foo():\n    pass\n")
-        result = engine.apply_semantic_patch(
-            file_path="sample.py", new_code="def bar():\n    pass\n"
-        )
+        result = engine.apply_semantic_patch(file_path="sample.py", new_code="def bar():\n    pass\n")
         assert result is None
 
     def test_class_not_found_returns_none(self, engine, tmp_path):
         _write(tmp_path, "sample.py", "class Foo:\n    pass\n")
-        result = engine.apply_semantic_patch(
-            file_path="sample.py", new_code="class Bar:\n    pass\n"
-        )
+        result = engine.apply_semantic_patch(file_path="sample.py", new_code="class Bar:\n    pass\n")
         assert result is None
 
     def test_comment_only_new_code_returns_none(self, engine, tmp_path):
         # Non-empty text that parses to an empty module body -> guard at line 66.
         _write(tmp_path, "sample.py", "def foo():\n    pass\n")
-        result = engine.apply_semantic_patch(
-            file_path="sample.py", new_code="# just a comment\n"
-        )
+        result = engine.apply_semantic_patch(file_path="sample.py", new_code="# just a comment\n")
         assert result is None
 
     def test_missing_target_file_returns_none(self, engine, tmp_path):
         # _load_ast raises (FileNotFoundError) inside try -> None
-        assert engine.apply_semantic_patch(
-            file_path="does_not_exist.py", new_code="def foo():\n    pass\n"
-        ) is None
+        assert engine.apply_semantic_patch(file_path="does_not_exist.py", new_code="def foo():\n    pass\n") is None
 
 
 # ---------------------------------------------------------------------------
 # generate_patch
 # ---------------------------------------------------------------------------
+
 
 class TestGeneratePatch:
     def test_patch_has_git_header_and_hunk(self, engine, tmp_path):

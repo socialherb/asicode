@@ -5,6 +5,7 @@ collection, read-site collection, constant-domain inference, reachability
 grading) and the end-to-end ``scan_container_reachability`` against in-memory
 temp files.
 """
+
 from __future__ import annotations
 
 import ast
@@ -38,6 +39,7 @@ from external_llm.analysis.container_reachability_scanner import (
 )
 
 # ── helpers ─────────────────────────────────────────────────────────────────
+
 
 def _mod(src: str) -> ast.Module:
     return ast.parse(src)
@@ -93,17 +95,26 @@ def _scan(src: str, **kw) -> list:
 
 # ── _is_private_name ────────────────────────────────────────────────────────
 
+
 class TestIsPrivateName:
-    @pytest.mark.parametrize("name, expected", [
-        ("_foo", True), ("_", True), ("_D", True),
-        ("__foo__", False), ("__init__", False),
-        ("foo", False), ("Bar", False),
-    ])
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            ("_foo", True),
+            ("_", True),
+            ("_D", True),
+            ("__foo__", False),
+            ("__init__", False),
+            ("foo", False),
+            ("Bar", False),
+        ],
+    )
     def test_privacy(self, name, expected):
         assert _is_private_name(name) is expected
 
 
 # ── _extract_string_keys ────────────────────────────────────────────────────
+
 
 class TestExtractStringKeys:
     def test_all_strings(self):
@@ -120,6 +131,7 @@ class TestExtractStringKeys:
 
 
 # ── _classify_key_expr ──────────────────────────────────────────────────────
+
 
 class TestClassifyKeyExpr:
     def test_literal(self):
@@ -142,6 +154,7 @@ class TestClassifyKeyExpr:
 
 
 # ── _is_container_ref ───────────────────────────────────────────────────────
+
 
 class TestIsContainerRef:
     def test_bare_name(self):
@@ -168,21 +181,17 @@ class TestIsContainerRef:
 
 # ── _build_lineno_to_method ─────────────────────────────────────────────────
 
+
 class TestBuildLinenoToMethod:
     def test_qualified_names(self):
-        tree = _mod(
-            "class C:\n"
-            "    def foo(self):\n"
-            "        return 1\n"
-            "    async def bar(self):\n"
-            "        return 2\n"
-        )
+        tree = _mod("class C:\n    def foo(self):\n        return 1\n    async def bar(self):\n        return 2\n")
         m = _build_lineno_to_method(tree)
-        assert m[3] == "C.foo"      # foo body line
-        assert m[5] == "C.bar"      # bar body line
+        assert m[3] == "C.foo"  # foo body line
+        assert m[5] == "C.bar"  # bar body line
 
 
 # ── _collect_dict_literals ──────────────────────────────────────────────────
+
 
 class TestCollectDictLiterals:
     def test_private_module_dict(self):
@@ -221,6 +230,7 @@ class TestCollectDictLiterals:
 
 # ── _collect_read_sites ─────────────────────────────────────────────────────
 
+
 class TestCollectReadSites:
     def test_get_literal(self):
         tree = _mod('_D = {"a": 1}\nx = _D.get("a", None)\n')
@@ -255,25 +265,27 @@ class TestCollectReadSites:
 
 # ── _collect_constant_returns ───────────────────────────────────────────────
 
+
 class TestCollectConstantReturns:
     def test_all_constants(self):
         tree = _mod('def f():\n    if c:\n        return "a"\n    return "b"\n')
         assert _collect_constant_returns(_func(tree, "f")) == {"a", "b"}
 
     def test_non_constant_returns_none(self):
-        tree = _mod('def f():\n    return x\n')
+        tree = _mod("def f():\n    return x\n")
         assert _collect_constant_returns(_func(tree, "f")) is None
 
     def test_bare_return_returns_none(self):
-        tree = _mod('def f():\n    return\n')
+        tree = _mod("def f():\n    return\n")
         assert _collect_constant_returns(_func(tree, "f")) is None
 
     def test_no_return_returns_none(self):
-        tree = _mod('def f():\n    pass\n')
+        tree = _mod("def f():\n    pass\n")
         assert _collect_constant_returns(_func(tree, "f")) is None
 
 
 # ── _find_method_in_class / _resolve_class_constant / _find_class_node ──────
+
 
 class TestClassResolution:
     def test_find_method_in_class(self):
@@ -291,7 +303,7 @@ class TestClassResolution:
         assert _resolve_class_constant(_find_class_node(tree, "C"), "TYPE_A") == "type_a"
 
     def test_resolve_class_constant_missing(self):
-        tree = _mod('class C:\n    pass\n')
+        tree = _mod("class C:\n    pass\n")
         assert _resolve_class_constant(_find_class_node(tree, "C"), "TYPE_A") is None
 
     def test_resolve_class_constant_non_string(self):
@@ -303,6 +315,7 @@ class TestClassResolution:
 
 
 # ── _binds_name ─────────────────────────────────────────────────────────────
+
 
 class TestBindsName:
     def test_simple_name(self):
@@ -319,27 +332,21 @@ class TestBindsName:
 
 # ── _domain_of_rhs ──────────────────────────────────────────────────────────
 
+
 class TestDomainOfRhs:
     def test_constant(self):
         assert _domain_of_rhs(_expr('"a"'), _mod("x=1\n"), None) == {"a"}
 
     def test_self_helper_traced(self):
         tree = _mod(
-            'class C:\n'
-            '    def _kind(self):\n'
-            '        return "general"\n'
-            '    def run(self):\n'
-            '        k = self._kind()\n'
+            'class C:\n    def _kind(self):\n        return "general"\n    def run(self):\n        k = self._kind()\n'
         )
         helper_call = _func(tree, "run").body[0].value
         assert _domain_of_rhs(helper_call, tree, "C") == {"general"}
+
     def test_self_helper_non_constant(self):
         tree = _mod(
-            'class C:\n'
-            '    def _kind(self):\n'
-            '        return self.x\n'
-            '    def run(self):\n'
-            '        k = self._kind()\n'
+            "class C:\n    def _kind(self):\n        return self.x\n    def run(self):\n        k = self._kind()\n"
         )
         helper_call = _func(tree, "run").body[0].value
         assert _domain_of_rhs(helper_call, tree, "C") is None
@@ -347,15 +354,16 @@ class TestDomainOfRhs:
 
 # ── _infer_key_domain_for_var ───────────────────────────────────────────────
 
+
 class TestInferKeyDomain:
     def test_union_of_branches(self):
         tree = _mod(
-            'def f(cond):\n'
-            '    if cond:\n'
+            "def f(cond):\n"
+            "    if cond:\n"
             '        intent = "a"\n'
-            '    else:\n'
+            "    else:\n"
             '        intent = "b"\n'
-            '    return _D.get(intent)\n'
+            "    return _D.get(intent)\n"
         )
         fn = _func(tree, "f")
         # target_lineno = the get() line (6); domain is the union of every
@@ -363,11 +371,11 @@ class TestInferKeyDomain:
         assert _infer_key_domain_for_var(tree, fn, "intent", None, 6) == {"a", "b"}
 
     def test_param_returns_none(self):
-        tree = _mod('def f(intent):\n    return _D.get(intent)\n')
+        tree = _mod("def f(intent):\n    return _D.get(intent)\n")
         assert _infer_key_domain_for_var(tree, _func(tree, "f"), "intent", None, 2) is None
 
     def test_non_constant_returns_none(self):
-        tree = _mod('def f():\n    intent = g()\n    return _D.get(intent)\n')
+        tree = _mod("def f():\n    intent = g()\n    return _D.get(intent)\n")
         assert _infer_key_domain_for_var(tree, _func(tree, "f"), "intent", None, 2) is None
 
     def test_tuple_unpack_returns_none(self):
@@ -379,11 +387,12 @@ class TestInferKeyDomain:
         assert _infer_key_domain_for_var(tree, _func(tree, "f"), "intent", None, 3) is None
 
     def test_no_assignment_returns_none(self):
-        tree = _mod('def f():\n    return _D.get(intent)\n')
+        tree = _mod("def f():\n    return _D.get(intent)\n")
         assert _infer_key_domain_for_var(tree, _func(tree, "f"), "intent", None, 2) is None
 
 
 # ── _reachability_reason ────────────────────────────────────────────────────
+
 
 class TestReachabilityReason:
     def test_structurally_unreachable(self):
@@ -408,6 +417,7 @@ class TestReachabilityReason:
 
 # ── _compute_reachability ───────────────────────────────────────────────────
 
+
 class TestComputeReachability:
     def test_literal_key_marks_others_unreachable(self):
         sites = [ContainerReadSite("get", "literal", "'used'", "", 2)]
@@ -417,15 +427,11 @@ class TestComputeReachability:
         assert dom == ["used"]
 
     def test_name_key_full_domain(self):
-        tree = _mod(
-            'def f():\n    intent = "general"\n    return _D.get(intent)\n'
-        )
+        tree = _mod('def f():\n    intent = "general"\n    return _D.get(intent)\n')
         l2m = _build_lineno_to_method(tree)
-        method_nodes = {l2m[n.lineno]: n for n in ast.walk(tree)
-                        if isinstance(n, ast.FunctionDef)}
+        method_nodes = {l2m[n.lineno]: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         sites = [ContainerReadSite("get", "name", "intent", "f", 2)]
-        u, _p, _r, dom, _ev = _compute_reachability(
-            ["general", "removed"], sites, tree, None, method_nodes)
+        u, _p, _r, dom, _ev = _compute_reachability(["general", "removed"], sites, tree, None, method_nodes)
         assert u == ["removed"]
         assert dom == ["general"]
 
@@ -433,22 +439,17 @@ class TestComputeReachability:
         # read site references a method not in method_nodes → unknown domain →
         # per-key possibly_unreachable verdicts are suppressed to reachable.
         sites = [ContainerReadSite("get", "name", "intent", "ghost", 2)]
-        u, _p, r, _dom, _ev = _compute_reachability(
-            ["a", "b"], sites, _mod("x=1"), None,
-        {})
+        u, _p, r, _dom, _ev = _compute_reachability(["a", "b"], sites, _mod("x=1"), None, {})
         assert u == []
         assert r == ["a", "b"]
 
 
 # ── scan_container_reachability (end-to-end) ────────────────────────────────
 
+
 class TestScanContainerReachability:
     def test_unreachable_key_detected(self):
-        src = (
-            '_D = {"used": 1, "unused": 2}\n'
-            'def f():\n'
-            '    return _D.get("used")\n'
-        )
+        src = '_D = {"used": 1, "unused": 2}\ndef f():\n    return _D.get("used")\n'
         cands = _scan(src)
         assert len(cands) == 1
         c = cands[0]
@@ -458,19 +459,11 @@ class TestScanContainerReachability:
         assert c.confidence == 0.90
 
     def test_all_reachable_emits_nothing_by_default(self):
-        src = (
-            '_D = {"a": 1}\n'
-            'def f():\n'
-            '    return _D.get("a")\n'
-        )
+        src = '_D = {"a": 1}\ndef f():\n    return _D.get("a")\n'
         assert _scan(src) == []
 
     def test_all_reachable_emitted_with_min_zero(self):
-        src = (
-            '_D = {"a": 1}\n'
-            'def f():\n'
-            '    return _D.get("a")\n'
-        )
+        src = '_D = {"a": 1}\ndef f():\n    return _D.get("a")\n'
         cands = _scan(src, min_unreachable_keys=0)
         assert len(cands) == 1
         assert cands[0].keys_reachable == ["a"]
@@ -478,39 +471,22 @@ class TestScanContainerReachability:
 
     def test_dynamic_use_skipped(self):
         # Iteration over the dict → every key may be consumed → no candidate.
-        src = (
-            '_D = {"a": 1, "b": 2}\n'
-            'def f():\n'
-            '    for k in _D:\n'
-            '        pass\n'
-        )
+        src = '_D = {"a": 1, "b": 2}\ndef f():\n    for k in _D:\n        pass\n'
         assert _scan(src) == []
 
     def test_non_private_skipped_without_graph(self):
-        src = (
-            'D = {"a": 1, "b": 2}\n'
-            'def f():\n'
-            '    return D.get("a")\n'
-        )
+        src = 'D = {"a": 1, "b": 2}\ndef f():\n    return D.get("a")\n'
         # No cross_file_referenced_names → conservative private-only → D excluded.
         assert _scan(src) == []
 
     def test_non_private_scanned_with_empty_cross_file_set(self):
-        src = (
-            'D = {"a": 1, "removed": 2}\n'
-            'def f():\n'
-            '    return D.get("a")\n'
-        )
+        src = 'D = {"a": 1, "removed": 2}\ndef f():\n    return D.get("a")\n'
         cands = _scan(src, cross_file_referenced_names=set())
         assert len(cands) == 1
         assert cands[0].keys_unreachable == ["removed"]
 
     def test_to_dict_roundtrip(self):
-        src = (
-            '_D = {"used": 1, "unused": 2}\n'
-            'def f():\n'
-            '    return _D.get("used")\n'
-        )
+        src = '_D = {"used": 1, "unused": 2}\ndef f():\n    return _D.get("used")\n'
         d = _scan(src)[0].to_dict()
         assert d["container_symbol"] == "_D"
         assert d["keys_unreachable"] == ["unused"]
@@ -523,16 +499,13 @@ class TestScanContainerReachability:
 
 # ── per-file extraction cache (2026-08-16, commit 786ffcdc pattern) ────────
 
+
 class TestScanCache:
     """(mtime_ns, size)-fingerprint disk cache: hit/miss parity, invalidation,
     fail-open, and cross-file-set independence of the cached superset."""
 
     def test_cold_equals_hot(self):
-        src = (
-            '_PRIVATE = {"alpha": 1, "beta": 2}\n'
-            'def f():\n'
-            '    return _PRIVATE["alpha"]\n'
-        )
+        src = '_PRIVATE = {"alpha": 1, "beta": 2}\ndef f():\n    return _PRIVATE["alpha"]\n'
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "m.py")
             with open(p, "w") as fh:
@@ -583,9 +556,7 @@ class TestScanCache:
     def test_empty_repo_root_bypasses_cache(self, tmp_path, monkeypatch):
         # repo_root="" (unit-test convention) must not write .cache in CWD
         monkeypatch.chdir(tmp_path)
-        (tmp_path / "m.py").write_text(
-            '_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n'
-        )
+        (tmp_path / "m.py").write_text('_D = {"a": 1, "b": 2}\n\ndef f():\n    return _D["a"]\n')
         out = scan_container_reachability(repo_root="", file_paths=["m.py"])
         assert len(out) == 1
         assert not (tmp_path / ".cache").exists()
@@ -595,30 +566,25 @@ class TestScanCache:
         # the graph set between runs (all cache hits after the first) must not
         # change per-run semantics vs. the unfiltered original.
         src = (
-            '_PRIVATE = {"a": 1, "x": 2}\n'
-            'PUBLIC = {"b": 1, "y": 2}\n'
-            'def f():\n'
-            '    return _PRIVATE["a"] + PUBLIC["b"]\n'
+            '_PRIVATE = {"a": 1, "x": 2}\nPUBLIC = {"b": 1, "y": 2}\ndef f():\n    return _PRIVATE["a"] + PUBLIC["b"]\n'
         )
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "m.py")
             with open(p, "w") as fh:
                 fh.write(src)
             # warm the cache with graph mode; neither name referenced → both allowed
-            r1 = scan_container_reachability(
-                repo_root=d, file_paths=[p], cross_file_referenced_names={"OTHER"})
+            r1 = scan_container_reachability(repo_root=d, file_paths=[p], cross_file_referenced_names={"OTHER"})
             assert len(r1) == 2
             # both cross-referenced → nothing allowed (cache hit)
             r2 = scan_container_reachability(
-                repo_root=d, file_paths=[p],
-                cross_file_referenced_names={"PUBLIC", "_PRIVATE"})
+                repo_root=d, file_paths=[p], cross_file_referenced_names={"PUBLIC", "_PRIVATE"}
+            )
             assert r2 == []
             # no graph data → private only (cache hit)
             r3 = scan_container_reachability(repo_root=d, file_paths=[p])
             assert [c.container_symbol for c in r3] == ["_PRIVATE"]
             # empty set (graph mode, nothing referenced) → both (cache hit)
-            r4 = scan_container_reachability(
-                repo_root=d, file_paths=[p], cross_file_referenced_names=set())
+            r4 = scan_container_reachability(repo_root=d, file_paths=[p], cross_file_referenced_names=set())
             assert len(r4) == 2
 
     def test_unparseable_file_skip_is_cached(self):

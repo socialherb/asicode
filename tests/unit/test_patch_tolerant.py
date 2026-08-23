@@ -8,6 +8,7 @@ handles them correctly.
 
 Run: pytest tests/unit/test_patch_tolerant.py -v
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -16,6 +17,7 @@ import textwrap
 import pytest
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def git_repo(tmp_path):
@@ -27,7 +29,8 @@ def git_repo(tmp_path):
     subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
 
     src = repo / "app.py"
-    src.write_text(textwrap.dedent("""\
+    src.write_text(
+        textwrap.dedent("""\
         def greet(name):
             msg = "Hello, " + name
             return msg
@@ -39,7 +42,8 @@ def git_repo(tmp_path):
 
         def multiply(a, b):
             return a * b
-    """))
+    """)
+    )
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True)
     return repo
@@ -49,10 +53,12 @@ def git_repo(tmp_path):
 def engine(git_repo):
     """Return a PatchEngine bound to the test repo."""
     from external_llm.patch_engine import PatchEngine
+
     return PatchEngine(str(git_repo))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def read_file(git_repo, name="app.py"):
     return (git_repo / name).read_text()
@@ -127,10 +133,10 @@ class TestTolerantPatchVariants:
             "--- a/app.py\n"
             "+++ b/app.py\n"
             "@@ -1,3 +1,3 @@\n"
-            " def greet(name):   \n"          # trailing space in context
-            "-    msg = \"Hello, \" + name\n"
-            "+    msg = \"Hi, \" + name\n"
-            "     return msg\n"               # leading extra space
+            " def greet(name):   \n"  # trailing space in context
+            '-    msg = "Hello, " + name\n'
+            '+    msg = "Hi, " + name\n'
+            "     return msg\n"  # leading extra space
         )
         result = engine.apply_patch(patch, "app.py")
         assert result.success, f"Tolerant apply should handle trailing whitespace: {result.error}"
@@ -150,9 +156,7 @@ class TestTolerantPatchVariants:
                  return msg
         """)
         result = engine.apply_patch(patch, "app.py")
-        assert result.success, (
-            f"Reanchor should correct wrong line numbers: {result.error}"
-        )
+        assert result.success, f"Reanchor should correct wrong line numbers: {result.error}"
         assert "Hi, " in read_file(git_repo)
         git_reset(git_repo)
 
@@ -186,6 +190,7 @@ class TestTolerantPatchVariants:
 
 
 # ── Tests: Reanchor logic directly ───────────────────────────────────────────
+
 
 class TestReanchorPatch:
     def test_correct_position_unchanged(self, engine, git_repo):
@@ -221,6 +226,7 @@ class TestReanchorPatch:
         assert reanchored is not None, "Should produce a reanchored patch"
         # The corrected start line should be ≤ 11 (file has 11 lines)
         import re
+
         m = re.search(r"@@ -(\d+),", reanchored)
         assert m, "Reanchored patch should contain @@ header"
         corrected_line = int(m.group(1))
@@ -228,6 +234,7 @@ class TestReanchorPatch:
 
 
 # ── Tests: _convert_patch_to_edit_blocks ────────────────────────────────────
+
 
 class TestConvertPatchToEditBlocks:
     """Tests for _hunk_to_before_after and _convert_patch_to_edit_blocks helpers."""
@@ -257,10 +264,10 @@ class TestConvertPatchToEditBlocks:
     def test_hunk_to_before_after_basic(self, git_repo):
         loop = self._make_loop(git_repo)
         hunk = [
-            ' def greet(name):\n',
+            " def greet(name):\n",
             '-    msg = "Hello, " + name\n',
             '+    msg = "Hi, " + name\n',
-            '     return msg\n',
+            "     return msg\n",
         ]
         before, after = loop._hunk_to_before_after(hunk)
         assert "Hello" in before
@@ -277,6 +284,7 @@ class TestConvertPatchToEditBlocks:
     def test_convert_applies_successfully(self, git_repo):
         from external_llm.patch_engine import PatchEngine
         from plan_compiler import compile_plan_to_unified_diff
+
         engine = PatchEngine(str(git_repo))
         patch = textwrap.dedent("""\
             diff --git a/app.py b/app.py
@@ -299,7 +307,7 @@ class TestConvertPatchToEditBlocks:
                     "path": result["file_path"],
                     "blocks": result["blocks"],
                 }
-            ]
+            ],
         }
         try:
             compile_result = compile_plan_to_unified_diff(repo_root=str(git_repo), plan=plan)
@@ -315,6 +323,7 @@ class TestConvertPatchToEditBlocks:
 
     def test_convert_no_path_extracts_from_patch(self, git_repo):
         from external_llm.patch_engine import PatchEngine
+
         engine = PatchEngine(str(git_repo))
         patch = textwrap.dedent("""\
             diff --git a/app.py b/app.py
@@ -391,7 +400,7 @@ MALFORMED_PATCH_CASES = [
             "--- a/app.py\n"
             "+++ b/app.py\n"
             "@@ -6,3 +6,3 @@\n"
-            " def add(a, b):  \n"   # trailing space
+            " def add(a, b):  \n"  # trailing space
             "-    return a + b\n"
             "+    return a + b + 0\n"
         ),
@@ -419,8 +428,7 @@ def test_patch_success_rate(engine, git_repo, desc, patch, expected):
     result = engine.apply_patch(patch, "app.py")
     if expected:
         assert result.success, (
-            f"[{desc}] Expected patch to succeed but got: {result.error}\n"
-            f"  metadata: {result.metadata}"
+            f"[{desc}] Expected patch to succeed but got: {result.error}\n  metadata: {result.metadata}"
         )
     else:
         assert not result.success, f"[{desc}] Expected patch to fail but it succeeded"
@@ -444,7 +452,7 @@ class TestFixHunkCountsBlankContext:
         "+++ b/file.py\n"
         "@@ -2,7 +2,6 @@\n"
         "     return STALE_CONTEXT_LINE\n"
-        "\n"                              # blank context line, space stripped
+        "\n"  # blank context line, space stripped
         " def b():\n"
         "-    return 2\n"
         "-\n"
@@ -462,32 +470,25 @@ class TestFixHunkCountsBlankContext:
         """The bare blank body line is rewritten to a ' ' context line."""
         fixed = engine._fix_hunk_counts(self.STALE_PATCH_WITH_BLANK_CTX)
         body = fixed.split("@@ -2,7 +2,4 @@\n", 1)[1]
-        assert "\n\n" not in "\n" + body.rstrip("\n"), (
-            f"bare empty line survived normalization:\n{fixed}"
-        )
+        assert "\n\n" not in "\n" + body.rstrip("\n"), f"bare empty line survived normalization:\n{fixed}"
 
     def test_no_silent_half_hunk_apply(self, engine, git_repo):
         """End-to-end regression: stale-context patch on a freshly-edited file
         must either fail cleanly or apply the FULL hunk — never a truncated
         prefix that drops the '+' line."""
         src = git_repo / "file.py"
-        src.write_text(
-            "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
-        )
+        src.write_text("def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n")
         subprocess.run(["git", "add", "file.py"], cwd=git_repo, check=True)
         subprocess.run(["git", "commit", "-qm", "add file.py"], cwd=git_repo, check=True)
         # freshly-edited: working tree differs from index
-        src.write_text(
-            "def a():\n    return 111\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n"
-        )
+        src.write_text("def a():\n    return 111\n\ndef b():\n    return 2\n\ndef c():\n    return 3\n")
 
         result = engine.apply_patch(self.STALE_PATCH_WITH_BLANK_CTX, "file.py")
         content = src.read_text()
         if result.success:
             # Full-hunk semantics: b() -> 99, c() deleted
             assert "return 99" in content, (
-                f"silent half-hunk apply: '+' line dropped.\n"
-                f"metadata={result.metadata}\ncontent:\n{content}"
+                f"silent half-hunk apply: '+' line dropped.\nmetadata={result.metadata}\ncontent:\n{content}"
             )
             assert "def c()" not in content
         else:
@@ -601,44 +602,31 @@ class TestPatchIndexShasAreFake:
     def _real_blob_sha(git_repo, name="app.py"):
         out = subprocess.run(
             ["git", "ls-files", "-s", name],
-            cwd=git_repo, capture_output=True, text=True, check=True,
+            cwd=git_repo,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout
         # "100644 <sha> 0\tapp.py"
         return out.split()[1]
 
     def test_fabricated_sha_is_fake(self, engine, git_repo):
-        patch = (
-            "diff --git a/app.py b/app.py\n"
-            "index abcdef0..1234567 100644\n"
-            "--- a/app.py\n"
-        )
+        patch = "diff --git a/app.py b/app.py\nindex abcdef0..1234567 100644\n--- a/app.py\n"
         assert engine._patch_index_shas_are_fake(patch) is True
 
     def test_real_blob_sha_not_fake(self, engine, git_repo):
         sha = self._real_blob_sha(git_repo)
-        patch = (
-            "diff --git a/app.py b/app.py\n"
-            f"index {sha}..{sha} 100644\n"
-            "--- a/app.py\n"
-        )
+        patch = f"diff --git a/app.py b/app.py\nindex {sha}..{sha} 100644\n--- a/app.py\n"
         assert engine._patch_index_shas_are_fake(patch) is False
 
     def test_no_index_line_not_fake(self, engine, git_repo):
-        patch = (
-            "diff --git a/app.py b/app.py\n"
-            "--- a/app.py\n"
-            "+++ b/app.py\n"
-        )
+        patch = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
         assert engine._patch_index_shas_are_fake(patch) is False
 
     def test_allzero_placeholder_not_fake(self, engine, git_repo):
         """new-file patch uses 0000000 on the old side (creation) — not fake."""
         sha = self._real_blob_sha(git_repo)
-        patch = (
-            "diff --git a/app.py b/app.py\n"
-            "new file mode 100644\n"
-            f"index 0000000..{sha}\n"
-        )
+        patch = f"diff --git a/app.py b/app.py\nnew file mode 100644\nindex 0000000..{sha}\n"
         assert engine._patch_index_shas_are_fake(patch) is False
 
     def test_mixed_files_one_fake_is_fake(self, engine, git_repo):
@@ -694,8 +682,12 @@ class TestModeB3waySkip:
     @staticmethod
     def _apply(git_repo, patch, skip_3way):
         from diff_apply import apply_patch
+
         return apply_patch(
-            git_repo, patch, file_path_hint="app.py", skip_3way=skip_3way,
+            git_repo,
+            patch,
+            file_path_hint="app.py",
+            skip_3way=skip_3way,
         )
 
     def test_matching_context_skip_is_a_noop(self, git_repo):
@@ -809,20 +801,20 @@ class TestC0PlacementVerification:
         ok, err, mode = engine._tolerant_git_apply(self.STALE_INSERT_PATCH, "code.kt")
         content = (kt_repo / "code.kt").read_text()
         assert not ok, f"unverifiable -C0 apply must not report success (mode={mode})"
-        assert content == self.KT_CONTENT, (
-            f"failed apply must roll back cleanly:\n{content}"
-        )
+        assert content == self.KT_CONTENT, f"failed apply must roll back cleanly:\n{content}"
         assert "rolled back" in (err or ""), f"error should explain the rollback: {err}"
 
     def test_rollback_routes_through_atomic_write_text(self, engine, kt_repo, monkeypatch):
         """Rollback must restore via atomic_write_text, never open(path, "w")."""
         from external_llm import patch_engine as pe_mod
+
         calls = []
         real = pe_mod.atomic_write_text
 
         def _spy(path, content, **kw):
             calls.append((str(path), content))
             return real(path, content, **kw)
+
         monkeypatch.setattr(pe_mod, "atomic_write_text", _spy)
         ok, _err, mode = engine._tolerant_git_apply(self.STALE_INSERT_PATCH, "code.kt")
         assert not ok, f"unverifiable -C0 apply must not report success (mode={mode})"
@@ -837,8 +829,7 @@ class TestC0PlacementVerification:
         result = engine.apply_patch(self.STALE_INSERT_PATCH, "code.kt")
         content = (kt_repo / "code.kt").read_text()
         assert "two()\n        inserted()" not in content, (
-            f"misplaced insert survived the pipeline "
-            f"(metadata={result.metadata}):\n{content}"
+            f"misplaced insert survived the pipeline (metadata={result.metadata}):\n{content}"
         )
         if "inserted()" not in content:
             assert content == self.KT_CONTENT
@@ -846,13 +837,7 @@ class TestC0PlacementVerification:
     def test_contextless_insert_still_applies(self, engine, kt_repo):
         """A pure line-number insert with NO context lines is -C0's raison
         d'être — nothing to verify against, must keep working."""
-        patch = (
-            "diff --git a/code.kt b/code.kt\n"
-            "--- a/code.kt\n"
-            "+++ b/code.kt\n"
-            "@@ -3,0 +4 @@\n"
-            "+        oneAndAHalf()\n"
-        )
+        patch = "diff --git a/code.kt b/code.kt\n--- a/code.kt\n+++ b/code.kt\n@@ -3,0 +4 @@\n+        oneAndAHalf()\n"
         ok, err, mode = engine._tolerant_git_apply(patch, "code.kt")
         assert ok, f"context-free insert should still apply: {err} (mode={mode})"
         assert "oneAndAHalf()" in (kt_repo / "code.kt").read_text()
@@ -870,14 +855,16 @@ class TestC0PlacementVerification:
             "    }\n"
         )
         # Simulate the CORRECT post-apply state → verification passes.
-        (kt_repo / "code.kt").write_text(self.KT_CONTENT.replace(
-            "        one()\n", "        one()\n        inserted()\n", 1))
+        (kt_repo / "code.kt").write_text(
+            self.KT_CONTENT.replace("        one()\n", "        one()\n        inserted()\n", 1)
+        )
         ok, detail = engine._verify_c0_placement(correct_patch)
         assert ok, detail
         # Simulate a MISPLACED post-apply state (insert landed inside Beta,
         # context `one()` nowhere adjacent) → verification fails.
-        (kt_repo / "code.kt").write_text(self.KT_CONTENT.replace(
-            "        two()\n", "        two()\n        inserted()\n", 1))
+        (kt_repo / "code.kt").write_text(
+            self.KT_CONTENT.replace("        two()\n", "        two()\n        inserted()\n", 1)
+        )
         ok, detail = engine._verify_c0_placement(correct_patch)
         assert not ok, "misplaced hunk must fail placement verification"
         assert "code.kt" in detail
@@ -885,18 +872,14 @@ class TestC0PlacementVerification:
     def test_new_file_patch_skips_verification(self, engine, kt_repo):
         """New-file hunks (--- /dev/null) have no placement to verify."""
         patch = (
-            "diff --git a/fresh.kt b/fresh.kt\n"
-            "--- /dev/null\n"
-            "+++ b/fresh.kt\n"
-            "@@ -0,0 +1,2 @@\n"
-            "+object Fresh {\n"
-            "+}\n"
+            "diff --git a/fresh.kt b/fresh.kt\n--- /dev/null\n+++ b/fresh.kt\n@@ -0,0 +1,2 @@\n+object Fresh {\n+}\n"
         )
         ok, detail = engine._verify_c0_placement(patch)
         assert ok, detail
 
 
 # ── Tests: conflicted --3way rollback (content + index) ───────────────────────
+
 
 class TestThreeWayConflictRollback:
     """A conflicted ``--3way`` must leave the tree exactly as it found it.
@@ -917,23 +900,21 @@ class TestThreeWayConflictRollback:
         """Patch whose pre-image is HEAD, against a differently-edited worktree."""
         app = repo / "app.py"
         original = app.read_text()
-        app.write_text(original.replace('msg = "Hello, " + name',
-                                        'msg = "Patched, " + name'))
+        app.write_text(original.replace('msg = "Hello, " + name', 'msg = "Patched, " + name'))
         # git diff emits the `index <sha>..<sha>` lines --3way needs to find the
         # pre-image blob; a hand-written patch would fail before conflicting.
-        patch = subprocess.run(["git", "diff"], cwd=repo, capture_output=True,
-                               text=True, check=True).stdout
+        patch = subprocess.run(["git", "diff"], cwd=repo, capture_output=True, text=True, check=True).stdout
         # A DIFFERENT edit at the same line, staged: --3way requires the
         # worktree to match the index for its target.
-        app.write_text(original.replace('msg = "Hello, " + name',
-                                        'msg = "Local, " + name'))
+        app.write_text(original.replace('msg = "Hello, " + name', 'msg = "Local, " + name'))
         subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
         return patch
 
     @staticmethod
     def _index_state(repo) -> str:
-        return subprocess.run(["git", "ls-files", "-s", "--", "app.py"], cwd=repo,
-                              capture_output=True, text=True, check=True).stdout
+        return subprocess.run(
+            ["git", "ls-files", "-s", "--", "app.py"], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout
 
     def test_conflicted_3way_rolls_back_content_and_index(self, engine, git_repo):
         patch = self._conflicting_patch(git_repo)
@@ -954,8 +935,9 @@ class TestThreeWayConflictRollback:
         assert ">>>>>>>" not in after
         assert after == before_content, "content not restored to its pre-apply state"
 
-        unmerged = subprocess.run(["git", "ls-files", "-u"], cwd=git_repo,
-                                  capture_output=True, text=True, check=True).stdout
+        unmerged = subprocess.run(
+            ["git", "ls-files", "-u"], cwd=git_repo, capture_output=True, text=True, check=True
+        ).stdout
         assert unmerged == "", f"unmerged index entries left behind:\n{unmerged}"
         assert self._index_state(git_repo) == before_index, "index entry not restored"
 
@@ -983,11 +965,5 @@ class TestThreeWayConflictRollback:
 
     def test_untracked_path_is_not_restored(self, engine, git_repo):
         """No stage-0 entry captured → nothing of ours to put back."""
-        patch = (
-            "diff --git a/brand_new.py b/brand_new.py\n"
-            "--- /dev/null\n"
-            "+++ b/brand_new.py\n"
-            "@@ -0,0 +1,1 @@\n"
-            "+x = 1\n"
-        )
+        patch = "diff --git a/brand_new.py b/brand_new.py\n--- /dev/null\n+++ b/brand_new.py\n@@ -0,0 +1,1 @@\n+x = 1\n"
         assert engine._snapshot_index_entries(patch) == {}

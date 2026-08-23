@@ -8,6 +8,7 @@ Covers the three response modes of ``POST /mcp``:
                  later POSTs acked 202 with responses on the open stream;
   * teardown   — DELETE /mcp closes the session stream.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -53,8 +54,7 @@ def _wait_until(predicate, timeout=5.0):
     return predicate()
 
 
-def _post(server, body: dict, *, accept: str = "application/json",
-          session_id: str = "") -> tuple[int, str, dict]:
+def _post(server, body: dict, *, accept: str = "application/json", session_id: str = "") -> tuple[int, str, dict]:
     """POST /mcp; returns (status, content_type, headers)."""
     conn = HTTPConnection("127.0.0.1", server.port, timeout=5)
     headers = {"Content-Type": "application/json", "Accept": accept}
@@ -96,11 +96,14 @@ def test_json_mode_roundtrip(streamable_server):
 
 def test_json_mode_notification_gets_202(streamable_server):
     """Notification (no id) → 202 Accepted, no response body."""
-    status, _, _, body = _post(streamable_server, {
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-        "params": {},
-    })
+    status, _, _, body = _post(
+        streamable_server,
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        },
+    )
     assert status == 202
     assert body == b""
 
@@ -108,9 +111,12 @@ def test_json_mode_notification_gets_202(streamable_server):
 def test_sse_mode_opens_stream_and_returns_session_id(streamable_server):
     """SSE mode: 200 text/event-stream + Mcp-Session-Id + first response event."""
     import http.client
+
     conn = http.client.HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn.request(
-        "POST", "/mcp", body=json.dumps(_initialize()),
+        "POST",
+        "/mcp",
+        body=json.dumps(_initialize()),
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
     resp = conn.getresponse()
@@ -121,13 +127,14 @@ def test_sse_mode_opens_stream_and_returns_session_id(streamable_server):
 
     # First event = the initialize response
     import socket as _socket
+
     _socket.setdefaulttimeout(5)
     try:
         first = resp.readline().decode()
         assert first.startswith("event: message")
         data = resp.readline().decode()
         assert data.startswith("data: ")
-        payload = json.loads(data[len("data: "):])
+        payload = json.loads(data[len("data: ") :])
         assert payload["id"] == 1
         assert "serverInfo" in payload["result"]
     finally:
@@ -142,7 +149,9 @@ def test_sse_session_second_post_202_and_stream_delivery(streamable_server):
 
     conn = http.client.HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn.request(
-        "POST", "/mcp", body=json.dumps(_initialize()),
+        "POST",
+        "/mcp",
+        body=json.dumps(_initialize()),
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
     resp = conn.getresponse()
@@ -168,7 +177,7 @@ def test_sse_session_second_post_202_and_stream_delivery(streamable_server):
         line = resp.readline().decode()
         assert line.startswith("event: message"), f"got {line!r}"
         data = resp.readline().decode()
-        payload = json.loads(data[len("data: "):])
+        payload = json.loads(data[len("data: ") :])
         assert payload["id"] == 2
         assert "tools" in payload["result"]
     finally:
@@ -182,11 +191,16 @@ def test_sse_mode_error_response_on_stream(streamable_server):
 
     conn = http.client.HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn.request(
-        "POST", "/mcp", body=json.dumps({
-            "jsonrpc": "2.0", "id": 7,
-            "method": "mcp.call_tool",
-            "params": {"name": "no_such_tool", "arguments": {}},
-        }),
+        "POST",
+        "/mcp",
+        body=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "mcp.call_tool",
+                "params": {"name": "no_such_tool", "arguments": {}},
+            }
+        ),
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
     resp = conn.getresponse()
@@ -195,7 +209,7 @@ def test_sse_mode_error_response_on_stream(streamable_server):
     try:
         resp.readline()  # event: message
         data = resp.readline().decode()
-        payload = json.loads(data[len("data: "):])
+        payload = json.loads(data[len("data: ") :])
         assert payload["id"] == 7
         # Unknown tool → result.isError=True (the _dispatch_tool contract),
         # delivered as a message event on the stream.
@@ -211,7 +225,9 @@ def test_delete_closes_session(streamable_server):
     # Open an SSE session
     conn = http.client.HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn.request(
-        "POST", "/mcp", body=json.dumps(_initialize()),
+        "POST",
+        "/mcp",
+        body=json.dumps(_initialize()),
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
     resp = conn.getresponse()
@@ -229,6 +245,7 @@ def test_delete_closes_session(streamable_server):
     conn2.close()
 
     import socket as _socket
+
     _socket.setdefaulttimeout(5)
     try:
         assert resp.read() == b"", "stream should close after DELETE"
@@ -246,7 +263,9 @@ def test_delete_removes_session_from_server(streamable_server):
 
     conn = http.client.HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn.request(
-        "POST", "/mcp", body=json.dumps(_initialize()),
+        "POST",
+        "/mcp",
+        body=json.dumps(_initialize()),
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
     )
     resp = conn.getresponse()
@@ -277,9 +296,10 @@ def test_delete_removes_session_from_server(streamable_server):
     # Re-POST with the stale id → a NEW session (was: dead 202/enqueue loop).
     conn3 = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn3.request(
-        "POST", "/mcp", body=json.dumps(_initialize(9)),
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream",
-                 "Mcp-Session-Id": session_id},
+        "POST",
+        "/mcp",
+        body=json.dumps(_initialize(9)),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream", "Mcp-Session-Id": session_id},
     )
     resp3 = conn3.getresponse()
     assert resp3.status == 200
@@ -298,7 +318,9 @@ def test_idle_sessions_swept_after_ttl():
     try:
         conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
         conn.request(
-            "POST", "/mcp", body=json.dumps(_initialize()),
+            "POST",
+            "/mcp",
+            body=json.dumps(_initialize()),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
         resp = conn.getresponse()
@@ -329,7 +351,9 @@ def test_disconnected_client_session_reclaimed_by_sweep():
     try:
         conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
         conn.request(
-            "POST", "/mcp", body=json.dumps(_initialize()),
+            "POST",
+            "/mcp",
+            body=json.dumps(_initialize()),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
         resp = conn.getresponse()
@@ -354,7 +378,9 @@ def test_shutdown_drops_all_sessions():
     try:
         conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
         conn.request(
-            "POST", "/mcp", body=json.dumps(_initialize()),
+            "POST",
+            "/mcp",
+            body=json.dumps(_initialize()),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
         resp = conn.getresponse()
@@ -397,7 +423,9 @@ def test_sse_post_during_teardown_answers_409_not_silent_202():
     try:
         # Open the SSE session (first request's response is delivered inline).
         conn.request(
-            "POST", "/mcp", body=json.dumps(_initialize()),
+            "POST",
+            "/mcp",
+            body=json.dumps(_initialize()),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
         resp = conn.getresponse()
@@ -438,6 +466,7 @@ def test_sse_post_during_teardown_answers_409_not_silent_202():
 
         # The stream closed without ever delivering the response.
         import socket as _socket
+
         _socket.setdefaulttimeout(5)
         # connection reset is also acceptable
         with contextlib.suppress(OSError):
@@ -474,9 +503,14 @@ def test_concurrency_cap_returns_503():
         assert status == 503, f"expected 503, got {status}: {body!r}"
         assert b"concurrency" in body.lower()
 
-        status2, _, _, _ = _post(server, {
-            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {},
-        })
+        status2, _, _, _ = _post(
+            server,
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+        )
         assert status2 == 202
 
         release.set()
@@ -532,7 +566,9 @@ def test_post_invalid_content_length_400(streamable_server):
     """A non-numeric Content-Length answers 400 (L180-182)."""
     conn = HTTPConnection("127.0.0.1", streamable_server.port, timeout=5)
     conn.request(
-        "POST", "/mcp", body=b"{}",
+        "POST",
+        "/mcp",
+        body=b"{}",
         headers={"Content-Type": "application/json", "Content-Length": "abc"},
     )
     resp = conn.getresponse()
@@ -560,7 +596,13 @@ def test_post_body_too_large_413(streamable_server):
         if not chunk:
             break
         buf += chunk
-    assert b" 413 " in buf.split(b"\r\n")[0], buf
+    header_block = buf.split(b"\r\n\r\n")[0]
+    assert b" 413 " in header_block.split(b"\r\n")[0], header_block
+    # Error responses must close the connection (no keep-alive reuse): the
+    # server would otherwise loop back into rfile.readline() on a socket the
+    # client has closed, and socketserver prints a ConnectionResetError
+    # traceback for that routine disconnect.
+    assert b"close" in header_block.lower(), header_block
     sock.close()
 
 
@@ -638,8 +680,7 @@ def test_get_resume_stream(streamable_server):
         sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
         try:
             sock.sendall(
-                f"GET /mcp?session_id={sid} HTTP/1.1\r\nHost: localhost\r\n"
-                "Accept: text/event-stream\r\n\r\n".encode()
+                f"GET /mcp?session_id={sid} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n".encode()
             )
             buf = b""
             while b"\r\n\r\n" not in buf:
@@ -672,10 +713,7 @@ def test_stream_loop_client_disconnect_logged(streamable_server, caplog):
 
     sid, q = streamable_server._new_session()
     sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
-    sock.sendall(
-        f"GET /mcp?session_id={sid} HTTP/1.1\r\nHost: localhost\r\n"
-        "Accept: text/event-stream\r\n\r\n".encode()
-    )
+    sock.sendall(f"GET /mcp?session_id={sid} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n".encode())
     buf = b""
     while b"\r\n\r\n" not in buf:
         buf += sock.recv(4096)
@@ -685,9 +723,7 @@ def test_stream_loop_client_disconnect_logged(streamable_server, caplog):
     sock.close()
     with caplog.at_level(logging.DEBUG, logger="external_llm.editor.agent.mcp.streamable_server"):
         q.put(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}))
-        assert _wait_until(
-            lambda: any("client disconnected" in r.message for r in caplog.records)
-        )
+        assert _wait_until(lambda: any("client disconnected" in r.message for r in caplog.records))
 
 
 def test_sse_new_session_concurrency_503():
@@ -710,7 +746,9 @@ def test_sse_new_session_concurrency_503():
         assert entered.wait(timeout=5), "first request should occupy the cap slot"
         conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
         conn.request(
-            "POST", "/mcp", body=json.dumps(_initialize(2)),
+            "POST",
+            "/mcp",
+            body=json.dumps(_initialize(2)),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         )
         resp = conn.getresponse()
@@ -780,23 +818,71 @@ def test_sse_existing_session_queue_full_503(streamable_server):
         streamable_server._close_session(sid)
 
 
-def test_sse_session_start_write_failure_drops_session(streamable_server):
-    """A failure between _new_session and the stream loop drops the session
-    and re-raises (L277-281)."""
+def test_sse_session_start_write_failure_drops_session():
+    """A failure between _new_session and the stream loop drops the session.
+
+    (The stream loop / do_POST error path reclaims it; a normal client
+    disconnect is NOT re-raised — socketserver would traceback-spam the log.)"""
     import socket as _socket
     import struct
 
-    body = json.dumps(_initialize()).encode()
-    sock = _socket.create_connection(("127.0.0.1", streamable_server.port), timeout=5)
-    sock.sendall(
-        f"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
-        f"Accept: text/event-stream\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
-    )
-    # Kill the connection before the server writes the first event.
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, struct.pack("ii", 1, 0))
-    sock.close()
-    # The failure path must not leave the just-created session behind.
-    assert _wait_until(lambda: len(streamable_server._sessions) == 0)
+    server, thread = _start_server(heartbeat_interval=0.1)
+    try:
+        body = json.dumps(_initialize()).encode()
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(
+            f"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            f"Accept: text/event-stream\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        # Wait until the server actually created the session (deterministic: the
+        # old version killed the connection before _new_session ran, so the test
+        # passed vacuously — the session never existed to be dropped).
+        assert _wait_until(lambda: len(server._sessions) == 1), "server never created the SSE session"
+        # Kill the connection before the server writes the first event.
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+        # The failure path must not leave the just-created session behind.
+        # (If the first write already succeeded, the 0.1s heartbeat detects the
+        # vanished client and drops it too — either path must reclaim it.)
+        assert _wait_until(lambda: len(server._sessions) == 0, timeout=3)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_sse_vanish_after_stream_open_dropped_by_heartbeat():
+    """A client that vanishes AFTER the stream opened (first write already
+    succeeded) still has its session dropped — the heartbeat write fails fast
+    on the dead connection (L214-222). Previously the loop blocked on
+    ``messages.get()`` with nothing to write, so the session lingered until the
+    30-min idle sweep."""
+    import socket as _socket
+    import struct
+
+    server, thread = _start_server(heartbeat_interval=0.1)
+    try:
+        body = json.dumps(_initialize()).encode()
+        sock = _socket.create_connection(("127.0.0.1", server.port), timeout=5)
+        sock.sendall(
+            f"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+            f"Accept: text/event-stream\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        # Let the stream open and deliver the first event (write succeeds here).
+        assert _wait_until(lambda: len(server._sessions) == 1), "session never created"
+        time.sleep(0.3)  # > heartbeat: first write definitely happened
+        # Now vanish without DELETE — RST kills the connection.
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+        # The heartbeat write on the dead socket fails → session dropped well
+        # before the 30-min idle TTL.
+        assert _wait_until(lambda: len(server._sessions) == 0, timeout=3), (
+            "vanished client's session not reclaimed by heartbeat"
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
 
 
 def test_handle_request_without_handler():

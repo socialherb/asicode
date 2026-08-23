@@ -8,6 +8,7 @@ estimate clamp (min(reduced, est*0.85)) — the override then only falls 25% per
 callback contract is now ``Callable[[], int | None]`` — the post-trim estimate
 (or None = no progress) — and the wrappers feed it back between attempts.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -20,9 +21,7 @@ from external_llm.client import LLMAPIError
 
 
 def _context_error() -> LLMAPIError:
-    return LLMAPIError(
-        "upstream 400: maximum context length is 128000 tokens, but you sent 300000"
-    )
+    return LLMAPIError("upstream 400: maximum context length is 128000 tokens, but you sent 300000")
 
 
 def test_retry_on_rate_limit_feeds_post_trim_estimate_back():
@@ -51,7 +50,9 @@ def test_retry_on_rate_limit_feeds_post_trim_estimate_back():
 
     with patch("external_llm.agent.agent_loop._record_context_overflow", _fake_record):
         loop._retry_on_rate_limit(
-            _callable, _estimated_prompt_tokens=300_000, overflow_retry_cb=_trim_cb,
+            _callable,
+            _estimated_prompt_tokens=300_000,
+            overflow_retry_cb=_trim_cb,
         )
 
     # Attempt 1 records the initial pre-trim estimate; attempts 2-3 record the
@@ -104,7 +105,9 @@ def test_design_call_llm_with_retry_feeds_post_trim_estimate_back():
 
     with patch("external_llm.agent.design_chat_loop._record_context_overflow", _fake_record):
         loop._call_llm_with_retry(
-            fn, _estimated_prompt_tokens=200_000, overflow_retry_cb=_trim,
+            fn,
+            _estimated_prompt_tokens=200_000,
+            overflow_retry_cb=_trim,
         )
 
     # Attempt 1 records the initial estimate; attempt 2 records the post-trim

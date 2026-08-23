@@ -5,6 +5,7 @@ Provides file snapshot/verify/restore safety for write operations,
 and approval gating for dangerous tool calls.
 Extracted from tool_registry.py to reduce its size and improve SRP.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -13,7 +14,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.common.atomic_io import atomic_write_text
 from external_llm.languages.tree_sitter_utils import grammar_key_for_ext
@@ -37,7 +38,8 @@ _MISSING_SNAP = object()
 # (the planner lane may be removed later). Unlike intent assertions, this
 # needs no declared intent — it is computed purely from pre/post snapshots.
 
-def _python_decl_sets(source: str, _return_tree: bool = False):
+
+def _python_decl_sets(source: str, _return_tree: bool = False) -> tuple[set, set] | tuple[set, set, Any] | None:
     """Extract (symbols, import bindings) declared at module/class level.
 
     Symbols: top-level functions/classes + class methods as 'Class.method'.
@@ -49,6 +51,7 @@ def _python_decl_sets(source: str, _return_tree: bool = False):
     ``auto_repair_semantic``) avoids a second ast.parse of the same text.
     """
     import ast
+
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -72,7 +75,6 @@ def _python_decl_sets(source: str, _return_tree: bool = False):
     return symbols, imports
 
 
-
 def _treesitter_symbol_set(source: str, language: str):
     """Symbol names via tree-sitter for non-Python languages.
 
@@ -86,6 +88,7 @@ def _treesitter_symbol_set(source: str, language: str):
     # tree_sitter_utils guards its own optional tree-sitter import, so this
     # import cannot fail — the old except ImportError fallback was dead code.
     from external_llm.languages.tree_sitter_utils import find_all_symbols, get_parser
+
     parser = get_parser(language)
     if parser is None:
         return None
@@ -208,8 +211,8 @@ class WriteSafetyManager:
         self,
         tool_name: str,
         args: dict,
-        approval_callback: Optional[Callable],
-    ) -> Optional[dict[str, Any]]:
+        approval_callback: Callable | None,
+    ) -> dict[str, Any] | None:
         """Check if tool call needs approval and if it was granted.
 
         Returns:
@@ -251,10 +254,7 @@ class WriteSafetyManager:
         snapshots: dict = {}
         with contextlib.suppress(OSError):
             for target in write_target_paths(tool_name, args):
-                full_path = (
-                    target if os.path.isabs(target)
-                    else os.path.join(self.repo_root, target)
-                )
+                full_path = target if os.path.isabs(target) else os.path.join(self.repo_root, target)
                 if full_path in snapshots:
                     continue
                 if os.path.isfile(full_path):
@@ -276,15 +276,12 @@ class WriteSafetyManager:
         optimisation for call sites that already hold the just-written content.
         """
         from ..languages import LanguageRegistry
+
         for path in snapshots:
             _vaw_provider = LanguageRegistry.instance().get(path)
             if _vaw_provider and _vaw_provider.capabilities().has_syntax_validator and os.path.isfile(path):
                 try:
-                    _content = (
-                        _post_contents.get(path)
-                        if _post_contents
-                        else None
-                    )
+                    _content = _post_contents.get(path) if _post_contents else None
                     if _content is None:
                         with open(path, encoding="utf-8", errors="replace") as f:
                             _content = f.read()
@@ -298,19 +295,17 @@ class WriteSafetyManager:
                         # full ``file:line:col:`` shape that downstream rollback
                         # context (tool_registry) parses out of this detail.
                         _errs = _val.errors or []
-                        _MAX_SHOWN = 3
+                        _max_shown = 3
                         if _errs:
                             _head = _errs[0]
                             _detail = f"{_head.file}:{_head.line}:{_head.col}: {_head.message}"
-                            for _e in _errs[1:_MAX_SHOWN]:
+                            for _e in _errs[1:_max_shown]:
                                 _detail += f"; L{_e.line}:{_e.col} {_e.message}"
-                            if len(_errs) > _MAX_SHOWN:
-                                _detail += f" (+{len(_errs) - _MAX_SHOWN} more syntax errors)"
+                            if len(_errs) > _max_shown:
+                                _detail += f" (+{len(_errs) - _max_shown} more syntax errors)"
                         else:
                             _detail = f"syntax error in {path}"
-                        logger.warning(
-                            "verify_after_write: syntax error in %s — %s", path, _detail
-                        )
+                        logger.warning("verify_after_write: syntax error in %s — %s", path, _detail)
                         return False, _detail
                 except OSError:
                     return False, f"OS error reading {path}"
@@ -375,7 +370,7 @@ class WriteSafetyManager:
             parts = [*parts[:max_shown], f"(+{extra} more)"]
         return ", ".join(parts)
 
-    def summarize_change(self, snapshots: dict) -> Optional[str]:
+    def summarize_change(self, snapshots: dict) -> str | None:
         """Deterministic post-write diff summary for write tools.
 
         Diffs each pre-write snapshot against the file's current on-disk
@@ -428,26 +423,21 @@ class WriteSafetyManager:
                 if tag == "equal":
                     continue
                 if tag in ("replace", "insert"):
-                    added += (j2 - j1)
+                    added += j2 - j1
                 if tag in ("replace", "delete"):
-                    removed += (i2 - i1)
+                    removed += i2 - i1
                 if j2 > j1:
                     regions.append((j1 + 1, j2))
                 elif tag == "delete":
                     # pure deletion — point to the gap in the new file
                     regions.append((j1 + 1, j1 + 1))
 
-            lines_out.append(
-                f"  {rel}: +{added}/-{removed} lines; changed "
-                f"{self._format_regions(regions)}"
-            )
+            lines_out.append(f"  {rel}: +{added}/-{removed} lines; changed {self._format_regions(regions)}")
 
             # Declaration-loss guard: flag symbols/imports that disappeared
             # (Python via ast; JS/TS/Go/Java/Kotlin via tree-sitter — both
             # sides must parse cleanly; see summarize_decl_losses)
-            _loss = summarize_decl_losses(
-                original, current, os.path.splitext(path)[1].lower()
-            )
+            _loss = summarize_decl_losses(original, current, os.path.splitext(path)[1].lower())
             if _loss:
                 lines_out.append(_loss)
 
@@ -493,7 +483,7 @@ class WriteSafetyManager:
                 return False
         return True
 
-    def new_semantic_warnings(self, snapshots: dict) -> Optional[str]:
+    def new_semantic_warnings(self, snapshots: dict) -> str | None:
         """Compare pre-snapshot vs current content for new ruff F-code findings.
 
         The keystone: ruff F401/F811/F821/F841 findings that appeared AFTER the
@@ -536,20 +526,19 @@ class WriteSafetyManager:
                         rel = os.path.relpath(path, self.repo_root)
                     except ValueError:
                         rel = path
-                    new_findings.append({
-                        "code": f["code"],
-                        "line": f["line"],
-                        "message": f.get("message", ""),
-                        "path": rel,
-                    })
+                    new_findings.append(
+                        {
+                            "code": f["code"],
+                            "line": f["line"],
+                            "message": f.get("message", ""),
+                            "path": rel,
+                        }
+                    )
 
         if not new_findings:
             return None
         return "[SEMANTIC LINT]\n" + "\n".join(
-            "  {}:L{} {} {}".format(
-                f["path"], f["line"], f["code"], f["message"]
-            )
-            for f in new_findings
+            "  {}:L{} {} {}".format(f["path"], f["line"], f["code"], f["message"]) for f in new_findings
         )
 
     # ── Phase 2: deterministic semantic auto-repair ──────────────────────
@@ -558,9 +547,7 @@ class WriteSafetyManager:
     # Non-fatal: any failure here degrades gracefully to Phase 1 warning.
     # ─────────────────────────────────────────────────────────────────────
 
-    def _resolve_missing_import(
-        self, name: str, repo_root: str, current_file: str
-    ) -> Optional[str]:
+    def _resolve_missing_import(self, name: str, repo_root: str, current_file: str) -> str | None:
         """Search project files for *name* as an imported symbol.
 
         Standalone version of planner lane's repair_f821._find_import_for_name.
@@ -592,6 +579,7 @@ class WriteSafetyManager:
         for search_dir in search_dirs:
             if not os.path.isdir(search_dir):
                 continue
+            fpath = current_file  # default for exception handlers before the loop assigns
             try:
                 for fname in os.listdir(search_dir):
                     if not fname.endswith(".py") or fname.startswith("_"):
@@ -633,9 +621,7 @@ class WriteSafetyManager:
                                         # silent-corruption failure mode).
                                         module = "." * (node.level or 0) + (node.module or "")
                                         if alias.asname:
-                                            found.append(
-                                                f"from {module} import {alias.name} as {alias.asname}"
-                                            )
+                                            found.append(f"from {module} import {alias.name} as {alias.asname}")
                                         else:
                                             found.append(f"from {module} import {name}")
                                         break
@@ -644,9 +630,7 @@ class WriteSafetyManager:
                                     actual = alias.asname or alias.name.split(".")[0]
                                     if actual == name:
                                         if alias.asname:
-                                            found.append(
-                                                f"import {alias.name} as {alias.asname}"
-                                            )
+                                            found.append(f"import {alias.name} as {alias.asname}")
                                         else:
                                             found.append(f"import {alias.name}")
                                         break
@@ -707,17 +691,15 @@ class WriteSafetyManager:
         for node in tree.body:
             if isinstance(node, (_ast.Import, _ast.ImportFrom)):
                 last_import = node
-        insert_idx = last_import.end_lineno if last_import else -1
+        insert_idx = (last_import.end_lineno if last_import else None) or -1
 
         if insert_idx == -1:
             # No module-level imports — insert after module docstring, or at line 0
             insert_idx = 0
             if tree.body and isinstance(tree.body[0], _ast.Expr):
                 first = tree.body[0]
-                if isinstance(first.value, _ast.Constant) and isinstance(
-                    first.value.value, str
-                ):
-                    insert_idx = first.end_lineno
+                if isinstance(first.value, _ast.Constant) and isinstance(first.value.value, str):
+                    insert_idx = first.end_lineno or 0
             lines.insert(insert_idx, import_line)
         else:
             lines.insert(insert_idx, import_line)
@@ -751,6 +733,7 @@ class WriteSafetyManager:
         """
         import ast as _ast
         import importlib.util as _ilu
+
         try:
             _tree = _ast.parse(import_line)
         except SyntaxError:
@@ -864,9 +847,7 @@ class WriteSafetyManager:
                     except ValueError:
                         rel = path
 
-                    import_line = self._resolve_missing_import(
-                        missing_name, self.repo_root, rel
-                    )
+                    import_line = self._resolve_missing_import(missing_name, self.repo_root, rel)
                     if not import_line:
                         continue
                     if import_line in current:
@@ -876,7 +857,8 @@ class WriteSafetyManager:
                             "AUTO-REPAIR F821: skip import '%s' in %s — module does "
                             "not resolve (would trade a loud F821 for a silent "
                             "ModuleNotFoundError at import time)",
-                            import_line, path,
+                            import_line,
+                            path,
                         )
                         continue
 
@@ -906,10 +888,12 @@ class WriteSafetyManager:
                     if import_line.startswith("from typing import "):
                         with contextlib.suppress(OSError):  # non-critical — worst case normalizer strips it once
                             from external_llm.editor._editor_core.common.import_normalizer import mark_f821_protected
+
                             mark_f821_protected(path, missing_name)
                             logger.debug(
                                 "AUTO-REPAIR marked '%s' as F821-protected in %s",
-                                missing_name, path,
+                                missing_name,
+                                path,
                             )
 
             # --- Phase 3: decl-loss symbol → F821 → auto-restore ---
@@ -920,20 +904,15 @@ class WriteSafetyManager:
             pre_sets = _python_decl_sets(pre_content, _return_tree=True)
             post_sets = _python_decl_sets(current)
             if pre_sets is not None and post_sets is not None:
-                pre_syms = pre_sets[0]
+                pre_syms, _pre_imports, pre_tree = pre_sets  # type: ignore[misc]  # 3-tuple when _return_tree=True
                 post_syms = post_sets[0]
-                pre_tree = pre_sets[2]  # tree shared from _python_decl_sets — no second parse
                 removed_syms = pre_syms - post_syms
                 if removed_syms:
                     # Phase 2 may have inserted imports (mutating `current`):
                     # re-scan only then; otherwise the batch scan above is
                     # still valid and is reused instead of re-spawning ruff
                     # (cf. the `current = f.read()` read above).
-                    remaining_f821 = (
-                        ruff_findings(current, path=path)
-                        if _current_mutated
-                        else post
-                    )
+                    remaining_f821 = ruff_findings(current, path=path) if _current_mutated else post
                     # Ruff uses backticks: "Undefined name `parse_config`"
                     f821_undefined = set()
                     for _f in remaining_f821:
@@ -948,6 +927,7 @@ class WriteSafetyManager:
                     to_restore = removed_syms & f821_undefined
                     if to_restore:
                         import ast as _ast  # type-name references only — tree comes from _python_decl_sets
+
                         pre_lines = pre_content.split("\n")
                         try:
                             # pre_tree was parsed once by _python_decl_sets
@@ -965,20 +945,23 @@ class WriteSafetyManager:
                             restore_blocks: list = []
                             for sym in to_restore_sorted:
                                 start, end = sym_ranges[sym]
-                                block_text = "\n".join(pre_lines[start - 1:end])
+                                block_text = "\n".join(pre_lines[start - 1 : end])
                                 restore_blocks.append(block_text)
                             if restore_blocks:
                                 # Append at file end (before trailing whitespace)
                                 current = current.rstrip("\n") + "\n\n" + "\n\n".join(restore_blocks) + "\n"
                                 # Safety net: validate syntax before writing Phase 3 restore
                                 if not self._validate_python_syntax(current):
-                                    logger.warning("Phase 3 decl-loss restore would produce invalid syntax in %s — skipped", path)
+                                    logger.warning(
+                                        "Phase 3 decl-loss restore would produce invalid syntax in %s — skipped", path
+                                    )
                                     continue
                                 atomic_write_text(path, current)
                                 repaired_count += 1
                                 logger.info(
                                     "Phase 3: auto-restored symbols %s from pre-snapshot in %s",
-                                    sorted(to_restore_sorted), path,
+                                    sorted(to_restore_sorted),
+                                    path,
                                 )
                         except SyntaxError:
                             logger.debug("tool_safety: restore would produce invalid syntax in %s — skipped", path)

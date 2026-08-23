@@ -10,13 +10,14 @@ Analyzes project structure to help LLM understand:
 
 This provides rich context for general requests like "create login functionality".
 """
+
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar, Optional
+from typing import ClassVar
 
 from .common.walk_policy import _walk_should_skip_dir
 from .languages import LanguageId
@@ -29,7 +30,7 @@ class ProjectStructure:
     """Analyzed project structure"""
 
     # Framework/tech detected
-    framework: Optional[str] = None
+    framework: str | None = None
 
     # All detected frameworks (multi-framework support)
     frameworks: list[str] = field(default_factory=list)
@@ -38,7 +39,7 @@ class ProjectStructure:
     languages: list[str] = field(default_factory=list)
 
     # Primary (most common) source language, or None if undetermined
-    primary_language: Optional[str] = None
+    primary_language: str | None = None
 
     # Project types: 'web', 'cli', 'mobile', 'library', 'package'
     project_types: list[str] = field(default_factory=list)
@@ -56,7 +57,7 @@ class ProjectStructure:
     entry_points: list[str] = field(default_factory=list)
 
     # Test directory
-    test_dir: Optional[str] = None
+    test_dir: str | None = None
 
     # Example files for reference
     example_files: dict[str, str] = field(default_factory=dict)  # {type: path}
@@ -84,131 +85,127 @@ class ProjectAnalyzer:
     # longer confirm a framework on its own (e.g. an Alembic ``migrations/``
     # dir must not imply Django).  See ``_detect_frameworks``.
     FRAMEWORK_MARKERS: ClassVar[dict] = {
-        'django': [
-            ('file', 'manage.py', 3),
-            ('import', 'from django.', 3),
-            ('py_dep', 'django', 4),
-            ('file', 'wsgi.py', 1),
-            ('dir', 'migrations', 1),
+        "django": [
+            ("file", "manage.py", 3),
+            ("import", "from django.", 3),
+            ("py_dep", "django", 4),
+            ("file", "wsgi.py", 1),
+            ("dir", "migrations", 1),
         ],
-        'fastapi': [
-            ('import', 'from fastapi', 3),
-            ('import', 'import fastapi', 3),
-            ('py_dep', 'fastapi', 4),
-            ('file', 'main.py', 1),  # with FastAPI app
+        "fastapi": [
+            ("import", "from fastapi", 3),
+            ("import", "import fastapi", 3),
+            ("py_dep", "fastapi", 4),
+            ("file", "main.py", 1),  # with FastAPI app
         ],
-        'flask': [
-            ('import', 'from flask', 3),
-            ('import', 'import flask', 3),
-            ('py_dep', 'flask', 4),
-            ('file', 'app.py', 1),
+        "flask": [
+            ("import", "from flask", 3),
+            ("import", "import flask", 3),
+            ("py_dep", "flask", 4),
+            ("file", "app.py", 1),
         ],
-        'react': [
-            ('pkg_dep', 'react', 3),
-            ('file_ext', '.jsx', 1),
-            ('dir', 'node_modules', 1),
+        "react": [
+            ("pkg_dep", "react", 3),
+            ("file_ext", ".jsx", 1),
+            ("dir", "node_modules", 1),
         ],
-        'nextjs': [
-            ('file', 'next.config.ts', 3),
-            ('file', 'next.config.js', 3),
-            ('dir', '.next', 2),
-            ('dir', 'pages', 1),
+        "nextjs": [
+            ("file", "next.config.ts", 3),
+            ("file", "next.config.js", 3),
+            ("dir", ".next", 2),
+            ("dir", "pages", 1),
         ],
-        'vue': [
-            ('pkg_dep', 'vue', 3),
-            ('file_ext', '.vue', 2),
+        "vue": [
+            ("pkg_dep", "vue", 3),
+            ("file_ext", ".vue", 2),
         ],
-        'nuxt': [
-            ('file', 'nuxt.config.ts', 3),
-            ('file', 'nuxt.config.js', 3),
-            ('dir', '.nuxt', 2),
+        "nuxt": [
+            ("file", "nuxt.config.ts", 3),
+            ("file", "nuxt.config.js", 3),
+            ("dir", ".nuxt", 2),
         ],
-        'astro': [
-            ('file', 'astro.config.mjs', 3),
-            ('file_ext', '.astro', 2),
+        "astro": [
+            ("file", "astro.config.mjs", 3),
+            ("file_ext", ".astro", 2),
         ],
-
         # Python CLI frameworks. ``argparse`` is Python stdlib, not a real
         # third-party framework — it is tracked in STDLIB_CLI (used only for
         # project-type classification) and deliberately omitted from here so a
         # bare ``import argparse`` can never inflate the framework list.
-        'click': [
-            ('import', 'import click', 2),
-            ('import', 'from click', 2),
-            ('py_dep', 'click', 4),
+        "click": [
+            ("import", "import click", 2),
+            ("import", "from click", 2),
+            ("py_dep", "click", 4),
         ],
-        'typer': [
-            ('import', 'import typer', 2),
-            ('import', 'from typer', 2),
-            ('py_dep', 'typer', 4),
+        "typer": [
+            ("import", "import typer", 2),
+            ("import", "from typer", 2),
+            ("py_dep", "typer", 4),
         ],
-
         # Python libraries commonly worth surfacing as a detected dependency.
         # Detected purely via manifest declaration — their import usage is too
         # ubiquitous / alias-prone to scan reliably.
-        'pydantic': [
-            ('py_dep', 'pydantic', 4),
+        "pydantic": [
+            ("py_dep", "pydantic", 4),
         ],
-        'rich': [
-            ('py_dep', 'rich', 4),
+        "rich": [
+            ("py_dep", "rich", 4),
         ],
-        'libcst': [
-            ('py_dep', 'libcst', 4),
+        "libcst": [
+            ("py_dep", "libcst", 4),
         ],
-        'httpx': [
-            ('py_dep', 'httpx', 3),
+        "httpx": [
+            ("py_dep", "httpx", 3),
         ],
-        'requests': [
-            ('py_dep', 'requests', 3),
+        "requests": [
+            ("py_dep", "requests", 3),
         ],
-        'sqlalchemy': [
-            ('py_dep', 'sqlalchemy', 4),
-            ('import', 'from sqlalchemy', 3),
+        "sqlalchemy": [
+            ("py_dep", "sqlalchemy", 4),
+            ("import", "from sqlalchemy", 3),
         ],
-        'pytest': [
-            ('py_dep', 'pytest', 3),
-            ('file', 'pytest.ini', 2),
-            ('file', 'conftest.py', 2),
+        "pytest": [
+            ("py_dep", "pytest", 3),
+            ("file", "pytest.ini", 2),
+            ("file", "conftest.py", 2),
         ],
         # tree-sitter: import-based detection is unreliable (the library is
         # often wrapped, e.g. ``from external_llm.languages.tree_sitter_utils``),
         # so rely on the manifest + presence of grammar packages.
-        'tree-sitter': [
-            ('py_dep', 'tree-sitter', 4),
-            ('py_dep', 'tree-sitter-python', 2),
-            ('py_dep', 'tree-sitter-javascript', 2),
+        "tree-sitter": [
+            ("py_dep", "tree-sitter", 4),
+            ("py_dep", "tree-sitter-python", 2),
+            ("py_dep", "tree-sitter-javascript", 2),
         ],
-
         # Go CLI frameworks
-        'cobra': [
-            ('go_dep', 'github.com/spf13/cobra', 3),
+        "cobra": [
+            ("go_dep", "github.com/spf13/cobra", 3),
         ],
-        'fang': [
-            ('go_dep', 'charm.land/fang', 3),
+        "fang": [
+            ("go_dep", "charm.land/fang", 3),
         ],
-        'urfave-cli': [
-            ('go_dep', 'github.com/urfave/cli', 3),
+        "urfave-cli": [
+            ("go_dep", "github.com/urfave/cli", 3),
         ],
-        'kong': [
-            ('go_dep', 'github.com/alecthomas/kong', 3),
+        "kong": [
+            ("go_dep", "github.com/alecthomas/kong", 3),
         ],
         # Go web frameworks
-        'gin': [
-            ('go_dep', 'github.com/gin-gonic/gin', 3),
+        "gin": [
+            ("go_dep", "github.com/gin-gonic/gin", 3),
         ],
-        'echo': [
-            ('go_dep', 'github.com/labstack/echo', 3),
+        "echo": [
+            ("go_dep", "github.com/labstack/echo", 3),
         ],
-        'fiber': [
-            ('go_dep', 'github.com/gofiber/fiber', 3),
+        "fiber": [
+            ("go_dep", "github.com/gofiber/fiber", 3),
         ],
-        'chi': [
-            ('go_dep', 'github.com/go-chi/chi', 3),
+        "chi": [
+            ("go_dep", "github.com/go-chi/chi", 3),
         ],
-        'gorilla-mux': [
-            ('go_dep', 'github.com/gorilla/mux', 3),
+        "gorilla-mux": [
+            ("go_dep", "github.com/gorilla/mux", 3),
         ],
-
         # JVM / Android. Kotlin is reported as a *language* by
         # _detect_languages, so it is not listed as a framework here. Android
         # app/library modules and Jetpack Compose are detected via Gradle
@@ -216,14 +213,14 @@ class ProjectAnalyzer:
         # imports (jvm_import). The catalog path matters because projects
         # declare plugins as ``alias(libs.plugins.android.application)``
         # rather than inline ids — the real id lives in libs.versions.toml.
-        'android': [
-            ('gradle_text', 'com.android.application', 4),  # app plugin — definitive
-            ('gradle_text', 'com.android.library', 3),      # library module
-            ('gradle_text', 'applicationId', 2),            # app module config
+        "android": [
+            ("gradle_text", "com.android.application", 4),  # app plugin — definitive
+            ("gradle_text", "com.android.library", 3),  # library module
+            ("gradle_text", "applicationId", 2),  # app module config
         ],
-        'jetpack-compose': [
-            ('jvm_import', 'import androidx.compose', 3),
-            ('gradle_text', 'androidx.compose', 3),
+        "jetpack-compose": [
+            ("jvm_import", "import androidx.compose", 3),
+            ("gradle_text", "androidx.compose", 3),
         ],
     }
 
@@ -231,8 +228,7 @@ class ProjectAnalyzer:
     # These are *not* third-party frameworks and must never appear in the
     # detected framework list, but they are still evidence of a CLI project
     # type. ``_detect_project_types`` consults this set directly.
-    STDLIB_CLI = frozenset({'argparse'})
-
+    STDLIB_CLI = frozenset({"argparse"})
 
     # Maps each framework to the language(s) it can only appear in.  A
     # framework is scored only when one of its languages is actually present
@@ -240,28 +236,28 @@ class ProjectAnalyzer:
     # repo can never match a Python/JS framework). Frameworks omitted here are
     # not language-gated.
     FRAMEWORK_LANGUAGES: ClassVar[dict] = {
-        'django': {'python'},
-        'fastapi': {'python'},
-        'flask': {'python'},
-        'argparse': {'python'},
-        'click': {'python'},
-        'typer': {'python'},
-        'react': {'javascript', 'typescript'},
-        'nextjs': {'javascript', 'typescript'},
-        'vue': {'javascript', 'typescript'},
-        'nuxt': {'javascript', 'typescript'},
-        'astro': {'javascript', 'typescript'},
-        'cobra': {'go'},
-        'fang': {'go'},
-        'urfave-cli': {'go'},
-        'kong': {'go'},
-        'gin': {'go'},
-        'echo': {'go'},
-        'fiber': {'go'},
-        'chi': {'go'},
-        'gorilla-mux': {'go'},
-        'android': {'kotlin', 'java'},
-        'jetpack-compose': {'kotlin', 'java'},
+        "django": {"python"},
+        "fastapi": {"python"},
+        "flask": {"python"},
+        "argparse": {"python"},
+        "click": {"python"},
+        "typer": {"python"},
+        "react": {"javascript", "typescript"},
+        "nextjs": {"javascript", "typescript"},
+        "vue": {"javascript", "typescript"},
+        "nuxt": {"javascript", "typescript"},
+        "astro": {"javascript", "typescript"},
+        "cobra": {"go"},
+        "fang": {"go"},
+        "urfave-cli": {"go"},
+        "kong": {"go"},
+        "gin": {"go"},
+        "echo": {"go"},
+        "fiber": {"go"},
+        "chi": {"go"},
+        "gorilla-mux": {"go"},
+        "android": {"kotlin", "java"},
+        "jetpack-compose": {"kotlin", "java"},
     }
 
     # Minimum total score for a framework to be reported. With the weighting
@@ -298,21 +294,20 @@ class ProjectAnalyzer:
     # analyzer-only extras that predicate does not cover: ``target`` (JVM
     # build output, unique to this walker's purpose).  Walk pruning below
     # applies the union, so this walker can never drift from the others again.
-    _EXTRA_SKIP_DIRS = frozenset({'target'})
-
+    _EXTRA_SKIP_DIRS = frozenset({"target"})
 
     # Common directory purposes
     DIRECTORY_PURPOSES: ClassVar[dict] = {
-        'models': frozenset(['model', 'models', 'db', 'database']),
-        'views': frozenset(['view', 'views', 'controller', 'controllers', 'handler', 'handlers']),
-        'routes': frozenset(['route', 'routes', 'router', 'routers', 'urls', 'api']),
-        'services': frozenset(['service', 'services', 'business', 'logic']),
-        'agents': frozenset(['agent', 'agents', 'llm', 'external_llm', 'ai', 'bots']),
-        'utils': frozenset(['util', 'utils', 'helper', 'helpers', 'common']),
-        'tests': frozenset(['test', 'tests', '__tests__']),
-        'static': frozenset(['static', 'assets', 'public']),
-        'templates': frozenset(['template', 'templates', 'views']),
-        'config': frozenset(['config', 'settings', 'conf']),
+        "models": frozenset(["model", "models", "db", "database"]),
+        "views": frozenset(["view", "views", "controller", "controllers", "handler", "handlers"]),
+        "routes": frozenset(["route", "routes", "router", "routers", "urls", "api"]),
+        "services": frozenset(["service", "services", "business", "logic"]),
+        "agents": frozenset(["agent", "agents", "llm", "external_llm", "ai", "bots"]),
+        "utils": frozenset(["util", "utils", "helper", "helpers", "common"]),
+        "tests": frozenset(["test", "tests", "__tests__"]),
+        "static": frozenset(["static", "assets", "public"]),
+        "templates": frozenset(["template", "templates", "views"]),
+        "config": frozenset(["config", "settings", "conf"]),
     }
 
     def __init__(self, repo_root: str, max_depth: int = 5):
@@ -323,15 +318,15 @@ class ProjectAnalyzer:
         # (see _iter_source_files), so the repo tree is no longer re-walked ~7x.
         # Stored as an immutable tuple so the shared cache cannot be silently
         # corrupted by a caller mutating the returned collection in place.
-        self._source_files_cache: Optional[tuple[Path, ...]] = None
+        self._source_files_cache: tuple[Path, ...] | None = None
         # Lazily-populated cache for _read_pyproject_deps(); shared across all
         # py_dep marker lookups during one analyze() pass so the manifest is
         # parsed at most once.
-        self._pyproject_deps_cache: Optional[set] = None
+        self._pyproject_deps_cache: set | None = None
         # Lazily-populated cache for _read_gradle_text(); shared across all
         # gradle_text marker lookups during one analyze() pass so the Gradle
         # build files + version catalog are read at most once.
-        self._gradle_text_cache: Optional[str] = None
+        self._gradle_text_cache: str | None = None
 
     def analyze(self) -> ProjectStructure:
         """
@@ -362,14 +357,11 @@ class ProjectAnalyzer:
         structure.entry_points = self._find_entry_points()
 
         # Detect project types (web, cli, library, package)
-        structure.project_types = self._detect_project_types(
-            structure.frameworks, structure.languages
-        )
+        structure.project_types = self._detect_project_types(structure.frameworks, structure.languages)
 
         # Detect naming style
-        structure.naming_style = self._detect_naming_style()
-        if structure.naming_style is None:
-            structure.naming_style = "unknown"
+        _detected_style = self._detect_naming_style()
+        structure.naming_style = _detected_style if _detected_style is not None else "unknown"
 
         # Find common imports
         structure.common_imports = self._find_common_imports()
@@ -438,37 +430,38 @@ class ProjectAnalyzer:
         return self._source_files_cache
 
     def _dir_exists_pruned(self, name: str) -> bool:
-            """Return True if a directory named *name* exists in the source tree.
+        """Return True if a directory named *name* exists in the source tree.
 
-            Pruned descent: each directory entry is TESTED against *name* (so a
-            marker like ``('dir','node_modules')`` still matches), but os.walk never
-            DESCENDS into vendored/build/VCS dirs (walk_policy / dotdirs) afterwards.
-            The former ``rglob(name)`` walked the entire tree — including a huge
-            node_modules — once per ``dir`` marker per ``_detect_frameworks`` pass,
-            and could match a vendored nested copy (false positive). This caps the
-            walk to the source tree and short-circuits on the first match.
-            """
-            try:
-                stack = [self.repo_root]
-                while stack:
-                    current = stack.pop()
-                    try:
-                        entries = list(current.iterdir())
-                    except (OSError, PermissionError):
-                        logger.debug("project_analyzer: cannot list %s — skipping", current)
+        Pruned descent: each directory entry is TESTED against *name* (so a
+        marker like ``('dir','node_modules')`` still matches), but os.walk never
+        DESCENDS into vendored/build/VCS dirs (walk_policy / dotdirs) afterwards.
+        The former ``rglob(name)`` walked the entire tree — including a huge
+        node_modules — once per ``dir`` marker per ``_detect_frameworks`` pass,
+        and could match a vendored nested copy (false positive). This caps the
+        walk to the source tree and short-circuits on the first match.
+        """
+        try:
+            stack = [self.repo_root]
+            while stack:
+                current = stack.pop()
+                try:
+                    entries = list(current.iterdir())
+                except (OSError, PermissionError):
+                    logger.debug("project_analyzer: cannot list %s — skipping", current)
+                    continue
+                for entry in entries:
+                    if not entry.is_dir():
                         continue
-                    for entry in entries:
-                        if not entry.is_dir():
-                            continue
-                        if entry.name == name:
-                            return True
-                        # Test the entry, but do not descend into vendor/build/VCS.
-                        if _walk_should_skip_dir(entry.name) or entry.name in self._EXTRA_SKIP_DIRS:
-                            continue
-                        stack.append(entry)
-            except Exception as e:
-                logger.debug("Error walking pruned dirs (name=%r): %s", name, e)
-            return False
+                    if entry.name == name:
+                        return True
+                    # Test the entry, but do not descend into vendor/build/VCS.
+                    if _walk_should_skip_dir(entry.name) or entry.name in self._EXTRA_SKIP_DIRS:
+                        continue
+                    stack.append(entry)
+        except Exception as e:
+            logger.debug("Error walking pruned dirs (name=%r): %s", name, e)
+        return False
+
     def _sample_files(self, suffixes, limit: int) -> list[Path]:
         """Sample up to ``limit`` repo files with the given suffix(es),
         skipping vendored/build/VCS directories (.venv, node_modules, …).
@@ -506,7 +499,7 @@ class ProjectAnalyzer:
             # configuration, not application source — a lone build.gradle.kts
             # in a Python repo must not make "kotlin" a present language (which
             # would unlock android/compose detection on a non-JVM project).
-            if path.name.endswith('.gradle.kts') or path.name.endswith('.gradle'):
+            if path.name.endswith(".gradle.kts") or path.name.endswith(".gradle"):
                 continue
             counts[lang.value] += 1
 
@@ -515,7 +508,8 @@ class ProjectAnalyzer:
             return []
 
         present = [
-            lang for lang, n in counts.items()
+            lang
+            for lang, n in counts.items()
             if n >= self.MIN_LANGUAGE_FILES and (n / total) >= self.MIN_LANGUAGE_SHARE
         ]
         # Fall back to the single dominant language if the share gate rejected
@@ -525,7 +519,7 @@ class ProjectAnalyzer:
 
         return sorted(present, key=lambda lang: counts[lang], reverse=True)
 
-    def _detect_frameworks(self, languages: Optional[list[str]] = None) -> list[str]:
+    def _detect_frameworks(self, languages: list[str] | None = None) -> list[str]:
         """Detect all project frameworks (multi-framework support)
 
         Scoring is weighted (definitive markers count more than generic ones)
@@ -547,47 +541,47 @@ class ProjectAnalyzer:
                 continue
 
             for marker_type, marker_value, weight in markers:
-                if marker_type == 'file':
+                if marker_type == "file":
                     if (self.repo_root / marker_value).exists():
                         scores[framework] += weight
 
-                elif marker_type == 'dir':
+                elif marker_type == "dir":
                     if self._dir_exists_pruned(marker_value):
                         scores[framework] += weight
 
-                elif marker_type == 'import':
+                elif marker_type == "import":
                     # Match real import *statements* (line starts with the
                     # marker), not the string appearing anywhere — otherwise a
                     # marker literal like 'from django.' in this very file, or
                     # a quoted mention in another, would self-trigger.
-                    for py_file in self._sample_files('.py', 50):
+                    for py_file in self._sample_files(".py", 50):
                         try:
                             content = py_file.read_text(encoding="utf-8", errors="replace")
-                            if any(line.lstrip().startswith(marker_value)
-                                   for line in content.splitlines()):
+                            if any(line.lstrip().startswith(marker_value) for line in content.splitlines()):
                                 scores[framework] += weight
                                 break
                         except Exception:
                             logger.debug("project_analyzer: cannot read %s — skipping marker scan", py_file)
                             continue
 
-                elif marker_type == 'pkg_dep':
-                    pkg_path = self.repo_root / 'package.json'
+                elif marker_type == "pkg_dep":
+                    pkg_path = self.repo_root / "package.json"
                     if pkg_path.exists():
                         try:
                             import json
+
                             pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
-                            all_deps = {**pkg.get('dependencies', {}), **pkg.get('devDependencies', {})}
+                            all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
                             if marker_value in all_deps:
                                 scores[framework] += weight
                         except Exception as e:
                             logger.debug("Error parsing %s (JS deps): %s", pkg_path, e)
 
-                elif marker_type == 'go_dep':
+                elif marker_type == "go_dep":
                     if self._go_mod_requires(marker_value):
                         scores[framework] += weight
 
-                elif marker_type == 'py_dep':
+                elif marker_type == "py_dep":
                     # Manifest-declared dependency — the strongest, alias- and
                     # sampling-immune signal (see _read_pyproject_deps).
                     deps = self._pyproject_deps_cache
@@ -597,7 +591,7 @@ class ProjectAnalyzer:
                     if marker_value in deps:
                         scores[framework] += weight
 
-                elif marker_type == 'file_ext':
+                elif marker_type == "file_ext":
                     # Reuse the cached, pruned source-file list rather than a
                     # fresh rglob (which walks node_modules and can false-positive
                     # on a vendored .vue/.astro). Suffix membership is O(n) but
@@ -605,7 +599,7 @@ class ProjectAnalyzer:
                     if any(p.suffix == marker_value for p in self._iter_source_files()):
                         scores[framework] += weight
 
-                elif marker_type == 'gradle_text':
+                elif marker_type == "gradle_text":
                     # Substring across Gradle build scripts + version catalog.
                     # Catches projects that declare plugins/deps via catalog
                     # aliases (the id lives in libs.versions.toml, not the
@@ -613,14 +607,13 @@ class ProjectAnalyzer:
                     if marker_value in self._read_gradle_text():
                         scores[framework] += weight
 
-                elif marker_type == 'jvm_import':
+                elif marker_type == "jvm_import":
                     # Import-statement prefix match in Kotlin/Java sources —
                     # parallel to the 'import' marker (Python) but on .kt/.java.
-                    for src_file in self._sample_files(('.kt', '.java'), 50):
+                    for src_file in self._sample_files((".kt", ".java"), 50):
                         try:
                             content = src_file.read_text(encoding="utf-8", errors="replace")
-                            if any(line.lstrip().startswith(marker_value)
-                                   for line in content.splitlines()):
+                            if any(line.lstrip().startswith(marker_value) for line in content.splitlines()):
                                 scores[framework] += weight
                                 break
                         except Exception:
@@ -647,7 +640,6 @@ class ProjectAnalyzer:
             reverse=True,
         )
 
-
     def _go_mod_requires(self, module_prefix: str) -> bool:
         """Return True if go.mod has a *direct* require matching module_prefix.
 
@@ -655,18 +647,18 @@ class ProjectAnalyzer:
         ignored, so a transitively pulled-in web framework can't be reported
         as one the project uses directly.
         """
-        go_mod = self.repo_root / 'go.mod'
+        go_mod = self.repo_root / "go.mod"
         if not go_mod.exists():
             return False
         try:
             for line in go_mod.read_text(encoding="utf-8").splitlines():
                 stripped = line.strip()
-                if not stripped or stripped.startswith('//'):
+                if not stripped or stripped.startswith("//"):
                     continue
-                if '// indirect' in line:
+                if "// indirect" in line:
                     continue
                 # Match the module path token (first field of a require line).
-                token = stripped.split()[0] if stripped.split() else ''
+                token = stripped.split()[0] if stripped.split() else ""
                 if token == module_prefix or token.startswith(module_prefix):
                     return True
         except (OSError, UnicodeDecodeError):  # unreadable go.mod
@@ -753,7 +745,7 @@ class ProjectAnalyzer:
         """
         names: set = set()
 
-        pyproject = self.repo_root / 'pyproject.toml'
+        pyproject = self.repo_root / "pyproject.toml"
         if pyproject.exists():
             try:
                 data = self._parse_toml(pyproject.read_text(encoding="utf-8"))
@@ -761,25 +753,26 @@ class ProjectAnalyzer:
                 data = None
             if isinstance(data, dict):
                 # PEP 621 main deps
-                project = data.get('project') or {}
-                for dep in (project.get('dependencies') or []):
+                project = data.get("project") or {}
+                for dep in project.get("dependencies") or []:
                     names.add(self._normalize_dep_name(dep))
                 # PEP 621 optional-dependencies (extra groups)
-                for group in (project.get('optional-dependencies') or {}).values():
+                for group in (project.get("optional-dependencies") or {}).values():
                     for dep in group:
                         names.add(self._normalize_dep_name(dep))
                 # Poetry deps
-                poetry = (data.get('tool') or {}).get('poetry') or {}
-                for dep in (poetry.get('dependencies') or {}):
+                poetry = (data.get("tool") or {}).get("poetry") or {}
+                for dep in poetry.get("dependencies") or {}:
                     # Skip Python version constraint keys like 'python = "^3.9"'.
-                    if dep.lower() == 'python':
+                    if dep.lower() == "python":
                         continue
                     names.add(self._normalize_dep_name(dep))
 
-        setup_py = self.repo_root / 'setup.py'
+        setup_py = self.repo_root / "setup.py"
         if setup_py.exists():
             try:
                 import ast as _ast
+
                 content = setup_py.read_text(encoding="utf-8", errors="replace")
                 tree = _ast.parse(content)
                 for node in _ast.walk(tree):
@@ -805,9 +798,9 @@ class ProjectAnalyzer:
         ``'PyYAML'`` → ``'pyyaml'``  (PEP 503 normalization: case-fold + dash)
         """
         name = dep.strip()
-        for sep in ('[', ' ', ';', '<', '>', '=', '~', '!'):
+        for sep in ("[", " ", ";", "<", ">", "=", "~", "!"):
             name = name.split(sep, 1)[0]
-        return name.strip().lower().replace('_', '-')
+        return name.strip().lower().replace("_", "-")
 
     def _parse_toml(self, text: str):
         """Parse TOML using the stdlib (3.11+) tomllib, else a minimal fallback.
@@ -817,6 +810,7 @@ class ProjectAnalyzer:
         """
         try:
             import tomllib
+
             return tomllib.loads(text)
         except ImportError:
             return self._parse_toml_fallback(text)
@@ -844,39 +838,39 @@ class ProjectAnalyzer:
         current_table = result
         for raw in text.splitlines():
             line = raw.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith("#"):
                 continue
-            if line.startswith('[') and line.endswith(']'):
+            if line.startswith("[") and line.endswith("]"):
                 header = line[1:-1].strip()
-                current_table = descend([p.strip() for p in header.split('.')])
+                current_table = descend([p.strip() for p in header.split(".")])
                 continue
-            if '=' not in line:
+            if "=" not in line:
                 continue
-            key, _, value = line.partition('=')
+            key, _, value = line.partition("=")
             key = key.strip().strip('"').strip("'")
             value = value.strip()
-            if value.startswith('['):
-                inner = value.strip('[]').strip()
+            if value.startswith("["):
+                inner = value.strip("[]").strip()
                 items = []
-                buf = ''
+                buf = ""
                 in_str = False
-                quote = ''
+                quote = ""
                 for ch in inner:
                     if in_str:
                         if ch == quote:
                             in_str = False
                             items.append(buf)
-                            buf = ''
+                            buf = ""
                         else:
                             buf += ch
                     elif ch in ('"', "'"):
                         in_str = True
                         quote = ch
-                    elif ch == ',':
+                    elif ch == ",":
                         if buf:
                             items.append(buf)
-                            buf = ''
-                    elif ch not in (' ', '\t'):
+                            buf = ""
+                    elif ch not in (" ", "\t"):
                         buf += ch
                 if buf:
                     items.append(buf)
@@ -890,18 +884,31 @@ class ProjectAnalyzer:
     def _detect_project_types(
         self,
         frameworks: list[str],
-        languages: Optional[list[str]] = None,
+        languages: list[str] | None = None,
     ) -> list[str]:
         """Detect project type(s): 'web', 'cli', 'library', 'package'"""
         types: list[str] = []
         languages = languages or []
         web_frameworks = {
-            'fastapi', 'flask', 'django', 'nextjs', 'nuxt', 'astro',
-            'gin', 'echo', 'fiber', 'chi', 'gorilla-mux',
+            "fastapi",
+            "flask",
+            "django",
+            "nextjs",
+            "nuxt",
+            "astro",
+            "gin",
+            "echo",
+            "fiber",
+            "chi",
+            "gorilla-mux",
         }
         cli_frameworks = {
-            'click', 'typer',
-            'cobra', 'fang', 'urfave-cli', 'kong',
+            "click",
+            "typer",
+            "cobra",
+            "fang",
+            "urfave-cli",
+            "kong",
         }
         # stdlib CLI modules (argparse) are not frameworks, but still evidence
         # of a CLI project type — scanned directly from source, not from the
@@ -910,29 +917,24 @@ class ProjectAnalyzer:
 
         # Type 1: Web — any web framework detected
         if any(fw in web_frameworks for fw in frameworks):
-            types.append('web')
+            types.append("web")
 
         # Type 2: CLI — CLI framework detected, OR a language-specific entry
         # with CLI patterns.
         if any(fw in cli_frameworks for fw in frameworks):
-            types.append('cli')
+            types.append("cli")
         # NOTE: plain `else` — 'cli' can only be added by the branch above, so
         # `elif 'cli' not in types:` was always True here (dead condition).
         else:
             # Python fallback: a __main__ guard wired to argv/argparse, or a
             # direct stdlib CLI module import (argparse is no longer in the
             # framework list but still signals a CLI).
-            for py_file in self._sample_files('.py', 30):
+            for py_file in self._sample_files(".py", 30):
                 try:
                     content = py_file.read_text(encoding="utf-8", errors="replace")
-                    stdlib_hit = any(
-                        f'import {mod}' in content or f'from {mod}' in content
-                        for mod in stdlib_cli
-                    )
-                    if ('if __name__ ==' in content and (
-                        'sys.argv' in content or 'argparse' in content
-                    )) or stdlib_hit:
-                        types.append('cli')
+                    stdlib_hit = any(f"import {mod}" in content or f"from {mod}" in content for mod in stdlib_cli)
+                    if ("if __name__ ==" in content and ("sys.argv" in content or "argparse" in content)) or stdlib_hit:
+                        types.append("cli")
                         break
                 except Exception:
                     logger.debug("project_analyzer: cannot read %s — skipping CLI detection", py_file)
@@ -940,40 +942,37 @@ class ProjectAnalyzer:
 
         # Go fallback: a `package main` executable with no web framework is a
         # CLI/binary, not a web service or library.
-        if 'go' in languages and 'web' not in types and 'cli' not in types and self._go_has_main_package():
-            types.append('cli')
+        if "go" in languages and "web" not in types and "cli" not in types and self._go_has_main_package():
+            types.append("cli")
 
         # Android / mobile: an Android app or library module. ('mobile' is the
         # platform-agnostic type — extensible to iOS/Flutter/RN later.)
-        if 'android' in frameworks and 'mobile' not in types:
-            types.append('mobile')
+        if "android" in frameworks and "mobile" not in types:
+            types.append("mobile")
 
         # Type 3: Library — has pkg metadata but no web/CLI entry points
         if not types:
-            has_pkg_meta = any(
-                (self.repo_root / f).exists()
-                for f in ['setup.py', 'pyproject.toml', 'setup.cfg']
-            )
+            has_pkg_meta = any((self.repo_root / f).exists() for f in ["setup.py", "pyproject.toml", "setup.cfg"])
             # A Go module with no main package is a library too.
-            if has_pkg_meta or ('go' in languages and not self._go_has_main_package()):
-                types.append('library')
+            if has_pkg_meta or ("go" in languages and not self._go_has_main_package()):
+                types.append("library")
 
         # Default: at least 'package'
         if not types:
-            types.append('package')
+            types.append("package")
 
         return types
 
     def _go_has_main_package(self) -> bool:
         """Return True if the repo declares a Go `package main` (an executable)."""
-        if (self.repo_root / 'main.go').exists():
+        if (self.repo_root / "main.go").exists():
             return True
-        for go_file in self._sample_files('.go', 50):
+        for go_file in self._sample_files(".go", 50):
             try:
                 for line in go_file.read_text(encoding="utf-8", errors="replace").splitlines():
                     stripped = line.strip()
-                    if stripped.startswith('package '):
-                        if stripped == 'package main':
+                    if stripped.startswith("package "):
+                        if stripped == "package main":
                             return True
                         break  # only the package clause matters
             except Exception:
@@ -991,7 +990,7 @@ class ProjectAnalyzer:
                 if not item.is_dir():
                     continue
 
-                if item.name.startswith('.'):
+                if item.name.startswith("."):
                     continue
 
                 # Match against known patterns
@@ -1001,14 +1000,14 @@ class ProjectAnalyzer:
                         break
                 else:
                     # Unknown purpose
-                    categorized['other'].append(item.name)
+                    categorized["other"].append(item.name)
 
         except Exception as e:
             logger.debug("Error analyzing directories: %s", e)
 
         return dict(categorized)
 
-    def _detect_naming_style(self) -> Optional[str]:
+    def _detect_naming_style(self) -> str | None:
         """Detect naming convention from existing files.
 
         Returns None when there is no recognized evidence, so callers can
@@ -1026,16 +1025,26 @@ class ProjectAnalyzer:
         seen = 0
 
         try:
-            for ext in ('.py', '.ts', '.tsx', '.js', '.jsx',
-                        '.kt', '.java', '.go', '.rs', '.swift', '.cs'):
+            for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".kt", ".java", ".go", ".rs", ".swift", ".cs"):
                 for file in self._sample_files(ext, 30):
                     name = file.stem
-                    if name in ('index', 'next', 'vite', 'nuxt', 'astro', 'tailwind',
-                                'postcss', 'package', 'tsconfig', 'eslint', 'prettier'):
+                    if name in (
+                        "index",
+                        "next",
+                        "vite",
+                        "nuxt",
+                        "astro",
+                        "tailwind",
+                        "postcss",
+                        "package",
+                        "tsconfig",
+                        "eslint",
+                        "prettier",
+                    ):
                         continue
 
                     seen += 1
-                    if '_' in name:
+                    if "_" in name:
                         snake_count += 1
                     elif name[0].isupper() and any(c.isupper() for c in name[1:]):
                         pascal_count += 1
@@ -1073,22 +1082,22 @@ class ProjectAnalyzer:
 
         try:
             # Python imports
-            for py_file in self._sample_files('.py', 50):
+            for py_file in self._sample_files(".py", 50):
                 try:
                     content = py_file.read_text(encoding="utf-8", errors="replace")
                     # import can appear anywhere in a file (lazy import, long module docstring/
                     # license header). Same full-line scan as _detect_frameworks.
-                    for line in content.split('\n'):
+                    for line in content.split("\n"):
                         line = line.strip()
-                        if line.startswith('import '):
-                            module = line.split()[1].split('.')[0]
+                        if line.startswith("import "):
+                            module = line.split()[1].split(".")[0]
                             import_counts[module] += 1
-                        elif line.startswith('from '):
+                        elif line.startswith("from "):
                             parts = line.split()
                             # Skip relative imports ('from . import', 'from .x import'):
                             # parts[1] like '.x' splits to '' and would pollute counts.
-                            if len(parts) >= 2 and not parts[1].startswith('.'):
-                                module = parts[1].split('.')[0]
+                            if len(parts) >= 2 and not parts[1].startswith("."):
+                                module = parts[1].split(".")[0]
                                 # NOTE: `module` is never empty here — parts[1]
                                 # is a non-empty token not starting with '.', so
                                 # its first dot-split part is non-empty too. The
@@ -1099,35 +1108,35 @@ class ProjectAnalyzer:
                     continue
 
             # JS/TS imports (ESM + CJS)
-            for ts_ext in ['.ts', '.tsx', '.js', '.jsx']:
+            for ts_ext in [".ts", ".tsx", ".js", ".jsx"]:
                 for ts_file in self._sample_files(ts_ext, 50):
                     try:
                         content = ts_file.read_text(encoding="utf-8", errors="replace")
                         # ESM/CJS imports can appear anywhere too — full line scan.
-                        for line in content.split('\n'):
+                        for line in content.split("\n"):
                             line = line.strip()
-# ESM: `from 'module'` or `from "module"` — string ops instead of regex
+                            # ESM: `from 'module'` or `from "module"` — string ops instead of regex
                             for _q in ("'", '"'):
-                                _marker = f'from {_q}'
+                                _marker = f"from {_q}"
                                 _idx = line.find(_marker)
                                 if _idx != -1:
                                     _start = _idx + len(_marker)
                                     _end = line.find(_q, _start)
                                     if _end != -1:
                                         _mod = line[_start:_end]
-                                        if not _mod.startswith('.'):
-                                            import_counts[_mod.split('/')[0]] += 1
+                                        if not _mod.startswith("."):
+                                            import_counts[_mod.split("/")[0]] += 1
                             # CJS: `require('module')` or `require("module")`
                             for _q in ("'", '"'):
-                                _marker = f'require({_q}'
+                                _marker = f"require({_q}"
                                 _idx = line.find(_marker)
                                 if _idx != -1:
                                     _start = _idx + len(_marker)
                                     _end = line.find(_q, _start)
                                     if _end != -1:
                                         _mod = line[_start:_end]
-                                        if not _mod.startswith('.'):
-                                            import_counts[_mod.split('/')[0]] += 1
+                                        if not _mod.startswith("."):
+                                            import_counts[_mod.split("/")[0]] += 1
                     except Exception:
                         logger.debug("project_analyzer: cannot read %s — skipping import scan", ts_file)
                         continue
@@ -1153,42 +1162,47 @@ class ProjectAnalyzer:
         entry_points = []
 
         # --- Priority 1: pyproject.toml ---
-        pyproject_path = self.repo_root / 'pyproject.toml'
+        pyproject_path = self.repo_root / "pyproject.toml"
         if pyproject_path.exists():
             try:
                 import tomllib  # Python 3.11+
-                with open(pyproject_path, 'rb') as f:
+
+                with open(pyproject_path, "rb") as f:
                     data = tomllib.load(f)
-                scripts = (data.get('project', {}).get('scripts', {})
-                           or data.get('tool', {}).get('poetry', {}).get('scripts', {}))
+                scripts = data.get("project", {}).get("scripts", {}) or data.get("tool", {}).get("poetry", {}).get(
+                    "scripts", {}
+                )
                 for _name, _target in scripts.items():
                     entry_points.append(f"{_name} ({_target})")
             except Exception:
                 try:
-                    import tomli
-                    with open(pyproject_path, 'rb') as f:
+                    import tomli  # type: ignore[reportMissingImports]  # Python 3.10 fallback (tomllib is 3.11+)
+
+                    with open(pyproject_path, "rb") as f:
                         data = tomli.load(f)
-                    scripts = (data.get('project', {}).get('scripts', {})
-                               or data.get('tool', {}).get('poetry', {}).get('scripts', {}))
+                    scripts = data.get("project", {}).get("scripts", {}) or data.get("tool", {}).get("poetry", {}).get(
+                        "scripts", {}
+                    )
                     for _name, _target in scripts.items():
                         entry_points.append(f"{_name} ({_target})")
                 except Exception as e:
                     logger.debug("Error parsing %s entry_points: %s", pyproject_path, e)
 
         # --- Priority 2: setup.py (parse console_scripts via regex) ---
-        setup_py_path = self.repo_root / 'setup.py'
+        setup_py_path = self.repo_root / "setup.py"
         if setup_py_path.exists() and not entry_points:
             try:
                 import ast as _ast
+
                 with open(setup_py_path, encoding="utf-8", errors="replace") as f:
                     tree = _ast.parse(f.read())
                 for node in _ast.walk(tree):
-                    if isinstance(node, _ast.Call) and hasattr(node.func, 'id') and node.func.id == 'setup':
+                    if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) and node.func.id == "setup":
                         for kw in node.keywords:
-                            if kw.arg == 'entry_points':
+                            if kw.arg == "entry_points":
                                 try:
                                     ep_dict = _ast.literal_eval(kw.value)
-                                    console_scripts = ep_dict.get('console_scripts', [])
+                                    console_scripts = ep_dict.get("console_scripts", [])
                                     entry_points.extend(console_scripts)
                                 except Exception as e:
                                     logger.debug("Error evaluating entry_points in %s: %s", setup_py_path, e)
@@ -1196,32 +1210,34 @@ class ProjectAnalyzer:
                 logger.debug("Error parsing %s entry_points: %s", setup_py_path, e)
 
         # --- Priority 3: setup.cfg ---
-        setup_cfg_path = self.repo_root / 'setup.cfg'
+        setup_cfg_path = self.repo_root / "setup.cfg"
         if setup_cfg_path.exists() and not entry_points:
             try:
                 import configparser
+
                 cfg = configparser.ConfigParser()
                 cfg.read(setup_cfg_path)
-                if cfg.has_section('options.entry_points'):
-                    for k, v in cfg['options.entry_points'].items():
-                        if k == 'console_scripts':
-                            entry_points.extend(line.strip() for line in v.split('\n') if line.strip())
+                if cfg.has_section("options.entry_points"):
+                    for k, v in cfg["options.entry_points"].items():
+                        if k == "console_scripts":
+                            entry_points.extend(line.strip() for line in v.split("\n") if line.strip())
             except Exception as e:
                 logger.debug("Error parsing %s entry_points: %s", setup_cfg_path, e)
 
         # --- Priority 4: package.json ---
-        pkg_json = self.repo_root / 'package.json'
+        pkg_json = self.repo_root / "package.json"
         if pkg_json.exists():
             try:
                 import json
+
                 with open(pkg_json, encoding="utf-8") as f:
                     pkg = json.load(f)
-                bin_ = pkg.get('bin')
+                bin_ = pkg.get("bin")
                 if isinstance(bin_, str):
                     entry_points.append(bin_)
                 elif isinstance(bin_, dict):
                     entry_points.extend(bin_.values())
-                main_ = pkg.get('main')
+                main_ = pkg.get("main")
                 if main_ and main_ not in entry_points:
                     entry_points.append(main_)
             except Exception as e:
@@ -1230,20 +1246,20 @@ class ProjectAnalyzer:
         # --- Priority 5: Well-known filename fallback (always checked) ---
         # Strong candidates: include immediately if file exists
         strong_candidates = [
-            'main.py',
-            'app.py',
-            'manage.py',
-            'wsgi.py',
-            'asgi.py',
-            'asi.py',
-            '__main__.py',
+            "main.py",
+            "app.py",
+            "manage.py",
+            "wsgi.py",
+            "asgi.py",
+            "asi.py",
+            "__main__.py",
             # JS/TS entry points
-            'index.ts',
-            'index.tsx',
-            'index.js',
-            'index.jsx',
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.jsx",
             # Go entry point
-            'main.go',
+            "main.go",
         ]
 
         for candidate in strong_candidates:
@@ -1251,7 +1267,7 @@ class ProjectAnalyzer:
                 entry_points.append(candidate)
 
         # Weak candidates: include only if file contains a real entry pattern
-        weak_candidates = ['cli.py']
+        weak_candidates = ["cli.py"]
         for candidate in weak_candidates:
             path = self.repo_root / candidate
             if path.exists() and candidate not in entry_points and self._has_entry_pattern(path):
@@ -1267,14 +1283,16 @@ class ProjectAnalyzer:
         except OSError:
             return False
         else:
-            return ("if __name__ == '__main__'" in content
-                    or 'if __name__ == "__main__"' in content
-                    or 'def main():' in content)
+            return (
+                "if __name__ == '__main__'" in content
+                or 'if __name__ == "__main__"' in content
+                or "def main():" in content
+            )
 
-    def _find_test_dir(self) -> Optional[str]:
+    def _find_test_dir(self) -> str | None:
         """Find test directory"""
 
-        test_dirs = ['tests', 'test', '__tests__', 'spec']
+        test_dirs = ["tests", "test", "__tests__", "spec"]
 
         for test_dir in test_dirs:
             if (self.repo_root / test_dir).is_dir():
@@ -1282,53 +1300,54 @@ class ProjectAnalyzer:
 
         return None
 
-    def _first_glob(self, pattern: str) -> Optional[Path]:
-            """Return the first glob match without materializing the full match list.
+    def _first_glob(self, pattern: str) -> Path | None:
+        """Return the first glob match without materializing the full match list.
 
-            Equivalent to ``list(self.repo_root.glob(pattern))[0]`` when a match
-            exists, but short-circuits after the first hit (glob yields in the same
-            order either way) and returns ``None`` when there is no match.
-            """
-            return next(self.repo_root.glob(pattern), None)
-    def _find_example_files(self, framework: Optional[str]) -> dict[str, str]:
+        Equivalent to ``list(self.repo_root.glob(pattern))[0]`` when a match
+        exists, but short-circuits after the first hit (glob yields in the same
+        order either way) and returns ``None`` when there is no match.
+        """
+        return next(self.repo_root.glob(pattern), None)
+
+    def _find_example_files(self, framework: str | None) -> dict[str, str]:
         """Find example files of each type for reference"""
 
         examples = {}
 
         try:
-            if framework == 'django':
-                for pattern in ['*/views.py', '*/models.py', '*/urls.py']:
+            if framework == "django":
+                for pattern in ["*/views.py", "*/models.py", "*/urls.py"]:
                     match = self._first_glob(pattern)
                     if match is not None:
-                        file_type = match.name.replace('.py', '')
+                        file_type = match.name.replace(".py", "")
                         examples[file_type] = str(match.relative_to(self.repo_root))
 
-            elif framework == 'fastapi':
-                for pattern in ['routers/*.py', 'models/*.py', 'schemas/*.py']:
+            elif framework == "fastapi":
+                for pattern in ["routers/*.py", "models/*.py", "schemas/*.py"]:
                     match = self._first_glob(pattern)
                     if match is not None:
                         examples[match.parent.name] = str(match.relative_to(self.repo_root))
 
-            elif framework == 'flask':
-                for pattern in ['routes/*.py', 'models/*.py']:
+            elif framework == "flask":
+                for pattern in ["routes/*.py", "models/*.py"]:
                     match = self._first_glob(pattern)
                     if match is not None:
                         examples[match.parent.name] = str(match.relative_to(self.repo_root))
 
-            elif framework in ('react', 'nextjs'):
-                for pattern in ['components/*.tsx', 'components/*.jsx', 'pages/*.tsx', 'hooks/*.ts']:
+            elif framework in ("react", "nextjs"):
+                for pattern in ["components/*.tsx", "components/*.jsx", "pages/*.tsx", "hooks/*.ts"]:
                     match = self._first_glob(pattern)
                     if match is not None:
                         examples[match.parent.name] = str(match.relative_to(self.repo_root))
 
-            elif framework == 'vue':
-                for pattern in ['components/*.vue', 'pages/*.vue']:
+            elif framework == "vue":
+                for pattern in ["components/*.vue", "pages/*.vue"]:
                     match = self._first_glob(pattern)
                     if match is not None:
                         examples[match.parent.name] = str(match.relative_to(self.repo_root))
 
-            elif framework == 'nuxt':
-                for pattern in ['components/*.vue', 'pages/*.vue', 'layouts/*.vue']:
+            elif framework == "nuxt":
+                for pattern in ["components/*.vue", "pages/*.vue", "layouts/*.vue"]:
                     match = self._first_glob(pattern)
                     if match is not None:
                         examples[match.parent.name] = str(match.relative_to(self.repo_root))
@@ -1337,5 +1356,3 @@ class ProjectAnalyzer:
             logger.debug("Error finding example files: %s", e)
 
         return examples
-
-

@@ -16,6 +16,7 @@ Covers every uncovered surface of python_provider.py:
 - find_top_level_definitions / find_class_methods / find_all_class_methods
   / find_symbol_body_range incl. SyntaxError and end_lineno-less trees
 """
+
 from __future__ import annotations
 
 import ast
@@ -36,6 +37,7 @@ def _empty_pyright(returncode=0):
 
 
 # ── capabilities ───────────────────────────────────────────────────────────
+
 
 class TestCapabilities:
     def test_tree_sitter_unavailable_branch(self):
@@ -58,6 +60,7 @@ class TestCapabilities:
 
 # ── syntax validation: compile() strict pass ───────────────────────────────
 
+
 class TestValidateSyntaxCompileErrors:
     @staticmethod
     def _compile_raiser(exc):
@@ -77,9 +80,12 @@ class TestValidateSyntaxCompileErrors:
         return raiser
 
     def test_compile_syntax_error_appended(self, tmp_path):
-        with patch("builtins.compile", self._compile_raiser(
-            SyntaxError("synthetic", (str(tmp_path / "x.py"), 3, 4, "line")),
-        )):
+        with patch(
+            "builtins.compile",
+            self._compile_raiser(
+                SyntaxError("synthetic", (str(tmp_path / "x.py"), 3, 4, "line")),
+            ),
+        ):
             r = PythonSyntaxProvider().validate_syntax("x.py", "x = 1\n")
         assert r.ok is False
         assert len(r.errors) == 1
@@ -96,16 +102,16 @@ class TestValidateSyntaxCompileErrors:
 
 def builtins_compile():
     import builtins
+
     return builtins.compile
 
 
 # ── semantic validation: batch grouping + pyright runs ─────────────────────
 
+
 class TestSemanticsBatch:
     def test_missing_files_skipped(self, tmp_path):
-        out = PythonSyntaxProvider().validate_semantics_batch(
-            ["", str(tmp_path / "nope.py")]
-        )
+        out = PythonSyntaxProvider().validate_semantics_batch(["", str(tmp_path / "nope.py")])
         assert all(not r.checked for r in out.values())
         assert all(r.skip_reason == "the file is not on disk" for r in out.values())
 
@@ -226,9 +232,11 @@ class TestSemanticsBatch:
     def test_file_less_diagnostic_single_file_attributed(self, tmp_path):
         f = tmp_path / "a.py"
         f.write_text("x = 1\n")
-        payload = {"generalDiagnostics": [
-            {"severity": "error", "message": "config problem"},
-        ]}
+        payload = {
+            "generalDiagnostics": [
+                {"severity": "error", "message": "config problem"},
+            ]
+        }
         with patch(
             "subprocess.run",
             return_value=_fake_proc(1, json.dumps(payload)),
@@ -242,9 +250,11 @@ class TestSemanticsBatch:
         b = tmp_path / "b.py"
         a.write_text("x = 1\n")
         b.write_text("y = 2\n")
-        payload = {"generalDiagnostics": [
-            {"severity": "error", "message": "config problem"},
-        ]}
+        payload = {
+            "generalDiagnostics": [
+                {"severity": "error", "message": "config problem"},
+            ]
+        }
         with patch(
             "subprocess.run",
             return_value=_fake_proc(1, json.dumps(payload)),
@@ -288,63 +298,85 @@ def _no_ts():
 
 class TestFindSymbolFallbackChain:
     def test_libcst_primary_when_ts_unavailable(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=(7, 9),
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=(7, 9),
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "top", PY_SRC)
         assert r == (7, 9)
 
     def test_ts_raise_falls_to_libcst(self):
-        with patch(
-            "external_llm.languages.python_provider._tree_sitter_available",
-            return_value=True,
-        ), patch(
-            "external_llm.languages.tree_sitter_utils.find_symbol_range",
-            side_effect=RuntimeError("parser exploded"),
-        ), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=(7, 9),
+        with (
+            patch(
+                "external_llm.languages.python_provider._tree_sitter_available",
+                return_value=True,
+            ),
+            patch(
+                "external_llm.languages.tree_sitter_utils.find_symbol_range",
+                side_effect=RuntimeError("parser exploded"),
+            ),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=(7, 9),
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "top", PY_SRC)
         assert r == (7, 9)
 
     def test_libcst_raise_falls_to_ast(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            side_effect=RuntimeError("libcst exploded"),
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                side_effect=RuntimeError("libcst exploded"),
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "top", PY_SRC)
         assert r == (5, 6)
 
     def test_libcst_none_falls_to_ast(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "top", PY_SRC)
         assert r == (5, 6)
 
     def test_ast_qualified_name(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "Foo.bar", PY_SRC)
         assert r == (2, 3)
 
     def test_ast_qualified_name_missing_method(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "Foo.zzz", PY_SRC)
         assert r is None
 
     def test_ast_parse_failure_returns_none(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "top", "def broken(:\n")
         assert r is None
@@ -368,24 +400,33 @@ class TestFindSymbolEndLinenoMissing:
     def test_qualified_method_without_end_lineno_returns_none(self):
         cls = ast.ClassDef(name="Foo", bases=[], keywords=[], body=[_fn_node("bar")], decorator_list=[])
         fake = ast.Module(body=[cls], type_ignores=[])
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
-        ), patch("external_llm.languages.python_provider.ast.parse", return_value=fake):
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
+            patch("external_llm.languages.python_provider.ast.parse", return_value=fake),
+        ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "Foo.bar", "x")
         assert r is None
 
     def test_simple_symbol_without_end_lineno_returns_none(self):
         fake = ast.Module(body=[_fn_node("top")], type_ignores=[])
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
-        ), patch("external_llm.languages.python_provider.ast.parse", return_value=fake):
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
+            patch("external_llm.languages.python_provider.ast.parse", return_value=fake),
+        ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "top", "x")
         assert r is None
 
 
 # ── structural queries ─────────────────────────────────────────────────────
+
 
 class TestStructuralQueries:
     def test_top_level_definitions(self):
@@ -407,9 +448,7 @@ class TestStructuralQueries:
         assert p.find_class_methods(PY_SRC, "Missing") == []
 
     def test_find_all_class_methods(self):
-        out = PythonSyntaxProvider().find_all_class_methods(
-            "class A:\n    def a1(self): pass\n\nclass B:\n    x = 1\n"
-        )
+        out = PythonSyntaxProvider().find_all_class_methods("class A:\n    def a1(self): pass\n\nclass B:\n    x = 1\n")
         assert out == {"A": [("a1", 2, 2)]}  # B has no methods → absent
 
     def test_find_all_class_methods_syntax_error_empty(self):
@@ -444,11 +483,15 @@ class TestStructuralQueries:
 
 # ── remaining branch coverage: loop-exhaust / end_lineno-less tree paths ───
 
+
 class TestStructuralQueryEdges:
     def test_qualified_name_class_missing_loop_exhausts(self):
-        with _no_ts(), patch(
-            "external_llm.languages.libcst_utils.find_symbol_range",
-            return_value=None,
+        with (
+            _no_ts(),
+            patch(
+                "external_llm.languages.libcst_utils.find_symbol_range",
+                return_value=None,
+            ),
         ):
             r = PythonSyntaxProvider().find_symbol_in_file("x.py", "Nope.bar", PY_SRC)
         assert r is None

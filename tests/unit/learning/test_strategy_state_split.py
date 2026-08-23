@@ -10,6 +10,7 @@ serialised on a single lock while doing it.
 Routing the bulky namespace to its own file is only safe if reads keep working
 across the transition, which is what most of this file pins.
 """
+
 from __future__ import annotations
 
 import json
@@ -79,11 +80,16 @@ class TestMigration:
 
     @staticmethod
     def _seed_pre_split(state_dir: Path) -> None:
-        (state_dir / "strategy_state.json").write_text(json.dumps({
-            "experience_store": [{"r": i} for i in range(200)],
-            "adaptive_hub": {"a": 1},
-            "weights": {"w": 1},
-        }), encoding="utf-8")
+        (state_dir / "strategy_state.json").write_text(
+            json.dumps(
+                {
+                    "experience_store": [{"r": i} for i in range(200)],
+                    "adaptive_hub": {"a": 1},
+                    "weights": {"w": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def test_read_works_before_any_migration(self, state_dir: Path):
         """Read-through keeps the move invisible regardless of when it runs."""
@@ -116,14 +122,12 @@ class TestMigration:
         self._seed_pre_split(state_dir)
         ss.write_namespace("adaptive_hub", {"a": 2})
         calls = []
-        monkeypatch.setattr(ss, "atomic_write_json",
-                            lambda *a, **k: calls.append(a[0]))
+        monkeypatch.setattr(ss, "atomic_write_json", lambda *a, **k: calls.append(a[0]))
         ss._migrate_split_namespaces()
         assert calls == []
 
     def test_nothing_to_migrate_is_a_noop(self, state_dir: Path):
-        (state_dir / "strategy_state.json").write_text(
-            json.dumps({"adaptive_hub": {"a": 1}}), encoding="utf-8")
+        (state_dir / "strategy_state.json").write_text(json.dumps({"adaptive_hub": {"a": 1}}), encoding="utf-8")
         ss.write_namespace("adaptive_hub", {"a": 2})
         assert not (state_dir / "experience_store.json").exists()
 
@@ -133,11 +137,13 @@ class TestMigration:
 
 class TestBatchWrite:
     def test_batch_splits_across_target_files(self, state_dir: Path):
-        ss.batch_write_namespaces({
-            "adaptive_hub": {"a": 1},
-            "weights": {"w": 1},
-            "experience_store": [{"r": 1}],
-        })
+        ss.batch_write_namespaces(
+            {
+                "adaptive_hub": {"a": 1},
+                "weights": {"w": 1},
+                "experience_store": [{"r": 1}],
+            }
+        )
         main = _main(state_dir)
         assert set(main) == {"adaptive_hub", "weights"}
         assert _sidecar(state_dir)["experience_store"] == [{"r": 1}]
@@ -185,15 +191,25 @@ class TestMigrationPreservation:
     """
 
     def test_migration_keeps_newer_sidecar_value(self, state_dir: Path):
-        (state_dir / "strategy_state.json").write_text(json.dumps({
-            "experience_store": [{"r": i} for i in range(200)],
-            "adaptive_hub": {"a": 1},
-        }), encoding="utf-8")
+        (state_dir / "strategy_state.json").write_text(
+            json.dumps(
+                {
+                    "experience_store": [{"r": i} for i in range(200)],
+                    "adaptive_hub": {"a": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
         # A crashed migration already wrote the sidecar, and a later write
         # updated it with NEWER records than main still holds.
-        (state_dir / "experience_store.json").write_text(json.dumps({
-            "experience_store": [{"r": "newer"}],
-        }), encoding="utf-8")
+        (state_dir / "experience_store.json").write_text(
+            json.dumps(
+                {
+                    "experience_store": [{"r": "newer"}],
+                }
+            ),
+            encoding="utf-8",
+        )
         ss.write_namespace("adaptive_hub", {"a": 2})  # triggers the migration
         assert _sidecar(state_dir)["experience_store"] == [{"r": "newer"}]
         assert "experience_store" not in _main(state_dir)
@@ -201,10 +217,15 @@ class TestMigrationPreservation:
     def test_migration_heals_corrupt_sidecar_from_main_copy(self, state_dir: Path):
         """A corrupt sidecar cannot be merged; main's copy is the only readable
         one, so the move writes it and the atomic write heals the file."""
-        (state_dir / "strategy_state.json").write_text(json.dumps({
-            "experience_store": [{"r": i} for i in range(5)],
-            "adaptive_hub": {"a": 1},
-        }), encoding="utf-8")
+        (state_dir / "strategy_state.json").write_text(
+            json.dumps(
+                {
+                    "experience_store": [{"r": i} for i in range(5)],
+                    "adaptive_hub": {"a": 1},
+                }
+            ),
+            encoding="utf-8",
+        )
         (state_dir / "experience_store.json").write_text("{not json", encoding="utf-8")
         ss.write_namespace("adaptive_hub", {"a": 2})
         assert _sidecar(state_dir)["experience_store"] == [{"r": i} for i in range(5)]
@@ -220,8 +241,7 @@ class TestCorruption:
         (state_dir / "strategy_state.json").write_text("{not json", encoding="utf-8")
         with caplog.at_level(logging.WARNING, logger=self.LOGGER):
             assert ss.read_namespace("adaptive_hub") is None
-        assert any("corrupt JSON" in r.message and "strategy_state.json" in r.message
-                   for r in caplog.records)
+        assert any("corrupt JSON" in r.message and "strategy_state.json" in r.message for r in caplog.records)
 
     def test_corrupt_write_is_refused_and_file_untouched(self, state_dir: Path, caplog):
         """A corrupt file is never overwritten: its other namespaces would be
@@ -270,14 +290,13 @@ def test_read_top_level_non_object_warns_corrupt(state_dir: Path, caplog):
 def test_read_routed_namespace_falls_back_to_consolidated(state_dir: Path):
     """Pre-split install: a routed namespace still readable from the shared
     file when its sidecar does not exist yet (L186-187)."""
-    (state_dir / "strategy_state.json").write_text(
-        json.dumps({"experience_store": [{"r": 1}]}), encoding="utf-8"
-    )
+    (state_dir / "strategy_state.json").write_text(json.dumps({"experience_store": [{"r": 1}]}), encoding="utf-8")
     assert ss.read_namespace("experience_store") == [{"r": 1}]
 
 
 def test_read_other_exception_returns_none(state_dir: Path, monkeypatch):
     """Non-JSON read failures are swallowed into None (L220-222)."""
+
     def _boom(_path):
         raise RuntimeError("io exploded")
 
@@ -287,6 +306,7 @@ def test_read_other_exception_returns_none(state_dir: Path, monkeypatch):
 
 def test_write_other_exception_returns_false(state_dir: Path, monkeypatch):
     """Non-JSON write failures return False (L252-254)."""
+
     def _boom(*_a, **_k):
         raise RuntimeError("lock exploded")
 
@@ -296,6 +316,7 @@ def test_write_other_exception_returns_false(state_dir: Path, monkeypatch):
 
 def test_batch_write_other_exception_returns_false(state_dir: Path, monkeypatch):
     """Non-JSON batch write failures return False (L303-305)."""
+
     def _boom(*_a, **_k):
         raise RuntimeError("write exploded")
 

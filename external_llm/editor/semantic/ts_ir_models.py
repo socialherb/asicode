@@ -14,11 +14,11 @@ This is the foundation for:
 - Primitive system
 - Cross-language VM alignment
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 # ── enums ────────────────────────────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ class IRNodeMeta:
     end_byte: int
     start_line: int  # 1-indexed
     end_line: int  # 1-indexed
-    parent_id: Optional[str] = None
+    parent_id: str | None = None
 
 
 # ── core IR nodes ────────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ class TSParam:
     """A function/method parameter."""
 
     name: str
-    type_ref: Optional[TSTypeRef] = None
+    type_ref: TSTypeRef | None = None
     has_default: bool = False
     is_rest: bool = False
 
@@ -90,10 +90,10 @@ class IRImport:
 
     source: str
     specifiers: list[str] = field(default_factory=list)
-    default_name: Optional[str] = None
-    namespace_name: Optional[str] = None
+    default_name: str | None = None
+    namespace_name: str | None = None
     is_type_only: bool = False
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -102,7 +102,7 @@ class IRExport:
 
     name: str
     kind: ExportKind = ExportKind.NAMED
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -111,11 +111,11 @@ class IRVariable:
 
     name: str
     decl_kind: str = "const"
-    type_ref: Optional[TSTypeRef] = None
-    initializer_type: Optional[str] = None
+    type_ref: TSTypeRef | None = None
+    initializer_type: str | None = None
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -124,14 +124,14 @@ class IRFunction:
 
     name: str
     params: list[TSParam] = field(default_factory=list)
-    return_type: Optional[TSTypeRef] = None
+    return_type: TSTypeRef | None = None
     is_async: bool = False
     is_exported: bool = False
-    export_kind: Optional[ExportKind] = None
+    export_kind: ExportKind | None = None
     calls: list[str] = field(default_factory=list)
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -140,7 +140,7 @@ class IRMethod:
 
     name: str
     params: list[TSParam] = field(default_factory=list)
-    return_type: Optional[TSTypeRef] = None
+    return_type: TSTypeRef | None = None
     is_async: bool = False
     is_static: bool = False
     is_getter: bool = False
@@ -148,7 +148,7 @@ class IRMethod:
     calls: list[str] = field(default_factory=list)
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -156,7 +156,7 @@ class IRClassProperty:
     """A class/interface property with byte-precise location."""
 
     name: str
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -166,13 +166,13 @@ class IRClass:
     name: str
     methods: list[IRMethod] = field(default_factory=list)
     properties: list[IRClassProperty] = field(default_factory=list)
-    extends: Optional[str] = None
+    extends: str | None = None
     implements: list[str] = field(default_factory=list)
     is_exported: bool = False
-    export_kind: Optional[ExportKind] = None
+    export_kind: ExportKind | None = None
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -186,7 +186,7 @@ class IRInterface:
     is_exported: bool = False
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -197,7 +197,7 @@ class IRTypeAlias:
     is_exported: bool = False
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -209,7 +209,7 @@ class IREnum:
     is_exported: bool = False
     start_line: int = 0
     end_line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -219,9 +219,9 @@ class IRCallSite:
     caller: str
     callee: str
     is_method_call: bool = False
-    receiver: Optional[str] = None
+    receiver: str | None = None
     line: int = 0
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 # ── P2.5: symbol table, usage graph, data flow ──────────────────────────────
@@ -240,7 +240,7 @@ class IRSymbol:
     name: str
     kind: SymbolKind
     scope: str = "<module>"  # function/class name, or '<module>'
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -254,7 +254,7 @@ class IRUsage:
 
     symbol: str  # name of the referenced symbol
     scope: str = "<module>"  # function/class where the usage occurs
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 @dataclass
@@ -267,10 +267,10 @@ class IRAssignment:
     """
 
     target: str  # variable being assigned
-    source: Optional[str] = None  # source symbol or function name
-    source_type: Optional[str] = None  # "call", "variable", "literal", "new"
+    source: str | None = None  # source symbol or function name
+    source_type: str | None = None  # "call", "variable", "literal", "new"
     scope: str = "<module>"  # function where assignment occurs
-    meta: Optional[IRNodeMeta] = None
+    meta: IRNodeMeta | None = None
 
 
 # ── module-level IR ──────────────────────────────────────────────────────────
@@ -332,7 +332,7 @@ class TSModule:
     def import_sources(self) -> set[str]:
         return {i.source for i in self.imports}
 
-    def get_function(self, name: str) -> Optional[IRFunction]:
+    def get_function(self, name: str) -> IRFunction | None:
         """Find a top-level function by name, or a class method with matching name.
 
         Supports:
@@ -364,7 +364,7 @@ class TSModule:
                     return m  # type: ignore[return-value] -- IRMethod has meta
         return None
 
-    def get_class(self, name: str) -> Optional[IRClass]:
+    def get_class(self, name: str) -> IRClass | None:
         for c in self.classes:
             if c.name == name:
                 return c
@@ -378,7 +378,7 @@ class TSModule:
 
     # ── P2.5 convenience ─────────────────────────────────────────────
 
-    def get_symbol(self, name: str) -> Optional[IRSymbol]:
+    def get_symbol(self, name: str) -> IRSymbol | None:
         """Find a symbol table entry by name."""
         for s in self.symbols:
             if s.name == name:
@@ -399,7 +399,4 @@ class TSModule:
 
     def data_sources_of(self, target: str) -> list[str]:
         """What provides data to *target*? Returns source names."""
-        return [
-            a.source for a in self.assignments
-            if a.target == target and a.source is not None
-        ]
+        return [a.source for a in self.assignments if a.target == target and a.source is not None]

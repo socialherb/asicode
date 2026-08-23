@@ -13,6 +13,7 @@ Handles general requests like "create login functionality" by:
 - Creating an execution plan
 - Generating appropriate code for each file
 """
+
 from __future__ import annotations
 
 import itertools
@@ -20,7 +21,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .agent.config.thresholds import config as _cfg
 from .client import DEFAULT_LLM_TIMEOUT, OLLAMA_LLM_TIMEOUT
@@ -56,8 +57,8 @@ class IntelligentLLMService:
         self,
         provider: str,
         api_key: str,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
+        model: str | None = None,
+        base_url: str | None = None,
         timeout: int = DEFAULT_LLM_TIMEOUT,
     ):
         # Special handling for Ollama: use longer default timeout for model loading.
@@ -83,11 +84,11 @@ class IntelligentLLMService:
 
     def _emit_progress(
         self,
-        progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]],
+        progress_callback: Callable[[str, str, int | None, int | None], None] | None,
         phase: str,
         message: str,
-        current: Optional[int] = None,
-        total: Optional[int] = None,
+        current: int | None = None,
+        total: int | None = None,
     ) -> None:
         """Safely emit progress events without breaking the run."""
         if not progress_callback:
@@ -104,13 +105,13 @@ class IntelligentLLMService:
         self,
         repo_root: str,
         user_request: str,
-        target_file: Optional[str] = None,
+        target_file: str | None = None,
         mode: str = "auto",  # "auto", "single", "multi", "llm_plan", "agent"
         temperature: float = 0.0,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         context_variant: str = "v7",
         max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
-        progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
+        progress_callback: Callable[[str, str, int | None, int | None], None] | None = None,
         # Agent-mode knobs (best-effort; does not affect non-agent modes)
         agent_max_attempts: int = 3,
         agent_run_tests: bool = True,
@@ -161,7 +162,11 @@ class IntelligentLLMService:
             project_analyzer = ProjectAnalyzer(str(repo_path))
             project_structure = project_analyzer.analyze()
 
-            frameworks_str = ', '.join(project_structure.frameworks) if project_structure.frameworks else str(project_structure.framework)
+            frameworks_str = (
+                ", ".join(project_structure.frameworks)
+                if project_structure.frameworks
+                else str(project_structure.framework)
+            )
             logger.info("Project analysis: frameworks=[%s], types=%s", frameworks_str, project_structure.project_types)
 
             # Step 3: Determine execution mode
@@ -262,7 +267,7 @@ class IntelligentLLMService:
         analysis: RequestAnalysis,
         project_structure: ProjectStructure,
         context_variant: str = "v7",
-        progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
+        progress_callback: Callable[[str, str, int | None, int | None], None] | None = None,
         max_attempts: int = 3,
         run_tests: bool = True,
     ) -> dict[str, Any]:
@@ -435,7 +440,9 @@ class IntelligentLLMService:
             result["success"] = bool(applied_patches)
             result["error"] = "agent_max_turns"
             if not applied_patches:
-                result["explanation"] = f"Agent reached max turns ({self._agent_max_turns}) without applying any changes."
+                result["explanation"] = (
+                    f"Agent reached max turns ({self._agent_max_turns}) without applying any changes."
+                )
 
         elif status == "error":
             result["success"] = False
@@ -448,8 +455,8 @@ class IntelligentLLMService:
         repo_path: Path,
         target_file: str,
         operation: str = "modify",
-        file_exists: Optional[bool] = None,
-        change_size_hint: Optional[str] = None,  # 'small', 'medium', 'large', 'rewrite'
+        file_exists: bool | None = None,
+        change_size_hint: str | None = None,  # 'small', 'medium', 'large', 'rewrite'
     ) -> tuple[OutputMode, str]:
         """
         Determine output mode and context variant based on request type.
@@ -473,26 +480,26 @@ class IntelligentLLMService:
         """
         # Determine if file exists
         if file_exists is None:
-            file_path = repo_path / target_file.lstrip('/')
+            file_path = repo_path / target_file.lstrip("/")
             file_exists = file_path.exists()
 
         # New file creation: use FULL_FILE mode (no existing content for diff)
         if operation == "create" or not file_exists:
             # Ollama provider: try UNIFIED_DIFF even for new files
             # (Ollama seems better at diff generation than FILE block generation)
-            if self.provider.lower() in ['ollama']:
+            if self.provider.lower() in ["ollama"]:
                 logger.info("Ollama provider - using UNIFIED_DIFF for new file %s", target_file)
                 return OutputMode.UNIFIED_DIFF, "v7"
             return OutputMode.FULL_FILE, "v7"
 
         # Existing file: apply heuristics
-        file_path = repo_path / target_file.lstrip('/')
+        file_path = repo_path / target_file.lstrip("/")
 
         # Heuristic 1: Change size hint
-        if change_size_hint in ['large', 'rewrite']:
+        if change_size_hint in ["large", "rewrite"]:
             # Gemini provider: prefer UNIFIED_DIFF even for large changes
             # (Gemini produces stable unified diffs, reduce FULL_FILE frequency)
-            if self.provider.lower() in ['google', 'gemini']:
+            if self.provider.lower() in ["google", "gemini"]:
                 logger.info(
                     "Gemini provider - using UNIFIED_DIFF for %s despite change_size_hint=%s",
                     target_file,
@@ -506,7 +513,7 @@ class IntelligentLLMService:
         try:
             if file_path.exists():
                 # Count lines in file
-                with open(file_path, encoding='utf-8') as f:
+                with open(file_path, encoding="utf-8") as f:
                     line_count = sum(1 for _ in f)
 
                 # Large files (over 500 lines) might be better with FULL_FILE for major changes
@@ -517,7 +524,7 @@ class IntelligentLLMService:
                     logger.debug("Large file detected: %s has %s lines", target_file, line_count)
 
                     # If we have a hint that it's a medium or large change, use FULL_FILE
-                    if change_size_hint in ['medium', 'large', 'rewrite']:
+                    if change_size_hint in ["medium", "large", "rewrite"]:
                         logger.info("Using FULL_FILE for large file %s with %s change", target_file, change_size_hint)
                         return OutputMode.FULL_FILE, "v7"
         except (OSError, UnicodeDecodeError) as e:
@@ -542,12 +549,12 @@ class IntelligentLLMService:
         user_request: str,
         analysis: RequestAnalysis,
         project_structure: ProjectStructure,
-        target_file: Optional[str],
+        target_file: str | None,
         temperature: float,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         context_variant: str = "v7",
         max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
-        progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
+        progress_callback: Callable[[str, str, int | None, int | None], None] | None = None,
     ) -> dict[str, Any]:
         """Handle single-file operation"""
 
@@ -566,7 +573,7 @@ class IntelligentLLMService:
                 }
 
         # Determine operation type and output mode
-        file_path = repo_path / target_file.lstrip('/')
+        file_path = repo_path / target_file.lstrip("/")
         file_exists = file_path.exists()
         operation = "create" if not file_exists else "modify"
 
@@ -592,7 +599,7 @@ class IntelligentLLMService:
         # or FULL_FILE (other OutputModes are unreachable here — the multi-file
         # path handles them via force_output_mode).
 
-        result = None
+        result: dict[str, Any] = {}
         last_error = None
         used_output_mode = None
         failure_reason = None
@@ -601,6 +608,10 @@ class IntelligentLLMService:
         error_feedback_included = False
 
         # Retry loop with error feedback and failure tracking
+        # modes_to_try is never empty (_determine_output_mode only returns
+        # UNIFIED_DIFF/FULL_FILE), so the loop always binds i — init anyway
+        # so pyright sees a bound counter and the fallback is well-defined.
+        i = -1
         for i, current_mode in enumerate(modes_to_try):
             used_output_mode = current_mode
 
@@ -674,9 +685,11 @@ class IntelligentLLMService:
         if not result or not result.get("success"):
             logger.info("All output modes failed for %s, using fallback template", target_file)
             # Record failure reason and metadata
-            result["failure_reason"] = failure_reason or self._extract_failure_reason(last_error) if last_error else "unknown"
+            result["failure_reason"] = (
+                failure_reason or self._extract_failure_reason(last_error) if last_error else "unknown"
+            )
             result["output_mode"] = used_output_mode.value if used_output_mode else output_mode.value
-            result["retry_count"] = i+1 if 'i' in locals() else len(modes_to_try)
+            result["retry_count"] = i + 1 if "i" in locals() else len(modes_to_try)
             result["error_feedback_included"] = error_feedback_included
             result["same_failure_repeat"] = same_failure_repeat
             # Create a FileOperation for the target file.
@@ -712,7 +725,7 @@ class IntelligentLLMService:
             # Success - add metadata about which mode worked
             if used_output_mode:
                 result["output_mode_used"] = used_output_mode.value
-                result["retry_count"] = i+1 if 'i' in locals() else 1
+                result["retry_count"] = i + 1 if "i" in locals() else 1
             result["error_feedback_included"] = error_feedback_included
             result["same_failure_repeat"] = same_failure_repeat
             result["fallback_used"] = False
@@ -734,22 +747,22 @@ class IntelligentLLMService:
         analysis: RequestAnalysis,
         project_structure: ProjectStructure,
         temperature: float,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         context_variant: str = "v7",
         max_tokens: int = _cfg.tokens.INTELLIGENT_SERVICE_DEFAULT,
         llm_planning: bool = False,
-        progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
-        force_output_mode: Optional[OutputMode] = None,
-        force_context_variant: Optional[str] = None,
-        force_files: Optional[list[str]] = None,
+        progress_callback: Callable[[str, str, int | None, int | None], None] | None = None,
+        force_output_mode: OutputMode | None = None,
+        force_context_variant: str | None = None,
+        force_files: list[str] | None = None,
     ) -> dict[str, Any]:
         """Handle multi-file operation with planning"""
 
         # Debug logging
         logger.info(
-            "_handle_multi_file: llm_planning=%s, has_client=%s", llm_planning, hasattr(self.llm_service, 'client')
+            "_handle_multi_file: llm_planning=%s, has_client=%s", llm_planning, hasattr(self.llm_service, "client")
         )
-        if hasattr(self.llm_service, 'client'):
+        if hasattr(self.llm_service, "client"):
             logger.info("client type: %s, client value: %s", type(self.llm_service.client), self.llm_service.client)
 
         # Create execution plan
@@ -760,7 +773,7 @@ class IntelligentLLMService:
         if force_output_mode:
             logger.info("Agent override: force_output_mode=%s", force_output_mode.value)
 
-        if llm_planning and hasattr(self.llm_service, 'client'):
+        if llm_planning and hasattr(self.llm_service, "client"):
             # Use LLM-enhanced planner
             planner = LLMEnhancedMultiFilePlanner(
                 repo_root=str(repo_path),
@@ -779,7 +792,7 @@ class IntelligentLLMService:
             logger.info(
                 "Using rule-based multi-file planner (llm_planning=%s, has_client=%s)",
                 llm_planning,
-                hasattr(self.llm_service, 'client'),
+                hasattr(self.llm_service, "client"),
             )
 
         self._emit_progress(progress_callback, "planning", "Creating execution plan...", 3, None)
@@ -850,7 +863,7 @@ class IntelligentLLMService:
             )
 
             # Determine file path and existence
-            file_path = operation.file_path.lstrip('/')
+            file_path = operation.file_path.lstrip("/")
             target_path = repo_path / file_path
             file_exists = target_path.exists()
 
@@ -880,7 +893,7 @@ class IntelligentLLMService:
                 # Other modes (ASICODE_BLOCK, TARGETED_BLOCK, PLAN_JSON)
                 modes_to_try = [output_mode]
 
-            result = None
+            result: dict[str, Any] = {}
             last_error = None
             used_output_mode = None
             failure_reason = None
@@ -889,6 +902,8 @@ class IntelligentLLMService:
             error_feedback_included = False
 
             # Retry loop with error feedback and failure tracking
+            # modes_to_try is never empty here either (guarded above).
+            retry_idx = -1
             for retry_idx, current_mode in enumerate(modes_to_try):
                 used_output_mode = current_mode
 
@@ -936,9 +951,9 @@ class IntelligentLLMService:
                 logger.debug(
                     "LLM result for %s: success=%s, error=%s, patch_len=%s",
                     operation.file_path,
-                    result.get('success'),
-                    result.get('error'),
-                    len(result.get('patch', '')),
+                    result.get("success"),
+                    result.get("error"),
+                    len(result.get("patch", "")),
                 )
 
                 if result.get("success"):
@@ -968,9 +983,11 @@ class IntelligentLLMService:
             # If all modes failed, use fallback template (for create operations)
             if not result or not result.get("success"):
                 # Record failure reason and metadata
-                result["failure_reason"] = failure_reason or self._extract_failure_reason(last_error) if last_error else "unknown"
+                result["failure_reason"] = (
+                    failure_reason or self._extract_failure_reason(last_error) if last_error else "unknown"
+                )
                 result["output_mode"] = used_output_mode.value if used_output_mode else output_mode.value
-                result["retry_count"] = retry_idx+1 if 'retry_idx' in locals() else len(modes_to_try)
+                result["retry_count"] = retry_idx + 1 if "retry_idx" in locals() else len(modes_to_try)
                 result["error_feedback_included"] = error_feedback_included
                 result["same_failure_repeat"] = same_failure_repeat
 
@@ -1001,7 +1018,7 @@ class IntelligentLLMService:
                 # Success - add metadata about which mode worked
                 if used_output_mode:
                     result["output_mode_used"] = used_output_mode.value
-                    result["retry_count"] = retry_idx+1 if 'retry_idx' in locals() else 1
+                    result["retry_count"] = retry_idx + 1 if "retry_idx" in locals() else 1
                 result["error_feedback_included"] = error_feedback_included
                 result["same_failure_repeat"] = same_failure_repeat
                 result["fallback_used"] = False
@@ -1059,7 +1076,6 @@ class IntelligentLLMService:
             "explanation": self._generate_multi_file_explanation(plan, operations_results),
         }
 
-
     def _build_project_context_summary(self, project_structure: ProjectStructure) -> str:
         """Build concise project context summary for LLM planning"""
         lines = []
@@ -1075,7 +1091,7 @@ class IntelligentLLMService:
         if project_structure.directories:
             lines.append("- **Directory Structure**:")
             for purpose, dirs in project_structure.directories.items():
-                if purpose != 'other' and dirs:
+                if purpose != "other" and dirs:
                     lines.append(f"  - {purpose}: {', '.join(dirs)}")
 
         if project_structure.naming_style:
@@ -1090,7 +1106,6 @@ class IntelligentLLMService:
                 lines.append(f"  - {file_type}: `{path}`")
 
         return "\n".join(lines) if lines else "No project context available."
-
 
     def _build_enhanced_context(
         self,
@@ -1186,7 +1201,9 @@ class IntelligentLLMService:
             parts.append("  +// New line added")
             parts.append("   // More content")
             parts.append("  ```")
-            parts.append("- **CRITICAL**: If you cannot produce a valid diff with @@ hunks, use FILE block format instead")
+            parts.append(
+                "- **CRITICAL**: If you cannot produce a valid diff with @@ hunks, use FILE block format instead"
+            )
         else:
             # Other modes (ASICODE_BLOCK, TARGETED_BLOCK, PLAN_JSON, NEEDS_DISAMBIGUATION)
             parts.append("")
@@ -1220,31 +1237,31 @@ class IntelligentLLMService:
         if not instructions:
             # Generate enhanced instructions based on file type, operation, and description
             if operation.operation == "create":
-                if operation.file_path.endswith('.css'):
-                    if 'line number' in operation.description.lower() or 'editor' in operation.description.lower():
+                if operation.file_path.endswith(".css"):
+                    if "line number" in operation.description.lower() or "editor" in operation.description.lower():
                         instructions = f"Create a new CSS file at {operation.file_path} for a code editor with line numbers. Include:\n- Monospace font for code\n- Proper positioning for line numbers column\n- Styling for code editor area\n- Syntax highlighting styles if possible\n- Responsive design"
                     else:
                         instructions = f"Create a new CSS file at {operation.file_path} with appropriate styles. Include proper selectors, properties, and comments."
-                elif operation.file_path.endswith('.js'):
-                    if 'line number' in operation.description.lower() or 'editor' in operation.description.lower():
+                elif operation.file_path.endswith(".js"):
+                    if "line number" in operation.description.lower() or "editor" in operation.description.lower():
                         instructions = f"Create a new JavaScript file at {operation.file_path} for line number functionality. Implement:\n- Function to generate line numbers based on code content\n- Scroll synchronization between code area and line numbers\n- Update line numbers when code is edited\n- Event listeners for user interactions\n- Error handling and debugging"
                     else:
                         instructions = f"Create a new JavaScript file at {operation.file_path} with proper functions and event handlers. Include error handling and comments."
-                elif operation.file_path.endswith('.html') or 'templates/' in operation.file_path:
-                    if 'editor' in operation.description.lower() or 'line number' in operation.description.lower():
+                elif operation.file_path.endswith(".html") or "templates/" in operation.file_path:
+                    if "editor" in operation.description.lower() or "line number" in operation.description.lower():
                         instructions = f"Create a new HTML template at {operation.file_path} for a code editor with line numbers. Include:\n- A textarea or contenteditable div for code editing\n- A separate div for displaying line numbers\n- Proper CSS classes for styling\n- References to CSS and JavaScript files\n- JavaScript hooks for line number updates"
                     else:
                         instructions = f"Create a new HTML template at {operation.file_path} with proper structure, elements, and CSS/JS references."
                 elif LanguageId.from_path(operation.file_path) is LanguageId.PYTHON:
-                    if 'service' in operation.description.lower() or 'endpoint' in operation.description.lower():
+                    if "service" in operation.description.lower() or "endpoint" in operation.description.lower():
                         instructions = f"Create a new Python service file at {operation.file_path}. Include:\n- Route/endpoint definitions\n- Proper request/response models\n- Error handling and logging\n- Business logic for editor functionality"
-                    elif 'test' in operation.file_path:
+                    elif "test" in operation.file_path:
                         instructions = f"Create a new test file at {operation.file_path} for editor functionality. Include:\n- Test cases for line number functionality\n- Setup and teardown methods\n- Assertions and validation\n- Mocking if needed"
                     else:
                         instructions = f"Create a new Python file at {operation.file_path} with proper imports, functions, classes, and docstrings."
                 else:
                     instructions = f"Create a new file at {operation.file_path} for {original_request[:100]}..."
-            elif operation.file_path == 'main.py' and 'route' in operation.description.lower():
+            elif operation.file_path == "main.py" and "route" in operation.description.lower():
                 instructions = "Modify main.py to add a new route for the editor page. Include:\n- Import for editor service router\n- Route registration in the app\n- Proper route configuration\n- Update any necessary middleware or dependencies"
             else:
                 instructions = f"Modify the file {operation.file_path} to {operation.description}"
@@ -1346,7 +1363,6 @@ class IntelligentLLMService:
     def _combine_patches(self, operations_results: list[dict]) -> str:
         """Combine patches from multiple operations"""
 
-
         patches = [result["patch"] for result in operations_results if result.get("success") and result.get("patch")]
 
         return "\n\n".join(patches)
@@ -1358,7 +1374,7 @@ class IntelligentLLMService:
         bug can never clobber user code with placeholder content.
         """
 
-        file_path = operation.file_path.lstrip('/')
+        file_path = operation.file_path.lstrip("/")
         target_path = repo_path / file_path
 
         # Defensive guard: never overwrite an existing file.
@@ -1370,9 +1386,9 @@ class IntelligentLLMService:
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Generate default content based on file type
-        ext = file_path.split('.')[-1].lower() if '.' in file_path else ''
+        ext = file_path.split(".")[-1].lower() if "." in file_path else ""
 
-        if ext == 'js':
+        if ext == "js":
             content = """// JavaScript file for editor with line numbers
 // Created automatically because LLM failed to generate content
 
@@ -1398,7 +1414,7 @@ window.EditorUtils = {
     updateLineNumbers,
     syncScroll
 };"""
-        elif ext == 'css':
+        elif ext == "css":
             content = """/* CSS for editor with line numbers */
 /* Created automatically because LLM failed to generate content */
 
@@ -1430,7 +1446,7 @@ window.EditorUtils = {
     font-family: monospace;
     white-space: pre;
 }"""
-        elif ext == 'html' or 'templates/' in file_path:
+        elif ext == "html" or "templates/" in file_path:
             content = f"""<!-- HTML template for editor with line numbers -->
 <!-- Created automatically because LLM failed to generate content -->
 
@@ -1440,18 +1456,18 @@ window.EditorUtils = {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Code Editor</title>
-    <link rel="stylesheet" href="/static/css/{file_path.replace('.html', '.css').split('/')[-1].replace('editor.html', 'editor.css')}">
+    <link rel="stylesheet" href="/static/css/{file_path.replace(".html", ".css").split("/")[-1].replace("editor.html", "editor.css")}">
 </head>
 <body>
     <div class="editor-container">
         <div class="line-numbers" id="editor-linenumbers">1</div>
         <textarea class="code-area" id="editor" oninput="updateLineNumbers('editor')" onscroll="syncScroll('editor')"></textarea>
     </div>
-    <script src="/static/js/{file_path.replace('.html', '.js').split('/')[-1].replace('editor.html', 'editor.js')}"></script>
+    <script src="/static/js/{file_path.replace(".html", ".js").split("/")[-1].replace("editor.html", "editor.js")}"></script>
 </body>
 </html>"""
-        elif ext == 'py':
-            if 'test' in file_path:
+        elif ext == "py":
+            if "test" in file_path:
                 content = """# Test file for editor functionality
 # Created automatically because LLM failed to generate content
 
@@ -1479,12 +1495,12 @@ index 0000000..e69de29
 --- /dev/null
 +++ b/{file_path}
 @@ -0,0 +1,{len(content.split(chr(10)))} @@
-{chr(10).join('+' + line for line in content.split(chr(10)))}
+{chr(10).join("+" + line for line in content.split(chr(10)))}
 """
 
         # Write the file
         try:
-            target_path.write_text(content, encoding='utf-8')
+            target_path.write_text(content, encoding="utf-8")
             logger.info("Created default file: %s", file_path)
         except Exception as e:
             logger.exception("Failed to create default file %s: %s", file_path, e)
@@ -1523,7 +1539,7 @@ index 0000000..e69de29
 
         return "\n".join(lines)
 
-    def _estimate_change_size(self, operation: str) -> Optional[str]:
+    def _estimate_change_size(self, operation: str) -> str | None:
         """
         Estimate change size based on operation type.
 
@@ -1531,10 +1547,10 @@ index 0000000..e69de29
         "add" could mean anything from adding a line to adding a feature.
         Operation type is the only reliable structural signal available here.
         """
-        if operation == 'create':
-            return 'medium'
-        if operation == 'modify':
-            return 'small'
+        if operation == "create":
+            return "medium"
+        if operation == "modify":
+            return "small"
         return None
 
     def _analyze_failure_patterns(self, result: dict) -> None:
@@ -1543,23 +1559,23 @@ index 0000000..e69de29
 
         This can be extended to track statistics over time.
         """
-        if not result.get('success'):
-            error = result.get('error', '')
-            output_mode = result.get('output_mode_used', result.get('output_mode', 'unknown'))
-            target_file = result.get('target_file', 'unknown')
+        if not result.get("success"):
+            error = result.get("error", "")
+            output_mode = result.get("output_mode_used", result.get("output_mode", "unknown"))
+            target_file = result.get("target_file", "unknown")
 
             # Extract file extension for pattern analysis
-            file_ext = 'unknown'
-            if target_file and target_file != 'unknown':
-                file_ext = target_file.split('.')[-1] if '.' in target_file else 'no_extension'
+            file_ext = "unknown"
+            if target_file and target_file != "unknown":
+                file_ext = target_file.split(".")[-1] if "." in target_file else "no_extension"
 
-            failure_type = 'unknown'
-            if 'empty_patch' in error:
-                failure_type = 'empty_patch'
-            elif 'git_apply_check_failed' in error:
-                failure_type = 'git_apply_failed'
-            elif 'invalid_diff' in error:
-                failure_type = 'invalid_diff'
+            failure_type = "unknown"
+            if "empty_patch" in error:
+                failure_type = "empty_patch"
+            elif "git_apply_check_failed" in error:
+                failure_type = "git_apply_failed"
+            elif "invalid_diff" in error:
+                failure_type = "invalid_diff"
 
             logger.info(
                 "Failure analysis - Type: %s, Mode: %s, File: .%s, Error: %s...",
@@ -1570,9 +1586,9 @@ index 0000000..e69de29
             )
 
             # Simple recommendations based on failure patterns
-            if failure_type == 'empty_patch' and output_mode == 'unified_diff':
+            if failure_type == "empty_patch" and output_mode == "unified_diff":
                 logger.info("  → Recommendation: Try FULL_FILE mode for this file type")
-            elif failure_type == 'git_apply_failed':
+            elif failure_type == "git_apply_failed":
                 logger.info("  → Recommendation: Check if diff context lines match file content")
 
     def _build_error_feedback(self, error: str, file_path: Path, repo_path: Path) -> str:
@@ -1615,7 +1631,7 @@ index 0000000..e69de29
                 if head:
                     feedback_lines.append("- Original file context (first 30 lines):")
                     for i, line in enumerate(head):
-                        feedback_lines.append(f"  {i+1}: {line}")
+                        feedback_lines.append(f"  {i + 1}: {line}")
             except Exception as e:
                 logger.warning("Could not read original file for error feedback: %s", e)
         else:
@@ -1682,10 +1698,10 @@ index 0000000..e69de29
 
 
 def create_intelligent_service_from_env(
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Optional[IntelligentLLMService]:
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> IntelligentLLMService | None:
     """
     Create IntelligentLLMService from environment variables.
 
@@ -1706,7 +1722,7 @@ def create_intelligent_service_from_env(
 
     # Remove "external_" prefix if present (UI uses "external_google", "external_deepseek")
     if prov.startswith("external_"):
-        prov = prov[len("external_"):]
+        prov = prov[len("external_") :]
 
     api_key_env_vars = {
         "openai": "OPENAI_API_KEY",
@@ -1742,6 +1758,7 @@ def create_intelligent_service_from_env(
     # leak in (see resolve_provider_base_url). Falls back to the client's
     # DEFAULT_BASE_URL when no override applies.
     from .client import resolve_provider_base_url
+
     base_url = resolve_provider_base_url(prov)
 
     try:

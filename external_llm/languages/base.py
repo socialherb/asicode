@@ -1,6 +1,7 @@
 """
 Abstract base for language syntax providers.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -12,7 +13,6 @@ from abc import ABC, abstractmethod
 from bisect import bisect_left
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
-from typing import Optional
 
 from .models import (
     LanguageCapabilities,
@@ -37,7 +37,10 @@ def _tempfile_for_content(content: str, suffix: str) -> tuple[str, Callable[[], 
     """
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=suffix, delete=False, encoding="utf-8",
+            mode="w",
+            suffix=suffix,
+            delete=False,
+            encoding="utf-8",
         ) as _tf:
             _tf.write(content)
             _tmp_path: str = _tf.name
@@ -65,7 +68,9 @@ def _replace_last_cmd_path(cmd: list[str], old_path: str, new_path: str) -> list
 
 
 def tree_sitter_syntax_fallback(
-    content: str, lang_id: LanguageId, file_path: str = "",
+    content: str,
+    lang_id: LanguageId,
+    file_path: str = "",
 ) -> SyntaxValidationResult:
     """Syntax validation via tree-sitter for languages without a bundled toolchain.
 
@@ -92,21 +97,24 @@ def tree_sitter_syntax_fallback(
     if err_nodes:
         return SyntaxValidationResult(
             ok=False,
-            errors=[SyntaxError_(
-                file="",
-                # find_error_nodes reports 0-based positions; SyntaxError_
-                # consumers (tool_safety / write-tool diagnostics, tool_registry
-                # "file:line:col:" parsing) expect 1-based — the convention of
-                # kotlinc/javac/ast producers. Off-by-one here misled repair
-                # prompts about the error location.
-                line=n.line + 1,
-                col=n.column + 1,
-                message=(
-                    f"syntax error (tree-sitter): expected '{n.missing_token}'"
-                    if n.missing_token
-                    else "syntax error (tree-sitter)"
-                ),
-            ) for n in err_nodes],
+            errors=[
+                SyntaxError_(
+                    file="",
+                    # find_error_nodes reports 0-based positions; SyntaxError_
+                    # consumers (tool_safety / write-tool diagnostics, tool_registry
+                    # "file:line:col:" parsing) expect 1-based — the convention of
+                    # kotlinc/javac/ast producers. Off-by-one here misled repair
+                    # prompts about the error location.
+                    line=n.line + 1,
+                    col=n.column + 1,
+                    message=(
+                        f"syntax error (tree-sitter): expected '{n.missing_token}'"
+                        if n.missing_token
+                        else "syntax error (tree-sitter)"
+                    ),
+                )
+                for n in err_nodes
+            ],
             language=lang_id,
         )
     return SyntaxValidationResult(ok=True, language=lang_id)
@@ -123,9 +131,17 @@ def detect_project_root(file_path: str, markers: tuple[str, ...] = ()) -> str:
     providers may pass their own (e.g. ``("go.mod",)`` for Go).
     """
     default_markers = (
-        "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
-        "tsconfig.json", "package.json", "go.mod", "Cargo.toml",
-        "build.gradle", "pom.xml", "build.gradle.kts",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "tsconfig.json",
+        "package.json",
+        "go.mod",
+        "Cargo.toml",
+        "build.gradle",
+        "pom.xml",
+        "build.gradle.kts",
         ".git",
     )
     used_markers = markers or default_markers
@@ -203,7 +219,7 @@ _RESOLUTION_ERROR_PHRASES: dict[LanguageId, tuple[str, ...]] = {
     ),
     # ``javac`` without -sourcepath/-classpath.
     LanguageId.JAVA: (
-        "does not exist",          # "package foo does not exist"
+        "does not exist",  # "package foo does not exist"
         "cannot find symbol",
         "is public, should be declared",
     ),
@@ -297,9 +313,10 @@ _RESOLUTION_CONTEXT_PHRASES: dict[LanguageId, tuple[str, ...]] = {
 
 
 def _filter_genuine_syntax_errors(
-    errors: list[SyntaxError_], lang_id: LanguageId,
+    errors: list[SyntaxError_],
+    lang_id: LanguageId,
     *,
-    has_resolution_context: Optional[bool] = None,
+    has_resolution_context: bool | None = None,
 ) -> list[SyntaxError_]:
     """Drop resolution/semantic errors, keeping only genuine SYNTAX errors.
 
@@ -334,10 +351,7 @@ def _filter_genuine_syntax_errors(
     #    context-dependent phrases resolution noise rather than real typos.)
     if has_resolution_context is None:
         _ctx_indicators = _RESOLUTION_CONTEXT_PHRASES.get(lang_id, ())
-        has_resolution_context = any(
-            any(ind in e.message.lower() for ind in _ctx_indicators)
-            for e in errors
-        )
+        has_resolution_context = any(any(ind in e.message.lower() for ind in _ctx_indicators) for e in errors)
 
     _ctx_phrases = _CONTEXT_DEPENDENT_PHRASES.get(lang_id, ())
 
@@ -481,10 +495,24 @@ def _consume_char_or_lifetime(content: str, i: int, length: int) -> int:
 
 
 _REGEX_PRECEDERS = frozenset("(,=:[!&|?{};+-*%^~<>")
-_REGEX_PRECEDING_KEYWORDS = frozenset({
-    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
-    "throw", "case", "do", "else", "yield", "await",
-})
+_REGEX_PRECEDING_KEYWORDS = frozenset(
+    {
+        "return",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "new",
+        "delete",
+        "void",
+        "throw",
+        "case",
+        "do",
+        "else",
+        "yield",
+        "await",
+    }
+)
 
 
 def _regex_can_start_at(content: str, i: int) -> bool:
@@ -509,7 +537,7 @@ def _regex_can_start_at(content: str, i: int) -> bool:
         k = j
         while k >= 0 and (content[k].isalnum() or content[k] in "_$"):
             k -= 1
-        return content[k + 1:j + 1] in _REGEX_PRECEDING_KEYWORDS
+        return content[k + 1 : j + 1] in _REGEX_PRECEDING_KEYWORDS
     return True
 
 
@@ -595,9 +623,16 @@ def _iter_brace_tokens(content: str, offset: int = 0, *, js_lexing: bool = False
             continue
         if ch == "`":
             # JS/TS template literals honour \` escapes; Go raw strings do not.
-            i = _skip_quoted_literal(
-                content, i, length, "`", escapes=js_lexing,
-            ) + 1
+            i = (
+                _skip_quoted_literal(
+                    content,
+                    i,
+                    length,
+                    "`",
+                    escapes=js_lexing,
+                )
+                + 1
+            )
             continue
         # ── JS/TS regex literal ───────────────────────────────────────
         # Opt-in: in C-family languages a bare `/` is division, and treating
@@ -747,12 +782,10 @@ class SyntaxProvider(ABC):
     """Interface that each language must implement."""
 
     @abstractmethod
-    def language_id(self) -> LanguageId:
-        ...
+    def language_id(self) -> LanguageId: ...
 
     @abstractmethod
-    def capabilities(self) -> LanguageCapabilities:
-        ...
+    def capabilities(self) -> LanguageCapabilities: ...
 
     _SYNTAX_MEMO_MAX = 128
 
@@ -776,7 +809,7 @@ class SyntaxProvider(ABC):
         memo = self.__dict__.get("_syntax_memo")
         if memo is None:
             memo = OrderedDict()
-            self.__dict__["_syntax_memo"] = memo
+            self.__dict__["_syntax_memo"] = memo  # type: ignore[index]  # dataclass __dict__ is a real dict
         key = (file_path, _sha256_hex(content))
         cached = memo.get(key)
         if cached is not None:
@@ -786,7 +819,9 @@ class SyntaxProvider(ABC):
             # file across the agent edit-validate loop).
             _ok, _errors_t, _lang = cached
             return SyntaxValidationResult(
-                ok=_ok, errors=list(_errors_t), language=_lang,
+                ok=_ok,
+                errors=list(_errors_t),
+                language=_lang,
             )
         result = self._validate_syntax_impl(file_path, content)
         # Store as immutable tuple so cache hits reconstruct cheaply
@@ -794,7 +829,9 @@ class SyntaxProvider(ABC):
         while len(memo) > self._SYNTAX_MEMO_MAX:
             memo.popitem(last=False)
         return SyntaxValidationResult(
-            ok=result.ok, errors=list(result.errors), language=result.language,
+            ok=result.ok,
+            errors=list(result.errors),
+            language=result.language,
         )
 
     @abstractmethod
@@ -824,7 +861,8 @@ class SyntaxProvider(ABC):
         return SyntaxValidationResult(ok=True, language=self.language_id())
 
     def validate_semantics_batch(
-        self, file_paths: list[str],
+        self,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """Semantic-check several files, sharing toolchain startup where possible.
 
@@ -859,7 +897,9 @@ class SyntaxProvider(ABC):
         ...
 
     def _iter_symbol_matches(
-        self, content: str, symbol_name: str,
+        self,
+        content: str,
+        symbol_name: str,
     ) -> Iterator[tuple[SymbolPattern, re.Match[str]]]:
         """Yield ``(pattern, match)`` for every regex pattern matching *symbol_name*.
 
@@ -878,8 +918,10 @@ class SyntaxProvider(ABC):
     _LINE_BASED_KINDS: frozenset[str] = frozenset()
 
     def _find_symbol_regex(
-        self, symbol_name: str, content: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        symbol_name: str,
+        content: str,
+    ) -> tuple[int, int] | None:
         """Fallback: regex match + brace counting for block end.
 
         Pattern kinds listed in :attr:`_LINE_BASED_KINDS` (C ``macro``/
@@ -898,8 +940,10 @@ class SyntaxProvider(ABC):
         return None
 
     def _find_symbol_body_range_regex(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         """Regex fallback: find function body via first { after definition."""
         for _, m in self._iter_symbol_matches(content, symbol_name):
             body_start = content.find("{", m.end())
@@ -916,11 +960,11 @@ class SyntaxProvider(ABC):
         ...
 
     @abstractmethod
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         """Return the shell command to lint *file_path*, or ``None``."""
         ...
 
-    def get_test_directory(self, repo_root: str) -> Optional[str]:
+    def get_test_directory(self, repo_root: str) -> str | None:
         """Return the configured test directory for this language/project.
 
         Returns the configured test root (e.g. "__tests__", "tests", "spec")
@@ -931,23 +975,20 @@ class SyntaxProvider(ABC):
         return None  # Default: use convention (tests/)
 
     @abstractmethod
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         """Return the shell command to run tests, or ``None``."""
         ...
 
     @abstractmethod
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         """Return ``(start_line, end_line)`` (1-indexed) of *symbol_name* in *content*, or ``None``."""
         ...
 
     # ── Structural query methods (Stage 2: cross-language DPB) ────────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Return ``[(name, kind, start_line, end_line), ...]`` for all top-level
         definitions in *content* (functions, classes, interfaces, types, etc.).
@@ -965,7 +1006,9 @@ class SyntaxProvider(ABC):
         return []
 
     def find_class_methods(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         """Return ``[(method_name, start_line, end_line), ...]`` for methods of a
         class in *content*.
@@ -982,7 +1025,8 @@ class SyntaxProvider(ABC):
         return []
 
     def find_all_class_methods(
-        self, content: str,
+        self,
+        content: str,
     ) -> dict[str, list[tuple[str, int, int]]]:
         """Return ``{class_name: [(method_name, start_line, end_line), ...]}``.
 
@@ -1006,7 +1050,8 @@ class SyntaxProvider(ABC):
         return result
 
     def find_class_symbols(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[str]:
         """Return the names of all top-level class/type/struct/interface symbols.
 
@@ -1018,8 +1063,10 @@ class SyntaxProvider(ABC):
         return []
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         """Return ``(body_start_line, body_end_line)`` (1-indexed) for a function
         or method's executable body (indented block or brace-delimited block).
 
@@ -1030,8 +1077,10 @@ class SyntaxProvider(ABC):
     # ── SyntaxValidator dispatch helpers ───────────────────────────────────
 
     def find_symbol_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         """Return ``(start_line, end_line)`` (1-indexed) for *symbol_name* in *content*.
 
         Default implementation delegates to ``find_symbol_in_file`` with an
@@ -1043,7 +1092,8 @@ class SyntaxProvider(ABC):
         return None
 
     def find_symbols(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Enumerate all top-level symbols in *content*.
 
@@ -1053,8 +1103,10 @@ class SyntaxProvider(ABC):
         return self.find_top_level_definitions(content)
 
     def extract_symbol_body(
-        self, code: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        code: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         """Return ``(body_start_line, body_end_line)`` (1-indexed) for a function/method.
 
         The body excludes the signature line.

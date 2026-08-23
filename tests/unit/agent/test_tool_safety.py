@@ -1,4 +1,5 @@
 """Tests for WriteSafetyManager (external_llm/agent/tool_safety.py)."""
+
 import os
 import stat
 from typing import ClassVar
@@ -21,6 +22,7 @@ def manager(tmp_repo):
 
 # ── count_patch_files ─────────────────────────────────────────────────────────
 
+
 class TestCountPatchFiles:
     def test_bare_headers_counted(self, manager):
         # Bare "--- a/" / "+++ b/" hunks (no "diff --git" prefix) must be
@@ -41,11 +43,7 @@ class TestCountPatchFiles:
         assert WriteSafetyManager.count_patch_files(patch) == 1
 
     def test_multiple_files(self, manager):
-        patch = (
-            "diff --git a/a.py b/a.py\n"
-            "diff --git a/b.py b/b.py\n"
-            "diff --git a/c.py b/c.py\n"
-        )
+        patch = "diff --git a/a.py b/a.py\ndiff --git a/b.py b/b.py\ndiff --git a/c.py b/c.py\n"
         assert WriteSafetyManager.count_patch_files(patch) == 3
 
     def test_empty_string(self, manager):
@@ -54,6 +52,7 @@ class TestCountPatchFiles:
 
 # ── approval_preview ──────────────────────────────────────────────────────────
 
+
 class TestApprovalPreview:
     def test_apply_patch_small_no_approval(self, manager):
         patch = "diff --git a/a.py b/a.py\n"  # 1 file < threshold
@@ -61,9 +60,7 @@ class TestApprovalPreview:
         assert needs is False
 
     def test_apply_patch_large_needs_approval(self, manager):
-        patch = "\n".join(
-            f"diff --git a/f{i}.py b/f{i}.py" for i in range(5)
-        )
+        patch = "\n".join(f"diff --git a/f{i}.py b/f{i}.py" for i in range(5))
         preview, needs = manager.approval_preview("apply_patch", {"patch": patch})
         assert needs is True
         assert len(preview) > 0
@@ -95,6 +92,7 @@ class TestApprovalPreview:
 
 # ── gate_check ────────────────────────────────────────────────────────────────
 
+
 class TestGateCheck:
     # write_plan, not delete_file: these assert what gate_check does for a tool
     # that ACTUALLY needs approval. delete_file used to serve that role, and once
@@ -110,9 +108,7 @@ class TestGateCheck:
         assert needs is True
 
     def test_no_callback_always_passes(self, manager):
-        result = manager.gate_check(
-            self._APPROVING_TOOL, self._ARGS, approval_callback=None
-        )
+        result = manager.gate_check(self._APPROVING_TOOL, self._ARGS, approval_callback=None)
         assert result is None
 
     def test_approved_returns_none(self, manager):
@@ -139,6 +135,7 @@ class TestGateCheck:
 
 
 # ── snapshot_target_files ─────────────────────────────────────────────────────
+
 
 class TestSnapshotTargetFiles:
     def test_snapshots_existing_file(self, manager, tmp_repo):
@@ -192,10 +189,7 @@ class TestSnapshotTargetFiles:
 
     def test_new_file_creation_stored_as_missing_snap(self, manager, tmp_repo):
         """New-file hunks (--- /dev/null) are captured as _MISSING_SNAP."""
-        patch_text = (
-            "diff --git a/new_file.py b/new_file.py\n"
-            "--- /dev/null\n+++ b/new_file.py\n@@ -0,0 +1 @@\n+x = 1\n"
-        )
+        patch_text = "diff --git a/new_file.py b/new_file.py\n--- /dev/null\n+++ b/new_file.py\n@@ -0,0 +1 @@\n+x = 1\n"
         snapshots = manager.snapshot_target_files("apply_patch", {"patch": patch_text})
         # new_file.py doesn't exist on disk — should be stored as _MISSING_SNAP
         missing_key = next((p for p in snapshots if "new_file.py" in p), None)
@@ -204,6 +198,7 @@ class TestSnapshotTargetFiles:
 
 
 # ── restore_snapshots ─────────────────────────────────────────────────────────
+
 
 class TestRestoreSnapshots:
     def test_restores_file_content(self, tmp_repo):
@@ -278,6 +273,7 @@ class TestRestoreSnapshotsAtomicSafety:
 
         def _boom(*_a, **_k):
             raise OSError("replace denied")
+
         # Patch only os.replace; os.unlink must keep working so the cleanup runs.
         monkeypatch.setattr("os.replace", _boom)
 
@@ -358,6 +354,7 @@ class TestRestoreSnapshotsPreservesMode:
 
 # ── verify_after_write ────────────────────────────────────────────────────────
 
+
 class TestVerifyAfterWrite:
     def test_empty_snapshots_returns_true(self, manager):
         assert manager.verify_after_write({}) == (True, "")
@@ -379,6 +376,7 @@ class TestVerifyAfterWrite:
 
 # ── _treesitter_symbol_set ───────────────────────────────────────────────────
 
+
 class TestTreeSitterSymbolSet:
     """Module-level _treesitter_symbol_set() — error paths."""
 
@@ -389,6 +387,7 @@ class TestTreeSitterSymbolSet:
         import builtins
 
         from external_llm.agent.tool_safety import _treesitter_symbol_set
+
         real_import = builtins.__import__
 
         def _mock_import(name, *args, **kwargs):
@@ -396,8 +395,7 @@ class TestTreeSitterSymbolSet:
                 raise ImportError("mock: tree_sitter_utils not available")
             return real_import(name, *args, **kwargs)
 
-        with patch("builtins.__import__", side_effect=_mock_import), \
-                pytest.raises(ImportError):
+        with patch("builtins.__import__", side_effect=_mock_import), pytest.raises(ImportError):
             _treesitter_symbol_set("x = 1", "python")
 
     def test_get_parser_returns_none(self):
@@ -425,6 +423,7 @@ class TestTreeSitterSymbolSet:
 
 # ── _treesitter_symbol_set coverage supplements ────────────────────────────
 
+
 class TestTreeSitterSymbolSetErrors:
     """Additional error-path coverage for _treesitter_symbol_set."""
 
@@ -446,6 +445,7 @@ class TestTreeSitterSymbolSetErrors:
 
 # ── approval_preview supplement ───────────────────────────────────────────
 
+
 class TestApprovalPreviewWritePlanErrors:
     """Cover L176-177: write_plan preview when json.dumps fails."""
 
@@ -459,6 +459,7 @@ class TestApprovalPreviewWritePlanErrors:
 
 # ── snapshot_target_files supplement ──────────────────────────────────────
 
+
 class TestSnapshotTargetFilesDictPlan:
     """Cover L237-242: snapshot_target_files with dict plan ops."""
 
@@ -467,9 +468,7 @@ class TestSnapshotTargetFilesDictPlan:
         target = os.path.join(tmp_repo, "dict_target.py")
         with open(target, "w") as f:
             f.write("x = 1\n")
-        snapshots = manager.snapshot_target_files("write_plan", {
-            "plan": {"ops": [{"path": "dict_target.py"}]}
-        })
+        snapshots = manager.snapshot_target_files("write_plan", {"plan": {"ops": [{"path": "dict_target.py"}]}})
         assert any("dict_target.py" in p for p in snapshots)
 
     def test_dict_plan_with_single_path(self, manager, tmp_repo):
@@ -477,9 +476,7 @@ class TestSnapshotTargetFilesDictPlan:
         target = os.path.join(tmp_repo, "single_op.py")
         with open(target, "w") as f:
             f.write("y = 2\n")
-        snapshots = manager.snapshot_target_files("write_plan", {
-            "plan": {"path": "single_op.py"}
-        })
+        snapshots = manager.snapshot_target_files("write_plan", {"plan": {"path": "single_op.py"}})
         assert any("single_op.py" in p for p in snapshots)
 
     def test_non_safety_tool_snapshots(self, manager, tmp_repo):
@@ -501,6 +498,7 @@ class TestSnapshotTargetFilesDictPlan:
 
 
 # ── verify_after_write supplement ─────────────────────────────────────────
+
 
 class TestVerifyAfterWriteErrors:
     """Cover L285-294: verify_after_write error paths."""
@@ -546,6 +544,7 @@ class TestVerifyAfterWriteErrors:
 
 # ── _format_regions ──────────────────────────────────────────────────────
 
+
 class TestFormatRegions:
     """Cover L315, L318-319: _format_regions edge cases."""
 
@@ -572,6 +571,7 @@ class TestFormatRegions:
 
 
 # ── summarize_change ──────────────────────────────────────────────────────
+
 
 class TestSummarizeChange:
     """Cover summarize_change edge cases."""
@@ -643,6 +643,7 @@ class TestSummarizeChange:
 
 # ── all_files_unchanged (NO_EFFECTIVE_PROGRESS hard gate) ─────────────────
 
+
 class TestAllFilesUnchanged:
     """Cover all_files_unchanged — the apply_patch no-op downgrade signal."""
 
@@ -705,6 +706,7 @@ class TestAllFilesUnchanged:
 
 # ── Phase 1: semantic lint (new_semantic_warnings) ───────────────────────────
 
+
 class TestNewSemanticWarnings:
     """Phase 1: ruff F-code detection surfaced as soft warning."""
 
@@ -740,20 +742,22 @@ class TestNewSemanticWarnings:
         # The F821 on line 1 is pre-existing; only new findings would surface
         # Since nothing NEW was added beyond line 1, result should be None
         assert result is None
+
     def test_missing_snap_preserves_semantic_warning(self, manager, tmp_repo):
-            """_MISSING_SNAP pre-content → treated as empty; new F821 surfaced."""
-            target = os.path.join(tmp_repo, "missing_new.py")
-            post = "x = Optional[int]\n"  # F821: Optional is undefined
-            with open(target, "w") as f:
-                f.write(post)
-            # New file (was _MISSING_SNAP), pre treated as ""
-            result = manager.new_semantic_warnings({target: _MISSING_SNAP})
-            assert result is not None
-            assert "[SEMANTIC LINT]" in result
-            assert "F821" in result
+        """_MISSING_SNAP pre-content → treated as empty; new F821 surfaced."""
+        target = os.path.join(tmp_repo, "missing_new.py")
+        post = "x = Optional[int]\n"  # F821: Optional is undefined
+        with open(target, "w") as f:
+            f.write(post)
+        # New file (was _MISSING_SNAP), pre treated as ""
+        result = manager.new_semantic_warnings({target: _MISSING_SNAP})
+        assert result is not None
+        assert "[SEMANTIC LINT]" in result
+        assert "F821" in result
 
 
 # ── Phase 2: F821 deterministic auto-repair ──────────────────────────────────
+
 
 class TestAutoRepairF821:
     """Phase 2: ruff F821 → project-wide import search → insert import."""
@@ -805,9 +809,7 @@ class TestAutoRepairF821:
     def test_resolve_import_from_typing(self, manager, tmp_repo):
         """_resolve_missing_import finds 'Optional' in the real typing module
         via the external_llm/agent directory scan."""
-        import_line = manager._resolve_missing_import(
-            "Optional", tmp_repo, "test.py"
-        )
+        import_line = manager._resolve_missing_import("Optional", tmp_repo, "test.py")
         # The resolver searches the repo tree, not tmp_repo, so it might
         # or might not find something. Just verify it doesn't crash.
         if import_line:
@@ -913,12 +915,8 @@ class TestAutoRepairF821:
             "    from typing import Dict\n"
             "    x = 1\n"
         )
-        result = WriteSafetyManager._insert_import_line(
-            content, "from typing import Any"
-        )
-        assert manager._validate_python_syntax(result), (
-            "inserting after a nested import must not break syntax"
-        )
+        result = WriteSafetyManager._insert_import_line(content, "from typing import Any")
+        assert manager._validate_python_syntax(result), "inserting after a nested import must not break syntax"
         # The new import lands right after the last MODULE-LEVEL import (os),
         # NOT inside the TYPE_CHECKING block.
         result_lines = result.splitlines()
@@ -956,9 +954,7 @@ class TestAutoRepairF821:
         assert "from .helper_mod import Helper" in result, (
             "relative-import level must be preserved — got broken absolute form"
         )
-        assert "from helper_mod import" not in result, (
-            "broken absolute form must NOT appear (node.level was dropped)"
-        )
+        assert "from helper_mod import" not in result, "broken absolute form must NOT appear (node.level was dropped)"
 
     def test_cross_dir_relative_import_skipped(self, manager, tmp_repo):
         """Regression: a relative import found in a source file in a DIFFERENT
@@ -978,9 +974,7 @@ class TestAutoRepairF821:
         with open(os.path.join(agent_dir, "sibling_xdir.py"), "w") as f:
             f.write("from .internal_pkg import CrossTarget\n")
         # Target lives in B (external_llm/) — a DIFFERENT directory than the source
-        result = manager._resolve_missing_import(
-            "CrossTarget", tmp_repo, "external_llm/top_level.py"
-        )
+        result = manager._resolve_missing_import("CrossTarget", tmp_repo, "external_llm/top_level.py")
         assert result is None, (
             "cross-directory relative import must be skipped (would silently "
             f"rebind in the target's package); got: {result!r}"
@@ -1000,12 +994,9 @@ class TestAutoRepairF821:
         with open(os.path.join(ext_dir, "abs_src.py"), "w") as f:
             f.write("from typing import Opt\n")
         # Target in B: cross-dir relative (A) skipped → absolute (B) returned
-        result = manager._resolve_missing_import(
-            "Opt", tmp_repo, "external_llm/top_level.py"
-        )
+        result = manager._resolve_missing_import("Opt", tmp_repo, "external_llm/top_level.py")
         assert result == "from typing import Opt", (
-            "guard must skip the cross-dir relative and fall back to the "
-            f"importable absolute match; got: {result!r}"
+            f"guard must skip the cross-dir relative and fall back to the importable absolute match; got: {result!r}"
         )
 
     def test_unresolvable_absolute_import_skipped(self, manager, tmp_repo):
@@ -1028,9 +1019,7 @@ class TestAutoRepairF821:
 
         with open(target) as f:
             result = f.read()
-        assert "from definitely_not_a_real_pkg_zzz import" not in result, (
-            "broken absolute import must NOT be inserted"
-        )
+        assert "from definitely_not_a_real_pkg_zzz import" not in result, "broken absolute import must NOT be inserted"
         # Original content untouched (F821 remains; no silent corruption)
         assert "x = Thing()" in result
 
@@ -1053,6 +1042,7 @@ class TestAutoRepairF821:
 
 
 # ── Phase 3: decl-loss auto-restore ──────────────────────────────────────────
+
 
 class TestAutoRestoreDeclLoss:
     """Phase 3: accidentally removed symbol → F821 → auto-restore."""
@@ -1094,6 +1084,7 @@ class TestAutoRestoreDeclLoss:
         """Regression pin: Phase 3 reuses the _python_decl_sets tree — the
         pre-snapshot text must be ast.parse'd exactly once per file."""
         import ast
+
         target = os.path.join(tmp_repo, "decl_loss_pin.py")
         pre = "def helper():\n    return 42\n\ndef caller():\n    return helper()\n"
         post = "def caller():\n    return helper()\n"  # helper() removed, now F821
@@ -1111,8 +1102,7 @@ class TestAutoRestoreDeclLoss:
         count = manager.auto_repair_semantic(snapshots)
         assert count == 1
         assert sum(1 for c in calls if c[0] == pre) == 1, (
-            "pre-snapshot text must be parsed exactly once "
-            "(decl_sets + Phase 3 shared tree)"
+            "pre-snapshot text must be parsed exactly once (decl_sets + Phase 3 shared tree)"
         )
 
 
@@ -1124,9 +1114,11 @@ class TestAutoRestoreDeclLoss:
 # spying on builtins.open: atomic_write_text writes via os.fdopen (not
 # builtins.open), so a correctly-routed repair records ZERO write-opens.
 
+
 def _spy_write_opens(monkeypatch, target):
     """Record any builtins.open(file, mode='w...') hitting `target`."""
     import builtins
+
     real_open = builtins.open
     target_abs = os.path.abspath(target)
     writes: list = []
@@ -1184,6 +1176,5 @@ class TestRepairUsesAtomicWrite:
         manager.auto_repair_semantic({target: content})
 
         assert writes == [], (
-            "F821 rollback restore used a truncating open(target,'w'); must "
-            "route through atomic_write_text"
+            "F821 rollback restore used a truncating open(target,'w'); must route through atomic_write_text"
         )

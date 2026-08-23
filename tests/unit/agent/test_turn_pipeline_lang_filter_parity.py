@@ -4,6 +4,7 @@ lang_filter=repo_language). Before the fix it called get_tool_schemas() with
 no filter, so a non-Python repo's occupancy budget accounted for masked
 python-only tools the request never sends — budget and wire disagreed.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -31,12 +32,22 @@ def _make_loop():
 
 def _make_ctx():
     return SimpleNamespace(
-        ephemeral_pending=[], messages=[LLMMessage(role="user", content="hi")],
-        turn_num=1, search_first_hint_done=False, target_keywords=[],
-        known_target_file=None, reads_since_last_edit=0, goal_reminder_injected=0,
-        request="test", plan_subtasks=[], plan_current_index=0,
-        read_only_request=False, is_local_model=False, turns=[],
-        budget_warned=False, model_name="claude-test",
+        ephemeral_pending=[],
+        messages=[LLMMessage(role="user", content="hi")],
+        turn_num=1,
+        search_first_hint_done=False,
+        target_keywords=[],
+        known_target_file=None,
+        reads_since_last_edit=0,
+        goal_reminder_injected=0,
+        request="test",
+        plan_subtasks=[],
+        plan_current_index=0,
+        read_only_request=False,
+        is_local_model=False,
+        turns=[],
+        budget_warned=False,
+        model_name="claude-test",
     )
 
 

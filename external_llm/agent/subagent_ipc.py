@@ -24,6 +24,7 @@ that directory, runs the AgentLoop, and writes ``result.json`` back.
 │    write result.json (echoes task.epoch)      │
 └───────────────────────────────────────────────┘
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -36,7 +37,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.config.thresholds import config as _cfg
 
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SubagentTask:
     """A task dispatched by the orchestrator to a sub-agent."""
+
     task_id: str
     title: str
     description: str
@@ -75,7 +77,7 @@ class SubagentTask:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "SubagentTask":
+    def from_dict(cls, d: dict) -> SubagentTask:
         # Filter out unknown keys so forward compat works
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
@@ -84,6 +86,7 @@ class SubagentTask:
 @dataclass
 class SubagentResult:
     """A result written back by the sub-agent after execution."""
+
     task_id: str
     status: str  # "success" | "error" | "max_turns" | "cancelled"
     final_message: str = ""
@@ -107,12 +110,12 @@ class SubagentResult:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "SubagentResult":
+    def from_dict(cls, d: dict) -> SubagentResult:
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
 
-def build_subagent_prompt(task: "SubagentTask") -> str:
+def build_subagent_prompt(task: SubagentTask) -> str:
     """Build the IPC worker's initial user-message text.
 
     Mirrors the in-process path (``orchestrator._run_subagent``):
@@ -132,10 +135,7 @@ def build_subagent_prompt(task: "SubagentTask") -> str:
     """
     prompt = task.predecessor_context or task.description
     if task.original_request and task.original_request not in prompt:
-        prompt = (
-            f"[Original request goal]\n{task.original_request}\n\n"
-            f"[This sub-agent's task]\n{prompt}"
-        )
+        prompt = f"[Original request goal]\n{task.original_request}\n\n[This sub-agent's task]\n{prompt}"
     return prompt
 
 
@@ -160,7 +160,9 @@ def _path_matches_scope(changed_path: str, scope: set[str]) -> bool:
 
 
 def partition_changed_files(
-    repo_root: str, assigned_files: list[str], timeout_s: float = 30.0,
+    repo_root: str,
+    assigned_files: list[str],
+    timeout_s: float = 30.0,
 ) -> tuple[list[dict], list[dict]]:
     """Partition the working-tree changes into (in-scope, out-of-scope).
 
@@ -192,9 +194,14 @@ def partition_changed_files(
     """
     try:
         import subprocess as _sp
+
         cmd = ["git", "status", "-z", "--porcelain", "--untracked-files=all"]
         out = _sp.run(
-            cmd, cwd=repo_root, capture_output=True, text=True, timeout=timeout_s,
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
             check=False,
         ).stdout
         # porcelain -z format (NUL-delimited):
@@ -241,7 +248,9 @@ def partition_changed_files(
 
 
 def derive_applied_patches(
-    repo_root: str, assigned_files: list[str], timeout_s: float = 30.0,
+    repo_root: str,
+    assigned_files: list[str],
+    timeout_s: float = 30.0,
 ) -> list[dict]:
     """Derive the in-scope applied-patch file list (``git status --porcelain``).
 
@@ -253,7 +262,9 @@ def derive_applied_patches(
 
 
 def derive_unassigned_changes(
-    repo_root: str, assigned_files: list[str], timeout_s: float = 30.0,
+    repo_root: str,
+    assigned_files: list[str],
+    timeout_s: float = 30.0,
 ) -> list[dict]:
     """Derive the OUT-of-scope working-tree changes a worker made.
 
@@ -341,8 +352,8 @@ def _read_expected_epoch(d: str) -> int:
 # heartbeat.json uses wall-clock ``time.time()`` (NOT ``time.monotonic()``): it
 # is written by the worker PROCESS and read by the orchestrator PROCESS, and
 # monotonic clocks are per-process and not comparable across processes.
-HEARTBEAT_INTERVAL_S = 15.0   # worker writes a heartbeat this often
-HEARTBEAT_STALE_S = 120.0     # orchestrator presumes dead past this age
+HEARTBEAT_INTERVAL_S = 15.0  # worker writes a heartbeat this often
+HEARTBEAT_STALE_S = 120.0  # orchestrator presumes dead past this age
 
 # Idle heartbeat: written by the worker into ITS OWN poll directory while
 # waiting for a task (not the task's dir, which does not exist yet). This lets
@@ -358,7 +369,7 @@ def _heartbeat_path(d: str) -> str:
     return os.path.join(d, "heartbeat.json")
 
 
-def _load_heartbeat_json(path: str) -> Optional[dict]:
+def _load_heartbeat_json(path: str) -> dict | None:
     """Read & parse a heartbeat JSON file, returning ``None`` on any error.
 
     Centralizes the open/parse/except skeleton shared by EVERY heartbeat reader
@@ -373,13 +384,12 @@ def _load_heartbeat_json(path: str) -> Optional[dict]:
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError,
-            PermissionError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError, PermissionError, OSError):
         logger.debug("IPC: cannot read %s — heartbeat inconclusive", path)
         return None
 
 
-def _heartbeat_age_from(data: Optional[dict]) -> Optional[float]:
+def _heartbeat_age_from(data: dict | None) -> float | None:
     """Compute heartbeat age (seconds) from a parsed payload, or ``None``.
 
     Shared by both age readers so the ts-extraction + invalid/stale handling
@@ -402,7 +412,7 @@ def _heartbeat_age_from(data: Optional[dict]) -> Optional[float]:
     return time.time() - ts
 
 
-def _write_idle_heartbeat(repo_root: str, worker_id: str, payload: dict) -> Optional[str]:
+def _write_idle_heartbeat(repo_root: str, worker_id: str, payload: dict) -> str | None:
     """Atomically write the worker's idle heartbeat (``worker.heartbeat.json``).
 
     Centralizes the path computation (``_subagent_dir`` — which CREATES the
@@ -423,8 +433,12 @@ def _write_idle_heartbeat(repo_root: str, worker_id: str, payload: dict) -> Opti
 
 
 def write_heartbeat(
-    repo_root: str, agent_id: str, *, pid: int = 0,
-    turn: int = 0, last_tool: str = "",
+    repo_root: str,
+    agent_id: str,
+    *,
+    pid: int = 0,
+    turn: int = 0,
+    last_tool: str = "",
 ) -> str:
     """Write a liveness heartbeat for *agent_id*'s current task.
 
@@ -440,15 +454,22 @@ def write_heartbeat(
     """
     d = _subagent_dir(repo_root, agent_id)
     path = _heartbeat_path(d)
-    _atomic_write(path, json.dumps({
-        "ts": time.time(), "pid": pid, "agent_id": agent_id,
-        "turn": int(turn) if turn else 0,
-        "last_tool": last_tool or "",
-    }))
+    _atomic_write(
+        path,
+        json.dumps(
+            {
+                "ts": time.time(),
+                "pid": pid,
+                "agent_id": agent_id,
+                "turn": int(turn) if turn else 0,
+                "last_tool": last_tool or "",
+            }
+        ),
+    )
     return path
 
 
-def read_heartbeat_state(repo_root: str, agent_id: str) -> Optional[dict]:
+def read_heartbeat_state(repo_root: str, agent_id: str) -> dict | None:
     """Return the full heartbeat payload for *agent_id*, or ``None``.
 
     Exposes the progress hints (``turn``/``last_tool``) alongside the liveness
@@ -460,9 +481,14 @@ def read_heartbeat_state(repo_root: str, agent_id: str) -> Optional[dict]:
 
 
 def write_worker_idle_heartbeat(
-    repo_root: str, worker_id: str, *, pid: int = 0,
-    tasks_served: int = 0, last_task_id: str = "", uptime_s: float = 0.0,
-) -> Optional[str]:
+    repo_root: str,
+    worker_id: str,
+    *,
+    pid: int = 0,
+    tasks_served: int = 0,
+    last_task_id: str = "",
+    uptime_s: float = 0.0,
+) -> str | None:
     """Write an IDLE liveness heartbeat into the worker's OWN poll directory.
 
     Distinct from :func:`write_heartbeat` (which targets the *task's* dir while a
@@ -485,16 +511,22 @@ def write_worker_idle_heartbeat(
 
     Returns the path written, or ``None`` on failure (advisory — never fatal).
     """
-    return _write_idle_heartbeat(repo_root, worker_id, {
-        "ts": time.time(), "pid": pid, "worker_id": worker_id,
-        "state": "idle",
-        "tasks_served": int(tasks_served),
-        "last_task_id": last_task_id or "",
-        "uptime_s": round(float(uptime_s), 1),
-    })
+    return _write_idle_heartbeat(
+        repo_root,
+        worker_id,
+        {
+            "ts": time.time(),
+            "pid": pid,
+            "worker_id": worker_id,
+            "state": "idle",
+            "tasks_served": int(tasks_served),
+            "last_task_id": last_task_id or "",
+            "uptime_s": round(float(uptime_s), 1),
+        },
+    )
 
 
-def write_worker_exited_heartbeat(repo_root: str, worker_id: str, *, pid: int = 0) -> Optional[str]:
+def write_worker_exited_heartbeat(repo_root: str, worker_id: str, *, pid: int = 0) -> str | None:
     """Mark the worker's idle heartbeat ``state`` as ``"exited"`` right before exit.
 
     Written once, synchronously, from the worker's main loop after
@@ -510,13 +542,19 @@ def write_worker_exited_heartbeat(repo_root: str, worker_id: str, *, pid: int = 
 
     Returns the path written, or ``None`` on failure (advisory — never fatal).
     """
-    return _write_idle_heartbeat(repo_root, worker_id, {
-        "ts": time.time(), "pid": pid, "worker_id": worker_id,
-        "state": "exited",
-    })
+    return _write_idle_heartbeat(
+        repo_root,
+        worker_id,
+        {
+            "ts": time.time(),
+            "pid": pid,
+            "worker_id": worker_id,
+            "state": "exited",
+        },
+    )
 
 
-def _read_idle_heartbeat(repo_root: str, worker_id: str) -> Optional[dict]:
+def _read_idle_heartbeat(repo_root: str, worker_id: str) -> dict | None:
     """Read the worker's idle heartbeat payload, or ``None``.
 
     Centralizes the idle-heartbeat path/load skeleton (``_subagent_dir_path`` +
@@ -528,7 +566,7 @@ def _read_idle_heartbeat(repo_root: str, worker_id: str) -> Optional[dict]:
     return _load_heartbeat_json(os.path.join(d, _IDLE_HEARTBEAT_FILENAME))
 
 
-def read_worker_idle_heartbeat_state(repo_root: str, worker_id: str) -> Optional[str]:
+def read_worker_idle_heartbeat_state(repo_root: str, worker_id: str) -> str | None:
     """Return the ``state`` field of the worker's idle heartbeat, or ``None``.
 
     ``"exited"`` means the worker process has terminated cleanly and must never
@@ -543,7 +581,7 @@ def read_worker_idle_heartbeat_state(repo_root: str, worker_id: str) -> Optional
     return data.get("state") if data is not None else None
 
 
-def read_worker_idle_heartbeat_age(repo_root: str, worker_id: str) -> Optional[float]:
+def read_worker_idle_heartbeat_age(repo_root: str, worker_id: str) -> float | None:
     """Return the age (seconds) of the worker's idle heartbeat, or ``None``.
 
     ``None`` means no idle heartbeat exists (worker is a legacy build that does
@@ -560,7 +598,7 @@ def read_worker_idle_heartbeat_age(repo_root: str, worker_id: str) -> Optional[f
     return _heartbeat_age_from(_read_idle_heartbeat(repo_root, worker_id))
 
 
-def read_heartbeat_age_s(repo_root: str, agent_id: str) -> Optional[float]:
+def read_heartbeat_age_s(repo_root: str, agent_id: str) -> float | None:
     """Return the age (seconds) of the worker's last heartbeat, or None.
 
     ``None`` means no heartbeat exists yet (worker just starting, or a legacy
@@ -603,13 +641,16 @@ def _quarantine_and_recheck(result_path, expected_epoch, agent_id):
             if getattr(candidate, "epoch", 0) == expected_epoch:
                 logger.info(
                     "IPC: adopted fresh result for %s recovered from quarantine "
-                    "(raced write detected between read and rename)", agent_id,
+                    "(raced write detected between read and rename)",
+                    agent_id,
                 )
                 return candidate
     finally:
         with contextlib.suppress(OSError):
             os.unlink(qpath)
     return None
+
+
 # ── Orchestrator-side API ──────────────────────────────────────────────────
 
 
@@ -691,12 +732,12 @@ def wait_for_result(
     *,
     poll_interval_s: float = 0.5,
     timeout_s: float = 600.0,
-    cancel_event: Optional[Any] = None,
-    on_poll: Optional[Callable[[float, str], None]] = None,
+    cancel_event: Any | None = None,
+    on_poll: Callable[[float, str], None] | None = None,
     heartbeat_stale_s: float = HEARTBEAT_STALE_S,
     startup_timeout_s: float = 0.0,
     max_timeout_s: float = 0.0,
-) -> Optional[SubagentResult]:
+) -> SubagentResult | None:
     """Poll for a result file.  Returns the deserialized result or None on timeout/cancel.
 
     Blocks up to *timeout_s* seconds, polling every *poll_interval_s*.
@@ -753,14 +794,12 @@ def wait_for_result(
             # Reject a stale result whose epoch does not match the task we
             # dispatched.  Backward-compatible: if either side lacks an epoch
             # (0), skip validation so legacy workers/results still resolve.
-            if (
-                expected_epoch
-                and getattr(result, "epoch", 0)
-                and result.epoch != expected_epoch
-            ):
+            if expected_epoch and getattr(result, "epoch", 0) and result.epoch != expected_epoch:
                 logger.warning(
                     "IPC: ignoring stale result for %s (epoch %d != expected %d)",
-                    agent_id, result.epoch, expected_epoch,
+                    agent_id,
+                    result.epoch,
+                    expected_epoch,
                 )
                 # TOCTOU-safe stale-result removal. A plain ``os.unlink`` would
                 # *lose* a fresh result that the worker renamed in between our
@@ -772,7 +811,9 @@ def wait_for_result(
                 # expected epoch, a fresh write won the race — adopt it instead
                 # of discarding it.
                 _adopted = _quarantine_and_recheck(
-                    result_path, expected_epoch, agent_id,
+                    result_path,
+                    expected_epoch,
+                    agent_id,
                 )
                 if _adopted is not None:
                     return _adopted
@@ -791,7 +832,9 @@ def wait_for_result(
                         logger.warning(
                             "IPC: wait_for_result(%s) worker heartbeat stale "
                             "(%.0fs > %.0fs threshold); presuming worker dead.",
-                            agent_id, _hb_age, heartbeat_stale_s,
+                            agent_id,
+                            _hb_age,
+                            heartbeat_stale_s,
                         )
                         return None
                     # Soft-timeout extension: heartbeat is fresh (worker alive and
@@ -799,16 +842,16 @@ def wait_for_result(
                     # so a legitimately-slow task isn't abandoned the instant it
                     # crosses timeout_s. Only a fresh heartbeat earns the
                     # extension; a subsequently-stale heartbeat is caught above.
-                    if (
-                        max_timeout_s > timeout_s
-                        and not heartbeat_extended
-                    ):
+                    if max_timeout_s > timeout_s and not heartbeat_extended:
                         deadline = start_ts + max_timeout_s
                         heartbeat_extended = True
                         logger.info(
                             "IPC: wait_for_result(%s) heartbeat fresh (%.0fs) — "
                             "extending deadline %.0fs → %.0fs (worker progressing)",
-                            agent_id, _hb_age, timeout_s, max_timeout_s,
+                            agent_id,
+                            _hb_age,
+                            timeout_s,
+                            max_timeout_s,
                         )
             # Startup-failure guard: no heartbeat has EVER appeared past the
             # startup deadline → the worker likely never engaged the task
@@ -831,7 +874,8 @@ def wait_for_result(
                     logger.warning(
                         "IPC: wait_for_result(%s) startup timeout — no heartbeat "
                         "within %.0fs; presuming worker failed to start.",
-                        agent_id, startup_timeout_s,
+                        agent_id,
+                        startup_timeout_s,
                     )
                     return None
             now = time.monotonic()
@@ -895,7 +939,10 @@ def _write_lifecycle_sentinel(repo_root: str, agent_id: str, *, kind: str) -> st
 
 
 def _write_lifecycle_sentinels(
-    repo_root: str, agent_ids: list[str], *, kind: str,
+    repo_root: str,
+    agent_ids: list[str],
+    *,
+    kind: str,
 ) -> list[str]:
     """Write lifecycle sentinels for all given agent IDs (best-effort)."""
     paths: list[str] = []
@@ -904,7 +951,10 @@ def _write_lifecycle_sentinels(
             paths.append(_write_lifecycle_sentinel(repo_root, aid, kind=kind))
         except Exception as e:
             logger.warning(
-                "IPC: failed to write %s sentinel for %s: %s", kind, aid, e,
+                "IPC: failed to write %s sentinel for %s: %s",
+                kind,
+                aid,
+                e,
             )
     return paths
 
@@ -943,6 +993,7 @@ def check_shutdown_sentinel(repo_root: str, agent_id: str) -> bool:
     Pure check — no filesystem mutation.
     """
     return _check_lifecycle_sentinel(repo_root, agent_id, kind="shutdown")
+
 
 # ── Cancel sentinel (mid-task abort) ─────────────────────────────────────
 # Distinct from the shutdown sentinel: shutdown = "exit the poll loop after
@@ -1000,17 +1051,17 @@ def _is_process_alive(pid: int) -> bool:
     if os.name == "nt":
         import ctypes
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
+        _process_query_limited_information = 0x1000
+        _still_active = 259
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        handle = kernel32.OpenProcess(_process_query_limited_information, False, pid)
         if not handle:
             return False
         try:
             exit_code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return False
-            return exit_code.value == STILL_ACTIVE
+            return exit_code.value == _still_active
         finally:
             kernel32.CloseHandle(handle)
     try:
@@ -1030,13 +1081,13 @@ def poll_for_task(
     agent_id: str,
     *,
     poll_interval_s: float = 0.5,
-    timeout_s: Optional[float] = None,
-    cancel_event: Optional[Any] = None,
-    expected_parent_pid: Optional[int] = None,
-    orchestrator_pid: Optional[int] = None,
+    timeout_s: float | None = None,
+    cancel_event: Any | None = None,
+    expected_parent_pid: int | None = None,
+    orchestrator_pid: int | None = None,
     idle_warn_s: float = 3600.0,
-    max_poll_s: Optional[float] = 86400.0,
-) -> Optional[SubagentTask]:
+    max_poll_s: float | None = 86400.0,
+) -> SubagentTask | None:
     """Poll for a new task.  Blocks until a task appears or timeout expires.
 
     If *cancel_event* (a ``threading.Event``) is set, returns None immediately.
@@ -1110,9 +1161,10 @@ def poll_for_task(
                 # PID-reuse race — a recycled PID won't match.
                 if os.getppid() != expected_parent_pid:
                     logger.warning(
-                        "IPC: sub-agent %s orphaned — getppid()=%d != "
-                        "expected_parent_pid=%d; self-exit.",
-                        agent_id, os.getppid(), expected_parent_pid,
+                        "IPC: sub-agent %s orphaned — getppid()=%d != expected_parent_pid=%d; self-exit.",
+                        agent_id,
+                        os.getppid(),
+                        expected_parent_pid,
                     )
                     return None
             # Windows: getppid() stays at the dead pid forever (no
@@ -1121,9 +1173,9 @@ def poll_for_task(
             # live process) but no better option without psutil.
             elif not _is_process_alive(expected_parent_pid):
                 logger.warning(
-                    "IPC: sub-agent %s orphaned — originator pid=%s gone; "
-                    "self-exit to avoid an infinite poll.",
-                    agent_id, expected_parent_pid,
+                    "IPC: sub-agent %s orphaned — originator pid=%s gone; self-exit to avoid an infinite poll.",
+                    agent_id,
+                    expected_parent_pid,
                 )
                 return None
         # Direct orchestrator liveness probe (cross-platform, no reparenting
@@ -1132,9 +1184,9 @@ def poll_for_task(
         # getppid() reflects the login shell, not the orchestrator.
         if orchestrator_pid is not None and not _is_process_alive(orchestrator_pid):
             logger.warning(
-                "IPC: sub-agent %s orphaned — orchestrator pid=%s gone; "
-                "self-exit to avoid an infinite poll.",
-                agent_id, orchestrator_pid,
+                "IPC: sub-agent %s orphaned — orchestrator pid=%s gone; self-exit to avoid an infinite poll.",
+                agent_id,
+                orchestrator_pid,
             )
             return None
         # 1) A pending task ALWAYS wins over the shutdown sentinel — never
@@ -1191,7 +1243,8 @@ def poll_for_task(
                     os.replace(claimed_path, _bad)
                 logger.warning(
                     "IPC: sub-agent %s found malformed task.json, quarantined → %s",
-                    agent_id, _bad,
+                    agent_id,
+                    _bad,
                 )
             except FileNotFoundError:
                 # claimed_path vanished between rename and read (e.g. an external
@@ -1215,9 +1268,9 @@ def poll_for_task(
         _now = time.monotonic()
         if idle_warn_s > 0 and (_now - last_warn_ts) >= idle_warn_s:
             logger.warning(
-                "IPC: sub-agent %s idle %.0fs with no task; still polling "
-                "(orchestrator alive but not dispatching?).",
-                agent_id, _now - start_ts,
+                "IPC: sub-agent %s idle %.0fs with no task; still polling (orchestrator alive but not dispatching?).",
+                agent_id,
+                _now - start_ts,
             )
             last_warn_ts = _now
         if interruptible_sleep(interval, cancel_event):
@@ -1227,9 +1280,9 @@ def poll_for_task(
 
     if timeout_s is None and max_poll_s is not None:
         logger.warning(
-            "IPC: sub-agent %s hit the max_poll_s safety cap (%.0fs idle) — "
-            "self-exiting instead of polling forever.",
-            agent_id, max_poll_s,
+            "IPC: sub-agent %s hit the max_poll_s safety cap (%.0fs idle) — self-exiting instead of polling forever.",
+            agent_id,
+            max_poll_s,
         )
     else:
         logger.info("IPC: sub-agent %s poll timeout", agent_id)

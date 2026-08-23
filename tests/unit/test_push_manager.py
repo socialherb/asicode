@@ -6,6 +6,7 @@ push()/broadcast() enqueue, and producers must wake the async consumer promptly.
 make_sse_generator is ASYNC (cancellation-aware disconnect handling), so we
 drive it via asyncio.run + async for / aclose.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +20,7 @@ import pytest
 from external_llm.editor.agent.autonomous.push_manager import PushManager, get_push_manager
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
 
 async def _consume_events_async(gen, count: int, timeout: float = 5.0) -> list[dict]:
     """Read *count* SSE events from an async generator, return parsed dicts."""
@@ -54,6 +56,7 @@ async def _consume_events_async(gen, count: int, timeout: float = 5.0) -> list[d
 
 
 # ── Tests ────────────────────────────────────────────────────────────────
+
 
 class TestPushManagerRoundtrip:
     """push → SSE generator roundtrip.
@@ -178,6 +181,7 @@ class TestPushManagerRoundtrip:
         silently dropped on queue.Full and make_sse_generator never exited on
         graceful teardown."""
         import queue as _q
+
         pm = self.pm
         client_id = "full-client"
         q = pm.register(client_id)
@@ -259,6 +263,7 @@ class TestPushManagerRoundtrip:
         """broadcast() must not raise when a client queue is full; the event
         is dropped for that client and it is not counted (L151-152)."""
         import queue as _q
+
         pm = self.pm
         client_id = "full-broadcast"
         q = pm.register(client_id)
@@ -273,6 +278,7 @@ class TestPushManagerRoundtrip:
     def test_push_returns_false_on_full_queue(self) -> None:
         """push() returns False when the client queue is full (L176-177)."""
         import queue as _q
+
         pm = self.pm
         client_id = "full-push"
         q = pm.register(client_id)
@@ -404,13 +410,8 @@ class TestPushManagerRoundtrip:
         asyncio.run(_go())
 
 
-
 class TestPushManagerSingleton:
     """get_push_manager singleton contract."""
 
     def test_identical_instances(self) -> None:
         assert get_push_manager() is get_push_manager()
-
-
-
-

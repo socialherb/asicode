@@ -4,7 +4,7 @@ import hashlib
 import logging
 import re as _re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -71,24 +71,25 @@ def _extract_missing_pytest_plugins(raw: str) -> tuple[list[str], list[str]]:
 # Data structures
 # -----------------------------
 
+
 @dataclass
 class TraceFrame:
     file: str
-    line: Optional[int] = None
-    func: Optional[str] = None
-    text: Optional[str] = None
+    line: int | None = None
+    func: str | None = None
+    text: str | None = None
 
 
 @dataclass
 class FailureContext:
     stage: str  # plan|llm_generate|diff_clean|git_apply_check|apply|tests|runtime
-    type: str   # normalized failure type (AssertionError, ImportError, GitApplyError, ...)
+    type: str  # normalized failure type (AssertionError, ImportError, GitApplyError, ...)
     message: str
 
-    primary_file: Optional[str] = None
-    primary_line: Optional[int] = None
-    primary_symbol: Optional[str] = None  # function/class/variable/module
-    test_id: Optional[str] = None
+    primary_file: str | None = None
+    primary_line: int | None = None
+    primary_symbol: str | None = None  # function/class/variable/module
+    test_id: str | None = None
 
     traceback: list[TraceFrame] = field(default_factory=list)
 
@@ -101,6 +102,7 @@ class FailureContext:
 # -----------------------------
 # Public API
 # -----------------------------
+
 
 def analyze_failure(*, stage: str, raw_text: str) -> FailureContext:
     """Parse raw error/log text into FailureContext."""
@@ -142,7 +144,8 @@ def analyze_failure(*, stage: str, raw_text: str) -> FailureContext:
 # Parsers
 # -----------------------------
 
-def _try_parse_git_apply(stage: str, raw: str) -> Optional[FailureContext]:
+
+def _try_parse_git_apply(stage: str, raw: str) -> FailureContext | None:
     lower = raw.lower()
 
     # Common asicode pipeline errors you already use
@@ -156,11 +159,11 @@ def _try_parse_git_apply(stage: str, raw: str) -> Optional[FailureContext]:
         _pf_prefix = "patch failed:"
         _idx = lower.find(_pf_prefix)
         if _idx >= 0:
-            _line_end = raw.find('\n', _idx)
+            _line_end = raw.find("\n", _idx)
             if _line_end == -1:
                 _line_end = len(raw)
             _line = raw[_idx:_line_end]
-            _suffix = _line[len(_pf_prefix):].strip()
+            _suffix = _line[len(_pf_prefix) :].strip()
             _parts = _suffix.split(":", 1)
             ctx.primary_file = _parts[0].strip()
             if len(_parts) > 1 and _parts[1].strip().isdigit():
@@ -175,7 +178,7 @@ def _try_parse_git_apply(stage: str, raw: str) -> Optional[FailureContext]:
     return None
 
 
-def _try_parse_diff_format(stage: str, raw: str) -> Optional[FailureContext]:
+def _try_parse_diff_format(stage: str, raw: str) -> FailureContext | None:
     lower = raw.lower()
 
     if "empty_patch" in lower:
@@ -196,7 +199,7 @@ def _try_parse_diff_format(stage: str, raw: str) -> Optional[FailureContext]:
     return None
 
 
-def _try_parse_pytest(stage: str, raw: str) -> Optional[FailureContext]:
+def _try_parse_pytest(stage: str, raw: str) -> FailureContext | None:
     """
     Parse pytest output (including collection/import errors).
 
@@ -236,7 +239,11 @@ def _try_parse_pytest(stage: str, raw: str) -> Optional[FailureContext]:
     ctx = FailureContext(stage=stage or "tests", type="PytestFailure", message=_first_line(raw))
 
     # Collection error detection
-    if ("error collecting" in low) or ("importerror while importing test module" in low) or ("collected 0 items" in low):
+    if (
+        ("error collecting" in low)
+        or ("importerror while importing test module" in low)
+        or ("collected 0 items" in low)
+    ):
         ctx.tags.append("collection_error")
         ctx.type = "PytestCollectionError"
 
@@ -257,7 +264,7 @@ def _try_parse_pytest(stage: str, raw: str) -> Optional[FailureContext]:
     return ctx
 
 
-def _try_parse_python_traceback(stage: str, raw: str) -> Optional[FailureContext]:
+def _try_parse_python_traceback(stage: str, raw: str) -> FailureContext | None:
     if "Traceback (most recent call last):" not in raw and "SyntaxError" not in raw and "IndentationError" not in raw:
         # Also catch SyntaxError blocks that might not have full traceback
         return None
@@ -292,6 +299,7 @@ def _try_parse_python_traceback(stage: str, raw: str) -> Optional[FailureContext
 # Utilities
 # -----------------------------
 
+
 def _normalize_exception_type(t: str) -> str:
     t = (t or "").strip()
     if not t:
@@ -301,7 +309,7 @@ def _normalize_exception_type(t: str) -> str:
     return t
 
 
-def _extract_exception_tail(raw: str) -> tuple[Optional[str], Optional[str]]:
+def _extract_exception_tail(raw: str) -> tuple[str | None, str | None]:
     # typical tail: "TypeError: blah" (also allow pytest's "E   AssertionError: ...")
 
     lines = [ln.rstrip("\n") for ln in raw.splitlines() if ln.strip()]
@@ -321,7 +329,8 @@ def _extract_exception_tail(raw: str) -> tuple[Optional[str], Optional[str]]:
 
     return None, None
 
-def _extract_missing_module(raw: str) -> Optional[str]:
+
+def _extract_missing_module(raw: str) -> str | None:
     # ModuleNotFoundError: No module named 'xyz'
     prefix = "No module named "
     for _q in ("'", '"'):
@@ -338,12 +347,12 @@ def _extract_traceback_frames(raw: str, max_frames: int) -> list[TraceFrame]:
     frames: list[TraceFrame] = []
     _lines = raw.splitlines()
     for i, _ln in enumerate(_lines):
-        if _ln.startswith('  File "') and ', line ' in _ln and ', in ' in _ln:
-            _file = _ln.split(', line ')[0].replace('  File "', '').rstrip('"')
-            _rest = _ln.split(', line ', 1)[1]
-            if ', in ' not in _rest:
+        if _ln.startswith('  File "') and ", line " in _ln and ", in " in _ln:
+            _file = _ln.split(", line ")[0].replace('  File "', "").rstrip('"')
+            _rest = _ln.split(", line ", 1)[1]
+            if ", in " not in _rest:
                 continue
-            _line_str, _func = _rest.split(', in ', 1)
+            _line_str, _func = _rest.split(", in ", 1)
             _func = _func.strip()
             try:
                 _line_no = int(_line_str.strip())
@@ -357,21 +366,23 @@ def _extract_traceback_frames(raw: str, max_frames: int) -> list[TraceFrame]:
     return frames
 
 
-def _pick_primary_frame(frames: list[TraceFrame]) -> Optional[TraceFrame]:
+def _pick_primary_frame(frames: list[TraceFrame]) -> TraceFrame | None:
     if not frames:
         return None
     return frames[0]
 
 
 def _fingerprint(ctx: FailureContext) -> str:
-    basis = "|".join([
-        ctx.stage or "",
-        ctx.type or "",
-        ctx.primary_file or "",
-        str(ctx.primary_line or ""),
-        ctx.primary_symbol or "",
-        ctx.test_id or "",
-    ])
+    basis = "|".join(
+        [
+            ctx.stage or "",
+            ctx.type or "",
+            ctx.primary_file or "",
+            str(ctx.primary_line or ""),
+            ctx.primary_symbol or "",
+            ctx.test_id or "",
+        ]
+    )
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
@@ -380,4 +391,3 @@ def _first_line(raw: str) -> str:
         if ln.strip():
             return ln.strip()
     return raw[:200].strip()
-

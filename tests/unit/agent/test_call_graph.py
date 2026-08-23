@@ -1,4 +1,5 @@
 """Unit tests for call_graph.CallGraphIndexer."""
+
 import ast
 import shutil
 import tempfile
@@ -27,16 +28,19 @@ def _make_repo(files: dict) -> str:
 
 # ─── Case 1: top-level function a() calls b() ────────────────────────────────
 
+
 def test_simple_caller_callee():
-    repo = _make_repo({
-        "foo.py": """
+    repo = _make_repo(
+        {
+            "foo.py": """
             def b():
                 pass
 
             def a():
                 b()
         """
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # callee of a -> b
@@ -54,9 +58,11 @@ def test_simple_caller_callee():
 
 # ─── Case 2: class method self.b() ───────────────────────────────────────────
 
+
 def test_class_method_self_call():
-    repo = _make_repo({
-        "bar.py": """
+    repo = _make_repo(
+        {
+            "bar.py": """
             class X:
                 def a(self):
                     self.b()
@@ -64,7 +70,8 @@ def test_class_method_self_call():
                 def b(self):
                     pass
         """
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         callees = idx.get_callees("X.a")
@@ -80,10 +87,12 @@ def test_class_method_self_call():
 
 # ─── Case 2b: nested function calls belong to the nested caller only (B1) ───
 
+
 def test_nested_function_calls_not_misattributed():
     """B1: calls inside a nested def are NOT attributed to the enclosing fn."""
-    repo = _make_repo({
-        "nested.py": """
+    repo = _make_repo(
+        {
+            "nested.py": """
             def helper():
                 pass
 
@@ -95,26 +104,22 @@ def test_nested_function_calls_not_misattributed():
             def sibling():
                 helper()
         """
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # outer calls only inner() — helper() lives inside inner's body
         outer_callees = idx.get_callees("outer")
         outer_syms = [e.callee_symbol for e in outer_callees]
-        assert outer_syms == ["inner"], (
-            f"Expected outer -> [inner] only, got {outer_syms}"
-        )
+        assert outer_syms == ["inner"], f"Expected outer -> [inner] only, got {outer_syms}"
         # B1-2: caller_line points at the actual call site, not the def line
         assert outer_callees[0].caller_line == 8, (
-            f"Expected caller_line=8 (inner() call site), "
-            f"got {outer_callees[0].caller_line}"
+            f"Expected caller_line=8 (inner() call site), got {outer_callees[0].caller_line}"
         )
         # inner (nested) is its own caller and calls helper()
         inner_callees = idx.get_callees("inner")
         inner_syms = [e.callee_symbol for e in inner_callees]
-        assert inner_syms == ["helper"], (
-            f"Expected inner -> [helper] only, got {inner_syms}"
-        )
+        assert inner_syms == ["helper"], f"Expected inner -> [helper] only, got {inner_syms}"
         assert inner_callees[0].caller_line == 7
         # helper's callers: inner and sibling — never outer
         helper_callers = sorted(e.caller_symbol for e in idx.get_callers("helper"))
@@ -127,16 +132,19 @@ def test_nested_function_calls_not_misattributed():
 
 # ─── Case 3: get_related_symbols structure ───────────────────────────────────
 
+
 def test_get_related_symbols_structure():
-    repo = _make_repo({
-        "svc.py": """
+    repo = _make_repo(
+        {
+            "svc.py": """
             def helper():
                 pass
 
             def main():
                 helper()
         """
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         result = idx.get_related_symbols("main")
@@ -153,19 +161,22 @@ def test_get_related_symbols_structure():
 
 # ─── Case 4: callee_file resolved cross-file ─────────────────────────────────
 
+
 def test_cross_file_resolution():
-    repo = _make_repo({
-        "utils.py": """
+    repo = _make_repo(
+        {
+            "utils.py": """
             def util_fn():
                 pass
         """,
-        "main.py": """
+            "main.py": """
             from utils import util_fn
 
             def caller():
                 util_fn()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         callees = idx.get_callees("caller")
@@ -175,24 +186,25 @@ def test_cross_file_resolution():
         # callee_file should be resolved to utils.py
         for e in callees:
             if e.callee_symbol == "util_fn":
-                assert e.callee_file == "utils.py", (
-                    f"Expected callee_file='utils.py', got {e.callee_file!r}"
-                )
+                assert e.callee_file == "utils.py", f"Expected callee_file='utils.py', got {e.callee_file!r}"
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
 
 # ─── Case 5: invalidate clears index ─────────────────────────────────────────
 
+
 def test_invalidate():
-    repo = _make_repo({
-        "a.py": """
+    repo = _make_repo(
+        {
+            "a.py": """
             def foo():
                 bar()
             def bar():
                 pass
         """
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         assert len(idx.get_callees("foo")) > 0
@@ -208,11 +220,14 @@ def test_invalidate():
 
 # ─── Case 7: _walk_py_files skips vendored/hidden dirs ──────────────────────
 
+
 def test_walk_py_files_skips_hidden_dirs():
-    repo = _make_repo({
-        ".venv/lib/site-packages/pkg.py": "x = 1",
-        "app/module.py": "y = 2",
-    })
+    repo = _make_repo(
+        {
+            ".venv/lib/site-packages/pkg.py": "x = 1",
+            "app/module.py": "y = 2",
+        }
+    )
     try:
         files = _walk_py_files(Path(repo))
         names = [f.name for f in files]
@@ -224,11 +239,14 @@ def test_walk_py_files_skips_hidden_dirs():
 
 # ─── Case 8: _walk_ts_js_files skips vendored/hidden dirs ───────────────────
 
+
 def test_walk_ts_js_files_skips_hidden_dirs():
-    repo = _make_repo({
-        "node_modules/lib/index.js": "var x = 1;",
-        "src/app.ts": "const y = 2;",
-    })
+    repo = _make_repo(
+        {
+            "node_modules/lib/index.js": "var x = 1;",
+            "src/app.ts": "const y = 2;",
+        }
+    )
     try:
         files = _walk_ts_js_files(Path(repo))
         names = [f.name for f in files]
@@ -240,11 +258,14 @@ def test_walk_ts_js_files_skips_hidden_dirs():
 
 # ─── Case 9: SyntaxError in source file is skipped silently ─────────────────
 
+
 def test_syntax_error_skipped():
-    repo = _make_repo({
-        "bad.py": "def foo( bar",  # SyntaxError
-        "good.py": "def ok(): pass",
-    })
+    repo = _make_repo(
+        {
+            "bad.py": "def foo( bar",  # SyntaxError
+            "good.py": "def ok(): pass",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # build() should not crash
@@ -256,17 +277,20 @@ def test_syntax_error_skipped():
 
 # ─── Case 10: suffix fallback in get_callees ────────────────────────────────
 
+
 def test_get_callees_suffix_fallback():
     """Bare caller name matches qualified index key (e.g. 'a' → 'X.a')."""
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class X:
                 def b(self):
                     pass
                 def a(self):
                     self.b()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # Direct key "a" doesn't exist in _forward; suffix fallback matches "X.a"
@@ -278,17 +302,20 @@ def test_get_callees_suffix_fallback():
 
 # ─── Case 11: suffix fallback in get_callers ────────────────────────────────
 
+
 def test_get_callers_suffix_fallback():
     """Bare callee name matches qualified reverse index key (e.g. 'helper' → 'X.helper')."""
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class X:
                 def helper(self):
                     pass
                 def caller(self):
                     self.helper()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # "X.helper" is in _reverse (as callee); "helper" bare should match via suffix
@@ -300,6 +327,7 @@ def test_get_callers_suffix_fallback():
 
 # ─── Case 11b: M1 — bare-name reverse index dedups shared symbols ──────────
 
+
 def test_bare_index_dedups_shared_symbols():
     """M1: a symbol that is BOTH caller and callee appears once in _bare_index.
 
@@ -307,8 +335,9 @@ def test_bare_index_dedups_shared_symbols():
     without dedup, so a method that both calls and is called (X.a below) was
     registered twice -> suffix-fallback lookups returned doubled edges.
     """
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class X:
                 def a(self):      # caller of b, callee of c
                     self.b()
@@ -319,23 +348,20 @@ def test_bare_index_dedups_shared_symbols():
                 def c(self):
                     self.a()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()
-        assert idx._bare_index["a"] == ["X.a"], (
-            f"Expected bare index ['X.a'] (deduped), got {idx._bare_index['a']}"
-        )
+        assert idx._bare_index["a"] == ["X.a"], f"Expected bare index ['X.a'] (deduped), got {idx._bare_index['a']}"
         # suffix fallback on "a" must not double edges
         callees = idx.get_callees("a")
         assert [(e.callee_symbol, e.caller_symbol) for e in callees] == [("X.b", "X.a")], (
-            f"Expected single callee edge, got "
-            f"{[(e.callee_symbol, e.caller_symbol) for e in callees]}"
+            f"Expected single callee edge, got {[(e.callee_symbol, e.caller_symbol) for e in callees]}"
         )
         callers = idx.get_callers("a")
         assert [(e.caller_symbol, e.callee_symbol) for e in callers] == [("X.c", "X.a")], (
-            f"Expected single caller edge, got "
-            f"{[(e.caller_symbol, e.callee_symbol) for e in callers]}"
+            f"Expected single caller edge, got {[(e.caller_symbol, e.callee_symbol) for e in callers]}"
         )
     finally:
         shutil.rmtree(repo, ignore_errors=True)
@@ -343,16 +369,19 @@ def test_bare_index_dedups_shared_symbols():
 
 # ─── Case 12: get_callees with file_path filter ─────────────────────────────
 
+
 def test_get_callees_file_path_filter():
     """file_path parameter in get_callees filters by caller_file."""
-    repo = _make_repo({
-        "a.py": """
+    repo = _make_repo(
+        {
+            "a.py": """
             def helper():
                 pass
             def caller_a():
                 helper()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # callees of "caller_a" have caller_file="a.py"
@@ -365,19 +394,22 @@ def test_get_callees_file_path_filter():
 
 # ─── Case 13: get_callers with file_path filter ─────────────────────────────
 
+
 def test_get_callers_file_path_filter():
     """file_path parameter in get_callers filters by callee_file."""
-    repo = _make_repo({
-        "helper.py": """
+    repo = _make_repo(
+        {
+            "helper.py": """
             def helper():
                 pass
         """,
-        "main.py": """
+            "main.py": """
             from helper import helper
             def caller():
                 helper()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # callers of "helper" have callee_file="helper.py" (after _resolve_callees)
@@ -390,10 +422,12 @@ def test_get_callers_file_path_filter():
 
 # ─── Case 14: get_related_symbols with callers + depth=2 ────────────────────
 
+
 def test_get_related_symbols_depth2():
     """depth=2 covers extra_callee expansion and caller/callee file scoring."""
-    repo = _make_repo({
-        "svc.py": """
+    repo = _make_repo(
+        {
+            "svc.py": """
             def deep_leaf():
                 pass
             def leaf():
@@ -403,7 +437,8 @@ def test_get_related_symbols_depth2():
             def top():
                 middle()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         # "middle" has both callers (top) and callees (leaf → deep_leaf)
@@ -420,14 +455,17 @@ def test_get_related_symbols_depth2():
 
 # ─── Case 15: non-standard call forms are silently skipped ──────────────────
 
+
 def test_non_standard_call_forms():
     """Calls with non-Name/non-Attribute func should not crash the indexer."""
-    repo = _make_repo({
-        "expr.py": """
+    repo = _make_repo(
+        {
+            "expr.py": """
             def f():
                 (lambda: 42)()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         result = idx.get_related_symbols("f")
@@ -438,16 +476,19 @@ def test_non_standard_call_forms():
 
 # ─── Case 16: attribute call where base of chain is not Name ────────────────
 
+
 def test_attribute_chain_non_name_base():
     """foo().bar() has an Attribute chain ending in Call, not Name → L387."""
-    repo = _make_repo({
-        "expr.py": """
+    repo = _make_repo(
+        {
+            "expr.py": """
             def factory():
                 return {}
             def f():
                 factory().get("key")
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         result = idx.get_related_symbols("f")
@@ -458,10 +499,12 @@ def test_attribute_chain_non_name_base():
 
 # ─── Case 17: obj.method() call (non-self attribute base) → L403 ────────────
 
+
 def test_obj_method_call():
     """obj.method() should create a CallEdge with lower confidence (0.5)."""
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class Helper:
                 def do_it(self):
                     pass
@@ -469,7 +512,8 @@ def test_obj_method_call():
                 h = Helper()
                 h.do_it()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         callees = idx.get_callees("f")
@@ -482,9 +526,11 @@ def test_obj_method_call():
 
 # ─── Case 18: Exception during file indexing (non-SyntaxError) → L114-115 ───
 
+
 def test_index_file_os_error(monkeypatch):
     """An OSError during _index_file is caught and logged."""
     import external_llm.agent.call_graph as cg
+
     original_index = cg.CallGraphIndexer._index_file
 
     def broken_index(self, path):
@@ -493,10 +539,12 @@ def test_index_file_os_error(monkeypatch):
         return original_index(self, path)
 
     monkeypatch.setattr(cg.CallGraphIndexer, "_index_file", broken_index)
-    repo = _make_repo({
-        "broken.py": "x = 1",
-        "good.py": "def ok(): pass",
-    })
+    repo = _make_repo(
+        {
+            "broken.py": "x = 1",
+            "good.py": "def ok(): pass",
+        }
+    )
     try:
         idx = cg.CallGraphIndexer(repo)
         idx.build()  # Should not raise — OSError is caught by generic except
@@ -506,6 +554,7 @@ def test_index_file_os_error(monkeypatch):
 
 
 # ─── Case 19: MULTILANG_CALLGRAPH import failure → L121-122 ─────────────────
+
 
 def test_ml_cg_import_failure():
     """When config.MULTILANG_CALLGRAPH is absent, _ML_CG defaults to False."""
@@ -534,6 +583,7 @@ def test_ml_cg_import_failure():
 
 # ─── Case 16: unknown symbol returns empty gracefully ───────────────────────
 
+
 def test_unknown_symbol_empty():
     repo = _make_repo({"empty.py": "x = 1\n"})
     try:
@@ -550,19 +600,22 @@ def test_unknown_symbol_empty():
 
 # ─── Case 20: TS file indexing via build() ─────────────────────────────────
 
+
 def test_ts_file_indexing():
     """build() indexes .ts files when MULTILANG_CALLGRAPH is True."""
-    repo = _make_repo({
-        "util.ts": """
+    repo = _make_repo(
+        {
+            "util.ts": """
             function greet(name: string): string {
                 return "Hello " + name;
             }
         """,
-        "main.py": """
+            "main.py": """
             def f():
                 pass
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()
@@ -573,10 +626,12 @@ def test_ts_file_indexing():
 
 # ─── Case 21: TS file with class methods ────────────────────────────────────
 
+
 def test_ts_class_method_indexing():
     """TS class methods are registered as ClassName.method in _nodes."""
-    repo = _make_repo({
-        "app.ts": """
+    repo = _make_repo(
+        {
+            "app.ts": """
             class Calculator {
                 add(x: number, y: number): number {
                     return x + y;
@@ -586,8 +641,9 @@ def test_ts_class_method_indexing():
                 }
             }
         """,
-        "main.py": "x = 1",
-    })
+            "main.py": "x = 1",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()
@@ -599,10 +655,12 @@ def test_ts_class_method_indexing():
 
 # ─── Case 22: TS call edges ────────────────────────────────────────────────
 
+
 def test_ts_call_edge_indexing():
     """TS call sites create forward/reverse edges."""
-    repo = _make_repo({
-        "app.ts": """
+    repo = _make_repo(
+        {
+            "app.ts": """
             function helper(): void {
                 // nothing
             }
@@ -610,8 +668,9 @@ def test_ts_call_edge_indexing():
                 helper();
             }
         """,
-        "main.py": "x = 1",
-    })
+            "main.py": "x = 1",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()
@@ -624,6 +683,7 @@ def test_ts_call_edge_indexing():
 
 
 # ─── Case 23: _rel ValueError path ──────────────────────────────────────────
+
 
 def test_rel_value_error():
     """When relative_to raises ValueError, _rel returns the raw path str."""
@@ -650,17 +710,21 @@ def test_rel_value_error():
 
 # ─── Case 24: file walk limit break (patched) ───────────────────────────────
 
+
 def test_walk_py_files_limit():
     """When MAX_PY_FILES is reached, walker breaks and returns."""
     import external_llm.agent.call_graph as cg
+
     old_limit = cg._MAX_PY_FILES
     try:
         cg._MAX_PY_FILES = 2
-        repo = _make_repo({
-            "a.py": "x = 1",
-            "b.py": "y = 2",
-            "c.py": "z = 3",
-        })
+        repo = _make_repo(
+            {
+                "a.py": "x = 1",
+                "b.py": "y = 2",
+                "c.py": "z = 3",
+            }
+        )
         try:
             files = cg._walk_py_files(Path(repo))
             assert len(files) == 2, f"Expected 2 files, got {len(files)}"
@@ -672,17 +736,21 @@ def test_walk_py_files_limit():
 
 # ─── Case 25: TS file walk limit ────────────────────────────────────────────
 
+
 def test_walk_ts_js_files_limit():
     """When MAX_TS_FILES is reached, walker returns early."""
     import external_llm.agent.call_graph as cg
+
     old_limit = cg._MAX_TS_FILES
     try:
         cg._MAX_TS_FILES = 2
-        repo = _make_repo({
-            "a.ts": "let x = 1;",
-            "b.ts": "let y = 2;",
-            "c.ts": "let z = 3;",
-        })
+        repo = _make_repo(
+            {
+                "a.ts": "let x = 1;",
+                "b.ts": "let y = 2;",
+                "c.ts": "let z = 3;",
+            }
+        )
         try:
             files = cg._walk_ts_js_files(Path(repo))
             assert len(files) == 2, f"Expected 2 files, got {len(files)}"
@@ -693,6 +761,7 @@ def test_walk_ts_js_files_limit():
 
 
 # ─── Case 26: TS file indexing exception → L129-130 ────────────────────────
+
 
 def test_ts_file_indexing_exception():
     """Exception during TS file indexing is caught without crashing build()."""
@@ -706,14 +775,14 @@ def test_ts_file_indexing_exception():
         return original_index_ts(self, path)
 
     original_index_ts = cg.CallGraphIndexer._index_ts_file
-    with unittest.mock.patch.object(
-        cg.CallGraphIndexer, "_index_ts_file", broken_index_ts
-    ):
-        repo = _make_repo({
-            "broken.ts": "let x = 1;",
-            "good.ts": "function ok(): void { return; }",
-            "main.py": "def f(): pass",
-        })
+    with unittest.mock.patch.object(cg.CallGraphIndexer, "_index_ts_file", broken_index_ts):
+        repo = _make_repo(
+            {
+                "broken.ts": "let x = 1;",
+                "good.ts": "function ok(): void { return; }",
+                "main.py": "def f(): pass",
+            }
+        )
         try:
             idx = cg.CallGraphIndexer(repo)
             idx.build()  # Should not raise — exception is caught
@@ -725,6 +794,7 @@ def test_ts_file_indexing_exception():
 
 
 # ─── Case 27: TS call_site with empty caller/callee → L449 ──────────────────
+
 
 def test_ts_call_site_empty_caller():
     """Call sites with empty caller or callee are skipped (continue)."""
@@ -753,13 +823,14 @@ def test_ts_call_site_empty_caller():
     ts_module.call_sites = [empty_caller, normal_cs]
 
     from external_llm.editor.semantic.ts_semantic_tracer import TSSemanticTracer
-    with unittest.mock.patch.object(
-        TSSemanticTracer, "analyze_core", return_value=ts_module
-    ):
-        repo = _make_repo({
-            "app.ts": "function caller_fn(): void { target_func(); }",
-            "main.py": "x = 1",
-        })
+
+    with unittest.mock.patch.object(TSSemanticTracer, "analyze_core", return_value=ts_module):
+        repo = _make_repo(
+            {
+                "app.ts": "function caller_fn(): void { target_func(); }",
+                "main.py": "x = 1",
+            }
+        )
         try:
             idx = CallGraphIndexer(repo)
             idx.build()
@@ -773,17 +844,20 @@ def test_ts_call_site_empty_caller():
 
 # ─── Case 28: bare-name reverse index (M1) ───────────────────────────────────
 
+
 def test_bare_name_index_supports_suffix_lookup():
     """M1: suffix fallback resolves via the build-time bare-name index."""
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class X:
                 def b(self):
                     pass
                 def a(self):
                     self.b()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()  # explicit — the index is lazy (first access triggers build)
@@ -799,15 +873,17 @@ def test_bare_name_index_supports_suffix_lookup():
 
 def test_bare_name_index_rebuilt_after_invalidate():
     """M1: invalidate clears the bare index; the next access rebuilds it."""
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class X:
                 def b(self):
                     pass
                 def a(self):
                     self.b()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         assert len(idx.get_callees("a")) > 0  # builds + populates bare index
@@ -822,20 +898,25 @@ def test_bare_name_index_rebuilt_after_invalidate():
 
 # ─── invalidate_files(): incremental re-indexing after writes ───────────────
 
+
 def test_invalidate_files_reindexes_changed_file():
-    repo = _make_repo({
-        "a.py": "def foo(): pass\n",
-        "b.py": "def bar(): foo()\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\n",
+            "b.py": "def bar(): foo()\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         assert "foo" in {e.callee_symbol for e in idx.get_callees("bar")}
         # Edit b.py: bar() now also calls a NEW function
-        (Path(repo) / "b.py").write_text(textwrap.dedent("""
+        (Path(repo) / "b.py").write_text(
+            textwrap.dedent("""
             def bar():
                 foo()
                 baz()
-        """))
+        """)
+        )
         idx.invalidate_files(["b.py"])
         callees = {e.callee_symbol for e in idx.get_callees("bar")}
         assert "baz" in callees
@@ -849,10 +930,12 @@ def test_invalidate_files_reindexes_changed_file():
 
 
 def test_invalidate_files_removes_deleted_file():
-    repo = _make_repo({
-        "a.py": "def foo(): pass\n",
-        "b.py": "def bar(): foo()\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\n",
+            "b.py": "def bar(): foo()\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         assert idx.get_callers("foo")
@@ -862,8 +945,8 @@ def test_invalidate_files_removes_deleted_file():
         callers = idx.get_callers("foo")
         assert len(callers) == 1
         assert callers[0].caller_symbol == "bar"
-        assert "foo" not in idx._nodes        # node gone
-        assert "bar" in idx._nodes            # b.py untouched
+        assert "foo" not in idx._nodes  # node gone
+        assert "bar" in idx._nodes  # b.py untouched
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
@@ -872,10 +955,12 @@ def test_invalidate_files_reassigns_shadowed_node():
     # Two files define the same symbol; the lexicographically first file
     # (a.py) owns the node.  Deleting a.py must move ownership to b.py —
     # matching what a full rebuild would produce.
-    repo = _make_repo({
-        "a.py": "def dup(): pass\n",
-        "b.py": "def dup(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def dup(): pass\n",
+            "b.py": "def dup(): pass\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.get_callers("dup")  # lazy build
@@ -897,11 +982,13 @@ def test_invalidate_files_reassignment_follows_walk_order_not_lexicographic():
     # dir's filenames first, then descends). b.py and c.py are therefore
     # visited before a/x.py despite "a/x.py" < "b.py". After deleting the
     # owner (b.py) the next full-rebuild winner is c.py, not a/x.py.
-    repo = _make_repo({
-        "a/x.py": "def dup(): pass\n",
-        "b.py": "def dup(): pass\n",
-        "c.py": "def dup(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a/x.py": "def dup(): pass\n",
+            "b.py": "def dup(): pass\n",
+            "c.py": "def dup(): pass\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.get_callers("dup")  # lazy build
@@ -909,8 +996,7 @@ def test_invalidate_files_reassignment_follows_walk_order_not_lexicographic():
         (Path(repo) / "b.py").unlink()
         idx.invalidate_files(["b.py"])
         assert idx._nodes["dup"].file == "c.py", (
-            "reassignment must mirror walk order (root c.py before a/x.py), "
-            f"got {idx._nodes['dup'].file!r}"
+            f"reassignment must mirror walk order (root c.py before a/x.py), got {idx._nodes['dup'].file!r}"
         )
     finally:
         shutil.rmtree(repo, ignore_errors=True)
@@ -922,10 +1008,12 @@ def test_invalidate_files_owner_reclaims_when_redefined():
     # b.py), editing a.py BACK never reclaimed — incremental ownership
     # diverged from a full rebuild forever after. The rank-based claim must
     # restore a.py (earlier in walk order) on re-index.
-    repo = _make_repo({
-        "a.py": "def dup(): pass\n",
-        "b.py": "def dup(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def dup(): pass\n",
+            "b.py": "def dup(): pass\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.get_callers("dup")  # lazy build
@@ -951,20 +1039,24 @@ def test_invalidate_files_owner_reclaims_when_redefined():
 
 
 def test_invalidate_files_keeps_unrelated_edges_intact():
-    repo = _make_repo({
-        "a.py": "def foo(): pass\ndef alpha(): foo()\n",
-        "b.py": "def bar(): foo()\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\ndef alpha(): foo()\n",
+            "b.py": "def bar(): foo()\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.get_callers("foo")  # lazy build
         alpha_before = idx._forward["alpha"][0]
         foo_node_before = idx._nodes["foo"]
-        (Path(repo) / "b.py").write_text(textwrap.dedent("""
+        (Path(repo) / "b.py").write_text(
+            textwrap.dedent("""
             def bar():
                 foo()
                 extra()
-        """))
+        """)
+        )
         idx.invalidate_files(["b.py"])
         # a.py's edge and node are the SAME objects — no rebuild touched them
         assert idx._forward["alpha"][0] is alpha_before
@@ -977,10 +1069,12 @@ def test_invalidate_files_keeps_unrelated_edges_intact():
 def test_invalidate_files_identity_removal_keeps_equal_edges():
     # Both files call foo() — value-equal but distinct edge objects; removing
     # one file must not remove the other's edge (identity-based removal).
-    repo = _make_repo({
-        "a.py": "def foo(): pass\ndef alpha(): foo()\n",
-        "b.py": "def beta(): foo()\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\ndef alpha(): foo()\n",
+            "b.py": "def beta(): foo()\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.get_callers("foo")  # lazy build
@@ -1008,17 +1102,21 @@ def test_invalidate_files_noop_when_not_built():
 
 
 def test_invalidate_files_handles_leading_slash_and_absolute_root():
-    repo = _make_repo({
-        "a.py": "def foo(): pass\ndef alpha(): foo()\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\ndef alpha(): foo()\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.get_callers("foo")  # lazy build
-        (Path(repo) / "a.py").write_text(textwrap.dedent("""
+        (Path(repo) / "a.py").write_text(
+            textwrap.dedent("""
             def foo(): pass
             def alpha(): foo()
             def gamma(): pass
-        """))
+        """)
+        )
         idx.invalidate_files(["/a.py"])  # facade-style leading slash
         assert "gamma" in idx._nodes
     finally:
@@ -1027,24 +1125,30 @@ def test_invalidate_files_handles_leading_slash_and_absolute_root():
 
 # ─── Property: incremental == full rebuild ───────────────────────────────────
 
+
 def _cg_snapshot(idx):
     """Field-level snapshot of everything ownership/invalidation touches."""
     nodes = {s: (n.file, n.line, n.kind) for s, n in sorted(idx._nodes.items())}
     fwd = {s: {_edge_key(e) for e in es} for s, es in idx._forward.items()}
     rev = {s: {_edge_key(e) for e in es} for s, es in idx._reverse.items()}
     file_nodes = {rel: sorted(syms) for rel, syms in sorted(idx._file_nodes.items())}
-    def_sources = {
-        s: dict(sorted(srcs.items())) for s, srcs in sorted(idx._def_sources.items())
-    }
+    def_sources = {s: dict(sorted(srcs.items())) for s, srcs in sorted(idx._def_sources.items())}
     return nodes, fwd, rev, file_nodes, def_sources
 
 
 def _edge_key(e):
     """Hashable full-field key (call_args is a list — astuple would not do)."""
     return (
-        e.caller_symbol, e.caller_file, e.caller_line,
-        e.callee_symbol, e.callee_display, e.callee_file, e.callee_line,
-        e.confidence, str(e.edge_kind), tuple(e.call_args),
+        e.caller_symbol,
+        e.caller_file,
+        e.caller_line,
+        e.callee_symbol,
+        e.callee_display,
+        e.callee_file,
+        e.callee_line,
+        e.confidence,
+        str(e.edge_kind),
+        tuple(e.call_args),
     )
 
 
@@ -1122,11 +1226,13 @@ def test_invalidate_files_skips_walk_pruned_directory():
     incremental path must re-apply the SAME pruning or it indexes files a
     fresh build() would drop -- the graph diverges from a clean rebuild.
     """
-    repo = _make_repo({
-        "a.py": "def a():\n    b()\n",
-        "b.py": "def b():\n    pass\n",
-        "node_modules/pkg/v.py": "def vendored():\n    pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def a():\n    b()\n",
+            "b.py": "def b():\n    pass\n",
+            "node_modules/pkg/v.py": "def vendored():\n    pass\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()
@@ -1134,9 +1240,7 @@ def test_invalidate_files_skips_walk_pruned_directory():
         assert before == ["a", "b"], before
 
         idx.invalidate_files(["node_modules/pkg/v.py"])
-        assert sorted(idx._nodes) == before, (
-            "incremental path injected a pruned-dir symbol"
-        )
+        assert sorted(idx._nodes) == before, "incremental path injected a pruned-dir symbol"
 
         idx.build()
         assert sorted(idx._nodes) == before
@@ -1145,6 +1249,7 @@ def test_invalidate_files_skips_walk_pruned_directory():
 
 
 # ─── A2 (2026-08-12): single-walk traversal parity ──────────────────────────
+
 
 def test_single_walk_parity_with_reference_traversal():
     """The merged single-BFS-pass ``_index_file`` (A2) must produce exactly
@@ -1196,15 +1301,7 @@ def test_single_walk_parity_with_reference_traversal():
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 cn = class_names.get(id(node))
                 symbol = f"{cn}.{node.name}" if cn else node.name
-                kind = (
-                    "method"
-                    if cn
-                    else (
-                        "async_function"
-                        if isinstance(node, ast.AsyncFunctionDef)
-                        else "function"
-                    )
-                )
+                kind = "method" if cn else ("async_function" if isinstance(node, ast.AsyncFunctionDef) else "function")
                 ref_nodes[symbol] = ("sample.py", node.lineno, kind)
 
         ref_edges: dict[str, list[str]] = {}
@@ -1215,21 +1312,13 @@ def test_single_walk_parity_with_reference_traversal():
             caller = f"{cn}.{node.name}" if cn else node.name
             seen: set[str] = set()
             for child in _iter_calls(node):
-                edge = idx._parse_call(
-                    child, caller, "sample.py", child.lineno, cn
-                )
+                edge = idx._parse_call(child, caller, "sample.py", child.lineno, cn)
                 if edge and edge.callee_display not in seen:
                     seen.add(edge.callee_display)
                     ref_edges.setdefault(caller, []).append(edge.callee_display)
 
-        got_nodes = {
-            sym: (n.file, n.line, n.kind)
-            for sym, n in idx._nodes.items()
-        }
-        got_edges = {
-            sym: [e.callee_display for e in edges]
-            for sym, edges in idx._forward.items()
-        }
+        got_nodes = {sym: (n.file, n.line, n.kind) for sym, n in idx._nodes.items()}
+        got_edges = {sym: [e.callee_display for e in edges] for sym, edges in idx._forward.items()}
         assert got_nodes == ref_nodes, (got_nodes, ref_nodes)
         assert got_edges == ref_edges, (got_edges, ref_edges)
     finally:
@@ -1238,14 +1327,16 @@ def test_single_walk_parity_with_reference_traversal():
 
 # ─── A4 (2026-08-12): incremental invalidation parity ────────────────────────
 
+
 def test_invalidate_files_parity_with_full_rebuild():
     """A4: after a mixed edit/delete/add batch, the incrementally updated
     graph must equal a fresh build() over the same tree — node ownership,
     forward/reverse edges (including resolved callee_file/callee_line) and
     the bare-name suffix index.
     """
-    repo = _make_repo({
-        "pkg/a.py": """
+    repo = _make_repo(
+        {
+            "pkg/a.py": """
             def shared():
                 pass
 
@@ -1253,34 +1344,39 @@ def test_invalidate_files_parity_with_full_rebuild():
                 shared()
                 other()
         """,
-        "pkg/b.py": """
+            "pkg/b.py": """
             def other():
                 pass
 
             def from_b():
                 other()
         """,
-    })
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()
 
         # Edit a.py: from_a disappears, new_a appears (calls shared + from_b).
-        (Path(repo) / "pkg/a.py").write_text(textwrap.dedent("""
+        (Path(repo) / "pkg/a.py").write_text(
+            textwrap.dedent("""
             def shared():
                 pass
 
             def new_a():
                 shared()
                 from_b()
-        """))
+        """)
+        )
         # Delete b.py: other/from_b vanish; new_a -> from_b must clear.
         (Path(repo) / "pkg/b.py").unlink()
         # Add c.py.
-        (Path(repo) / "pkg/c.py").write_text(textwrap.dedent("""
+        (Path(repo) / "pkg/c.py").write_text(
+            textwrap.dedent("""
             def from_c():
                 shared()
-        """))
+        """)
+        )
         # The shared walkers cache per-root for _WALK_CACHE_TTL; a fresh
         # indexer must re-walk to see c.py (otherwise ref misses it).
         invalidate_walk_caches()
@@ -1295,7 +1391,8 @@ def test_invalidate_files_parity_with_full_rebuild():
         assert idx._forward == ref._forward, (idx._forward, ref._forward)
         assert idx._reverse == ref._reverse, (idx._reverse, ref._reverse)
         assert idx._bare_index == ref._bare_index, (
-            idx._bare_index, ref._bare_index,
+            idx._bare_index,
+            ref._bare_index,
         )
         # Spot-check the resolved callee pointers the incremental path is
         # responsible for updating: shared's edges point at pkg/a.py; the
@@ -1313,10 +1410,12 @@ def test_invalidate_files_new_dir_recomputes_ranks_only_when_needed():
     """A4: invalidating a file inside an already-known directory must not
     recompute dir ranks, while a file in a brand-new directory must.
     """
-    repo = _make_repo({
-        "a.py": "def a():\n    pass\n",
-        "sub/b.py": "def b():\n    pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def a():\n    pass\n",
+            "sub/b.py": "def b():\n    pass\n",
+        }
+    )
     try:
         idx = CallGraphIndexer(repo)
         idx.build()

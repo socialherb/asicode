@@ -21,6 +21,7 @@ and failure-pattern analysis can measure the mechanism's effect.
 
 Run: pytest tests/unit/agent/test_write_tools_reread_retry.py -v
 """
+
 from __future__ import annotations
 
 import pytest
@@ -51,6 +52,7 @@ class _Harness(WriteToolsMixin):
 
     def _secure_path(self, path, *, confine=False):
         from pathlib import Path as _Path
+
         repo = _Path(self.repo_root).resolve()
         p = _Path(path)
         resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -70,6 +72,7 @@ def harness(tmp_path):
 
 
 # ── Auto re-read + bounded retry ────────────────────────────────────────────
+
 
 class TestRereadRetry:
     def test_retry_once_when_file_changed_under_us(self, harness, tmp_path):
@@ -97,11 +100,13 @@ class TestRereadRetry:
             return orig_apply(content, file_path, old_string, new_string, replace_all, scope)
 
         harness._apply_one_edit_text = _fake_apply
-        result = harness._tool_edit_text({
-            "file_path": "t.txt",
-            "old_string": "beta",
-            "new_string": "BETA",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.txt",
+                "old_string": "beta",
+                "new_string": "BETA",
+            }
+        )
 
         assert result.ok, result.error
         assert calls["n"] == 2, "exactly one retry after the forced failure"
@@ -124,11 +129,13 @@ class TestRereadRetry:
             return orig_apply(content, file_path, old_string, new_string, replace_all, scope)
 
         harness._apply_one_edit_text = _counting_apply
-        result = harness._tool_edit_text({
-            "file_path": "t.txt",
-            "old_string": "zzz",  # absent AND no near match
-            "new_string": "YYY",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.txt",
+                "old_string": "zzz",  # absent AND no near match
+                "new_string": "YYY",
+            }
+        )
 
         assert not result.ok
         assert calls["n"] == 1, "no retry when the file did not change"
@@ -163,11 +170,13 @@ class TestRereadRetry:
             return orig_apply(content, file_path, old_string, new_string, replace_all, scope)
 
         harness._apply_one_edit_text = _fake_apply
-        result = harness._tool_edit_text({
-            "file_path": "t.txt",
-            "old_string": "beta",
-            "new_string": "BETA",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.txt",
+                "old_string": "beta",
+                "new_string": "BETA",
+            }
+        )
 
         assert not result.ok
         assert calls["n"] == 2, "retry happened once; no second retry (depth-1 bound)"
@@ -191,11 +200,13 @@ class TestRereadRetry:
             }
 
         harness._apply_one_edit_text = _near_fail_apply
-        result = harness._tool_edit_text({
-            "file_path": "t.txt",
-            "old_string": "zzz",
-            "new_string": "YYY",
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.txt",
+                "old_string": "zzz",
+                "new_string": "YYY",
+            }
+        )
 
         assert not result.ok
         assert result.metadata.get("reread_snippet") is None
@@ -224,13 +235,15 @@ class TestRereadRetry:
             return orig_apply(content, file_path, old_string, new_string, replace_all, scope)
 
         harness._apply_one_edit_text = _fake_apply
-        result = harness._tool_edit_text({
-            "file_path": "t.txt",
-            "edits": [
-                {"old_string": "beta", "new_string": "BETA"},
-                {"old_string": "gamma", "new_string": "GAMMA"},
-            ],
-        })
+        result = harness._tool_edit_text(
+            {
+                "file_path": "t.txt",
+                "edits": [
+                    {"old_string": "beta", "new_string": "BETA"},
+                    {"old_string": "gamma", "new_string": "GAMMA"},
+                ],
+            }
+        )
 
         assert result.ok, result.error
         # First attempt fails (1 call), retry applies both edits (2 calls).
@@ -243,15 +256,14 @@ class TestRereadRetry:
 
 # ── apply_patch stale-target snippet (no auto-retry) ───────────────────────
 
+
 class TestPatchFailureSnippet:
     def test_snippet_attached_to_patch_failure(self, harness, tmp_path):
         """Failed apply_patch on a stale target gets the current file head."""
         target = tmp_path / "t.txt"
         target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
         patch_text = (
-            "diff --git a/t.txt b/t.txt\n"
-            "--- a/t.txt\n+++ b/t.txt\n"
-            "@@ -1,3 +1,3 @@\n alpha\n-beta\n+BBB\n gamma\n"
+            "diff --git a/t.txt b/t.txt\n--- a/t.txt\n+++ b/t.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BBB\n gamma\n"
         )
         result = harness._tool_apply_patch({"patch": patch_text, "path": "t.txt"})
         # The patch SHOULD apply cleanly here (context matches); the snippet

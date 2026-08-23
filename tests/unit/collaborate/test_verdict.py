@@ -1,6 +1,7 @@
 """
 Tests for CollaborationVerdict.
 """
+
 from __future__ import annotations
 
 from external_llm.repl.collaborate import CollaborationVerdict
@@ -101,6 +102,7 @@ class TestCollaborationVerdict:
         class _FakeResultMessage:
             def __init__(self):
                 self.result = {"status": "success", "summary": "via attr", "plan": {"steps": ["x"]}}
+
         v = CollaborationVerdict.from_result_message(_FakeResultMessage())
         assert v.status == "success"
         assert v.summary == "via attr"
@@ -113,9 +115,7 @@ class TestCollaborationVerdict:
         assert v.confidence == 0.5
 
     def test_from_result_message_metadata_non_dict_reset(self):
-        v = CollaborationVerdict.from_result_message(
-            {"status": "success", "metadata": "oops"}
-        )
+        v = CollaborationVerdict.from_result_message({"status": "success", "metadata": "oops"})
         assert v.metadata == {}
 
     def test_post_init_normalizes_confidence_on_direct_construction(self):

@@ -5,6 +5,7 @@ Pins the format contract: four mandatory sections (version/manifest/files/
 imported_names), fail-open load (None on any corruption or version mismatch),
 atomic best-effort save, and lossless data_to_json/data_from_json roundtrip.
 """
+
 import json
 import os
 import shutil
@@ -57,15 +58,18 @@ def test_load_corrupt_json_returns_none(cache_dir):
     assert sc.load(path) is None
 
 
-@pytest.mark.parametrize("mutate", [
-    lambda d: d.update({"version": 999}),
-    lambda d: d.pop("manifest"),
-    lambda d: d.update({"manifest": []}),          # wrong section type
-    lambda d: d.pop("files"),
-    lambda d: d.update({"files": []}),             # wrong section type
-    lambda d: d.pop("imported_names"),             # mandatory — empty cross-refs
-    lambda d: d.update({"imported_names": []}),    # would silently corrupt suppression
-])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.update({"version": 999}),
+        lambda d: d.pop("manifest"),
+        lambda d: d.update({"manifest": []}),  # wrong section type
+        lambda d: d.pop("files"),
+        lambda d: d.update({"files": []}),  # wrong section type
+        lambda d: d.pop("imported_names"),  # mandatory — empty cross-refs
+        lambda d: d.update({"imported_names": []}),  # would silently corrupt suppression
+    ],
+)
 def test_load_rejects_bad_shape(cache_dir, mutate):
     path = cache_dir / "cache.json"
     data = {"version": sc._current_schema_version(), **_sample_cache()}
@@ -88,6 +92,7 @@ def test_schema_folding_detects_payload_field_changes(cache_dir, monkeypatch):
     from dataclasses import fields
 
     from external_llm.graph.models import SymbolNode
+
     real_fields = fields(SymbolNode)
     _saved_version = sc._schema_version
     sc._schema_version = None  # drop the memo so the patch is observed
@@ -147,7 +152,8 @@ def test_save_tmp_name_is_pid_scoped(cache_dir, monkeypatch):
 def test_data_roundtrip_lossless(tmp_path):
     repo = tmp_path / "repo"
     (repo / "pkg").mkdir(parents=True)
-    (repo / "pkg" / "mod.py").write_text(textwrap.dedent("""
+    (repo / "pkg" / "mod.py").write_text(
+        textwrap.dedent("""
         import os
         from pkg import other
 
@@ -157,7 +163,8 @@ def test_data_roundtrip_lossless(tmp_path):
         class C:
             def m(self):
                 helper(1)
-    """))
+    """)
+    )
     (repo / "pkg" / "other.py").write_text("def other(): pass\n")
     from dataclasses import asdict
 
@@ -183,7 +190,7 @@ def test_save_output_byte_identical_to_plain_dumps(cache_dir):
     files = {
         f"m{i}.py": {
             "symbols": [{"name": f"s{i}", "qualname": f"m{i}.s{i}", "kind": "함수"}],
-            "calls": [{"caller": f"m{i}.s{i}", "callee": f"m{i-1}.s{i-1}", "caller_line": i}],
+            "calls": [{"caller": f"m{i}.s{i}", "callee": f"m{i - 1}.s{i - 1}", "caller_line": i}],
             "imports": [{"module": f"m{i}", "name": "한글", "alias": None}],
         }
         for i in range(n)
@@ -218,7 +225,7 @@ def test_save_streaming_peak_memory_bounded(cache_dir):
     for i in range(n):
         files[f"m{i}.py"] = {
             "symbols": [{"name": f"s{i}", "qualname": f"m{i}.s{i}", "kind": "function"}],
-            "calls": [{"caller": f"m{i}.s{i}", "callee": f"m{i-1}.s{i-1}", "caller_line": i}],
+            "calls": [{"caller": f"m{i}.s{i}", "callee": f"m{i - 1}.s{i - 1}", "caller_line": i}],
             "imports": [{"module": f"m{i}", "name": f"s{i}", "alias": None}],
         }
     imported_names = {f"m{i}.py": [f"n{i}"] for i in range(n)}

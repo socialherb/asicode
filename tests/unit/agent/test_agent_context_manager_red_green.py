@@ -3,6 +3,7 @@
 get_git_snapshot의 병렬 수집·예외 경로와 ContextManagerMixin의
 trim/compress/tier/git/session/continuation 브랜치를 고정한다.
 """
+
 from __future__ import annotations
 
 import time
@@ -99,8 +100,7 @@ class TestGetGitSnapshot:
     def test_log_without_tab_splits_to_empty_last_commit(self, monkeypatch):
         pool = _FakePool()
         monkeypatch.setattr("external_llm.agent._thread_pool.shared_pool", pool)
-        monkeypatch.setattr(acm, "_run_git_raw",
-                            lambda root, *args: "deadbeef" if args[0] == "log" else "")
+        monkeypatch.setattr(acm, "_run_git_raw", lambda root, *args: "deadbeef" if args[0] == "log" else "")
         snap = get_git_snapshot("/repo/b")
         assert snap["head_hash"] == "deadbeef"
         assert snap["last_commit"] == ""
@@ -122,8 +122,10 @@ class TestGetGitSnapshot:
     def test_concurrent_populate_recheck_hit(self, monkeypatch):
         def seed():
             key = acm.canonical_repo_key("/repo/e")
-            acm._git_cache[key] = (time.monotonic(), {"branch": "concurrent", "status": "",
-                                                      "head_hash": "h", "last_commit": ""})
+            acm._git_cache[key] = (
+                time.monotonic(),
+                {"branch": "concurrent", "status": "", "head_hash": "h", "last_commit": ""},
+            )
 
         pool = _FakePool(concurrent_seed=seed)
         monkeypatch.setattr("external_llm.agent._thread_pool.shared_pool", pool)
@@ -135,8 +137,7 @@ class TestGetGitSnapshot:
         pool = _FakePool()
         monkeypatch.setattr("external_llm.agent._thread_pool.shared_pool", pool)
         long_status = "M" * (acm.GIT_STATUS_MAX_CHARS + 100)
-        monkeypatch.setattr(acm, "_run_git_raw",
-                            lambda root, *args: long_status if args[0] == "status" else "")
+        monkeypatch.setattr(acm, "_run_git_raw", lambda root, *args: long_status if args[0] == "status" else "")
         snap = get_git_snapshot("/repo/f")
         assert len(snap["status"]) == acm.GIT_STATUS_MAX_CHARS
 
@@ -196,13 +197,11 @@ class TestResolveContextTier:
 
 class TestRunGit:
     def test_success_trimmed(self, monkeypatch):
-        monkeypatch.setattr(acm.subprocess, "run",
-                            lambda *a, **k: SimpleNamespace(stdout="  out\n", stderr=""))
+        monkeypatch.setattr(acm.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="  out\n", stderr=""))
         assert _CtxHost()._run_git("status") == "out"
 
     def test_max_lines_trims_output(self, monkeypatch):
-        monkeypatch.setattr(acm.subprocess, "run",
-                            lambda *a, **k: SimpleNamespace(stdout="l1\nl2\nl3\n", stderr=""))
+        monkeypatch.setattr(acm.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="l1\nl2\nl3\n", stderr=""))
         assert _CtxHost()._run_git("log", max_lines=2) == "l1\nl2"
 
     def test_exception_returns_empty(self, monkeypatch):
@@ -216,8 +215,7 @@ class TestRunGit:
 class TestBuildSessionContext:
     def test_tier_none_defaults_main_agent(self, monkeypatch):
         # None 기본값 → MAIN_AGENT → status 블록 실행("Working tree: clean" 라인 존재)
-        monkeypatch.setattr(acm, "get_git_snapshot",
-                            lambda root: {"branch": "main", "status": ""})
+        monkeypatch.setattr(acm, "get_git_snapshot", lambda root: {"branch": "main", "status": ""})
         h = _CtxHost()
         out = h._build_session_context()
         assert "Working tree: clean" in out
@@ -228,8 +226,7 @@ class TestBuildSessionContext:
         assert h._build_session_context(ContextTier.COMPACT) == "(session context unavailable)"
 
     def test_branch_and_status_rendered(self, monkeypatch):
-        monkeypatch.setattr(acm, "get_git_snapshot",
-                            lambda root: {"branch": "main", "status": " M a.py"})
+        monkeypatch.setattr(acm, "get_git_snapshot", lambda root: {"branch": "main", "status": " M a.py"})
         h = _CtxHost()
         out = h._build_session_context(ContextTier.MAIN_AGENT)
         assert "Working directory: /repo/host" in out
@@ -237,8 +234,7 @@ class TestBuildSessionContext:
         assert "Modified files (git status):\n M a.py" in out
 
     def test_compact_tier_omits_status(self, monkeypatch):
-        monkeypatch.setattr(acm, "get_git_snapshot",
-                            lambda root: {"branch": "main", "status": " M a.py"})
+        monkeypatch.setattr(acm, "get_git_snapshot", lambda root: {"branch": "main", "status": " M a.py"})
         h = _CtxHost()
         out = h._build_session_context(ContextTier.COMPACT)
         assert "Branch: main" in out
@@ -270,9 +266,9 @@ class TestBuildContinuationMessages:
                 "system_prompt": "SYS",
                 "conversation": [
                     {"role": "user", "content": "hi"},
-                    {"role": "assistant", "content": ""},   # 빈 턴 스킵
+                    {"role": "assistant", "content": ""},  # 빈 턴 스킵
                     {"role": "user", "content": "again"},
-                    {"role": "user"},                          # content 키 없음 → 빈 값
+                    {"role": "user"},  # content 키 없음 → 빈 값
                 ],
             },
             "impl now",
@@ -284,8 +280,7 @@ class TestBuildContinuationMessages:
 
     def test_default_role_user(self):
         h = _CtxHost()
-        msgs = h._build_continuation_messages(
-            {"system_prompt": "S", "conversation": [{"content": "x"}]}, "r")
+        msgs = h._build_continuation_messages({"system_prompt": "S", "conversation": [{"content": "x"}]}, "r")
         assert msgs[1].role == "user"
 
 

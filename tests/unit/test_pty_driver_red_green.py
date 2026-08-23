@@ -11,6 +11,7 @@ loop. ``dump()`` has pumped the master fd directly since the v0.2.24
 truncation flake (commit 0f64d74b). These tests pin ``wait_for`` to the same
 contract: it must observe bytes even when the drain thread is dead.
 """
+
 from __future__ import annotations
 
 import sys
@@ -39,9 +40,7 @@ def test_spawn_wait_for_reads_master_with_dead_drain(tmp_path):
     self-pumping wait_for the master fd is read directly and the marker is
     observed within one poll interval.
     """
-    sess = SpawnPtySession(
-        [sys.executable, "-u", "-c", _CHILD_SRC], cwd=str(tmp_path),
-        timeout=15)
+    sess = SpawnPtySession([sys.executable, "-u", "-c", _CHILD_SRC], cwd=str(tmp_path), timeout=15)
     try:
         sess.wait_for(b"ready", timeout=15)
         # Kill the drain thread: deterministic stand-in for the xdist load
@@ -95,9 +94,7 @@ def test_spawn_slave_cr_translation_cleared(tmp_path):
     state the harness actually delivers (RED on HEAD: icrnl=1 — the pty
     default).
     """
-    sess = SpawnPtySession(
-        [sys.executable, "-u", "-c", _TERMIOS_CHILD], cwd=str(tmp_path),
-        timeout=15)
+    sess = SpawnPtySession([sys.executable, "-u", "-c", _TERMIOS_CHILD], cwd=str(tmp_path), timeout=15)
     try:
         buf = sess.wait_for(b"FLAGS ", timeout=10)
         assert b"icrnl=0" in buf, f"ICRNL must be cleared: {buf[-120:]!r}"

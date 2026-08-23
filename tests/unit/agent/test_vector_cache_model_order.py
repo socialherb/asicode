@@ -15,6 +15,7 @@ index first used to cause three distinct bugs:
 These tests drive the REAL loader path (configured->fallback candidate loop)
 with a stub SentenceTransformer, so they run offline.
 """
+
 from __future__ import annotations
 
 import json
@@ -68,9 +69,7 @@ def _seed_marker(cache_dir, model_name, n_docs=3):
     index.add(np.ones((n_docs, 384), dtype="float32"))
     faiss.write_index(index, str(cache_dir / "faiss_index.bin"))
     (cache_dir / "metadata.json").write_text(
-        json.dumps(
-            {str(i): {"file_path": f"f{i}", "doc_id": f"d{i}"} for i in range(n_docs)}
-        ),
+        json.dumps({str(i): {"file_path": f"f{i}", "doc_id": f"d{i}"} for i in range(n_docs)}),
         encoding="utf-8",
     )
     (cache_dir / "embedding_model.txt").write_text(model_name, encoding="utf-8")
@@ -85,9 +84,7 @@ def test_offline_fallback_cache_reused_next_session(tmp_path):
     first = VectorCacheManager(str(tmp_path))
     first.add_document("src/a.py", "hello world")
     first._flush_if_dirty()
-    assert (tmp_path / "embedding_model.txt").read_text(encoding="utf-8") == (
-        "all-MiniLM-L6-v2"
-    )
+    assert (tmp_path / "embedding_model.txt").read_text(encoding="utf-8") == ("all-MiniLM-L6-v2")
 
     # Session 2: fresh process — no model loaded yet, configured name is the
     # failing one, marker on disk is the fallback's.

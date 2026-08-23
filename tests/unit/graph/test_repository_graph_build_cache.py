@@ -6,6 +6,7 @@ the cached ``extract_file`` payload.  These tests pin the two contracts:
 bit-for-bit identical graphs, and re-extraction exactly on (and only on)
 mtime/size changes.
 """
+
 import os
 import shutil
 import tempfile
@@ -58,9 +59,18 @@ def _graph_snapshot(graph):
     symbols = {}
     for uid, s in sorted(graph.symbols.items()):
         symbols[uid] = (
-            s.name, s.qualname, s.module, s.file_path, s.kind,
-            s.start_line, s.end_line, s.language, s.signature_hash,
-            s.docstring, s.signature, tuple(s.bases or ()),
+            s.name,
+            s.qualname,
+            s.module,
+            s.file_path,
+            s.kind,
+            s.start_line,
+            s.end_line,
+            s.language,
+            s.signature_hash,
+            s.docstring,
+            s.signature,
+            tuple(s.bases or ()),
         )
     edges = [(e.caller, e.callee, e.file_path, e.line) for e in graph.call_edges]
     imports = [(e.importer, e.imported, e.import_type) for e in graph.import_edges]
@@ -195,11 +205,14 @@ def test_py_files_stays_live_across_incremental_edits():
     graph.reparse_file(os.path.join(repo, "a.py"))
     assert graph.py_files == ["b.py", "a.py"]  # re-added once, no duplicate
 
+
 def test_rebuild_serves_unchanged_files_from_cache(monkeypatch):
-    repo = _make_repo({
-        "a.py": "def foo(): pass\n",
-        "b.py": "def bar(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\n",
+            "b.py": "def bar(): pass\n",
+        }
+    )
     try:
         RepositoryGraph(repo).build()  # cold build — parses everything
         calls = _count_extract_calls(monkeypatch)
@@ -213,9 +226,10 @@ def test_rebuild_serves_unchanged_files_from_cache(monkeypatch):
 
 
 def test_cached_rebuild_bit_for_bit_identical():
-    repo = _make_repo({
-        "pkg/__init__.py": "",
-        "pkg/mod.py": """
+    repo = _make_repo(
+        {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": """
             import os
             from pkg import other
 
@@ -226,8 +240,9 @@ def test_cached_rebuild_bit_for_bit_identical():
                 def m(self):
                     helper(1)
         """,
-        "pkg/other.py": "def other(): pass\n",
-    })
+            "pkg/other.py": "def other(): pass\n",
+        }
+    )
     try:
         g1 = RepositoryGraph(repo)
         g1.build()
@@ -242,11 +257,14 @@ def test_cached_rebuild_bit_for_bit_identical():
 
 # ── Invalidation (re-extraction) ─────────────────────────────────────────────
 
+
 def test_mtime_change_triggers_reextract(monkeypatch):
-    repo = _make_repo({
-        "a.py": "def foo(): pass\n",
-        "b.py": "def bar(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\n",
+            "b.py": "def bar(): pass\n",
+        }
+    )
     try:
         RepositoryGraph(repo).build()
         a = Path(repo) / "a.py"
@@ -277,10 +295,12 @@ def test_content_change_triggers_reextract(monkeypatch):
 
 
 def test_deleted_file_absent_on_cached_rebuild():
-    repo = _make_repo({
-        "a.py": "def foo(): pass\n",
-        "b.py": "def bar(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def foo(): pass\n",
+            "b.py": "def bar(): pass\n",
+        }
+    )
     try:
         RepositoryGraph(repo).build()
         (Path(repo) / "a.py").unlink()
@@ -293,6 +313,7 @@ def test_deleted_file_absent_on_cached_rebuild():
 
 
 # ── reparse_file / GC ────────────────────────────────────────────────────────
+
 
 def test_reparse_file_refreshes_cache(monkeypatch):
     repo = _make_repo({"a.py": "def foo(): pass\n"})
@@ -324,7 +345,9 @@ def test_gc_evicts_dead_entries_but_keeps_live_when_over_cap(monkeypatch):
     and ``os.stat`` failed for every entry — it passed for the wrong reason.)
     """
     monkeypatch.setattr(
-        rg_module, "_EXTRACT_CACHE_MAX_ENTRIES", 2,
+        rg_module,
+        "_EXTRACT_CACHE_MAX_ENTRIES",
+        2,
     )
     tmp = Path(tempfile.mkdtemp(prefix="test_rg_gc_"))
     try:
@@ -436,8 +459,8 @@ def test_overflow_reparse_does_not_rewrite_snapshot_or_count_as_changed(monkeypa
 
     g2 = RepositoryGraph(str(repo))
     g2.build(collect_imported_names=True)
-    assert g2.cache_stats["hit"] == 10       # 5 in-process + 5 from the snapshot
-    assert g2.cache_stats["changed"] == 0   # no-op rebuild reports no changes
+    assert g2.cache_stats["hit"] == 10  # 5 in-process + 5 from the snapshot
+    assert g2.cache_stats["changed"] == 0  # no-op rebuild reports no changes
     assert blob_path.read_bytes() == first  # snapshot NOT rewritten
 
 
@@ -486,6 +509,8 @@ def test_edit_of_admitted_file_still_counts_as_changed_and_rewrites(monkeypatch,
     g.build(collect_imported_names=True)
     assert g.cache_stats["changed"] == 1
     assert blob_path.read_bytes() != first  # snapshot rewritten with new payload
+
+
 def test_cap_is_defined_sane_default():
     # The cap must comfortably exceed the asicode repo's own file count so
     # the default never degrades the primary repo to admission-controlled caching.

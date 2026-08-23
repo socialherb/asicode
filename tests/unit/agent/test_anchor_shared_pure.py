@@ -15,6 +15,7 @@ This file locks those branches directly so a regression in the resolution
 logic is caught at the unit level instead of only as a downstream write-tool
 failure.
 """
+
 import logging
 
 from external_llm.agent.anchor_shared import (
@@ -88,9 +89,7 @@ class TestResolveMultilineAnchor:
 
     # -- failure class: multiline_mismatch (line content) ----------------------
     def test_second_line_mismatch_rejected(self):
-        res = resolve_multiline_anchor(
-            ["x = 1\n", "y = 2\n", "z = 3\n"], "x = 1\nWRONG"
-        )
+        res = resolve_multiline_anchor(["x = 1\n", "y = 2\n", "z = 3\n"], "x = 1\nWRONG")
         assert res["ok"] is False
         assert res["failure_class"] == "multiline_mismatch"
         # Error names the offending pattern line for actionable feedback.
@@ -192,10 +191,9 @@ class TestFindAnchorLine:
         with caplog.at_level(logging.WARNING, logger="asicode.anchor_shared"):
             result = _find_anchor_line(lines, "a", occurrence=5)
         assert result == 2  # last match, not None
-        assert any(
-            "ANCHOR_OCCURRENCE_FALLBACK" in r.getMessage()
-            for r in caplog.records
-        ), "overflow fallback must emit ANCHOR_OCCURRENCE_FALLBACK warning"
+        assert any("ANCHOR_OCCURRENCE_FALLBACK" in r.getMessage() for r in caplog.records), (
+            "overflow fallback must emit ANCHOR_OCCURRENCE_FALLBACK warning"
+        )
 
     # -- ctx_before disambiguation ---------------------------------------------
     def test_ctx_before_selects_matching_candidate(self):

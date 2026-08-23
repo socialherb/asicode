@@ -20,7 +20,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any  # f821-protected
 
 from ..common.atomic_io import atomic_write_json
 from . import parse_cache
@@ -115,7 +115,7 @@ class SimilarityCandidate:
     # Not used for action decisions yet — populated to guide future threshold calibration.
     #   call_overlap       — Jaccard of call_shapes sets
     #   result_key_overlap — Jaccard of result dict key access sets
-    shadow_overlaps: dict[str, float] = field(default_factory=dict)
+    shadow_overlaps: dict[str, Any] = field(default_factory=dict)
     # Canonical edit_kind for this pair, declared by the scanner from
     # (suggested_action, extractable).  Downstream (DPB) consumes this directly
     # instead of guessing a fallback; empty string means the pair is not
@@ -185,7 +185,7 @@ _SIMILARITY_ACTION_PROSE: dict[str, str] = {
 }
 
 
-def _similarity_reason(cand: "SimilarityCandidate") -> str:
+def _similarity_reason(cand: SimilarityCandidate) -> str:
     """One-line human summary of a similarity candidate."""
     prose = _SIMILARITY_ACTION_PROSE.get(cand.suggested_action) or cand.suggested_action or "similar"
     extras: list[str] = []
@@ -237,7 +237,7 @@ class NormalisedSymbol:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "NormalisedSymbol":
+    def from_dict(cls, d: dict) -> NormalisedSymbol:
         return cls(
             qualname=d["qualname"],
             params=d.get("params", []),
@@ -257,7 +257,7 @@ class NormalisedSymbol:
         )
 
 
-def _param_names(node: ast.FunctionDef) -> list[str]:
+def _param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
     args = node.args
     all_args = args.posonlyargs + args.args + args.kwonlyargs
     skip = {"self", "cls"}
@@ -407,7 +407,7 @@ def _norm_stmt(node: ast.stmt) -> str:
     return "stmt"
 
 
-def _call_shape(call_node: ast.Call) -> Optional[str]:
+def _call_shape(call_node: ast.Call) -> str | None:
     func = call_node.func
     if isinstance(func, ast.Attribute):
         if isinstance(func.value, ast.Name):
@@ -423,7 +423,7 @@ def _call_shape(call_node: ast.Call) -> Optional[str]:
 
 
 def _walk_function_features(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """Collect the four per-function feature sets in a single tree walk.
 
@@ -553,7 +553,7 @@ def _extract_ast_anchors(body: list[ast.stmt]) -> tuple[list[str], list[str]]:
     functions whose entire body is `try: ... except: pass` would yield only
     1 anchor and never be considered extractable.
     """
-    _SKIP = (ast.Pass, ast.Import, ast.ImportFrom)
+    _skip_node_types = (ast.Pass, ast.Import, ast.ImportFrom)
 
     def _is_docstring(node: ast.stmt) -> bool:
         return isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
@@ -571,7 +571,7 @@ def _extract_ast_anchors(body: list[ast.stmt]) -> tuple[list[str], list[str]]:
         return []
 
     def _candidates(stmts: list[ast.stmt]) -> list[ast.stmt]:
-        return [s for s in stmts if not _is_docstring(s) and not isinstance(s, _SKIP)]
+        return [s for s in stmts if not _is_docstring(s) and not isinstance(s, _skip_node_types)]
 
     candidates = _candidates(body)
 
@@ -608,7 +608,7 @@ def _extract_ast_anchors(body: list[ast.stmt]) -> tuple[list[str], list[str]]:
 
 
 def normalise_function(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     qualname: str,
 ) -> NormalisedSymbol:
     body = func_node.body
@@ -885,8 +885,8 @@ def _is_trivial_function_body(body: list[ast.stmt]) -> bool:
 @dataclass
 class _SymbolEntry:
     qualname: str
-    node: ast.FunctionDef
-    parent_class: Optional[str]
+    node: ast.FunctionDef | ast.AsyncFunctionDef | None
+    parent_class: str | None
 
 
 def _collect_symbols(tree: ast.Module) -> list[_SymbolEntry]:
@@ -917,10 +917,10 @@ _FILTER_BONUS = 0.05  # similarity bonus for filter-preferred symbols
 def scan_similarity_candidates(
     repo_root: str,
     file_paths: list[str],
-    symbol_filter: Optional[list[str]] = None,
+    symbol_filter: list[str] | None = None,
     max_candidates: int = 20,
     min_similarity: float = 0.72,
-    forced_pairs: Optional[list[tuple[str, str]]] = None,
+    forced_pairs: list[tuple[str, str]] | None = None,
 ) -> list[SimilarityCandidate]:
     """
     Scan files for structurally similar symbol pairs.
@@ -1010,6 +1010,8 @@ def scan_similarity_candidates(
             entries = []
             normed = []
             for e in all_entries:
+                if e.node is None:
+                    continue  # cache-reconstructed entry without AST node — not normalisable
                 try:
                     n = normalise_function(e.node, e.qualname)
                 except Exception:
@@ -1205,7 +1207,7 @@ def scan_similarity_candidates(
             # Always emit a candidate so DPB can distinguish "not checked" from
             # "checked and classified".  forced_reason carries the classification.
             _first_file = file_paths[0] if file_paths else ""
-            _fc: Optional[SimilarityCandidate] = None
+            _fc: SimilarityCandidate | None = None
 
             for fpath, nm in _fp_normed.items():
                 na = nm.get(bare_a)
@@ -1280,8 +1282,8 @@ def scan_similarity_candidates(
             if _fc is None:
                 # Cross-file fallback: symbols may live in different files.
                 # Find each independently across all scanned files.
-                _na_cross: Optional[NormalisedSymbol] = None
-                _nb_cross: Optional[NormalisedSymbol] = None
+                _na_cross: NormalisedSymbol | None = None
+                _nb_cross: NormalisedSymbol | None = None
                 _file_a: str = _first_file
                 _file_b: str = _first_file
                 for fpath, nm in _fp_normed.items():

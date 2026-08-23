@@ -5,6 +5,7 @@ run_tests contract file does not reach: provider-based runner dispatch,
 count-only summaries, failed/error detail rendering, empty-content fallback,
 proactive test notification, lint skipped/ok, and find_tests_for_symbol.
 """
+
 from __future__ import annotations
 
 import sys
@@ -379,9 +380,7 @@ def test_lint_issues_with_fix_hints(host):
 def test_lint_real_error_not_ok(host):
     from external_llm.agent.lint_runner import LintResult
 
-    _FakeLintRunner.result = LintResult(
-        ok=False, issues=[], summary="lint failed", error="timeout"
-    )
+    _FakeLintRunner.result = LintResult(ok=False, issues=[], summary="lint failed", error="timeout")
     res = host._tool_run_lint({"path": "."})
     assert res.ok is False  # real error (no issues, error set)
 
@@ -406,9 +405,7 @@ def test_find_tests_no_targets(host, monkeypatch):
         def discover_test_targets(self, target_symbols=None, target_files=None):
             return []
 
-    monkeypatch.setattr(
-        "external_llm.agent.tool_handlers.test_tools.SymbolAwareTestFinder", _Finder
-    )
+    monkeypatch.setattr("external_llm.agent.tool_handlers.test_tools.SymbolAwareTestFinder", _Finder)
     res = host._tool_find_tests_for_symbol({"symbol": "foo"})
     assert res.ok is True
     assert "No test file references 'foo'" in res.content
@@ -437,9 +434,7 @@ def test_find_tests_with_targets(host, monkeypatch):
         def discover_test_targets(self, target_symbols=None, target_files=None):
             return targets
 
-    monkeypatch.setattr(
-        "external_llm.agent.tool_handlers.test_tools.SymbolAwareTestFinder", _Finder
-    )
+    monkeypatch.setattr("external_llm.agent.tool_handlers.test_tools.SymbolAwareTestFinder", _Finder)
     res = host._tool_find_tests_for_symbol({"symbol": "foo"})
     assert res.ok is True
     assert "2 test file(s), strongest match first:" in res.content
@@ -461,9 +456,7 @@ def test_find_tests_uses_file_path_fallback(host, monkeypatch):
             seen["files"] = target_files
             return [SymbolAwareTestTarget(test_path="tests/test_x.py")]
 
-    monkeypatch.setattr(
-        "external_llm.agent.tool_handlers.test_tools.SymbolAwareTestFinder", _Finder
-    )
+    monkeypatch.setattr("external_llm.agent.tool_handlers.test_tools.SymbolAwareTestFinder", _Finder)
     res = host._tool_find_tests_for_symbol({"file_path": "src/x.py"})
     assert res.ok is True
     assert seen["symbols"] is None

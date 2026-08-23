@@ -5,6 +5,7 @@ end in a hardcoded magic 12 while every other entry point used
 ``AGENT_MAX_TURNS_DEFAULT`` (500). ``_resolve_subagent_max_turns`` now ends
 the chain at the SSOT; these tests pin the full resolution matrix.
 """
+
 import argparse
 
 from external_llm.agent.config.thresholds import config as _cfg
@@ -35,10 +36,7 @@ class TestResolveSubagentMaxTurns:
 
     def test_ssot_fallback_when_both_absent(self):
         # Non-CLI launcher: Namespace without a max_turns attribute.
-        assert (
-            _resolve_subagent_max_turns(_task(), argparse.Namespace())
-            == _cfg.counts.AGENT_MAX_TURNS_DEFAULT
-        )
+        assert _resolve_subagent_max_turns(_task(), argparse.Namespace()) == _cfg.counts.AGENT_MAX_TURNS_DEFAULT
         assert _cfg.counts.AGENT_MAX_TURNS_DEFAULT == 500
 
     def test_zero_falls_through_like_unset(self):

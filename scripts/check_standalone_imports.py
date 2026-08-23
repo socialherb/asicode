@@ -30,6 +30,7 @@ Usage:
 
 Scope: production code (external_llm/, services/, webapp/, root asi.py).
 """
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -47,10 +48,22 @@ BASELINE = REPO / "scripts" / "standalone_import_baseline.txt"
 _IMPORT_TIMEOUT = 120  # heavy deps (torch etc.) can take a while to import
 _MAX_WORKERS = 8
 
-_SKIP_DIRS = frozenset({
-    "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules",
-    ".venv", "venv", "env", ".tox", "dist", "build", ".eggs", ".git",
-})
+_SKIP_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        ".git",
+    }
+)
 _SCAN_ROOTS = ("external_llm", "services", "webapp")
 
 
@@ -60,21 +73,13 @@ def _should_skip(path: Path) -> bool:
 
 def _in_scope(rel: str) -> bool:
     p = Path(rel)
-    return (
-        p.suffix == ".py"
-        and not _should_skip(p)
-        and (p == Path("asi.py") or p.parts[0] in _SCAN_ROOTS)
-    )
+    return p.suffix == ".py" and not _should_skip(p) and (p == Path("asi.py") or p.parts[0] in _SCAN_ROOTS)
 
 
 def _module_name(rel: str) -> str | None:
     """Repo-relative .py path -> importable module name (None if not)."""
     p = Path(rel)
-    parts = (
-        list(p.parts[:-1])
-        if p.name == "__init__.py"
-        else [*p.parts[:-1], p.stem]
-    )
+    parts = list(p.parts[:-1]) if p.name == "__init__.py" else [*p.parts[:-1], p.stem]
     if not parts or not all(part.isidentifier() for part in parts):
         return None
     return ".".join(parts)
@@ -126,9 +131,10 @@ def _materialize_index(tmp: Path) -> list[str] | None:
     """
     try:
         proc = subprocess.run(
-            ["git", "-C", str(REPO), "checkout-index", "-a", "-f",
-             f"--prefix={tmp}/"],
-            capture_output=True, timeout=120, check=False,
+            ["git", "-C", str(REPO), "checkout-index", "-a", "-f", f"--prefix={tmp}/"],
+            capture_output=True,
+            timeout=120,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -147,7 +153,9 @@ def _tracked_first_party_tops() -> set[str]:
     try:
         proc = subprocess.run(
             ["git", "-C", str(REPO), "ls-files", "-z", "--", "*.py"],
-            capture_output=True, timeout=30, check=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return set()
@@ -168,7 +176,8 @@ _MISSING_DEP_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 
 
 def _third_party_only_missing(
-    err_text: str, first_party: set[str],
+    err_text: str,
+    first_party: set[str],
 ) -> set[str] | None:
     """Missing THIRD-PARTY top-level names if the failure is only that; else None.
 
@@ -195,7 +204,10 @@ def _try_import(module: str, cwd: Path) -> str:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", f"import {module}"],
-            cwd=cwd, capture_output=True, timeout=_IMPORT_TIMEOUT, check=False,
+            cwd=cwd,
+            capture_output=True,
+            timeout=_IMPORT_TIMEOUT,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return f"TIMEOUT after {_IMPORT_TIMEOUT}s"
@@ -291,26 +303,31 @@ def main() -> int:
         return 0
 
     if env_skipped:
-        counts = Counter(
-            dep for tops in env_skipped.values() for dep in sorted(tops))
+        counts = Counter(dep for tops in env_skipped.values() for dep in sorted(tops))
         detail = ", ".join(f"{dep} x{n}" for dep, n in counts.most_common())
-        print(f"⏭ {len(env_skipped)} module(s) skipped: third-party import(s) "
-              f"missing in this environment ({detail}) — dependency "
-              f"presence is the unit-test job's contract, not import order.")
+        print(
+            f"⏭ {len(env_skipped)} module(s) skipped: third-party import(s) "
+            f"missing in this environment ({detail}) — dependency "
+            f"presence is the unit-test job's contract, not import order."
+        )
 
     baseline = _load_baseline()
     new_failures = {m: e for m, e in real.items() if m not in baseline}
     stale = sorted(baseline - set(real))
 
     if stale:
-        print(f"Note: {len(stale)} stale baseline entr{'y' if len(stale) == 1 else 'ies'} "
-              f"(importing fine now): {', '.join(stale)} — re-run --write-baseline")
+        print(
+            f"Note: {len(stale)} stale baseline entr{'y' if len(stale) == 1 else 'ies'} "
+            f"(importing fine now): {', '.join(stale)} — re-run --write-baseline"
+        )
 
     if not new_failures:
         skipped_note = f", {len(env_skipped)} env-skipped" if env_skipped else ""
-        print(f"✅ All {len(modules)} modules import standalone "
-              f"({len(real)} baselined failure{'s' if len(real) != 1 else ''}"
-              f"{skipped_note})")
+        print(
+            f"✅ All {len(modules)} modules import standalone "
+            f"({len(real)} baselined failure{'s' if len(real) != 1 else ''}"
+            f"{skipped_note})"
+        )
         return 0
 
     print(f"❌ {len(new_failures)} module(s) FAIL standalone import (not in baseline):\n")

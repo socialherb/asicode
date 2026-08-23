@@ -5,13 +5,13 @@ Inherits symbol patterns, brace counting, and test runner from
 TypeScriptSyntaxProvider.  Overrides validation (ESLint-only, no tsc)
 and file globs.
 """
+
 from __future__ import annotations
 
 import logging
 import os
 import re
 import subprocess
-from typing import Optional
 
 from .base import (
     SyntaxProvider,
@@ -29,6 +29,7 @@ from .models import (
 from .typescript_provider import TypeScriptSyntaxProvider
 
 logger = logging.getLogger(__name__)
+
 
 def _make_capabilities() -> LanguageCapabilities:
     from .tree_sitter_utils import is_available
@@ -56,7 +57,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
     # Reuse the TS provider for shared logic (symbol finder, brace counting)
     _ts = TypeScriptSyntaxProvider()
 
-    _caps: Optional[LanguageCapabilities] = None
+    _caps: LanguageCapabilities | None = None
 
     def language_id(self) -> LanguageId:
         return LanguageId.JAVASCRIPT
@@ -79,13 +80,16 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
             return SyntaxValidationResult(ok=True, language=LanguageId.JAVASCRIPT)
         _cmd = _replace_last_cmd_path(
             ["node", "--check", file_path],
-            file_path, _tmp_path,
+            file_path,
+            _tmp_path,
         )
         try:
             try:
                 proc = subprocess.run(
                     _cmd,
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                     cwd=os.path.dirname(_tmp_path) or ".",
                     check=False,
                 )
@@ -131,24 +135,33 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
                     _detected_line = int(m.group(1))
                     # Strip file:line:col prefix from the same line
                     _stripped = re.sub(
-                        r"^.*?:\d+(?::\d+)?\s*", "", line.strip(), count=1,
+                        r"^.*?:\d+(?::\d+)?\s*",
+                        "",
+                        line.strip(),
+                        count=1,
                     ).strip()
                     _detected_msg = _stripped or line.strip()
                     break
             if _detected_msg:
-                errors.append(SyntaxError_(
-                    file=file_path,
-                    line=_detected_line,
-                    col=0,
-                    message=_detected_msg,
-                ))
+                errors.append(
+                    SyntaxError_(
+                        file=file_path,
+                        line=_detected_line,
+                        col=0,
+                        message=_detected_msg,
+                    )
+                )
 
             if not errors and proc.returncode != 0:
                 # Couldn't parse but node failed — report generic error
-                errors.append(SyntaxError_(
-                    file=file_path, line=0, col=0,
-                    message=(proc.stderr or "syntax error").strip()[:200],
-                ))
+                errors.append(
+                    SyntaxError_(
+                        file=file_path,
+                        line=0,
+                        col=0,
+                        message=(proc.stderr or "syntax error").strip()[:200],
+                    )
+                )
 
             return SyntaxValidationResult(
                 ok=len(errors) == 0,
@@ -177,7 +190,8 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
         return self.validate_semantics_batch([file_path])[file_path]
 
     def validate_semantics_batch(
-        self, file_paths: list[str],
+        self,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """Semantic-check *file_paths* with one tsc run per (project, config).
 
@@ -196,7 +210,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
         )
 
     @staticmethod
-    def _config_at_root(project_root: str) -> Optional[str]:
+    def _config_at_root(project_root: str) -> str | None:
         """Which config filename *project_root* carries, preferring jsconfig."""
         for name in ("jsconfig.json", "tsconfig.json"):
             if os.path.isfile(os.path.join(project_root, name)):
@@ -208,22 +222,28 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
     def get_symbol_patterns(self, kind: str = "any") -> list[SymbolPattern]:
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"(?:export\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*\(",
-                description="JS function declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"(?:export\s+)?(?:const|let|var)\s+{name}\s*=\s*(?:async\s*)?\(",
-                description="JS arrow / function expression",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"(?:export\s+)?(?:async\s+)?function\s*\*?\s*{name}\s*\(",
+                    description="JS function declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"(?:export\s+)?(?:const|let|var)\s+{name}\s*=\s*(?:async\s*)?\(",
+                    description="JS arrow / function expression",
+                )
+            )
         if kind in ("class", "any"):
-            patterns.append(SymbolPattern(
-                kind="class",
-                regex=r"(?:export\s+)?class\s+{name}\s*(?:extends|\{)",
-                description="JS class declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="class",
+                    regex=r"(?:export\s+)?class\s+{name}\s*(?:extends|\{)",
+                    description="JS class declaration",
+                )
+            )
         # JS has no interface/type keywords
         return patterns
 
@@ -234,22 +254,18 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
 
     # ── Lint / test commands (same as TS) ─────────────────────────────────
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return ["npx", "eslint", "--format=json", file_path]
 
-    def get_test_directory(self, repo_root: str) -> Optional[str]:
+    def get_test_directory(self, repo_root: str) -> str | None:
         return self._ts.get_test_directory(repo_root)
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return self._ts.get_test_command(repo_root, test_args)
 
     # ── Symbol finder (delegate to TS brace counting) ─────────────────────
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         """Find symbol using tree-sitter (precise) or regex + brace counting (fallback)."""
         from .tree_sitter_utils import find_symbol_range, is_available
 
@@ -266,13 +282,16 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
     # JS shares TS infrastructure via TypeScriptSyntaxProvider static methods.
 
     def _find_top_level_definitions_regex(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: delegate to TS provider (same patterns)."""
         return self._ts._find_top_level_definitions_regex(content)
 
     def _find_class_methods_regex(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         """Regex fallback: delegate to TS provider (same patterns)."""
         return self._ts._find_class_methods_regex(content, class_name)
@@ -280,27 +299,35 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         from .tree_sitter_utils import find_all_symbols, is_available
+
         result = find_all_symbols(content, "javascript") if is_available() else None
         if result:
             return result
         return self._find_top_level_definitions_regex(content)
 
     def find_class_methods(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         from .tree_sitter_utils import extract_class_methods, is_available
+
         result = extract_class_methods(content, class_name, "javascript") if is_available() else None
         if result:
             return result
         return self._find_class_methods_regex(content, class_name)
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         from .tree_sitter_utils import extract_symbol_body, is_available
+
         result = extract_symbol_body(content, symbol_name, "javascript") if is_available() else None
         if result:
             return result

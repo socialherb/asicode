@@ -18,6 +18,7 @@ not roll back a valid edit. The on-disk :meth:`validate_semantics` pass (run
 from the file's directory so sibling headers resolve) is the authoritative
 check.
 """
+
 from __future__ import annotations
 
 import json
@@ -27,7 +28,6 @@ import re
 import shutil
 import subprocess
 from contextlib import suppress
-from typing import Optional
 
 from .base import (
     SyntaxProvider,
@@ -71,15 +71,11 @@ def _make_capabilities() -> LanguageCapabilities:
 #   file.c:10:5: error: expected ';' after expression
 #   file.c:3:10: fatal error: foo.h: No such file or directory
 # Column is always emitted by modern gcc/clang but made optional for robustness.
-_CC_ERROR_RE = re.compile(
-    r"^(.+?):(\d+):(?:(\d+):)?\s*(error|fatal error):\s+(.+)$"
-)
+_CC_ERROR_RE = re.compile(r"^(.+?):(\d+):(?:(\d+):)?\s*(error|fatal error):\s+(.+)$")
 
 # Prefer GNU; fall back to LLVM. First hit on $PATH wins.
 _C_COMPILERS: tuple[str, ...] = ("gcc", "clang")
 _CPP_COMPILERS: tuple[str, ...] = ("g++", "clang++")
-
-
 
 
 def _is_c_family_header(file_path: str) -> bool:
@@ -96,7 +92,9 @@ def _is_c_family_header(file_path: str) -> bool:
 
 
 def _parse_cc_diagnostics(
-    output: str, lang: LanguageId, filter_resolution: bool,
+    output: str,
+    lang: LanguageId,
+    filter_resolution: bool,
 ) -> list[SyntaxError_]:
     """Parse ``file:line:col: (error|fatal error): msg`` lines into diagnostics.
 
@@ -110,13 +108,15 @@ def _parse_cc_diagnostics(
         m = _CC_ERROR_RE.match(line)
         if not m:
             continue
-        errors.append(SyntaxError_(
-            file=m.group(1),
-            line=int(m.group(2)),
-            col=int(m.group(3)) if m.group(3) else 0,
-            message=m.group(5),
-            severity="error",
-        ))
+        errors.append(
+            SyntaxError_(
+                file=m.group(1),
+                line=int(m.group(2)),
+                col=int(m.group(3)) if m.group(3) else 0,
+                message=m.group(5),
+                severity="error",
+            )
+        )
     if filter_resolution:
         errors = _filter_genuine_syntax_errors(errors, lang)
     return errors
@@ -141,7 +141,9 @@ def _same_path(a: str, base_dir: str, b: str) -> bool:
 
 
 def _keep_only_target_diagnostics(
-    errors: list[SyntaxError_], file_path: str, cwd: str,
+    errors: list[SyntaxError_],
+    file_path: str,
+    cwd: str,
 ) -> list[SyntaxError_]:
     """Keep only diagnostics located in *file_path*.
 
@@ -182,17 +184,18 @@ def _extract_include_flags(entry: dict) -> list[str]:
     # Prefer 'arguments' array — exact tokens, no shell parsing needed.
     args = entry.get("arguments")
     if args:
-        flags = _collect_I_flags(args)
+        flags = _collect_i_flags(args)
     else:
         # Fall back to 'command' string — requires shell-split.
         cmd = entry.get("command", "")
         if cmd:
             import shlex
+
             try:
                 tokens = shlex.split(cmd)
             except ValueError:
                 tokens = cmd.split()
-            flags = _collect_I_flags(tokens)
+            flags = _collect_i_flags(tokens)
         else:
             return []
 
@@ -200,7 +203,7 @@ def _extract_include_flags(entry: dict) -> list[str]:
     if base_dir:
         resolved: list[str] = []
         for flag in flags:
-            # _collect_I_flags only yields "-I<dir>" tokens (combined form
+            # _collect_i_flags only yields "-I<dir>" tokens (combined form
             # requires len > 2, the pair form always joins a non-empty next
             # token), so the prefix/length guards would be dead branches —
             # the isabs check is the only live one.
@@ -214,7 +217,8 @@ def _extract_include_flags(entry: dict) -> list[str]:
 
 
 def _match_compile_commands_entry(
-    entries: list[dict], file_path: str,
+    entries: list[dict],
+    file_path: str,
 ) -> dict | None:
     """Return the ``compile_commands.json`` entry that compiles *file_path*.
 
@@ -235,7 +239,7 @@ def _match_compile_commands_entry(
     return None
 
 
-def _collect_I_flags(tokens: list[str]) -> list[str]:
+def _collect_i_flags(tokens: list[str]) -> list[str]:
     """Extract -I<dir> and -I <dir> flags from a token list."""
     flags: list[str] = []
     i = 0
@@ -258,7 +262,7 @@ class _CFamilySyntaxProvider(SyntaxProvider):
     _suffix: str
     _compilers: tuple[str, ...]
     _globs: tuple[str, ...]
-    _caps: Optional[LanguageCapabilities] = None
+    _caps: LanguageCapabilities | None = None
 
     def capabilities(self) -> LanguageCapabilities:
         if self._caps is None:
@@ -267,7 +271,7 @@ class _CFamilySyntaxProvider(SyntaxProvider):
 
     # ── Syntax validation (content → temp file) ──────────────────────────
 
-    def _resolve_compilers(self, candidates: tuple[str, ...]) -> Optional[str]:
+    def _resolve_compilers(self, candidates: tuple[str, ...]) -> str | None:
         """Return the first compiler in *candidates* on ``$PATH``, cached.
 
         Cached **per instance** keyed by *candidates*. The singleton registry
@@ -281,7 +285,7 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         cache = self.__dict__.get("_compiler_cache")
         if cache is None:
             cache = {}
-            self.__dict__["_compiler_cache"] = cache
+            self.__dict__["_compiler_cache"] = cache  # type: ignore[index]  # instance __dict__ is a real dict
         if candidates in cache:
             return cache[candidates]
         cc = next((c for c in candidates if shutil.which(c)), None)
@@ -289,8 +293,12 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         return cc
 
     def _run_syntax_compile(
-        self, file_path: str, content: str, suffix: str,
-        compilers: tuple[str, ...], lang: LanguageId,
+        self,
+        file_path: str,
+        content: str,
+        suffix: str,
+        compilers: tuple[str, ...],
+        lang: LanguageId,
     ) -> SyntaxValidationResult:
         """Compile *content* via one of *compilers* on an isolated temp file.
 
@@ -310,12 +318,16 @@ class _CFamilySyntaxProvider(SyntaxProvider):
 
         _cmd = _replace_last_cmd_path(
             [cc, "-fsyntax-only", "-Wall", file_path],
-            file_path, _tmp_path,
+            file_path,
+            _tmp_path,
         )
         try:
             try:
                 proc = subprocess.run(
-                    _cmd, capture_output=True, text=True, timeout=30,
+                    _cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                     env=_compile_env(),
                     check=False,
                 )
@@ -333,7 +345,9 @@ class _CFamilySyntaxProvider(SyntaxProvider):
                 return SyntaxValidationResult(ok=True, language=lang)
 
             errors = _parse_cc_diagnostics(
-                proc.stdout + proc.stderr, lang, filter_resolution=True,
+                proc.stdout + proc.stderr,
+                lang,
+                filter_resolution=True,
             )
             if not errors:
                 return SyntaxValidationResult(ok=True, language=lang)
@@ -357,15 +371,19 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         tree-sitter C++ fallback for ``.h``.
         """
         result = self._run_syntax_compile(
-            file_path, content, self._suffix, self._compilers, self._lang,
+            file_path,
+            content,
+            self._suffix,
+            self._compilers,
+            self._lang,
         )
-        if (
-            not result.ok
-            and self._lang is LanguageId.C
-            and _is_c_family_header(file_path)
-        ):
+        if not result.ok and self._lang is LanguageId.C and _is_c_family_header(file_path):
             cpp = self._run_syntax_compile(
-                file_path, content, ".cpp", _CPP_COMPILERS, LanguageId.CPP,
+                file_path,
+                content,
+                ".cpp",
+                _CPP_COMPILERS,
+                LanguageId.CPP,
             )
             if cpp.ok:
                 return SyntaxValidationResult(ok=True, language=self._lang)
@@ -374,8 +392,13 @@ class _CFamilySyntaxProvider(SyntaxProvider):
     # ── Semantic validation (on-disk file, sibling includes resolve) ──────
 
     def _run_semantics_compile(
-        self, file_path: str, target: str, cwd: str,
-        include_flags: list[str], compilers: tuple[str, ...], lang: LanguageId,
+        self,
+        file_path: str,
+        target: str,
+        cwd: str,
+        include_flags: list[str],
+        compilers: tuple[str, ...],
+        lang: LanguageId,
     ) -> SyntaxValidationResult:
         """Run ``<cc> -fsyntax-only`` on the on-disk file from *cwd*.
 
@@ -387,7 +410,8 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         cc = self._resolve_compilers(compilers)
         if cc is None:
             return SyntaxValidationResult.unchecked(
-                lang, f"no C compiler found (tried {', '.join(compilers)})",
+                lang,
+                f"no C compiler found (tried {', '.join(compilers)})",
             )
 
         _cmd = [cc, "-fsyntax-only", "-Wall"]
@@ -397,7 +421,10 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         try:
             proc = subprocess.run(
                 _cmd,
-                capture_output=True, text=True, timeout=30, cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=cwd,
                 env=_compile_env(),
                 check=False,
             )
@@ -415,17 +442,28 @@ class _CFamilySyntaxProvider(SyntaxProvider):
             # The compile SUCCEEDED — a real clean verdict, not a skip.
             return SyntaxValidationResult(ok=True, language=lang)
 
-        errors: list[SyntaxError_] = [SyntaxError_(
-                file=file_path, line=e.line, col=e.col,
-                message=e.message, severity=e.severity,
-            ) for e in _keep_only_target_diagnostics(
-            _parse_cc_diagnostics(
-                proc.stdout + proc.stderr, lang, filter_resolution=True,
-            ),
-            file_path, cwd,
-        )]
+        errors: list[SyntaxError_] = [
+            SyntaxError_(
+                file=file_path,
+                line=e.line,
+                col=e.col,
+                message=e.message,
+                severity=e.severity,
+            )
+            for e in _keep_only_target_diagnostics(
+                _parse_cc_diagnostics(
+                    proc.stdout + proc.stderr,
+                    lang,
+                    filter_resolution=True,
+                ),
+                file_path,
+                cwd,
+            )
+        ]
         return SyntaxValidationResult(
-            ok=not errors, errors=errors, language=lang,
+            ok=not errors,
+            errors=errors,
+            language=lang,
         )
 
     def validate_semantics(self, file_path: str) -> SyntaxValidationResult:
@@ -444,7 +482,8 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         """
         if not file_path or not os.path.exists(file_path):
             return SyntaxValidationResult.unchecked(
-                self._lang, "the file is not on disk",
+                self._lang,
+                "the file is not on disk",
             )
 
         cwd = os.path.dirname(os.path.abspath(file_path)) or "."
@@ -462,15 +501,21 @@ class _CFamilySyntaxProvider(SyntaxProvider):
                     _include_flags = _extract_include_flags(_entry)
 
         result = self._run_semantics_compile(
-            file_path, target, cwd, _include_flags, self._compilers, self._lang,
+            file_path,
+            target,
+            cwd,
+            _include_flags,
+            self._compilers,
+            self._lang,
         )
-        if (
-            not result.ok
-            and self._lang is LanguageId.C
-            and _is_c_family_header(file_path)
-        ):
+        if not result.ok and self._lang is LanguageId.C and _is_c_family_header(file_path):
             cpp = self._run_semantics_compile(
-                file_path, target, cwd, _include_flags, _CPP_COMPILERS, LanguageId.CPP,
+                file_path,
+                target,
+                cwd,
+                _include_flags,
+                _CPP_COMPILERS,
+                LanguageId.CPP,
             )
             if cpp.ok:
                 return SyntaxValidationResult(ok=True, language=self._lang)
@@ -482,33 +527,43 @@ class _CFamilySyntaxProvider(SyntaxProvider):
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
             # <storage/return-type tokens> name(   — e.g. "static int *foo("
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"^[ \t]*[\w][\w\s\*]*?\b{name}\s*\(",
-                description="C/C++ function declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"^[ \t]*[\w][\w\s\*]*?\b{name}\s*\(",
+                    description="C/C++ function declaration",
+                )
+            )
         if kind in ("type", "class", "struct", "any"):
-            patterns.append(SymbolPattern(
-                kind="struct",
-                regex=r"\b(?:struct|union)\s+{name}\b",
-                description="C/C++ struct/union declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="enum",
-                regex=r"\benum\s+{name}\b",
-                description="C/C++ enum declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="typedef",
-                regex=r"\btypedef\b[\w\s\*]*?\b{name}\s*;",
-                description="C/C++ typedef",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="struct",
+                    regex=r"\b(?:struct|union)\s+{name}\b",
+                    description="C/C++ struct/union declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="enum",
+                    regex=r"\benum\s+{name}\b",
+                    description="C/C++ enum declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="typedef",
+                    regex=r"\btypedef\b[\w\s\*]*?\b{name}\s*;",
+                    description="C/C++ typedef",
+                )
+            )
         if kind in ("variable", "constant", "macro", "any"):
-            patterns.append(SymbolPattern(
-                kind="macro",
-                regex=r"^#define\s+{name}\b",
-                description="C/C++ object-like / function-like macro",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="macro",
+                    regex=r"^#define\s+{name}\b",
+                    description="C/C++ object-like / function-like macro",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -518,19 +573,19 @@ class _CFamilySyntaxProvider(SyntaxProvider):
 
     # ── Lint / test commands ──────────────────────────────────────────────
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
+        # C-family has no test command: parameters are unused by contract
+        # (interface parity with other providers), but keep base names to
+        # match the SyntaxProvider override signature.
+        del repo_root, test_args  # unused by contract
         return None
 
     # ── Symbol finder (tree-sitter → regex fallback) ──────────────────────
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         from .tree_sitter_utils import find_symbol_range, is_available
 
         if is_available():
@@ -556,19 +611,24 @@ class _CFamilySyntaxProvider(SyntaxProvider):
     # ── Regex fallback for structural queries ─────────────────────────────
 
     def _find_top_level_definitions_regex(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         results: list[tuple[str, str, int, int]] = []
         nl = build_line_index(content)
         # functions: <type tokens> name( ... ) {
         for m in re.finditer(
-            r"^[ \t]*[\w][\w\s\*]*?\b(\w+)\s*\(", content, re.MULTILINE,
+            r"^[ \t]*[\w][\w\s\*]*?\b(\w+)\s*\(",
+            content,
+            re.MULTILINE,
         ):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
         for m in re.finditer(
-            r"\b(?:struct|union)\s+(\w+)\s*\{", content, re.MULTILINE,
+            r"\b(?:struct|union)\s+(\w+)\s*\{",
+            content,
+            re.MULTILINE,
         ):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
@@ -589,18 +649,23 @@ class _CFamilySyntaxProvider(SyntaxProvider):
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         from .tree_sitter_utils import find_all_symbols, is_available
+
         result = find_all_symbols(content, self._lang.value) if is_available() else None
         if result:
             return result
         return self._find_top_level_definitions_regex(content)
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         from .tree_sitter_utils import extract_symbol_body, is_available
+
         result = extract_symbol_body(content, symbol_name, self._lang.value) if is_available() else None
         if result:
             return result

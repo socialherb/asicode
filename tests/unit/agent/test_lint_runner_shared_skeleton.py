@@ -8,6 +8,7 @@ tool missing → graceful skip, timeout → tool-named error, other failure →
 error, go passes → soft-fail — so a future edit cannot silently change the
 contract for one runner only.
 """
+
 from __future__ import annotations
 
 import json
@@ -175,18 +176,15 @@ def test_parse_lint_json_empty_stdout_skips_parse():
 
 
 def test_parse_lint_json_truncates_to_max_issues():
-    issues = [
-        LintIssue(file=f"a{i}.py", line=1, col=1, code="E1", message="m")
-        for i in range(3)
-    ]
+    issues = [LintIssue(file=f"a{i}.py", line=1, col=1, code="E1", message="m") for i in range(3)]
     out = _parse_lint_json("[1,2,3]", "ruff", lambda raw: issues, max_issues=2)
     assert out == issues[:2]
 
 
 def test_parse_lint_json_extracts_parse_results():
-    out = _parse_lint_json("[{}]", "eslint", lambda raw: [
-        LintIssue(file="a.py", line=1, col=1, code="E1", message="m") for _ in raw
-    ])
+    out = _parse_lint_json(
+        "[{}]", "eslint", lambda raw: [LintIssue(file="a.py", line=1, col=1, code="E1", message="m") for _ in raw]
+    )
     assert len(out) == 1
     assert out[0].code == "E1"
 
@@ -195,14 +193,18 @@ def test_ruff_json_issues_flow_through_parse_helper(tmp_path):
     # Wiring: run_ruff's issue extraction goes through _parse_lint_json, so the
     # severity filter + truncation semantics are the helper's.
     (tmp_path / "a.py").write_text("x = 1\n")
-    payload = json.dumps([{
-        "filename": str(tmp_path / "a.py"),
-        "location": {"row": 1, "column": 1},
-        "code": "F401",
-        "message": "unused import",
-        "severity": "error",
-        "fix": {"message": "remove"},
-    }])
+    payload = json.dumps(
+        [
+            {
+                "filename": str(tmp_path / "a.py"),
+                "location": {"row": 1, "column": 1},
+                "code": "F401",
+                "message": "unused import",
+                "severity": "error",
+                "fix": {"message": "remove"},
+            }
+        ]
+    )
     with _run_patch(return_value=_fake_proc(returncode=1, stdout=payload)):
         result = LintRunner(str(tmp_path)).run_ruff("a.py")
     assert result.ok is False

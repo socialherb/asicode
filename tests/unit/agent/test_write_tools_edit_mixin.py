@@ -7,6 +7,7 @@ suggestions, fallback matching (_resolve_with_fallback), scoped replacement,
 edited-line-region diagnosis, indentation/structural hints, raw-args recovery,
 and the end-to-end handlers on tmp files with stubbed side-effect hooks.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -38,6 +39,7 @@ class _Harness(WriteToolsMixin):
 
     def _secure_path(self, path, *, confine=False):
         from pathlib import Path as _Path
+
         repo = _Path(self.repo_root).resolve()
         p = _Path(path)
         resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -58,12 +60,13 @@ def harness(tmp_path):
 
 # ── _resolve_edit_anchor ────────────────────────────────────────────────────
 
+
 class TestResolveEditAnchor:
     CONTENT = "alpha\nbeta\ngamma\ndelta\n"
 
     def test_exact_unique(self, harness):
         pos, actual, ratio = harness._resolve_edit_anchor(self.CONTENT, "beta")
-        assert self.CONTENT[pos:pos + 4] == "beta"
+        assert self.CONTENT[pos : pos + 4] == "beta"
         assert actual == "beta"
         assert ratio == 0.0
 
@@ -72,7 +75,7 @@ class TestResolveEditAnchor:
         pos, actual, _ratio = harness._resolve_edit_anchor(content, "beta", line=4)
         assert actual == "beta"
         # line 4 is the second "beta" (0-indexed line 3)
-        assert content[pos:pos + 4] == "beta"
+        assert content[pos : pos + 4] == "beta"
         assert pos > content.find("beta")  # NOT the first occurrence
 
     def test_exact_multiple_without_line_hint_raises(self, harness):
@@ -83,7 +86,7 @@ class TestResolveEditAnchor:
     def test_line_hint_fallback_to_content(self, harness):
         pos, actual, _ratio = harness._resolve_edit_anchor(self.CONTENT, "ZZZ", line=3)
         assert actual == "gamma"
-        assert self.CONTENT[pos:pos + 5] == "gamma"
+        assert self.CONTENT[pos : pos + 5] == "gamma"
 
     def test_line_hint_empty_line_falls_through(self, harness):
         content = "a\n\nb\n"
@@ -116,6 +119,7 @@ class TestResolveEditAnchor:
 
 
 # ── _current_file_head_snippet / _patch_failure_snippet / _raw_repr ─────────
+
 
 class TestCurrentFileHeadSnippet:
     def test_basic(self, harness):
@@ -171,6 +175,7 @@ class TestRawRepr:
 
 # ── _near_match_hint ────────────────────────────────────────────────────────
 
+
 class TestNearMatchHint:
     def test_close_match_returns_numbered_block(self, harness):
         content = "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
@@ -204,10 +209,7 @@ class TestNearMatchHint:
         unreachable and the hint misleads the model. autojunk=False restores
         ~100%.
         """
-        lines = [
-            f"    self.attr_{i} = compute_value_{i}(input_{i}, options_{i}, flags[{i}])"
-            for i in range(60)
-        ]
+        lines = [f"    self.attr_{i} = compute_value_{i}(input_{i}, options_{i}, flags[{i}])" for i in range(60)]
         content = "\n".join(lines)
         old = content.replace("compute_value_10", "compute_value_1X")  # 1-char content edit
         out = harness._near_match_hint(content, old)
@@ -224,9 +226,11 @@ class TestNearMatchHint:
 
 # ── _suggest_missing_paths ──────────────────────────────────────────────────
 
+
 class TestSuggestMissingPaths:
     def test_exact_basename_suggestion(self, harness, tmp_path, monkeypatch):
         from external_llm.agent.tool_handlers import write_tools_edit_mixin as mod
+
         (tmp_path / "my_file.py").write_text("x", encoding="utf-8")
         monkeypatch.setattr(mod, "_repo_file_index", lambda root: ["my_file.py"])
         out = harness._suggest_missing_paths("my_fil.py")
@@ -234,16 +238,19 @@ class TestSuggestMissingPaths:
 
     def test_no_match_empty(self, harness, monkeypatch):
         from external_llm.agent.tool_handlers import write_tools_edit_mixin as mod
+
         monkeypatch.setattr(mod, "_repo_file_index", lambda root: ["a.py", "b.py"])
         assert harness._suggest_missing_paths("zzz.py") == ""
 
     def test_empty_input(self, harness, monkeypatch):
         from external_llm.agent.tool_handlers import write_tools_edit_mixin as mod
+
         monkeypatch.setattr(mod, "_repo_file_index", lambda root: ["a.py"])
         assert harness._suggest_missing_paths("") == ""
 
 
 # ── _ast_fail_hint ──────────────────────────────────────────────────────────
+
 
 class TestAstFailHint:
     def test_symbol_close_match(self, harness):
@@ -277,6 +284,7 @@ class TestAstFailHint:
 
 
 # ── _resolve_with_fallback ──────────────────────────────────────────────────
+
 
 class TestResolveWithFallback:
     def test_exact_match(self, harness):
@@ -313,6 +321,7 @@ class TestResolveWithFallback:
 
 # ── _edited_line_regions (static) ───────────────────────────────────────────
 
+
 class TestEditedLineRegions:
     def test_line_inside_edited_region(self, harness):
         orig = "a\nb\nc\nd\n"
@@ -348,6 +357,7 @@ class TestEditedLineRegions:
 
 
 # ── _indentation_hint / _structural_imbalance_hint (static) ─────────────────
+
 
 class TestIndentationHint:
     def test_unexpected_indent(self, harness):
@@ -388,13 +398,16 @@ class TestStructuralImbalanceHint:
         assert "{" in harness._structural_imbalance_hint("'{' was never closed")
 
     def test_unexpected_eof(self, harness):
-        assert "EOF" in harness._structural_imbalance_hint("unexpected EOF while parsing") or "bracket" in harness._structural_imbalance_hint("unexpected EOF while parsing")
+        assert "EOF" in harness._structural_imbalance_hint(
+            "unexpected EOF while parsing"
+        ) or "bracket" in harness._structural_imbalance_hint("unexpected EOF while parsing")
 
     def test_unknown_message_empty(self, harness):
         assert harness._structural_imbalance_hint("just an error") == ""
 
 
 # ── _apply_scoped_replacement / _apply_one_edit_text ────────────────────────
+
 
 class TestApplyScopedReplacement:
     def test_in_scope_unique_replaces(self, harness):
@@ -474,8 +487,7 @@ class TestApplyOneEditText:
         assert not res["ok"]
 
     def test_scoped_delegation(self, harness):
-        res = harness._apply_one_edit_text(
-            "x = 1\ny = 2\nx = 1\n", "f.py", "x = 1", "x = 9", False, scope=(1, 2))
+        res = harness._apply_one_edit_text("x = 1\ny = 2\nx = 1\n", "f.py", "x = 1", "x = 9", False, scope=(1, 2))
         assert res["ok"]
         assert res["new_content"] == "x = 9\ny = 2\nx = 1\n"
 
@@ -483,14 +495,14 @@ class TestApplyOneEditText:
         # old_string is absent verbatim (indent drift) → indent-tolerant fallback
         # resolves it; new_string's first-line indent is rebased to the match's.
         content = "def f():\n    body\n"
-        res = harness._apply_one_edit_text(
-            content, "f.py", "def f():\nbody", "    def g():\n    pass", False)
+        res = harness._apply_one_edit_text(content, "f.py", "def f():\nbody", "    def g():\n    pass", False)
         assert res["ok"]
         assert res["new_content"] == "def g():\npass\n"
         assert res["reindent_applied"] is True
 
 
 # ── _tool_edit_text end-to-end ──────────────────────────────────────────────
+
 
 class TestToolEditText:
     def test_single_success(self, harness, tmp_path):
@@ -502,64 +514,93 @@ class TestToolEditText:
 
     def test_batch_success(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py", "edits": [
-            {"old_string": "a = 1", "new_string": "a = 10"},
-            {"old_string": "b = 2", "new_string": "b = 20"},
-        ]})
+        r = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "edits": [
+                    {"old_string": "a = 1", "new_string": "a = 10"},
+                    {"old_string": "b = 2", "new_string": "b = 20"},
+                ],
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "a = 10\nb = 20\n"
 
     def test_batch_atomic_failure(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py", "edits": [
-            {"old_string": "a = 1", "new_string": "a = 10"},
-            {"old_string": "zzz", "new_string": "b = 20"},
-        ]})
+        r = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "edits": [
+                    {"old_string": "a = 1", "new_string": "a = 10"},
+                    {"old_string": "zzz", "new_string": "b = 20"},
+                ],
+            }
+        )
         assert not r.ok
         assert r.metadata.get("failed_edit_index") == 1
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "a = 1\nb = 2\n"  # untouched
 
     def test_scope_restricts_matching(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("x = 1\ny = 2\nx = 1\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py", "old_string": "x = 1",
-                                     "new_string": "x = 9",
-                                     "scope_start_line": 1, "scope_end_line": 2})
+        r = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "old_string": "x = 1",
+                "new_string": "x = 9",
+                "scope_start_line": 1,
+                "scope_end_line": 2,
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "x = 9\ny = 2\nx = 1\n"
 
     def test_scope_validation_errors(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("x = 1\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py", "old_string": "x",
-                                     "new_string": "y", "scope_start_line": 1})
+        r = harness._tool_edit_text({"file_path": "t.py", "old_string": "x", "new_string": "y", "scope_start_line": 1})
         assert not r.ok and "together" in r.error
-        r = harness._tool_edit_text({"file_path": "t.py", "old_string": "x",
-                                     "new_string": "y", "scope_start_line": 3, "scope_end_line": 1})
+        r = harness._tool_edit_text(
+            {"file_path": "t.py", "old_string": "x", "new_string": "y", "scope_start_line": 3, "scope_end_line": 1}
+        )
         assert not r.ok and "<=" in r.error
-        r = harness._tool_edit_text({"file_path": "t.py", "old_string": "x",
-                                     "new_string": "y", "scope_start_line": 1, "scope_end_line": 2,
-                                     "replace_all": True})
+        r = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "old_string": "x",
+                "new_string": "y",
+                "scope_start_line": 1,
+                "scope_end_line": 2,
+                "replace_all": True,
+            }
+        )
         assert not r.ok and "replace_all" in r.error
 
     def test_mixed_mode_rejected(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("x = 1\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py", "edits": [{"old_string": "x", "new_string": "y"}],
-                                     "old_string": "x", "new_string": "y"})
+        r = harness._tool_edit_text(
+            {
+                "file_path": "t.py",
+                "edits": [{"old_string": "x", "new_string": "y"}],
+                "old_string": "x",
+                "new_string": "y",
+            }
+        )
         assert not r.ok and "Cannot mix" in r.error
 
     def test_syntax_gate_refuses_broken_python(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("def f():\n    pass\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py",
-                                     "old_string": "def f():\n    pass",
-                                     "new_string": "def f():\npass"})
+        r = harness._tool_edit_text(
+            {"file_path": "t.py", "old_string": "def f():\n    pass", "new_string": "def f():\npass"}
+        )
         assert not r.ok
         assert r.metadata.get("failure_class") == "syntax_invalid_after_edit"
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "def f():\n    pass\n"  # untouched
 
     def test_syntax_gate_allows_fixing_broken_file(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("def f():\npass\n", encoding="utf-8")
-        r = harness._tool_edit_text({"file_path": "t.py",
-                                     "old_string": "def f():\npass",
-                                     "new_string": "def f():\n    pass\n"})
+        r = harness._tool_edit_text(
+            {"file_path": "t.py", "old_string": "def f():\npass", "new_string": "def f():\n    pass\n"}
+        )
         assert r.ok, r.error  # pre-existing broken file → gate opens
 
     def test_missing_file_error(self, harness, tmp_path):
@@ -589,7 +630,11 @@ class TestToolEditText:
                 # simulate a stale-entry mismatch, then change the file on disk
                 # (fresh content still contains the old_string so retry succeeds)
                 target.write_text("alpha\nbeta\nextra\n", encoding="utf-8")
-                return {"ok": False, "error": "old_string not found", "metadata": {"failure_class": "search_string_mismatch"}}
+                return {
+                    "ok": False,
+                    "error": "old_string not found",
+                    "metadata": {"failure_class": "search_string_mismatch"},
+                }
             return orig_apply(content, file_path, old, new, replace_all, scope)
 
         harness._apply_one_edit_text = flaky_apply
@@ -601,25 +646,29 @@ class TestToolEditText:
 
 # ── _tool_edit_file end-to-end ──────────────────────────────────────────────
 
+
 class TestToolEditFile:
     def test_replace_op(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\nc\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "replace", "anchor": "b", "content": "B"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "replace", "anchor": "b", "content": "B"}]}
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nB\nc\n"
 
     def test_insert_after(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "insert_after", "anchor": "a", "content": "A1"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "insert_after", "anchor": "a", "content": "A1"}]}
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nA1\nb\n"
 
     def test_insert_after_block_header_moves_to_block_end(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("def f():\n    body\nx = 1\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.py", "operations": [
-            {"type": "insert_after", "anchor": "def f():", "content": "y = 2"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.py", "operations": [{"type": "insert_after", "anchor": "def f():", "content": "y = 2"}]}
+        )
         assert r.ok, r.error
         content = (tmp_path / "t.py").read_text(encoding="utf-8")
         # inserted as a SIBLING after the block, not nested inside the body
@@ -628,34 +677,37 @@ class TestToolEditFile:
 
     def test_insert_after_idempotent_skip(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nX\nb\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "insert_after", "anchor": "a", "content": "X"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "insert_after", "anchor": "a", "content": "X"}]}
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nX\nb\n"  # unchanged
 
     def test_insert_before(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\nb\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "insert_before", "anchor": "b", "content": "B0"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "insert_before", "anchor": "b", "content": "B0"}]}
+        )
         assert r.ok, r.error
         assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "a\nB0\nb\n"
 
     def test_unknown_op_type_fails(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "teleport", "anchor": "a", "content": "x"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "teleport", "anchor": "a", "content": "x"}]}
+        )
         assert not r.ok and "unknown type" in r.error
 
     def test_missing_anchor_fails(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "replace", "content": "x"}]})
+        r = harness._tool_edit_file({"path": "t.txt", "operations": [{"type": "replace", "content": "x"}]})
         assert not r.ok and "anchor" in r.error
 
     def test_anchor_not_found(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("a\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "replace", "anchor": "zzz", "content": "x"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "replace", "anchor": "zzz", "content": "x"}]}
+        )
         assert not r.ok and "anchor text not found" in r.error
 
     def test_ops_recovered_from_raw_arguments(self, harness, tmp_path):
@@ -668,16 +720,21 @@ class TestToolEditFile:
     def test_syntax_rollback_on_bad_edit(self, harness, tmp_path):
         (tmp_path / "t.py").write_text("def f():\n    pass\n", encoding="utf-8")
         harness._run_syntax_check_for_file = lambda p: {
-            "ok": False, "skipped": False, "errors": [{"line": 1, "col": 0, "message": "boom"}]}
-        r = harness._tool_edit_file({"path": "t.py", "operations": [
-            {"type": "replace", "anchor": "def f():", "content": "def g():"}]})
+            "ok": False,
+            "skipped": False,
+            "errors": [{"line": 1, "col": 0, "message": "boom"}],
+        }
+        r = harness._tool_edit_file(
+            {"path": "t.py", "operations": [{"type": "replace", "anchor": "def f():", "content": "def g():"}]}
+        )
         assert not r.ok
         assert r.metadata.get("rollback_reason") == "syntax_error"
         assert (tmp_path / "t.py").read_text(encoding="utf-8") == "def f():\n    pass\n"  # rolled back
 
     def test_file_not_found(self, harness, tmp_path):
-        r = harness._tool_edit_file({"path": "missing.txt", "operations": [
-            {"type": "replace", "anchor": "x", "content": "y"}]})
+        r = harness._tool_edit_file(
+            {"path": "missing.txt", "operations": [{"type": "replace", "anchor": "x", "content": "y"}]}
+        )
         assert not r.ok and "File not found" in r.error
 
     def test_empty_operations_fails(self, harness, tmp_path):
@@ -687,13 +744,15 @@ class TestToolEditFile:
 
     def test_content_contains_anchor_warning(self, harness, tmp_path):
         (tmp_path / "t.txt").write_text("foo\n", encoding="utf-8")
-        r = harness._tool_edit_file({"path": "t.txt", "operations": [
-            {"type": "replace", "anchor": "foo", "content": "foo bar"}]})
+        r = harness._tool_edit_file(
+            {"path": "t.txt", "operations": [{"type": "replace", "anchor": "foo", "content": "foo bar"}]}
+        )
         assert r.ok
         assert "edit_warnings" in (r.metadata or {})
 
 
 # ── _tool_create_file end-to-end ────────────────────────────────────────────
+
 
 class TestToolCreateFile:
     def test_creates_file_with_parents(self, harness, tmp_path):
@@ -734,6 +793,7 @@ class TestToolCreateFile:
 
 
 # ── _extract_ops_from_raw / _run_syntax_check_for_file / misc ───────────────
+
 
 class TestExtractOpsFromRaw:
     def test_truncated_json_recovers_ops(self, harness):
@@ -777,12 +837,11 @@ class TestNormRepoRelAndRecord:
 
 # ── _tool_modify_symbol end-to-end ──────────────────────────────────────────
 
+
 class TestToolModifySymbol:
     def test_modify_symbol_success(self, harness, tmp_path):
         (tmp_path / "m.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
-        r = harness._tool_modify_symbol({
-            "file_path": "m.py", "symbol": "foo",
-            "code": "def foo():\n    return 42\n"})
+        r = harness._tool_modify_symbol({"file_path": "m.py", "symbol": "foo", "code": "def foo():\n    return 42\n"})
         assert r.ok, r.error
         assert "return 42" in (tmp_path / "m.py").read_text(encoding="utf-8")
         assert r.metadata.get("symbol_def_line") == 1
@@ -795,20 +854,20 @@ class TestToolModifySymbol:
     def test_path_traversal_blocked(self, harness, tmp_path):
         outside = tmp_path.parent / "m.py"
         outside.write_text("def foo():\n    pass\n", encoding="utf-8")
-        r = harness._tool_modify_symbol({
-            "file_path": str(outside), "symbol": "foo", "code": "def foo():\n    return 1\n"})
+        r = harness._tool_modify_symbol(
+            {"file_path": str(outside), "symbol": "foo", "code": "def foo():\n    return 1\n"}
+        )
         assert not r.ok and "blocked" in r.error
 
     def test_file_not_found(self, harness):
-        r = harness._tool_modify_symbol({
-            "file_path": "missing.py", "symbol": "foo", "code": "def foo():\n    pass\n"})
+        r = harness._tool_modify_symbol({"file_path": "missing.py", "symbol": "foo", "code": "def foo():\n    pass\n"})
         assert not r.ok and "File not found" in r.error
 
     def test_dry_run_restores_file(self, harness, tmp_path):
         (tmp_path / "m.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
-        r = harness._tool_modify_symbol({
-            "file_path": "m.py", "symbol": "foo",
-            "code": "def foo():\n    return 42\n", "dry_run": True})
+        r = harness._tool_modify_symbol(
+            {"file_path": "m.py", "symbol": "foo", "code": "def foo():\n    return 42\n", "dry_run": True}
+        )
         assert r.ok, r.error
         assert "preview" in r.content
         # file restored to pre-edit content
@@ -816,6 +875,7 @@ class TestToolModifySymbol:
 
 
 # ── _tool_edit_text additional paths ────────────────────────────────────────
+
 
 class TestToolEditTextExtra:
     def test_reread_retry_not_triggered_when_file_unchanged(self, harness, tmp_path):
@@ -825,7 +885,11 @@ class TestToolEditTextExtra:
 
         def fail_once(content, file_path, old, new, replace_all, scope=None):
             calls["n"] += 1
-            return {"ok": False, "error": "old_string not found", "metadata": {"failure_class": "search_string_mismatch"}}
+            return {
+                "ok": False,
+                "error": "old_string not found",
+                "metadata": {"failure_class": "search_string_mismatch"},
+            }
 
         harness._apply_one_edit_text = fail_once
         r = harness._tool_edit_text({"file_path": "t.txt", "old_string": "beta", "new_string": "gamma"})
@@ -860,6 +924,7 @@ class TestToolEditTextExtra:
 
 # ── _tool_create_file extra paths ───────────────────────────────────────────
 
+
 class TestToolCreateFileExtra:
     def test_non_python_language_syntax_gate(self, harness, tmp_path):
         # .ts files have a registered provider; a broken one must be refused
@@ -875,9 +940,11 @@ class TestToolCreateFileExtra:
         # non-python soft-fail path: provider reports a soft-fail error →
         # _should_soft_fail_verify returns False in harness → refused
         from external_llm.languages import LanguageRegistry as LR  # noqa: N817 — test-local shorthand
+
         prov = LR.instance().get("x.go")
         if prov is None:
             import pytest as _pt
+
             _pt.skip("go provider not registered")
         r = harness._tool_create_file({"path": "x.go", "content": "package p\nfunc f() {"})
         assert not r.ok
@@ -885,25 +952,27 @@ class TestToolCreateFileExtra:
 
 # ── _tool_modify_symbol extra paths ─────────────────────────────────────────
 
+
 class TestToolModifySymbolExtra:
     def test_failure_result(self, harness, tmp_path):
         (tmp_path / "m.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
-        r = harness._tool_modify_symbol({
-            "file_path": "m.py", "symbol": "nonexistent_symbol",
-            "code": "def foo():\n    return 42\n"})
+        r = harness._tool_modify_symbol(
+            {"file_path": "m.py", "symbol": "nonexistent_symbol", "code": "def foo():\n    return 42\n"}
+        )
         assert not r.ok
         assert "failed" in r.error
 
     def test_dry_run_preview_only_when_apply_fails(self, harness, tmp_path):
         (tmp_path / "m.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
-        r = harness._tool_modify_symbol({
-            "file_path": "m.py", "symbol": "nope", "code": "def nope():\n    pass\n",
-            "dry_run": True})
+        r = harness._tool_modify_symbol(
+            {"file_path": "m.py", "symbol": "nope", "code": "def nope():\n    pass\n", "dry_run": True}
+        )
         assert r.ok  # dry run failure → preview_only success
         assert r.metadata.get("preview_only") is True
 
 
 # ── B2: atomic funnel entry + symlink preservation (edit_text / edit_file) ──
+
 
 class TestB2AtomicFunnelAndSymlinks:
     def test_edit_text_write_goes_through_atomic_funnel(self, harness, tmp_path, monkeypatch):
@@ -923,13 +992,10 @@ class TestB2AtomicFunnelAndSymlinks:
         assert common_rf.cached_repo_file_list(str(tmp_path)) == ["app.py"]
         assert key in common_rf._FILE_INDEX_CACHE
 
-        r = harness._tool_edit_text({
-            "file_path": "app.py", "old_string": "x = 1", "new_string": "x = 2"})
+        r = harness._tool_edit_text({"file_path": "app.py", "old_string": "x = 1", "new_string": "x = 2"})
         assert r.ok, r.error
         assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 2\n"
-        assert key not in common_rf._FILE_INDEX_CACHE, (
-            "edit_text must invalidate through the atomic funnel"
-        )
+        assert key not in common_rf._FILE_INDEX_CACHE, "edit_text must invalidate through the atomic funnel"
 
     def test_edit_text_encoding_write_is_atomic(self, harness, tmp_path, monkeypatch):
         """The non-UTF-8 (latin-1) write path — the one that used raw
@@ -948,10 +1014,13 @@ class TestB2AtomicFunnelAndSymlinks:
         assert common_rf.cached_repo_file_list(str(tmp_path)) == ["app.py"]
         assert key in common_rf._FILE_INDEX_CACHE
 
-        r = harness._tool_edit_text({
-            "file_path": "app.py",
-            "old_string": "café", "new_string": "café!",
-        })
+        r = harness._tool_edit_text(
+            {
+                "file_path": "app.py",
+                "old_string": "café",
+                "new_string": "café!",
+            }
+        )
         assert r.ok, r.error
         assert (tmp_path / "app.py").read_bytes() == "x = 'café!'\n".encode("latin-1"), (
             "latin-1 bytes must round-trip exactly (no UTF-8 re-encode)"
@@ -964,12 +1033,9 @@ class TestB2AtomicFunnelAndSymlinks:
         (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
         (tmp_path / "link.py").symlink_to("real.py")
 
-        r = harness._tool_edit_text({
-            "file_path": "link.py", "old_string": "x = 1", "new_string": "x = 2"})
+        r = harness._tool_edit_text({"file_path": "link.py", "old_string": "x = 1", "new_string": "x = 2"})
         assert r.ok, r.error
-        assert (tmp_path / "link.py").is_symlink(), (
-            "symlink must not be replaced by a regular file"
-        )
+        assert (tmp_path / "link.py").is_symlink(), "symlink must not be replaced by a regular file"
         assert (tmp_path / "real.py").read_text(encoding="utf-8") == "x = 2\n"
 
     def test_edit_file_preserves_symlink(self, harness, tmp_path):
@@ -978,16 +1044,16 @@ class TestB2AtomicFunnelAndSymlinks:
         (tmp_path / "real.py").write_text("x = 1\n", encoding="utf-8")
         (tmp_path / "link.py").symlink_to("real.py")
 
-        r = harness._tool_edit_file({"path": "link.py", "operations": [
-            {"type": "replace", "anchor": "x = 1", "content": "x = 2"}]})
-        assert r.ok, r.error
-        assert (tmp_path / "link.py").is_symlink(), (
-            "symlink must not be replaced by a regular file"
+        r = harness._tool_edit_file(
+            {"path": "link.py", "operations": [{"type": "replace", "anchor": "x = 1", "content": "x = 2"}]}
         )
+        assert r.ok, r.error
+        assert (tmp_path / "link.py").is_symlink(), "symlink must not be replaced by a regular file"
         assert (tmp_path / "real.py").read_text(encoding="utf-8") == "x = 2\n"
 
 
 # ── real _run_syntax_check_for_file: non-UTF-8 read path ─────────────────────
+
 
 class _RealSyntaxHarness(WriteToolsEditMixin):
     """Minimal real-mixin host for _run_syntax_check_for_file (no stub).

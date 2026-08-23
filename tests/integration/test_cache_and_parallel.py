@@ -3,6 +3,7 @@
 Test script to verify parallel tool execution and tool result cache.
 Run with: python test_cache_and_parallel.py
 """
+
 import logging
 import os
 import sys
@@ -15,11 +16,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
 
 # Enable debug logging only for our module, suppress others
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 # Set our logger to DEBUG
 logging.getLogger("external_llm.agent.tool_registry").setLevel(logging.DEBUG)
 # Also enable cache logger if exists
 logging.getLogger("external_llm.agent.vector_cache").setLevel(logging.DEBUG)
+
 
 def test_tool_result_cache():
     """Test that tool result cache works for read-only tools."""
@@ -93,6 +95,7 @@ def test_tool_result_cache():
 
     print("\nCache test completed.")
 
+
 def test_parallel_execution():
     """Test parallel tool execution with multiple read-only tools."""
     print("\n=== Testing Parallel Tool Execution ===")
@@ -134,6 +137,7 @@ def test_parallel_execution():
 
     print("\nParallel execution test completed.")
 
+
 def test_dynamic_turn_budget():
     """Test dynamic turn budget calculation."""
     print("\n=== Testing Dynamic Turn Budget ===")
@@ -151,6 +155,7 @@ def test_dynamic_turn_budget():
     print("Test would require full AgentLoop instantiation.")
     print("Skipping detailed test for now.")
 
+
 if __name__ == "__main__":
     print("Starting tests for parallel execution and tool result cache...")
     try:
@@ -161,5 +166,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nError during tests: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)

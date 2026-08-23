@@ -47,7 +47,7 @@ def _patch_rich_md_tables_wrap() -> None:
             yield _item
 
     _TE.__rich_console__ = _fold
-    _TE._asicode_fold_patched = True
+    _TE._asicode_fold_patched = True  # type: ignore[attr-defined]  # dynamic class attr
 
 
 def markdown_cls():

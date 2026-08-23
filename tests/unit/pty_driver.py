@@ -32,6 +32,7 @@ Environment facts this harness accounts for:
   based ``get_size`` — setting the pty winsize is sufficient. Non-main
   threads get SIGINT/WINCH handling disabled automatically.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -128,6 +129,8 @@ def _pump_master_once(
     if on_data is not None:
         on_data(data)
     return True
+
+
 def _pump_master_until_quiet(
     master_fd: int,
     buf: bytearray,
@@ -145,8 +148,7 @@ def _pump_master_until_quiet(
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _pump_master_once(master_fd, buf, lock, on_data=on_data,
-                                 select_timeout=quiet):
+        if not _pump_master_once(master_fd, buf, lock, on_data=on_data, select_timeout=quiet):
             break  # quiet window / fd error / EOF: snapshot is settled
 
 
@@ -158,8 +160,7 @@ class PtySession:
     ioctl-based ``get_size`` reports sane dimensions.
     """
 
-    def __init__(self, monkeypatch, rows: int = 24, cols: int = 80,
-                 redirect_stdout: bool = True) -> None:
+    def __init__(self, monkeypatch, rows: int = 24, cols: int = 80, redirect_stdout: bool = True) -> None:
         self._monkeypatch = monkeypatch
         self._redirect_stdout = redirect_stdout
         self._master, self._slave = os.openpty()
@@ -172,30 +173,26 @@ class PtySession:
         self.master_fd = self._master
         self.slave_fd = self._slave
         fcntl.ioctl(
-            self._slave, termios.TIOCSWINSZ,
+            self._slave,
+            termios.TIOCSWINSZ,
             struct.pack("HHHH", rows, cols, 0, 0),
         )
         monkeypatch.setenv("TERM", "xterm")
-        monkeypatch.setattr(
-            sys, "stdin", os.fdopen(os.dup(self._slave), "r", buffering=1))
+        monkeypatch.setattr(sys, "stdin", os.fdopen(os.dup(self._slave), "r", buffering=1))
         if redirect_stdout:
-            monkeypatch.setattr(
-                sys, "stdout", os.fdopen(os.dup(self._slave), "w", buffering=1))
+            monkeypatch.setattr(sys, "stdout", os.fdopen(os.dup(self._slave), "w", buffering=1))
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._drain = threading.Thread(
-            target=self._drain_loop, name="pty-drain", daemon=True)
+        self._drain = threading.Thread(target=self._drain_loop, name="pty-drain", daemon=True)
         self._drain.start()
 
     def activate(self) -> None:
         """Re-apply the stream redirections (see module docstring)."""
         monkeypatch = self._monkeypatch
-        monkeypatch.setattr(
-            sys, "stdin", os.fdopen(os.dup(self._slave), "r", buffering=1))
+        monkeypatch.setattr(sys, "stdin", os.fdopen(os.dup(self._slave), "r", buffering=1))
         if self._redirect_stdout:
-            monkeypatch.setattr(
-                sys, "stdout", os.fdopen(os.dup(self._slave), "w", buffering=1))
+            monkeypatch.setattr(sys, "stdout", os.fdopen(os.dup(self._slave), "w", buffering=1))
 
     def _drain_loop(self) -> None:
         while not self._stop.is_set():
@@ -251,7 +248,9 @@ class PtySession:
         last = b""
         while time.monotonic() < deadline:
             _pump_master_once(
-                self._master, self._buf, self._lock,
+                self._master,
+                self._buf,
+                self._lock,
                 on_data=self._maybe_answer_cpr,
             )
             with self._lock:
@@ -260,8 +259,8 @@ class PtySession:
                 return last
             time.sleep(0.02)
         raise AssertionError(
-            f"timed out after {timeout}s waiting for {needle!r} in pty output; "
-            f"last {len(last)} bytes: {last[-400:]!r}")
+            f"timed out after {timeout}s waiting for {needle!r} in pty output; last {len(last)} bytes: {last[-400:]!r}"
+        )
 
     def dump(self, timeout: float = 5.0, quiet: float = 0.05) -> bytes:
         """All output drained so far (not consumed).
@@ -276,8 +275,11 @@ class PtySession:
         the just-printed truncation notice did not).
         """
         _pump_master_until_quiet(
-            self._master, self._buf, self._lock,
-            timeout=timeout, quiet=quiet,
+            self._master,
+            self._buf,
+            self._lock,
+            timeout=timeout,
+            quiet=quiet,
             on_data=self._maybe_answer_cpr,
         )
         with self._lock:
@@ -314,8 +316,7 @@ class SpawnPtySession:
     with the same CPR-answering loop as :class:`PtySession`.
     """
 
-    def __init__(self, argv, *, cwd=None, env=None, rows: int = 24,
-                 cols: int = 80, timeout: float = 45.0) -> None:
+    def __init__(self, argv, *, cwd=None, env=None, rows: int = 24, cols: int = 80, timeout: float = 45.0) -> None:
         self.timeout = timeout
         self._master, slave = os.openpty()
         # See PtySession.__init__: shared by two concurrent readers — the
@@ -323,7 +324,8 @@ class SpawnPtySession:
         os.set_blocking(self._master, False)
         with contextlib.suppress(OSError):
             fcntl.ioctl(
-                slave, termios.TIOCSWINSZ,
+                slave,
+                termios.TIOCSWINSZ,
                 struct.pack("HHHH", rows, cols, 0, 0),
             )
         # Must precede Popen: a CR the harness writes before the child's
@@ -347,15 +349,20 @@ class SpawnPtySession:
         child_env.pop("COVERAGE_PROCESS_START", None)
         child_env.pop("COVERAGE_PROCESS_CONFIG", None)
         self._proc = subprocess.Popen(
-            argv, stdin=slave, stdout=slave, stderr=slave,
-            cwd=cwd, env=child_env, close_fds=True, start_new_session=True,
+            argv,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=cwd,
+            env=child_env,
+            close_fds=True,
+            start_new_session=True,
         )
         os.close(slave)
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._drain = threading.Thread(
-            target=self._drain_loop, name="pty-spawn-drain", daemon=True)
+        self._drain = threading.Thread(target=self._drain_loop, name="pty-spawn-drain", daemon=True)
         self._drain.start()
 
     def _drain_loop(self) -> None:
@@ -404,7 +411,9 @@ class SpawnPtySession:
         last = b""
         while time.monotonic() < deadline:
             _pump_master_once(
-                self._master, self._buf, self._lock,
+                self._master,
+                self._buf,
+                self._lock,
                 on_data=self._maybe_answer_cpr,
             )
             with self._lock:
@@ -414,7 +423,8 @@ class SpawnPtySession:
             time.sleep(0.02)
         raise AssertionError(
             f"timed out after {timeout or self.timeout}s waiting for {needle!r} "
-            f"in pty output; last {len(last)} bytes: {last[-4000:]!r}")
+            f"in pty output; last {len(last)} bytes: {last[-4000:]!r}"
+        )
 
     def _maybe_answer_cpr(self, data: bytes) -> None:
         if b"\x1b[6n" in data:
@@ -430,8 +440,12 @@ class SpawnPtySession:
         not observe a snapshot that predates them.
         """
         _pump_master_until_quiet(
-            self._master, self._buf, self._lock,
-            timeout=timeout, quiet=quiet, on_data=self._maybe_answer_cpr,
+            self._master,
+            self._buf,
+            self._lock,
+            timeout=timeout,
+            quiet=quiet,
+            on_data=self._maybe_answer_cpr,
         )
         with self._lock:
             return bytes(self._buf)

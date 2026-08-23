@@ -9,6 +9,7 @@ grep. Two properties are load-bearing and are pinned here:
 * a miss says "no match was found", not "there are no tests". Those read the
   same to a model and lead to opposite actions.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -36,17 +37,13 @@ def repo(tmp_path):
         encoding="utf-8",
     )
     # unrelated
-    (tests / "test_other.py").write_text(
-        "def test_nothing():\n    assert True\n", encoding="utf-8"
-    )
+    (tests / "test_other.py").write_text("def test_nothing():\n    assert True\n", encoding="utf-8")
     return tmp_path
 
 
 def test_symbol_match_outranks_module_import(repo):
     finder = SymbolAwareTestFinder(str(repo))
-    targets = finder.discover_test_targets(
-        target_symbols=["Widget"], target_files=["pkg/widget.py"]
-    )
+    targets = finder.discover_test_targets(target_symbols=["Widget"], target_files=["pkg/widget.py"])
     paths = [t.test_path for t in targets]
     assert paths[0].endswith("test_widget.py"), paths
     assert targets[0].match_type == "direct_symbol"
@@ -88,9 +85,7 @@ def test_file_contents_are_read_once_per_file(repo, monkeypatch):
             reads.append(test_file)
         return _orig(self, test_file)
 
-    monkeypatch.setattr(
-        SymbolAwareTestFinder, "_read_test_file", _counting, raising=True
-    )
+    monkeypatch.setattr(SymbolAwareTestFinder, "_read_test_file", _counting, raising=True)
     finder.discover_test_targets(
         target_symbols=["Widget", "spin", "Nope1", "Nope2"],
         target_files=["pkg/widget.py"],
@@ -112,26 +107,20 @@ def test_tool_is_dispatchable_and_reports_the_reason(repo):
     result = _dispatch(repo, {"symbol": "Widget"})
     assert result.ok, result.error
     assert "test_widget.py" in result.content
-    assert "direct_symbol" in result.content, (
-        "the match reason must reach the model, not just the path"
-    )
+    assert "direct_symbol" in result.content, "the match reason must reach the model, not just the path"
     assert result.metadata.get("top_match_type") == "direct_symbol"
 
 
 def test_tool_accepts_name_as_an_alias(repo):
     """asi.py's preview table and models both reach for `name`."""
-    assert _dispatch(repo, {"name": "Widget"}).content == (
-        _dispatch(repo, {"symbol": "Widget"}).content
-    )
+    assert _dispatch(repo, {"name": "Widget"}).content == (_dispatch(repo, {"symbol": "Widget"}).content)
 
 
 def test_a_miss_does_not_read_as_proof_of_no_coverage(repo):
     result = _dispatch(repo, {"symbol": "NoSuchSymbol"})
     assert result.ok
     assert result.metadata.get("match_count") == 0
-    assert "NOT that the symbol is" in result.content, (
-        "a miss must distinguish 'not found' from 'not tested'"
-    )
+    assert "NOT that the symbol is" in result.content, "a miss must distinguish 'not found' from 'not tested'"
 
 
 def test_no_target_is_a_usable_error(repo):

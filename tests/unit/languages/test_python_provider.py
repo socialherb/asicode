@@ -1,4 +1,5 @@
 """Tests for PythonSyntaxProvider (external_llm/languages/python_provider.py)."""
+
 import importlib
 
 import pytest
@@ -15,11 +16,13 @@ def provider():
 
 # ── language_id ───────────────────────────────────────────────────────────────
 
+
 def test_language_id(provider):
     assert provider.language_id() == LanguageId.PYTHON
 
 
 # ── capabilities ──────────────────────────────────────────────────────────────
+
 
 def test_capabilities_python(provider):
     caps = provider.capabilities()
@@ -33,6 +36,7 @@ def test_capabilities_python(provider):
 
 
 # ── validate_syntax ───────────────────────────────────────────────────────────
+
 
 class TestValidateSyntax:
     def test_valid_python(self, provider):
@@ -63,6 +67,7 @@ class TestValidateSyntax:
 
 # ── get_symbol_patterns ───────────────────────────────────────────────────────
 
+
 class TestGetSymbolPatterns:
     def test_any_returns_function_and_class(self, provider):
         patterns = provider.get_symbol_patterns("any")
@@ -86,12 +91,14 @@ class TestGetSymbolPatterns:
 
 # ── get_file_globs ────────────────────────────────────────────────────────────
 
+
 def test_file_globs(provider):
     globs = provider.get_file_globs()
     assert "*.py" in globs
 
 
 # ── get_lint_command ──────────────────────────────────────────────────────────
+
 
 def test_lint_command(provider):
     cmd = provider.get_lint_command("foo.py")
@@ -101,6 +108,7 @@ def test_lint_command(provider):
 
 
 # ── get_test_command ──────────────────────────────────────────────────────────
+
 
 def test_test_command(provider):
     cmd = provider.get_test_command("/repo")
@@ -114,6 +122,7 @@ def test_test_command_with_args(provider):
 
 
 # ── find_symbol_in_file ───────────────────────────────────────────────────────
+
 
 class TestFindSymbolInFile:
     def test_finds_function(self, provider):
@@ -153,6 +162,7 @@ class TestFindSymbolInFile:
 
 # ── get_definition_keywords ───────────────────────────────────────────────────
 
+
 def test_definition_keywords(provider):
     keywords = provider.get_definition_keywords()
     assert "def " in keywords
@@ -164,6 +174,7 @@ def test_definition_keywords(provider):
 # which is memoised in its _LANG_CACHE (positive AND negative) and cleared by
 # invalidate_caches() — repeated checks are cache hits, and a grammar installed
 # mid-process takes effect after invalidate_caches() without a restart.
+
 
 def test_tree_sitter_available_matches_language_availability():
     tsu = importlib.import_module("external_llm.languages.tree_sitter_utils")

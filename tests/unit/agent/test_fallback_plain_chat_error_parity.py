@@ -12,6 +12,7 @@ classification in _respond_impl.
 This test pins the invariant: every LLMClientError subclass propagates
 unchanged; only non-LLMClientError (unexpected) exceptions are swallowed.
 """
+
 from __future__ import annotations
 
 from unittest import mock
@@ -48,9 +49,7 @@ def test_fallback_plain_chat_propagates_service_errors(exc: LLMClientError):
     client.chat.side_effect = exc
 
     with pytest.raises(type(exc)):
-        _fallback_plain_chat(
-            [LLMMessage(role="user", content="hi")], client, "test-model"
-        )
+        _fallback_plain_chat([LLMMessage(role="user", content="hi")], client, "test-model")
 
 
 def test_fallback_plain_chat_still_swallows_unexpected_exceptions():
@@ -60,9 +59,7 @@ def test_fallback_plain_chat_still_swallows_unexpected_exceptions():
     client = mock.MagicMock()
     client.chat.side_effect = RuntimeError("unexpected parse bug")
 
-    result = _fallback_plain_chat(
-        [LLMMessage(role="user", content="hi")], client, "test-model"
-    )
+    result = _fallback_plain_chat([LLMMessage(role="user", content="hi")], client, "test-model")
 
     assert result["error"] is True
     assert "unexpected parse bug" in result["content"]
@@ -76,6 +73,4 @@ def test_fallback_plain_chat_quota_error_regression():
     client.chat.side_effect = LLMQuotaExceededError("insufficient balance")
 
     with pytest.raises(LLMQuotaExceededError):
-        _fallback_plain_chat(
-            [LLMMessage(role="user", content="hi")], client, "test-model"
-        )
+        _fallback_plain_chat([LLMMessage(role="user", content="hi")], client, "test-model")

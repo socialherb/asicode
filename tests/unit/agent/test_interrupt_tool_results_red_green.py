@@ -4,6 +4,7 @@ Full-detail renderer for interrupted tool-loop results (Option B).
 Coverage gaps closed: args=None → 빈 str, json.dumps 실패 → repr,
 콘텐츠 cap 초과 truncation, total_chars 예산 중단.
 """
+
 from __future__ import annotations
 
 from external_llm.agent.interrupt_tool_results import (
@@ -27,9 +28,11 @@ def test_empty_input_returns_empty_string():
 
 
 def test_single_ok_result_renders_header_and_block():
-    out = render_interrupt_tool_results([
-        {"tool": "read_file", "args": {"path": "a.py"}, "content": "line1", "ok": True},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "read_file", "args": {"path": "a.py"}, "content": "line1", "ok": True},
+        ]
+    )
     assert "[Interrupted tool-loop results — full detail preserved]" in out
     assert "[1 of 1 tool call(s) shown" in out
     assert "[1] read_file (ok)" in out
@@ -38,49 +41,61 @@ def test_single_ok_result_renders_header_and_block():
 
 
 def test_failed_result_marks_fail_status():
-    out = render_interrupt_tool_results([
-        {"tool": "apply_patch", "args": {"patch": "x"}, "content": "", "ok": False},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "apply_patch", "args": {"patch": "x"}, "content": "", "ok": False},
+        ]
+    )
     assert "[1] apply_patch (FAIL)" in out
 
 
 def test_args_none_omits_args_line():
-    out = render_interrupt_tool_results([
-        {"tool": "bash", "args": None, "content": "out", "ok": True},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "bash", "args": None, "content": "out", "ok": True},
+        ]
+    )
     assert "(ok)" in out
     assert "args:" not in out
 
 
 def test_args_scalar_stringified():
-    out = render_interrupt_tool_results([
-        {"tool": "t", "args": 42, "content": "", "ok": True},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "t", "args": 42, "content": "", "ok": True},
+        ]
+    )
     assert "args: 42" in out
 
 
 def test_args_serialization_failure_falls_back_to_repr():
     bad = {"payload": _BadStr()}
-    out = render_interrupt_tool_results([
-        {"tool": "t", "args": bad, "content": "", "ok": True},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "t", "args": bad, "content": "", "ok": True},
+        ]
+    )
     assert "args:" in out
     assert "_BadStr" in out  # repr of the args dict
 
 
 def test_long_args_truncated_to_max_chars():
-    out = render_interrupt_tool_results([
-        {"tool": "t", "args": {"big": "x" * (MAX_ARGS_CHARS + 50)}, "content": "", "ok": True},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "t", "args": {"big": "x" * (MAX_ARGS_CHARS + 50)}, "content": "", "ok": True},
+        ]
+    )
     assert "…" in out
     args_line = out.split("args: ")[1].split("\n")[0]
     assert len(args_line.rstrip("…")) <= MAX_ARGS_CHARS + 1
 
 
 def test_long_content_truncated_with_marker():
-    out = render_interrupt_tool_results([
-        {"tool": "t", "args": {}, "content": "y" * (PER_RESULT_CHARS + 100), "ok": True},
-    ])
+    out = render_interrupt_tool_results(
+        [
+            {"tool": "t", "args": {}, "content": "y" * (PER_RESULT_CHARS + 100), "ok": True},
+        ]
+    )
     assert "[truncated 100 chars]" in out
 
 
@@ -95,7 +110,8 @@ def test_total_budget_stops_after_first_block():
 def test_per_result_cap_below_total():
     out = render_interrupt_tool_results(
         [{"tool": "t", "args": {}, "content": "q" * 200, "ok": True}],
-        per_result_chars=40, total_chars=TOTAL_CHARS,
+        per_result_chars=40,
+        total_chars=TOTAL_CHARS,
     )
     assert "[truncated 160 chars]" in out
 

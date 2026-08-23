@@ -21,10 +21,11 @@ Usage::
     syms = SyntaxValidator.find_symbols(content, lang)
     body = SyntaxValidator.extract_symbol_body(code, name, lang)
 """
+
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from . import tree_sitter_utils as ts_utils
 from .models import LanguageId, SyntaxValidationResult
@@ -64,8 +65,10 @@ class SyntaxValidator:
 
     @staticmethod
     def find_symbol_range(
-        content: str, symbol_name: str, lang: LanguageId,
-    ) -> Optional[tuple[int, int]]:
+        content: str,
+        symbol_name: str,
+        lang: LanguageId,
+    ) -> tuple[int, int] | None:
         """Return ``(start_line, end_line)`` (1-indexed) for *symbol_name*.
 
         Python → ``ast.parse`` + walk.
@@ -82,7 +85,8 @@ class SyntaxValidator:
 
     @staticmethod
     def find_symbols(
-        content: str, lang: LanguageId,
+        content: str,
+        lang: LanguageId,
     ) -> list[tuple[str, str, int, int]]:
         """Enumerate all top-level symbols.
 
@@ -97,10 +101,11 @@ class SyntaxValidator:
 
     @staticmethod
     def extract_symbol_body(
-        code: str, symbol_name: str, lang: LanguageId,
-    ) -> Optional[tuple[int, int]]:
-        """Return ``(body_start_line, body_end_line)`` for a function/method.
-        """
+        code: str,
+        symbol_name: str,
+        lang: LanguageId,
+    ) -> tuple[int, int] | None:
+        """Return ``(body_start_line, body_end_line)`` for a function/method."""
         provider = _get_provider(lang)
         if provider is not None:
             return provider.extract_symbol_body(code, symbol_name)
@@ -110,8 +115,7 @@ class SyntaxValidator:
 
     @staticmethod
     def is_dead_code_introduced(orig: str, new: str, lang: LanguageId) -> bool:
-        """Check if *new* introduces dead code compared to *orig*.
-        """
+        """Check if *new* introduces dead code compared to *orig*."""
         provider = _get_provider(lang)
         if provider is not None:
             return provider.is_dead_code_introduced(orig, new)
@@ -122,8 +126,10 @@ class SyntaxValidator:
 
     @staticmethod
     def find_symbol_in_file(
-        file_path: str, symbol_name: str, content: Optional[str] = None,
-    ) -> Optional[dict[str, Any]]:
+        file_path: str,
+        symbol_name: str,
+        content: str | None = None,
+    ) -> dict[str, Any] | None:
         """Read *file_path* and locate *symbol_name*, returning definition info."""
 
         lang = LanguageId.from_path(file_path)
@@ -162,8 +168,11 @@ class SyntaxValidator:
 
     @staticmethod
     def _ts_find_symbol_in_file(
-        file_path: str, symbol_name: str, source: str, lang: LanguageId,
-    ) -> Optional[dict[str, Any]]:
+        file_path: str,
+        symbol_name: str,
+        source: str,
+        lang: LanguageId,
+    ) -> dict[str, Any] | None:
         """Tree-sitter based symbol lookup for non-Python files."""
         lang_str = lang.value
         rng = ts_utils.find_symbol_range(source, symbol_name, lang_str)

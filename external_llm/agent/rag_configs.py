@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Optional
 
 from external_llm.agent.language_hint import _HANGUL_END, _HANGUL_START
 
@@ -45,10 +44,10 @@ def _scan_identifiers(text: str) -> list[str]:
             tokens.append(text[start:i])
             continue
         # Latin identifier start
-        if ch.isalpha() or ch == '_':
+        if ch.isalpha() or ch == "_":
             start = i
             i += 1
-            while i < n and (text[i].isalnum() or text[i] == '_'):
+            while i < n and (text[i].isalnum() or text[i] == "_"):
                 i += 1
             tokens.append(text[start:i])
             continue
@@ -77,7 +76,7 @@ def _extract_identifiers(text: str) -> list[str]:
     tokens: list[str] = []
     for tok in _IDENT_RE.findall(text):
         first = tok[0]
-        if first.isalpha() or first == '_':
+        if first.isalpha() or first == "_":
             tokens.append(tok)
         else:
             # Nl/No lead char: the scanner skips it and restarts after, which
@@ -139,18 +138,83 @@ def _split_camel_case(token: str) -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Common English stopwords for code tokenization
-_CODE_STOP_WORDS: frozenset[str] = frozenset({
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "should",
-    "could", "can", "may", "might", "must", "shall", "i", "you", "he", "she",
-    "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his",
-    "its", "our", "their", "mine", "yours", "hers", "ours", "theirs",
-    # Code-specific stop words (keywords that appear in requests but carry
-    # no semantic weight for matching).
-    "def", "class", "return", "import", "from", "not",
-    "this", "that", "these", "those", "then", "than",
-})
+_CODE_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "should",
+        "could",
+        "can",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "i",
+        "you",
+        "he",
+        "she",
+        "it",
+        "we",
+        "they",
+        "me",
+        "him",
+        "her",
+        "us",
+        "them",
+        "my",
+        "your",
+        "his",
+        "its",
+        "our",
+        "their",
+        "mine",
+        "yours",
+        "hers",
+        "ours",
+        "theirs",
+        # Code-specific stop words (keywords that appear in requests but carry
+        # no semantic weight for matching).
+        "def",
+        "class",
+        "return",
+        "import",
+        "from",
+        "not",
+        "this",
+        "that",
+        "these",
+        "those",
+        "then",
+        "than",
+    }
+)
 
 
 class CodeTokenizer:
@@ -175,10 +239,10 @@ class CodeTokenizer:
 
     def __init__(
         self,
-        stop_words: Optional[set[str]] = None,
+        stop_words: set[str] | None = None,
         min_token_len: int = 2,
         split_underscore: bool = True,
-        split_camel: bool = True
+        split_camel: bool = True,
     ):
         """
         Args:
@@ -261,5 +325,4 @@ class CodeTokenizer:
         return sorted(sub_tokens)
 
 
-
-__all__ = ['CodeTokenizer']
+__all__ = ["CodeTokenizer"]

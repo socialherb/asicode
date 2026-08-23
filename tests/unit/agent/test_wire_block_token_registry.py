@@ -37,6 +37,7 @@ def _msg_with_raw_content(blocks: list) -> LLMMessage:
 # 1. Registry completeness contract
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestRegistryContract:
     def test_canonical_types_are_all_registered(self):
         """Every canonical wire block type has a tokenizer (text is the lone
@@ -61,70 +62,55 @@ class TestRegistryContract:
 # 2. Known block types are counted (not zero)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestKnownBlockTypesCounted:
     def test_tool_use_block_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "tool_use", "id": "t1", "name": "bash",
-             "input": {"command": "ls -la /usr/bin"}}
-        ])
+        msg = _msg_with_raw_content(
+            [{"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls -la /usr/bin"}}]
+        )
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_tool_result_string_content_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "tool_result", "tool_use_id": "t1",
-             "content": "total 4096\ndrwxr-xr-x bin"}
-        ])
+        msg = _msg_with_raw_content(
+            [{"type": "tool_result", "tool_use_id": "t1", "content": "total 4096\ndrwxr-xr-x bin"}]
+        )
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_tool_result_list_content_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "tool_result",
-             "content": [{"type": "text", "text": "output line one"}]}
-        ])
+        msg = _msg_with_raw_content([{"type": "tool_result", "content": [{"type": "text", "text": "output line one"}]}])
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_thinking_block_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "thinking", "thinking": "Let me analyse the request step by step."}
-        ])
+        msg = _msg_with_raw_content([{"type": "thinking", "thinking": "Let me analyse the request step by step."}])
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_redacted_thinking_block_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "redacted_thinking", "data": "opaque-signature-payload-data"}
-        ])
+        msg = _msg_with_raw_content([{"type": "redacted_thinking", "data": "opaque-signature-payload-data"}])
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_function_call_typed_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "functionCall", "functionCall": {"name": "search", "args": {"q": "tokyo"}}}
-        ])
+        msg = _msg_with_raw_content(
+            [{"type": "functionCall", "functionCall": {"name": "search", "args": {"q": "tokyo"}}}]
+        )
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_function_response_typed_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "functionResponse",
-             "functionResponse": {"name": "search", "content": {"result": "found"}}}
-        ])
+        msg = _msg_with_raw_content(
+            [{"type": "functionResponse", "functionResponse": {"name": "search", "content": {"result": "found"}}}]
+        )
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_gemini_key_inferred_function_call_counted(self):
         """Gemini parts may omit ``type`` and carry it as a top-level key."""
-        msg = _msg_with_raw_content([
-            {"functionCall": {"name": "search", "args": {"q": "paris"}}}
-        ])
+        msg = _msg_with_raw_content([{"functionCall": {"name": "search", "args": {"q": "paris"}}}])
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_gemini_key_inferred_function_response_counted(self):
-        msg = _msg_with_raw_content([
-            {"functionResponse": {"name": "search", "content": {"result": "none"}}}
-        ])
+        msg = _msg_with_raw_content([{"functionResponse": {"name": "search", "content": {"result": "none"}}}])
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_plain_text_block_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "text", "text": "Running analysis on the dataset."}
-        ])
+        msg = _msg_with_raw_content([{"type": "text", "text": "Running analysis on the dataset."}])
         assert _estimate_single_message_tokens(msg) > 0
 
 
@@ -132,18 +118,15 @@ class TestKnownBlockTypesCounted:
 # 3. Fail-safe: unknown block types are NEVER silently zero (the core invariant)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestFailSafeUnknownTypes:
     def test_unknown_block_counted_wholesale_not_zero(self):
         """The seal: a brand-new provider block type must not vanish."""
-        unknown = {"type": "future_citations_block",
-                   "citations": ["doc1", "doc2", "doc3"],
-                   "metadata": {"k": "v" * 50}}
+        unknown = {"type": "future_citations_block", "citations": ["doc1", "doc2", "doc3"], "metadata": {"k": "v" * 50}}
         assert _count_block_wholesale(unknown) > 0
 
     def test_unknown_block_via_message_estimator_not_zero(self):
-        msg = _msg_with_raw_content([
-            {"type": "future_reasoning_signature", "signature": "x" * 200}
-        ])
+        msg = _msg_with_raw_content([{"type": "future_reasoning_signature", "signature": "x" * 200}])
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_wholesale_approximates_json_size(self):
@@ -154,6 +137,7 @@ class TestFailSafeUnknownTypes:
 
     def test_unknown_type_not_in_canonical_set(self):
         assert "future_citations_block" not in CANONICAL_WIRE_BLOCK_TYPES
+
     # ══════════════════════════════════════════════════════════════════════════════
     # 3b. CJK never under-counted (the regression this class of seal exists to catch)
     # ══════════════════════════════════════════════════════════════════════════════
@@ -175,7 +159,7 @@ class TestFailSafeUnknownTypes:
         formula ever returned.
         """
 
-        KOREAN = "안녕하세요" * 100          # 500 chars, all Hangul (3 bytes each)
+        KOREAN = "안녕하세요" * 100  # 500 chars, all Hangul (3 bytes each)
 
         def test_wholesale_cjk_not_undercounted(self):
             """Wholesale fail-safe must honour its 'never under-count' docstring for CJK."""
@@ -186,8 +170,7 @@ class TestFailSafeUnknownTypes:
 
         def test_tool_use_cjk_args_not_undercounted(self):
             """A Korean edit patch (tool_use input) must not be under-counted."""
-            block = {"type": "tool_use", "id": "t1", "name": "edit",
-                     "input": {"patch": self.KOREAN}}
+            block = {"type": "tool_use", "id": "t1", "name": "edit", "input": {"patch": self.KOREAN}}
             byte_lower = len(json.dumps(block["input"], ensure_ascii=False).encode("utf-8")) // 2
             assert _tok_tool_use(block) >= byte_lower
 
@@ -205,7 +188,8 @@ class TestFailSafeUnknownTypes:
             """End-to-end: an assistant message whose tool_call carries a Korean
             argument is counted at roughly its byte budget, not silently dropped."""
             msg = LLMMessage(
-                role="assistant", content="",
+                role="assistant",
+                content="",
                 tool_calls=[{"name": "edit", "args": {"patch": self.KOREAN}}],
             )
             est = _estimate_single_message_tokens(msg)
@@ -228,10 +212,12 @@ class TestFailSafeUnknownTypes:
     def test_non_string_type_field_does_not_crash(self):
         """Client-supplied raw_content may carry a malformed (unhashable) type
         field; the pre-registry ``==`` chain tolerated it, so must dispatch."""
-        msg = _msg_with_raw_content([
-            {"type": ["weird"], "text": "payload"},
-            {"type": {"nested": True}, "data": "x" * 30},
-        ])
+        msg = _msg_with_raw_content(
+            [
+                {"type": ["weird"], "text": "payload"},
+                {"type": {"nested": True}, "data": "x" * 30},
+            ]
+        )
         assert _estimate_single_message_tokens(msg) > 0
 
     def test_gemini_untyped_part_counted_not_zero(self):
@@ -274,11 +260,11 @@ class TestFailSafeUnknownTypes:
         """A base64 image must be charged at the provider cap (~1.6k), not by
         payload length — a 300 KB screenshot is ~1.6k real tokens, not ~130k."""
         import base64
+
         fake = base64.b64encode(b"\x00" * 300_000).decode()
-        msg = _msg_with_raw_content([
-            {"type": "image",
-             "source": {"type": "base64", "media_type": "image/png", "data": fake}}
-        ])
+        msg = _msg_with_raw_content(
+            [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": fake}}]
+        )
         est = _estimate_single_message_tokens(msg)
         assert 0 < est <= 2000, f"image over-counted: {est}"
 
@@ -287,13 +273,9 @@ class TestFailSafeUnknownTypes:
         fallback, so its count reflects the real payload (not the whole block)."""
         # tool_use with a small input: registry counts input; wholesale would
         # count the whole block (larger). Registry count must be strictly less.
-        msg = _msg_with_raw_content([
-            {"type": "tool_use", "id": "x", "name": "n", "input": {"a": 1}}
-        ])
+        msg = _msg_with_raw_content([{"type": "tool_use", "id": "x", "name": "n", "input": {"a": 1}}])
         registry_count = _estimate_single_message_tokens(msg)
-        wholesale = _count_block_wholesale(
-            {"type": "tool_use", "id": "x", "name": "n", "input": {"a": 1}}
-        )
+        wholesale = _count_block_wholesale({"type": "tool_use", "id": "x", "name": "n", "input": {"a": 1}})
         assert registry_count < wholesale
 
 
@@ -301,14 +283,17 @@ class TestFailSafeUnknownTypes:
 # 4. Regression: end-to-end via estimate_tokens_from_msgs
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestEndToEndEstimation:
     def test_mixed_blocks_all_counted(self):
-        msg = _msg_with_raw_content([
-            {"type": "text", "text": "Running analysis."},
-            {"type": "tool_use", "name": "bash", "input": {"command": "echo hi"}},
-            {"type": "tool_result", "content": "hi"},
-            {"type": "thinking", "thinking": "step one"},
-        ])
+        msg = _msg_with_raw_content(
+            [
+                {"type": "text", "text": "Running analysis."},
+                {"type": "tool_use", "name": "bash", "input": {"command": "echo hi"}},
+                {"type": "tool_result", "content": "hi"},
+                {"type": "thinking", "thinking": "step one"},
+            ]
+        )
         text_only = _msg_with_raw_content([{"type": "text", "text": "Running analysis."}])
         assert _estimate_single_message_tokens(msg) > _estimate_single_message_tokens(text_only)
 
@@ -321,6 +306,7 @@ class TestEndToEndEstimation:
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Wire-drift counter contract (get_unknown_block_type_counts)
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestWireDriftCounter:
     """Verifies the public API of the unknown-block-type occurrence counter.
@@ -396,6 +382,7 @@ class TestWireDriftCounter:
 # key it does not read counted as ~0 — the same silent under-count, reachable
 # without any new block type appearing.
 
+
 class TestIntraTypeDrift:
     _BIG = "y" * 40000
 
@@ -420,15 +407,11 @@ class TestIntraTypeDrift:
         """
         think = "reason. " * 100
         sig = "ErUBCkYIBBgCIkA" + "x" * 600
-        without = _estimate_single_message_tokens(
-            _msg_with_raw_content([{"type": "thinking", "thinking": think}])
-        )
+        without = _estimate_single_message_tokens(_msg_with_raw_content([{"type": "thinking", "thinking": think}]))
         with_sig = _estimate_single_message_tokens(
             _msg_with_raw_content([{"type": "thinking", "thinking": think, "signature": sig}])
         )
-        assert with_sig > without + 100, (
-            f"signature contributed {with_sig - without} tokens for {len(sig)} chars"
-        )
+        assert with_sig > without + 100, f"signature contributed {with_sig - without} tokens for {len(sig)} chars"
 
     def test_expected_extra_keys_do_not_warn(self):
         """Counted, but never reported as drift.
@@ -441,19 +424,14 @@ class TestIntraTypeDrift:
         for block in (
             {"type": "thinking", "thinking": "t", "signature": "sig"},
             {"type": "tool_use", "id": "toolu_01ABC", "name": "f", "input": {"q": "x"}},
-            {"type": "tool_result", "tool_use_id": "toolu_01ABC",
-             "content": "out", "is_error": False},
+            {"type": "tool_result", "tool_use_id": "toolu_01ABC", "content": "out", "is_error": False},
         ):
             _estimate_single_message_tokens(_msg_with_raw_content([block]))
-        assert get_unknown_block_type_counts() == {}, (
-            "ordinary wire fields reported as drift — the signal is now noise"
-        )
+        assert get_unknown_block_type_counts() == {}, "ordinary wire fields reported as drift — the signal is now noise"
 
     def test_real_drift_is_reported_under_a_namespaced_key(self):
         reset_unknown_block_type_counts()
-        _estimate_single_message_tokens(
-            _msg_with_raw_content([{"type": "thinking", "brand_new_field": "x" * 200}])
-        )
+        _estimate_single_message_tokens(_msg_with_raw_content([{"type": "thinking", "brand_new_field": "x" * 200}]))
         assert get_unknown_block_type_counts().get("thinking.brand_new_field") == 1
 
     def test_image_payload_stays_a_flat_estimate(self):
@@ -463,9 +441,9 @@ class TestIntraTypeDrift:
         counting a 300 KB base64 screenshot yields ~130k "tokens" and starves
         the budget. `source`/`data` are declared consumed for exactly this.
         """
-        n = _estimate_single_message_tokens(_msg_with_raw_content([
-            {"type": "image", "source": {"type": "base64", "data": "A" * 300000}}
-        ]))
+        n = _estimate_single_message_tokens(
+            _msg_with_raw_content([{"type": "image", "source": {"type": "base64", "data": "A" * 300000}}])
+        )
         assert n < 3000, f"image payload counted wholesale: {n} tokens"
 
     def test_every_registered_tokenizer_declares_its_keys(self):

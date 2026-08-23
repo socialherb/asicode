@@ -1,4 +1,3 @@
-
 """Centralized threshold/limit/constant configuration.
 
 All hardcoded numeric thresholds across the codebase are defined here as the
@@ -77,19 +76,20 @@ class TokenLimits:
     AGENT_TOOL_CALL: int = 32768  # agent_loop.py _llm_call_with_tools default max_tokens
 
     CONTEXT_HARD_CAP_SAFETY_MARGIN: int = 1024  # agent_loop.py / design_chat_loop.py: pre-flight
-                                                 # message-budget margin subtracted from the model's
-                                                 # context_limit for the structural-collapse check.
-                                                 # Prevents HTTP 400 "max context length exceeded"
-                                                 # errors from API providers (DeepSeek 1M, etc.).
+    # message-budget margin subtracted from the model's
+    # context_limit for the structural-collapse check.
+    # Prevents HTTP 400 "max context length exceeded"
+    # errors from API providers (DeepSeek 1M, etc.).
 
-    BASH_OUTPUT_MAX_CHARS: int = 60_000   # git_tools.py: max chars returned by `bash` tool output
-                                           # Prevents sudden token surges from large stdout/stderr.
-                                           # Sized for the WORST-case density, not prose: token-dense
-                                           # ASCII (timestamps, hashes, JSON, base64, `ls -la` listings)
-                                           # tokenizes at ~2 chars/token, so 60K chars ≈ 30K tokens
-                                           # worst-case (≈20K for prose at 3 chars/token). The old 100K
-                                           # cap assumed 3 chars/token universally and let dense output
-                                           # hit ~47K tokens — 1.5x the intended budget. (< 10% of 1M)
+    BASH_OUTPUT_MAX_CHARS: int = 60_000  # git_tools.py: max chars returned by `bash` tool output
+    # Prevents sudden token surges from large stdout/stderr.
+    # Sized for the WORST-case density, not prose: token-dense
+    # ASCII (timestamps, hashes, JSON, base64, `ls -la` listings)
+    # tokenizes at ~2 chars/token, so 60K chars ≈ 30K tokens
+    # worst-case (≈20K for prose at 3 chars/token). The old 100K
+    # cap assumed 3 chars/token universally and let dense output
+    # hit ~47K tokens — 1.5x the intended budget. (< 10% of 1M)
+
 
 @dataclass(frozen=True)
 class LineLimits:
@@ -175,7 +175,6 @@ class ScoreThresholds:
     SEMANTIC_INTENT_MIN: float = 0.10
     SEMANTIC_INTENT_MARGIN: float = 0.08
 
-
     # ── Tool health (failure_rate consumer) ─────────────────────────────────
     # A tool whose failure_rate ≥ this trips a ``warn_failing_tools`` health
     # warning and appears in the dashboard "Top Failing Tools" card. 0.5 = a tool
@@ -258,8 +257,9 @@ class CountLimits:
     # Evicted runners are stop()'d (drain thread + engine timers torn down) on
     # overflow. See proactive_runner.get_or_create_runner.
     AUTONOMOUS_RUNNER_MAX: int = 8
-    VULTURE_HUB_IMPORTER_THRESHOLD: int = 5  # arbitrary — no empirical basis yet; revisit after shadow log data accumulates
-
+    VULTURE_HUB_IMPORTER_THRESHOLD: int = (
+        5  # arbitrary — no empirical basis yet; revisit after shadow log data accumulates
+    )
 
     # Scanner max_per_file defaults — prevents silent truncation from hiding issues.
     # Values are conservative (5-10) to avoid overwhelming callers with noise, but
@@ -276,20 +276,24 @@ class CountLimits:
     SCANNER_CONTRADICTORY_DUP_DISTANCE: int = 100
 
     # ── Symbol Search / Tool Loop ────────────────────────────────────────
-    SEARCH_RESULTS_CAP: int = 30             # symbol_search.py max results before early break
-    AGENT_TOOL_RETRY_LIMIT: int = 5          # agent_loop.py per-tool cumulative exhaustion warning
-    AGENT_MAX_TURNS_DEFAULT: int = 500         # tool_registry + agent_stream + asi + subagent (ipc/orchestrator/worker) fallbacks
-    AGENT_MAX_TURNS_WEBAPP_MAX: int = 200      # webapp /agent/run ceiling — deliberately tighter than the CLI default (API-credit protection; see body_params.body_int P14-3 note)
+    SEARCH_RESULTS_CAP: int = 30  # symbol_search.py max results before early break
+    AGENT_TOOL_RETRY_LIMIT: int = 5  # agent_loop.py per-tool cumulative exhaustion warning
+    AGENT_MAX_TURNS_DEFAULT: int = (
+        500  # tool_registry + agent_stream + asi + subagent (ipc/orchestrator/worker) fallbacks
+    )
+    AGENT_MAX_TURNS_WEBAPP_MAX: int = 200  # webapp /agent/run ceiling — deliberately tighter than the CLI default (API-credit protection; see body_params.body_int P14-3 note)
     DESIGN_CHAT_MAX_TOOL_ITERATIONS: int = 500  # design_chat_loop.py + design_chat.py
-    DESIGN_CHAT_LLM_MAX_RETRIES: int = 2        # design_chat_loop.py outer retries on transient LLM errors (on top of the client's own)
+    DESIGN_CHAT_LLM_MAX_RETRIES: int = (
+        2  # design_chat_loop.py outer retries on transient LLM errors (on top of the client's own)
+    )
 
 
 @dataclass(frozen=True)
 class CompressionConfig:
     """Context compression tuning thresholds for SessionCompressionContext."""
 
-    MIN_RECENT_TURNS_KEEP: int = 4    # Always keep the most recent N turns as original text
-    COMPRESS_BATCH_MIN: int = 11      # Compress when this many new turns accumulate beyond recent_keep
+    MIN_RECENT_TURNS_KEEP: int = 4  # Always keep the most recent N turns as original text
+    COMPRESS_BATCH_MIN: int = 11  # Compress when this many new turns accumulate beyond recent_keep
     # In /general chat mode the periodic turn-count compression (above) is disabled:
     # turns accumulate verbatim so the stable prefix — and its prompt cache — survives
     # across many turns. Compression (summarize) fires only once the LIVE context window
@@ -317,16 +321,12 @@ class DisplayConfig:
 
     # Whether to auto-display the full file diff ("changes" block) after successful
     # execution. Default off — use /diff when needed.
-    #enable: ASICODE_RUN_DIFF=1 (or on/true/yes)
-    RUN_DIFF: bool = field(
-        default_factory=lambda: _env_flag("ASICODE_RUN_DIFF", False)
-    )
+    # enable: ASICODE_RUN_DIFF=1 (or on/true/yes)
+    RUN_DIFF: bool = field(default_factory=lambda: _env_flag("ASICODE_RUN_DIFF", False))
     # Whether to generate a one-line "next task" suggestion via a helper model after
     # turn end, shown as ghost text in the empty prompt. Adds one LLM call per turn.
-    #disable: ASICODE_NEXT_SUGGEST=0 (or off/false/no)
-    NEXT_SUGGEST: bool = field(
-        default_factory=lambda: _env_flag("ASICODE_NEXT_SUGGEST", True)
-    )
+    # disable: ASICODE_NEXT_SUGGEST=0 (or off/false/no)
+    NEXT_SUGGEST: bool = field(default_factory=lambda: _env_flag("ASICODE_NEXT_SUGGEST", True))
 
 
 @dataclass(frozen=True)

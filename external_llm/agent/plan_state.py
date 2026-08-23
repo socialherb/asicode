@@ -17,9 +17,10 @@ Statuses:
 the gate accepts an unfinished plan only when every remaining item carries
 an honest reason.
 """
+
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 OPEN_STATUSES = ("pending", "in_progress")
 TERMINAL_STATUSES = ("done", "skipped", "blocked")
@@ -38,7 +39,7 @@ _MAX_TITLE_CHARS = 300
 _MAX_NOTE_CHARS = 500
 
 
-def validate_plan(goal: Any, items: Any) -> tuple[Optional[dict[str, Any]], str]:
+def validate_plan(goal: Any, items: Any) -> tuple[dict[str, Any] | None, str]:
     """Validate and normalize an update_plan payload.
 
     Returns (plan_dict, "") on success or (None, error_message) on failure.
@@ -57,26 +58,25 @@ def validate_plan(goal: Any, items: Any) -> tuple[Optional[dict[str, Any]], str]
             return None, f"items[{i}].title is required"
         status = str(item.get("status", "pending")).strip() or "pending"
         if status not in ALL_STATUSES:
-            return None, (
-                f"items[{i}].status '{status}' is invalid — "
-                f"use one of: {', '.join(ALL_STATUSES)}"
-            )
+            return None, (f"items[{i}].status '{status}' is invalid — use one of: {', '.join(ALL_STATUSES)}")
         note = str(item.get("note", "")).strip()
         if status in ("skipped", "blocked") and not note:
             return None, (
                 f"items[{i}] ('{title[:60]}') is '{status}' but has no 'note' — "
                 "a reason is required when skipping or blocking an item"
             )
-        norm_items.append({
-            "title": title[:_MAX_TITLE_CHARS],
-            "status": status,
-            "note": note[:_MAX_NOTE_CHARS],
-        })
+        norm_items.append(
+            {
+                "title": title[:_MAX_TITLE_CHARS],
+                "status": status,
+                "note": note[:_MAX_NOTE_CHARS],
+            }
+        )
 
     return {"goal": str(goal or "").strip(), "items": norm_items}, ""
 
 
-def open_items(plan: Optional[dict[str, Any]]) -> list[dict[str, str]]:
+def open_items(plan: dict[str, Any] | None) -> list[dict[str, str]]:
     """Return items still in an open (non-terminal) status."""
     if not plan:
         return []
@@ -87,7 +87,7 @@ def _short_title(title: str, limit: int = 40) -> str:
     return title if len(title) <= limit else title[: limit - 1] + "…"
 
 
-def diff_plans(prev: Optional[dict[str, Any]], new: dict[str, Any]) -> str:
+def diff_plans(prev: dict[str, Any] | None, new: dict[str, Any]) -> str:
     """One-line summary of what changed between two plans.
 
     Emitted as the FIRST line of the update_plan tool result so the CLI's

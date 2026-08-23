@@ -30,7 +30,6 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.common.atomic_io import atomic_write_json
@@ -87,6 +86,7 @@ def _save_contradictory_cache(repo_root: str, files: dict[str, dict]) -> None:
     except (OSError, TypeError, ValueError):
         logger.debug("[CONTRADICTORY] cache write failed", exc_info=True)
 
+
 # ast.TryStar (except*) exists from Python 3.11
 _TRY_TYPES = (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
 
@@ -94,14 +94,15 @@ _TRY_TYPES = (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
 @dataclass
 class ContradictoryCandidate:
     """One instance of contradictory / unreachable / redundant logic."""
+
     file: str
-    symbol: str               # containing function/method/class name
-    contradiction_kind: str   # one of the "constant_*"/"contradictory_*"/etc. kind strings
+    symbol: str  # containing function/method/class name
+    contradiction_kind: str  # one of the "constant_*"/"contradictory_*"/etc. kind strings
     lineno: int
     end_lineno: int
-    detail: str               # human-readable description
-    confidence: float         # 0.0-1.0
-    node_kind: str = ""       # AST node type at lineno: "If" | "While" | "Assert"
+    detail: str  # human-readable description
+    confidence: float  # 0.0-1.0
+    node_kind: str = ""  # AST node type at lineno: "If" | "While" | "Assert"
     condition_dump: str = ""  # ast.dump(condition, annotate_fields=False) for If/While
 
     def to_dict(self) -> dict:
@@ -132,7 +133,7 @@ def _get_enclosing_symbol_name(tree: ast.Module, lineno: int) -> str:
     return "<module>"
 
 
-def _is_constant_false(node: ast.expr) -> Optional[bool]:
+def _is_constant_false(node: ast.expr) -> bool | None:
     """True if definitely falsy constant, False if definitely truthy, None if unknown."""
     if isinstance(node, ast.Constant):
         val = node.value
@@ -247,20 +248,68 @@ def _assignment_target_overlaps(target: ast.expr, names: set[str]) -> bool:
 # Known-pure call names — these cannot mutate object state, even when the
 # condition depends on attribute access.  Used to reduce false mutation
 # barriers in duplicate-condition detection.
-_KNOWN_PURE_CALL_NAMES: frozenset = frozenset({
-    # Logging — pure side-effect (no state mutation)
-    "debug", "info", "warning", "warn", "error", "critical", "exception", "log",
-    # Container read-only — getters do not mutate
-    "get", "keys", "values", "items", "copy",
-    # Pure builtins — no mutation of any object
-    "len", "str", "int", "float", "bool", "list", "dict", "tuple", "set", "frozenset",
-    "sorted", "reversed", "enumerate", "zip", "range", "iter", "next",
-    "isinstance", "issubclass", "hasattr", "getattr", "callable", "type", "id",
-    "repr", "format", "print", "ascii",
-    # String methods — strings are immutable
-    "strip", "split", "join", "replace", "lower", "upper", "lstrip", "rstrip",
-    "startswith", "endswith", "find", "index", "count",
-})
+_KNOWN_PURE_CALL_NAMES: frozenset = frozenset(
+    {
+        # Logging — pure side-effect (no state mutation)
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "critical",
+        "exception",
+        "log",
+        # Container read-only — getters do not mutate
+        "get",
+        "keys",
+        "values",
+        "items",
+        "copy",
+        # Pure builtins — no mutation of any object
+        "len",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "tuple",
+        "set",
+        "frozenset",
+        "sorted",
+        "reversed",
+        "enumerate",
+        "zip",
+        "range",
+        "iter",
+        "next",
+        "isinstance",
+        "issubclass",
+        "hasattr",
+        "getattr",
+        "callable",
+        "type",
+        "id",
+        "repr",
+        "format",
+        "print",
+        "ascii",
+        # String methods — strings are immutable
+        "strip",
+        "split",
+        "join",
+        "replace",
+        "lower",
+        "upper",
+        "lstrip",
+        "rstrip",
+        "startswith",
+        "endswith",
+        "find",
+        "index",
+        "count",
+    }
+)
 
 
 def _is_known_pure_call(node: ast.Call) -> bool:
@@ -346,6 +395,7 @@ def _bodies_have_overlapping_writes(body1: list, body2: list) -> bool:
     duplicate.  Return True (conservative) when either body has no write
     statements (e.g. only ``return`` / ``raise`` / ``pass``).
     """
+
     def _write_targets(stmts: list) -> set:
         targets: set = set()
         for stmt in stmts:
@@ -366,13 +416,44 @@ def _bodies_have_overlapping_writes(body1: list, body2: list) -> bool:
 
 # Names that appear in virtually every try/except block and carry no semantic
 # meaning for distinguishing independent guard blocks from redundant ones.
-_TRIVIAL_CALL_NAMES: frozenset = frozenset({
-    "debug", "info", "warning", "warn", "error", "critical", "exception", "log",
-    "append", "add", "get", "set", "update", "pop", "remove", "clear",
-    "isinstance", "len", "str", "int", "float", "bool", "list", "dict",
-    "tuple", "sorted", "range", "print", "repr", "format",
-    "getattr", "setattr", "hasattr", "type",
-})
+_TRIVIAL_CALL_NAMES: frozenset = frozenset(
+    {
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "critical",
+        "exception",
+        "log",
+        "append",
+        "add",
+        "get",
+        "set",
+        "update",
+        "pop",
+        "remove",
+        "clear",
+        "isinstance",
+        "len",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "list",
+        "dict",
+        "tuple",
+        "sorted",
+        "range",
+        "print",
+        "repr",
+        "format",
+        "getattr",
+        "setattr",
+        "hasattr",
+        "type",
+    }
+)
 
 
 def _bodies_have_overlapping_calls(body1: list, body2: list) -> bool:
@@ -383,6 +464,7 @@ def _bodies_have_overlapping_calls(body1: list, body2: list) -> bool:
     that call disjoint non-trivial functions are independent sequential guards
     — not removable duplicates.
     """
+
     def _nontrivial_calls(stmts: list) -> set:
         names: set = set()
         for stmt in stmts:
@@ -412,9 +494,7 @@ def _branch_body_end(lineno: int, branch_body: list) -> int:
     """Return the last line of *branch_body*, falling back to *lineno* if empty."""
     if not branch_body:
         return lineno
-    return max(
-        getattr(stmt, "end_lineno", lineno) for stmt in branch_body
-    )
+    return max(getattr(stmt, "end_lineno", lineno) for stmt in branch_body)
 
 
 def _collect_if_elif_chain(if_node: ast.If) -> tuple[list, list]:
@@ -469,48 +549,55 @@ def _check_body_stmts(
     """
     candidates: list = []
     scope_conditions: list[_SC] = []
-    flat_stmts: list = list(body)   # for mutation barrier slicing
+    flat_stmts: list = list(body)  # for mutation barrier slicing
 
     for flat_idx, node in enumerate(flat_stmts):
-
         # Nested function/class: new scope, new enclosing_symbol
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             candidates.extend(
                 _check_body_stmts(
                     list(node.body or []),
-                    node.name, rel_path, max_dup_distance,
+                    node.name,
+                    rel_path,
+                    max_dup_distance,
                 )
             )
 
         # if/elif/else — process entire chain as one unit
         if isinstance(node, ast.If):
-            chain_id = node.lineno   # unique per if/elif group in this file
+            chain_id = node.lineno  # unique per if/elif group in this file
             chain, else_body = _collect_if_elif_chain(node)
             for cond, lineno, branch_end, branch_body in chain:
                 _cdump = ast.dump(cond, annotate_fields=False)
                 for kind, detail, conf in _check_condition(cond):
-                    candidates.append(ContradictoryCandidate(
-                        file=rel_path,
-                        symbol=enclosing_symbol,
-                        contradiction_kind=kind,
-                        lineno=lineno,
-                        end_lineno=branch_end,
-                        detail=detail,
-                        confidence=conf,
-                        node_kind="If",
-                        condition_dump=_cdump,
-                    ))
-                scope_conditions.append((
-                    ast.dump(cond, annotate_fields=False),
-                    lineno, branch_end, chain_id, flat_idx, cond, branch_body, "If",
-                ))
-                candidates.extend(
-                    _check_body_stmts(branch_body, enclosing_symbol, rel_path, max_dup_distance)
+                    candidates.append(
+                        ContradictoryCandidate(
+                            file=rel_path,
+                            symbol=enclosing_symbol,
+                            contradiction_kind=kind,
+                            lineno=lineno,
+                            end_lineno=branch_end,
+                            detail=detail,
+                            confidence=conf,
+                            node_kind="If",
+                            condition_dump=_cdump,
+                        )
+                    )
+                scope_conditions.append(
+                    (
+                        ast.dump(cond, annotate_fields=False),
+                        lineno,
+                        branch_end,
+                        chain_id,
+                        flat_idx,
+                        cond,
+                        branch_body,
+                        "If",
+                    )
                 )
+                candidates.extend(_check_body_stmts(branch_body, enclosing_symbol, rel_path, max_dup_distance))
             if else_body:
-                candidates.extend(
-                    _check_body_stmts(else_body, enclosing_symbol, rel_path, max_dup_distance)
-                )
+                candidates.extend(_check_body_stmts(else_body, enclosing_symbol, rel_path, max_dup_distance))
 
         # while — same flat_idx/chain_id concept, no elif
         elif isinstance(node, ast.While):
@@ -519,81 +606,86 @@ def _check_body_stmts(
             while_end = getattr(node, "end_lineno", node.lineno)
             # while True: / while (x or not x): are idiomatic infinite-loop patterns
             # controlled by break/return — never flag as deletable.
-            _WHILE_SKIP_KINDS = frozenset({"constant_true_condition", "always_true_boolean"})
+            _while_skip_kinds = frozenset({"constant_true_condition", "always_true_boolean"})
             for kind, detail, conf in _check_condition(cond):
-                if kind in _WHILE_SKIP_KINDS:
+                if kind in _while_skip_kinds:
                     continue
-                candidates.append(ContradictoryCandidate(
-                    file=rel_path,
-                    symbol=enclosing_symbol,
-                    contradiction_kind=kind,
-                    lineno=node.lineno,
-                    end_lineno=while_end,
-                    detail=detail,
-                    confidence=conf,
-                    node_kind="While",
-                    condition_dump=ast.dump(cond, annotate_fields=False),
-                ))
-            scope_conditions.append((
-                ast.dump(cond, annotate_fields=False),
-                node.lineno, while_end, chain_id, flat_idx, cond, list(node.body or []), "While",
-            ))
-            candidates.extend(
-                _check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance)
+                candidates.append(
+                    ContradictoryCandidate(
+                        file=rel_path,
+                        symbol=enclosing_symbol,
+                        contradiction_kind=kind,
+                        lineno=node.lineno,
+                        end_lineno=while_end,
+                        detail=detail,
+                        confidence=conf,
+                        node_kind="While",
+                        condition_dump=ast.dump(cond, annotate_fields=False),
+                    )
+                )
+            scope_conditions.append(
+                (
+                    ast.dump(cond, annotate_fields=False),
+                    node.lineno,
+                    while_end,
+                    chain_id,
+                    flat_idx,
+                    cond,
+                    list(node.body or []),
+                    "While",
+                )
             )
+            candidates.extend(_check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance))
 
         # assert
         elif isinstance(node, ast.Assert):
             if isinstance(node.test, ast.Constant) and node.test.value is False:
-                candidates.append(ContradictoryCandidate(
-                    file=rel_path,
-                    symbol=enclosing_symbol,
-                    contradiction_kind="always_false_assert",
-                    lineno=node.lineno,
-                    end_lineno=node.lineno,
-                    detail="'assert False' always fails",
-                    confidence=1.0,
-                    node_kind="Assert",
-                    condition_dump=ast.dump(node.test, annotate_fields=False),
-                ))
+                candidates.append(
+                    ContradictoryCandidate(
+                        file=rel_path,
+                        symbol=enclosing_symbol,
+                        contradiction_kind="always_false_assert",
+                        lineno=node.lineno,
+                        end_lineno=node.lineno,
+                        detail="'assert False' always fails",
+                        confidence=1.0,
+                        node_kind="Assert",
+                        condition_dump=ast.dump(node.test, annotate_fields=False),
+                    )
+                )
 
         # try/except (incl. 3.11+ except*) — each clause is its own sub-scope
         elif isinstance(node, _TRY_TYPES):
-            candidates.extend(
-                _check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance)
-            )
-            for handler in (node.handlers or []):
+            candidates.extend(_check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance))
+            for handler in node.handlers or []:
                 candidates.extend(
                     _check_body_stmts(
-                        list(handler.body or []), enclosing_symbol, rel_path, max_dup_distance,
+                        list(handler.body or []),
+                        enclosing_symbol,
+                        rel_path,
+                        max_dup_distance,
                     )
                 )
-            candidates.extend(
-                _check_body_stmts(list(node.orelse or []), enclosing_symbol, rel_path, max_dup_distance)
-            )
+            candidates.extend(_check_body_stmts(list(node.orelse or []), enclosing_symbol, rel_path, max_dup_distance))
             candidates.extend(
                 _check_body_stmts(
                     list(getattr(node, "finalbody", None) or []),
-                    enclosing_symbol, rel_path, max_dup_distance,
+                    enclosing_symbol,
+                    rel_path,
+                    max_dup_distance,
                 )
             )
 
         # for / with — loop and context bodies are their own sub-scopes
         elif isinstance(node, (ast.For, ast.AsyncFor)):
-            candidates.extend(
-                _check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance)
-            )
-            candidates.extend(
-                _check_body_stmts(list(node.orelse or []), enclosing_symbol, rel_path, max_dup_distance)
-            )
+            candidates.extend(_check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance))
+            candidates.extend(_check_body_stmts(list(node.orelse or []), enclosing_symbol, rel_path, max_dup_distance))
         elif isinstance(node, (ast.With, ast.AsyncWith)):
-            candidates.extend(
-                _check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance)
-            )
+            candidates.extend(_check_body_stmts(list(node.body or []), enclosing_symbol, rel_path, max_dup_distance))
 
         # match — each case body is its own sub-scope
         elif isinstance(node, ast.Match):
-            for case in (node.cases or []):
+            for case in node.cases or []:
                 candidates.extend(
                     _check_body_stmts(list(case.body or []), enclosing_symbol, rel_path, max_dup_distance)
                 )
@@ -651,30 +743,29 @@ def _check_body_stmts(
                 # Same-chain dup (elif): always unreachable — flag as duplicate.
                 # Cross-chain dup near the first occurrence: merge candidate,
                 # not a delete-simple duplicate (bodies may differ in purpose).
-                _is_same_chain = (prev_chain_id == chain_id)
+                _is_same_chain = prev_chain_id == chain_id
                 _distance = lineno - prev_lineno
                 if not _is_same_chain and _distance <= max_dup_distance:
                     _kind = "mergeable_condition"
                     _conf = 0.85
-                    _detail = (
-                        f"same condition as line {prev_lineno} "
-                        f"({_distance} lines apart) — merge candidate"
-                    )
+                    _detail = f"same condition as line {prev_lineno} ({_distance} lines apart) — merge candidate"
                 else:
                     _kind = "duplicate_condition"
                     _conf = 0.8
                     _detail = f"duplicate condition previously checked at line {prev_lineno}"
-                candidates.append(ContradictoryCandidate(
-                    file=rel_path,
-                    symbol=enclosing_symbol,
-                    contradiction_kind=_kind,
-                    lineno=lineno,
-                    end_lineno=branch_end,
-                    detail=_detail,
-                    confidence=_conf,
-                    node_kind=node_kind,
-                    condition_dump=dump_str,
-                ))
+                candidates.append(
+                    ContradictoryCandidate(
+                        file=rel_path,
+                        symbol=enclosing_symbol,
+                        contradiction_kind=_kind,
+                        lineno=lineno,
+                        end_lineno=branch_end,
+                        detail=_detail,
+                        confidence=_conf,
+                        node_kind=node_kind,
+                        condition_dump=dump_str,
+                    )
+                )
 
         # Always track the nearest prior occurrence for future distance checks
         seen[dump_str] = (lineno, chain_id, flat_idx, dup_body)
@@ -721,11 +812,7 @@ def scan_contradictory_logic(
         _src, fp = pair
         rel = os.path.relpath(abs_path, repo_root) if repo_root else rel_path
         entry = files_cache.get(rel)
-        if (
-            entry is not None
-            and tuple(entry.get("fp") or ()) == fp
-            and entry.get("dup_dist") == max_dup_distance
-        ):
+        if entry is not None and tuple(entry.get("fp") or ()) == fp and entry.get("dup_dist") == max_dup_distance:
             for c in entry.get("cands", []):
                 candidates.append(ContradictoryCandidate(**c))
             continue
@@ -735,7 +822,10 @@ def scan_contradictory_logic(
             continue
 
         file_candidates = _check_body_stmts(
-            list(tree.body), "<module>", rel_path, max_dup_distance,
+            list(tree.body),
+            "<module>",
+            rel_path,
+            max_dup_distance,
         )
         for emitted, c in enumerate(file_candidates, start=1):
             candidates.append(c)
@@ -743,7 +833,9 @@ def scan_contradictory_logic(
                 _truncated_total += len(file_candidates) - emitted
                 logger.warning(
                     "[CONTRADICTORY] %s: hit max_per_file=%d, truncating %d remaining",
-                    rel_path, max_per_file, len(file_candidates) - emitted,
+                    rel_path,
+                    max_per_file,
+                    len(file_candidates) - emitted,
                 )
                 break
         files_cache[rel] = {
@@ -763,12 +855,13 @@ def scan_contradictory_logic(
         kind_summary = ", ".join(f"{k}={v}" for k, v in sorted(kinds.items()))
         logger.info(
             "[CONTRADICTORY] %d candidate(s) across %d file(s): %s",
-            len(candidates), len({c.file for c in candidates}),
+            len(candidates),
+            len({c.file for c in candidates}),
             kind_summary,
         )
 
     if _truncated_total:
         # Function attribute consumed by ScannerRegistry.run() (reset via
         # `del` before each invocation).
-        scan_contradictory_logic._truncated = _truncated_total
+        scan_contradictory_logic._truncated = _truncated_total  # type: ignore[attr-defined]  # dynamic attr consumed by ScannerRegistry.run()
     return candidates

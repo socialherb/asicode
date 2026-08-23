@@ -17,6 +17,7 @@ have:
 Both now route through ``external_llm.client.effective_content`` — the single
 canonical extractor for the LLMResponse shape.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -34,7 +35,9 @@ def _resp(*, content="", reasoning="", raw_response=None):
         content=content,
         model="glm-5.2",
         provider="zai",
-        raw_response=raw_response if raw_response is not None else {
+        raw_response=raw_response
+        if raw_response is not None
+        else {
             "choices": [{"message": {"reasoning_content": reasoning}}] if reasoning else [],
         },
     )
@@ -76,9 +79,10 @@ def test_effective_content_malformed_raw_response_is_safe():
     assert effective_content(_resp(content="", raw_response={"choices": []})) == ""
     assert effective_content(_resp(content="", raw_response={"choices": [{}]})) == ""
     # reasoning_content present but blank
-    assert effective_content(
-        _resp(content="", raw_response={"choices": [{"message": {"reasoning_content": "   "}}]})
-    ) == ""
+    assert (
+        effective_content(_resp(content="", raw_response={"choices": [{"message": {"reasoning_content": "   "}}]}))
+        == ""
+    )
 
 
 # ── context_manager integration: summary recovered, turns not lost ──────────
@@ -116,7 +120,7 @@ def test_compress_recovers_summary_from_reasoning_content():
     turns = [
         {"role": "user", "content": "fix the auth bug"},
         {"role": "assistant", "content": "done, fixed it"},
-        {"role": "user", "content": "recent1"},        # recent window (kept)
+        {"role": "user", "content": "recent1"},  # recent window (kept)
         {"role": "assistant", "content": "recent2"},
     ]
     session = _make_session(turns)
@@ -162,7 +166,9 @@ def test_intent_resolved_from_reasoning_content():
     """
     response = _resp(content="", reasoning=_INTENT_JSON)
     cfg = IntentResolutionConfig(
-        llm_client=_FakeClient(response), model="glm-5.2", enable_cache=False,
+        llm_client=_FakeClient(response),
+        model="glm-5.2",
+        enable_cache=False,
     )
     resolver = IntentResolver(cfg)
     result = resolver.resolve("Add validate() method to UserModel")
@@ -178,7 +184,9 @@ def test_intent_still_uses_content_when_present():
     """Behavior-preserving: content preferred over reasoning."""
     response = _resp(content=_INTENT_JSON, reasoning="thinking traces")
     cfg = IntentResolutionConfig(
-        llm_client=_FakeClient(response), model="glm-5.2", enable_cache=False,
+        llm_client=_FakeClient(response),
+        model="glm-5.2",
+        enable_cache=False,
     )
     resolver = IntentResolver(cfg)
     result = resolver.resolve("Add validate() method to UserModel")
@@ -204,7 +212,10 @@ def test_compress_preserves_turns_when_response_truly_empty():
     ]
     session = _make_session(turns)
     cm.compress_old_turns(
-        session, _FakeClient(_resp(content="", reasoning="")), "glm-5.2", recent_keep=2,
+        session,
+        _FakeClient(_resp(content="", reasoning="")),
+        "glm-5.2",
+        recent_keep=2,
     )
 
     assert session.compressed_up_to == 0, "pointer advanced despite empty summary"
@@ -212,7 +223,10 @@ def test_compress_preserves_turns_when_response_truly_empty():
 
     # Next cycle with a healthy helper model succeeds normally (retry works).
     cm.compress_old_turns(
-        session, _FakeClient(_resp(content="real summary")), "glm-5.2", recent_keep=2,
+        session,
+        _FakeClient(_resp(content="real summary")),
+        "glm-5.2",
+        recent_keep=2,
     )
     assert session.compressed_summary == "real summary"
     assert session.compressed_up_to == 2

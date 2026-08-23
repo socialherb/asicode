@@ -6,6 +6,7 @@ touch: version detection, TTY detection, the yes/no prompt, the npm/pip
 installers (incl. the PEP 668 retry), repo-language detection, tool
 resolution, and the interactive install prompt.
 """
+
 from __future__ import annotations
 
 import builtins
@@ -49,9 +50,7 @@ def state_file(tmp_path, monkeypatch):
 
 @pytest.fixture
 def npm_on_path(monkeypatch):
-    monkeypatch.setattr(
-        dc.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None
-    )
+    monkeypatch.setattr(dc.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
 
 
 # ── _detect_version ──────────────────────────────────────────────────────────
@@ -83,9 +82,7 @@ def test_detect_version_go_uses_version_subcommand(monkeypatch):
 
 def test_detect_version_stderr_fallback(monkeypatch):
     # Empty (or whitespace-only) stdout falls back to stderr.
-    monkeypatch.setattr(
-        dc.subprocess, "run", lambda *a, **kw: _FakeProc(0, stdout="   ", stderr="v2.0")
-    )
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **kw: _FakeProc(0, stdout="   ", stderr="v2.0"))
     assert dc._detect_version("tsc") == "v2.0"
 
 
@@ -207,9 +204,7 @@ def test_npm_install_success(monkeypatch, capsys):
 
 
 def test_npm_install_failure_prints_stderr_tail(monkeypatch, capsys):
-    monkeypatch.setattr(
-        dc.subprocess, "run", lambda *a, **kw: _FakeProc(1, stderr="e1\ne2\ne3\ne4")
-    )
+    monkeypatch.setattr(dc.subprocess, "run", lambda *a, **kw: _FakeProc(1, stderr="e1\ne2\ne3\ne4"))
     assert dc._npm_install("pyright") is False
     out = capsys.readouterr().out
     assert "e2" in out and "e3" in out and "e4" in out
@@ -397,9 +392,7 @@ def test_clone_tools_unknown_language_empty():
 
 
 def test_resolve_tool_bare_command(monkeypatch):
-    monkeypatch.setattr(
-        dc.shutil, "which", lambda name: "/usr/bin/pyright" if name == "pyright" else None
-    )
+    monkeypatch.setattr(dc.shutil, "which", lambda name: "/usr/bin/pyright" if name == "pyright" else None)
     assert dc._resolve_tool(dc._Tool(cmd="pyright", label="L")) is True
 
 
@@ -545,9 +538,7 @@ def test_prompt_and_install_npm_success(monkeypatch, npm_on_path):
     monkeypatch.setattr(dc, "_ask_yes_no", lambda prompt, default=True: True)
     installed = []
     monkeypatch.setattr(dc, "_npm_install", lambda pkg: installed.append(pkg) or True)
-    monkeypatch.setattr(
-        dc, "_pip_install", lambda pkg: pytest.fail("pip must not run when npm succeeded")
-    )
+    monkeypatch.setattr(dc, "_pip_install", lambda pkg: pytest.fail("pip must not run when npm succeeded"))
     dc._prompt_and_install(t)
     assert t.found is True
     assert installed == ["typescript"]
@@ -557,9 +548,7 @@ def test_prompt_and_install_npm_unavailable_pip_fallback(monkeypatch, capsys):
     monkeypatch.setattr(dc.shutil, "which", lambda name: None)
     t = dc._clone_tools({LanguageId.PYTHON})[0]  # pyright: npm + pip
     monkeypatch.setattr(dc, "_ask_yes_no", lambda prompt, default=True: True)
-    monkeypatch.setattr(
-        dc, "_npm_install", lambda pkg: pytest.fail("npm unavailable — must not run")
-    )
+    monkeypatch.setattr(dc, "_npm_install", lambda pkg: pytest.fail("npm unavailable — must not run"))
     installed = []
     monkeypatch.setattr(dc, "_pip_install", lambda pkg: installed.append(pkg) or True)
     dc._prompt_and_install(t)
@@ -571,9 +560,7 @@ def test_prompt_and_install_npm_unavailable_pip_fallback(monkeypatch, capsys):
 def test_prompt_and_install_user_declines(monkeypatch, capsys, npm_on_path):
     t = dc._clone_tools({LanguageId.PYTHON})[0]
     monkeypatch.setattr(dc, "_ask_yes_no", lambda prompt, default=True: False)
-    monkeypatch.setattr(
-        dc, "_npm_install", lambda pkg: pytest.fail("must not install when declined")
-    )
+    monkeypatch.setattr(dc, "_npm_install", lambda pkg: pytest.fail("must not install when declined"))
     dc._prompt_and_install(t)
     assert t.skipped is True
     assert "Skipped (semantic validation disabled for this language)" in capsys.readouterr().out

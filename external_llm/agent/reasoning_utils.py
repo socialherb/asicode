@@ -51,12 +51,15 @@ def reasoning_ab_kwargs(env_var: str = "ASICODE_PLANNER_REASONING") -> dict:
             raise TypeError(f"{env_var} JSON must be a JSON object")
     except Exception as exc:
         logger.warning(
-            "[%s] bad ASICODE_DEEPSEEK_NOTHINK_JSON (%r): %s — "
-            "suppression skipped (reasoning stays ON)", env_var, _raw, exc,
+            "[%s] bad ASICODE_DEEPSEEK_NOTHINK_JSON (%r): %s — suppression skipped (reasoning stays ON)",
+            env_var,
+            _raw,
+            exc,
         )
         return {}
     logger.info(
-        "[%s] suppression ON — injecting %s "
-        "(verify via reasoning→~0 tokens)", env_var, _frag,
+        "[%s] suppression ON — injecting %s (verify via reasoning→~0 tokens)",
+        env_var,
+        _frag,
     )
     return _frag

@@ -11,6 +11,7 @@ These tests pin the shared ``_apply_glm_reasoning_fallback`` helper and the
 critical ``tool_calls`` guard: on a tool-call turn empty ``content`` is NORMAL
 (the tool calls ARE the response), so reasoning must NOT be injected there.
 """
+
 from __future__ import annotations
 
 import json
@@ -22,6 +23,7 @@ from external_llm.openai_client import ZAIClient
 
 # ── response builders ──────────────────────────────────────────────────────
 
+
 def _toolcall_resp(*, content="", reasoning="", tool_calls=None):
     msg: dict = {"role": "assistant", "content": content}
     if reasoning:
@@ -31,9 +33,14 @@ def _toolcall_resp(*, content="", reasoning="", tool_calls=None):
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
     }
     return ToolCallResponse(
-        content=content, model="glm-5.2", provider="zai",
-        tokens_used=15, finish_reason="stop",
-        raw_response=raw, tool_calls=tool_calls or [], is_final=True,
+        content=content,
+        model="glm-5.2",
+        provider="zai",
+        tokens_used=15,
+        finish_reason="stop",
+        raw_response=raw,
+        tool_calls=tool_calls or [],
+        is_final=True,
     )
 
 
@@ -46,12 +53,17 @@ def _plain_resp(*, content="", reasoning=""):
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
     }
     return LLMResponse(
-        content=content, model="glm-5.2", provider="zai",
-        tokens_used=15, finish_reason="stop", raw_response=raw,
+        content=content,
+        model="glm-5.2",
+        provider="zai",
+        tokens_used=15,
+        finish_reason="stop",
+        raw_response=raw,
     )
 
 
 # ── 1. helper: direct unit tests ───────────────────────────────────────────
+
 
 def test_helper_recovers_reasoning_when_content_empty_no_tools():
     r = _toolcall_resp(content="", reasoning="## Done: changes applied")
@@ -81,9 +93,15 @@ def test_helper_empty_content_no_reasoning_returns_empty():
 
 
 def test_helper_no_raw_response_returns_unchanged():
-    r = ToolCallResponse(content="", model="glm-5.2", provider="zai",
-                         tokens_used=0, finish_reason="stop",
-                         raw_response=None, tool_calls=[])
+    r = ToolCallResponse(
+        content="",
+        model="glm-5.2",
+        provider="zai",
+        tokens_used=0,
+        finish_reason="stop",
+        raw_response=None,
+        tool_calls=[],
+    )
     out = ZAIClient._apply_glm_reasoning_fallback(r)
     assert out.content == ""
 
@@ -96,6 +114,7 @@ def test_helper_plain_llmresponse_recovers_reasoning():
 
 
 # ── 2. full path: chat_with_tools (the bug being fixed) ────────────────────
+
 
 class _OK:
     status_code = 200
@@ -119,7 +138,8 @@ def _payload_with_reasoning(*, content="", reasoning="", tool_calls=None):
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return {
-        "id": "x", "object": "chat.completion",
+        "id": "x",
+        "object": "chat.completion",
         "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
     }
@@ -136,7 +156,9 @@ def test_chat_with_tools_recovers_reasoning_content(monkeypatch):
     """THE BUG: chat_with_tools now recovers an answer that arrived only in reasoning_content."""
     client = _zai_client(monkeypatch, _payload_with_reasoning(content="", reasoning="resolved intent JSON"))
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[], model="glm-5.2",
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="glm-5.2",
     )
     assert resp.content == "resolved intent JSON"
 
@@ -146,7 +168,9 @@ def test_chat_with_tools_tool_calls_turn_not_injected(monkeypatch):
     tc = [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
     client = _zai_client(monkeypatch, _payload_with_reasoning(content="", reasoning="thinking", tool_calls=tc))
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[], model="glm-5.2",
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="glm-5.2",
     )
     assert resp.content == ""  # guard held
     assert resp.tool_calls  # tool calls preserved
@@ -155,12 +179,15 @@ def test_chat_with_tools_tool_calls_turn_not_injected(monkeypatch):
 def test_chat_with_tools_content_present_unchanged(monkeypatch):
     client = _zai_client(monkeypatch, _payload_with_reasoning(content="plain answer", reasoning="ignored"))
     resp = client.chat_with_tools(
-        [LLMMessage(role="user", content="hi")], tools=[], model="glm-5.2",
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="glm-5.2",
     )
     assert resp.content == "plain answer"
 
 
 # ── 3. full path: chat() regression ────────────────────────────────────────
+
 
 def test_chat_recovers_reasoning_content(monkeypatch):
     """chat() fallback preserved after extracting the shared helper."""

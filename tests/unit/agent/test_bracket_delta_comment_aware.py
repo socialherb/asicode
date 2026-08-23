@@ -15,6 +15,7 @@ The fix centralises comment classification in a typed policy,
 multi-line). These tests pin the SSOT helper behaviour across all comment
 families and the two call sites' language dispatch.
 """
+
 import pytest
 
 from external_llm.agent._shared_utils import _net_bracket_delta, _scan_line_brackets_delta
@@ -26,6 +27,7 @@ PY = comment_syntax_for(LanguageId.PYTHON)
 
 
 # ── SSOT helper: comment/string awareness ─────────────────────────────────
+
 
 class TestNetBracketDeltaCommentAware:
     def test_js_line_comment_brackets_ignored(self):
@@ -195,7 +197,7 @@ class TestEscapeHandling:
     def test_js_template_literal_escape(self):
         # Backtick template: \${ is an escaped interpolation, literal stays open
         # only until the real backtick close, then '(' counts.
-        assert _net_bracket_delta(r'const s = `\${a}`; fn(', JS) == 1
+        assert _net_bracket_delta(r"const s = `\${a}`; fn(", JS) == 1
 
     def test_string_then_comment_bracket_still_ignored(self):
         # Escape fix must not regress comment awareness.
@@ -226,9 +228,7 @@ class TestCallSiteLanguageDispatch:
         # helper is imported
         assert "_net_bracket_delta" in src, "tool path must import _net_bracket_delta"
         # the binary flag must be GONE — replaced by a typed CommentSyntax policy
-        assert re.search(r"_c_style_brackets", src) is None, (
-            "tool path must NOT use the binary _c_style_brackets flag"
-        )
+        assert re.search(r"_c_style_brackets", src) is None, "tool path must NOT use the binary _c_style_brackets flag"
         assert re.search(r"comment_syntax_for\s*\(\s*lang_id\s*\)", src), (
             "tool path must derive a CommentSyntax via comment_syntax_for(lang_id)"
         )
@@ -243,9 +243,7 @@ class TestCallSiteLanguageDispatch:
         # lane; the tool path is the only remaining consumer.
         for p in (WT_PATCH,):
             src = _read(p)
-            assert "_scan_line_brackets_delta(" in src, (
-                f"{p}: expansion scan must call _scan_line_brackets_delta"
-            )
+            assert "_scan_line_brackets_delta(" in src, f"{p}: expansion scan must call _scan_line_brackets_delta"
             # the inline bracket-counting scanner is gone from the call site
             assert re.search(r"while _j < len\(_sl\)", src) is None, (
                 f"{p}: inline expansion scanner must be removed (now in helper)"
@@ -260,6 +258,7 @@ class TestCallSiteLanguageDispatch:
 # so the F2 expansion scan never mis-counts a bracket inside a multi-line
 # construct (triple-quoted string, /* */ block comment) or a line comment.
 
+
 class TestScanLineBracketsDelta:
     def _run(self, lines, cs, start=+1, target=0):
         """Mirror the call-site loop: accumulate delta, carry state, return
@@ -267,9 +266,7 @@ class TestScanLineBracketsDelta:
         bal = start
         in_str, in_triple, block_close = None, False, None
         for i, ln in enumerate(lines, start=1):
-            ld, in_str, in_triple, block_close = _scan_line_brackets_delta(
-                ln, in_str, in_triple, block_close, cs
-            )
+            ld, in_str, in_triple, block_close = _scan_line_brackets_delta(ln, in_str, in_triple, block_close, cs)
             bal += ld
             if bal == target:
                 return i
@@ -342,9 +339,7 @@ class TestScanLineBracketsDelta:
     def test_escape_handling_single_line(self):
         # Regression: an escaped backslash before the closing quote must not
         # leave the literal "open" — the '(' after the closed string counts.
-        d, in_str, _t, _bc = _scan_line_brackets_delta(
-            r'x = "C:\\"; foo(', None, False, None, PY
-        )
+        d, in_str, _t, _bc = _scan_line_brackets_delta(r'x = "C:\\"; foo(', None, False, None, PY)
         assert d == 1 and in_str is None, "escaped-backslash literal must close"
 
     def test_escape_not_carried_across_line_in_triple(self):
@@ -352,8 +347,8 @@ class TestScanLineBracketsDelta:
         # CONTINUATION (it escapes the newline, not the first char of the next
         # line), so the next line must start UNESCAPED. The closing triple on
         # line 2 therefore closes the literal and the real '(' counts.
-        l1 = 'x = """abc' + chr(92)            # trailing backslash (continuation)
-        l2 = '""" + ('                         # closing triple + real code
+        l1 = 'x = """abc' + chr(92)  # trailing backslash (continuation)
+        l2 = '""" + ('  # closing triple + real code
         d1, s1, t1, bc1 = _scan_line_brackets_delta(l1, None, False, None, PY)
         d2, s2, _t2, _bc2 = _scan_line_brackets_delta(l2, s1, t1, bc1, PY)
         assert (d1, s1, t1) == (0, '"', True), "line 1 opens triple, swallows nothing"
@@ -405,7 +400,7 @@ class TestAnchorInitialStateSeed:
 
     def test_anchor_inside_triple_quoted_string_seeded(self):
         # Python triple-quoted docstring spanning lines; anchor inside it.
-        lines = ['def f():', '    """doc with ( paren', '    and ) close', '    """', '    return (']
+        lines = ["def f():", '    """doc with ( paren', "    and ) close", '    """', "    return ("]
         anchor = 2  # inside the docstring
         s0, t0, bc0 = _scan_to_line_state(lines, anchor, PY)
         assert s0 == '"' and t0 is True, "seed detected we are inside a triple-quoted string"
@@ -422,9 +417,7 @@ class TestAnchorInitialStateSeed:
         s0, t0, bc0 = _scan_to_line_state(lines, 2, PY)
         assert (s0, t0, bc0) == (None, False, None), "normal code => empty seed"
         line = "    if (a or b):"
-        assert _net_bracket_delta(line, PY) == _net_bracket_delta(
-            line, PY, in_str=s0, in_triple=t0, block_close=bc0
-        )
+        assert _net_bracket_delta(line, PY) == _net_bracket_delta(line, PY, in_str=s0, in_triple=t0, block_close=bc0)
 
     def test_seed_bounded_by_available_lines(self):
         # end_lineno beyond len(lines) must not raise.
@@ -472,9 +465,9 @@ class TestAnchorInitialStateSeed:
             "fn foo<'a>(",
             "    x: i32,",
             ") {",
-            "    m'a(",          # anchor: ' closes poison, then ( -> +1
+            "    m'a(",  # anchor: ' closes poison, then ( -> +1
             "    real_code();",  # victim
-            "    n');",          # ' closes, ) -> -1 (false close)
+            "    n');",  # ' closes, ) -> -1 (false close)
             "}",
         ]
         anchor = 3
@@ -494,7 +487,7 @@ class TestAnchorInitialStateSeed:
         # poison the seed either).
         lines = ['x = "unterminated', "    bar("]
         s0, t0, bc0 = _scan_to_line_state(lines, 1, PY)
-        assert (s0, t0, bc0) == (None, False, None), "non-triple \" open must reset"
+        assert (s0, t0, bc0) == (None, False, None), 'non-triple " open must reset'
 
     def test_triple_quote_seed_NOT_reset_by_fallback(self):
         # Regression guard: the fallback targets ONLY non-triple ' / ". A legit

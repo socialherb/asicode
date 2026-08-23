@@ -16,6 +16,7 @@ These tests pin the three-way contract:
   * syntax-broken files still yield symbols via the tree-sitter
     last resort.
 """
+
 from __future__ import annotations
 
 import time
@@ -57,11 +58,7 @@ class TestPrefilterDecision:
 
     def test_short_runs_stay_on_tree_sitter(self):
         # The largest run in this repo is 32 — well under the 50-line trigger.
-        src = (
-            "def target():\n"
-            + _comment_wall(lines=COMMENT_RUN - 1)
-            + "\n    return 1\n"
-        )
+        src = "def target():\n" + _comment_wall(lines=COMMENT_RUN - 1) + "\n    return 1\n"
         assert not _python_ts_parse_too_costly(src)
 
     def test_small_files_keep_error_tolerance(self):
@@ -71,11 +68,7 @@ class TestPrefilterDecision:
         assert not _python_ts_parse_too_costly(src)
 
     def test_non_comment_long_lines_are_not_costly(self):
-        src = (
-            "def target():\n"
-            + "\n".join("    x" + "w" * 196 for _ in range(4000))
-            + "\n    return 1\n"
-        )
+        src = "def target():\n" + "\n".join("    x" + "w" * 196 for _ in range(4000)) + "\n    return 1\n"
         assert not _python_ts_parse_too_costly(src)
 
 
@@ -85,9 +78,7 @@ class TestCommentWallSpeed:
     tens-of-milliseconds range while returning identical results."""
 
     def _wall_file(self, tmp_path) -> None:
-        (tmp_path / "big.py").write_text(
-            f"def target():\n{_comment_wall()}\n    return 1\n", encoding="utf-8"
-        )
+        (tmp_path / "big.py").write_text(f"def target():\n{_comment_wall()}\n    return 1\n", encoding="utf-8")
 
     def test_read_symbol_on_comment_wall_is_fast_and_correct(self, tmp_path):
         self._wall_file(tmp_path)
@@ -137,9 +128,7 @@ class TestSyntaxBrokenLastResort:
 
     def test_broken_comment_wall_file_skips_the_slow_last_resort(self, tmp_path):
         p = tmp_path / "broken.py"
-        p.write_text(
-            f"def target(:\n{_comment_wall()}\n    return 1\n", encoding="utf-8"
-        )
+        p.write_text(f"def target(:\n{_comment_wall()}\n    return 1\n", encoding="utf-8")
         assert _python_ts_parse_too_costly(p.read_text(encoding="utf-8"))
         searcher = SymbolSearcher(str(tmp_path))
         t0 = time.perf_counter()

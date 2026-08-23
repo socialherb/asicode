@@ -7,6 +7,7 @@ live consumer is symbol_modify_tool (``_strip_redundant_dataclass_decorator`` /
 ``_strip_redundant_inline_imports``). The remaining ``self``-taking methods are
 kept together with them rather than split across files.
 """
+
 from __future__ import annotations
 
 import ast as _ast
@@ -34,7 +35,7 @@ def _strip_redundant_inline_imports(new_body: str, file_source: str, _src_tree=N
         elif isinstance(node, _ast.ImportFrom):
             if node.module:
                 module_imports.add(node.module)
-            for alias in (node.names or []):
+            for alias in node.names or []:
                 module_imports.add(alias.name)
                 if alias.asname:
                     module_imports.add(alias.asname)
@@ -57,12 +58,16 @@ def _strip_redundant_inline_imports(new_body: str, file_source: str, _src_tree=N
             _node_last = getattr(_node, "end_lineno", None)
             if _node_last is None:
                 continue
-            _node_span = set(range(_node.lineno, _node_last + 1))
+            _node_span = set(range(_node.lineno, _node_last + 1))  # type: ignore[attr-defined]  # AST stmt node
             if isinstance(_node, _ast.Import):
                 for _alias in _node.names:
                     if _alias.name in module_imports or (_alias.asname and _alias.asname in module_imports):
                         if _alias.asname and _alias.asname not in module_imports:
-                            _al_refs = [_ln for i, _ln in enumerate(_body_lines, start=1) if i not in _node_span and _alias.asname in _ln]
+                            _al_refs = [
+                                _ln
+                                for i, _ln in enumerate(_body_lines, start=1)
+                                if i not in _node_span and _alias.asname in _ln
+                            ]
                             if _al_refs:
                                 continue
                         _redundant_lines |= _node_span
@@ -70,19 +75,27 @@ def _strip_redundant_inline_imports(new_body: str, file_source: str, _src_tree=N
             elif isinstance(_node, _ast.ImportFrom):
                 if _node.module and _node.module in module_imports:
                     _keep_from = False
-                    for _alias in (_node.names or []):
+                    for _alias in _node.names or []:
                         if _alias.asname and _alias.asname not in module_imports:
-                            _al_refs = [_ln for i, _ln in enumerate(_body_lines, start=1) if i not in _node_span and _alias.asname in _ln]
+                            _al_refs = [
+                                _ln
+                                for i, _ln in enumerate(_body_lines, start=1)
+                                if i not in _node_span and _alias.asname in _ln
+                            ]
                             if _al_refs:
                                 _keep_from = True
                                 break
                     if not _keep_from:
                         _redundant_lines |= _node_span
                 else:
-                    for _alias in (_node.names or []):
+                    for _alias in _node.names or []:
                         if _alias.name in module_imports or (_alias.asname and _alias.asname in module_imports):
                             if _alias.asname and _alias.asname not in module_imports:
-                                _al_refs = [_ln for i, _ln in enumerate(_body_lines, start=1) if i not in _node_span and _alias.asname in _ln]
+                                _al_refs = [
+                                    _ln
+                                    for i, _ln in enumerate(_body_lines, start=1)
+                                    if i not in _node_span and _alias.asname in _ln
+                                ]
                                 if _al_refs:
                                     continue
                             _redundant_lines |= _node_span
@@ -190,4 +203,3 @@ def _strip_redundant_dataclass_decorator(new_body: str, file_source: str, _src_t
         return "\n".join(_cleaned)
 
     return new_body
-

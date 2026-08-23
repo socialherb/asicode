@@ -14,6 +14,7 @@ Covers:
 No real browser: actions run on the dedicated executor against a fake page, or
 exercise module-level helpers / monkeypatched ``sync_playwright``.
 """
+
 from __future__ import annotations
 
 import threading
@@ -115,8 +116,8 @@ def test_navigate_length_metadata_excludes_marker(_real_browser_state, monkeypat
 
     res = host._tool_browser_action({"action": "navigate", "url": "https://x", "max_chars": 5000})
     assert res["ok"], res
-    assert res["metadata"]["length"] == 5000          # real content, not marker-inflated
-    assert res["metadata"]["total_length"] == 25000    # full body size
+    assert res["metadata"]["length"] == 5000  # real content, not marker-inflated
+    assert res["metadata"]["total_length"] == 25000  # full body size
     assert "TRUNCATED" in res["content"]
 
 
@@ -176,7 +177,7 @@ def test_get_browser_stops_driver_when_launch_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="no chromium binary"):
         host._get_browser()
 
-    assert stopped["called"] is True                  # driver stopped → no leak
+    assert stopped["called"] is True  # driver stopped → no leak
     assert BrowserActionToolsMixin._playwright is None  # not assigned on failure
     assert BrowserActionToolsMixin._browser is None
 
@@ -234,18 +235,18 @@ def test_render_and_eval_uses_isolated_page_and_closes_it(_real_browser_state, m
     out = host._render_and_eval("https://search.naver.com/x", "() => []", timeout_ms=5000)
 
     assert out == [{"title": "hello world", "url": "https://x/", "snippet": "s"}]
-    assert fresh.evaluated == "() => []"                # eval ran on the fresh page
+    assert fresh.evaluated == "() => []"  # eval ran on the fresh page
     assert fresh.goto_url == "https://search.naver.com/x"
-    assert fresh.closed is True                          # throwaway page closed
-    assert probe.closed is True                          # UA probe page closed too
+    assert fresh.closed is True  # throwaway page closed
+    assert probe.closed is True  # UA probe page closed too
     # The render page is created with the de-headlessed UA: leaving
     # "HeadlessChrome" in the string is by itself enough for some anti-bot
     # systems to refuse the request (measured on Startpage 2026-08-05).
-    assert handed_out[0] is None                         # probe itself is raw
+    assert handed_out[0] is None  # probe itself is raw
     assert "HeadlessChrome" not in handed_out[1]
     assert "Chrome/149.0.0.0" in handed_out[1]
-    assert shared.closed is False                        # shared session untouched
-    assert BrowserActionToolsMixin._page is shared       # shared _page not replaced
+    assert shared.closed is False  # shared session untouched
+    assert BrowserActionToolsMixin._page is shared  # shared _page not replaced
 
 
 def test_render_and_eval_raises_when_playwright_unavailable(monkeypatch):

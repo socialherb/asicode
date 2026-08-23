@@ -4,6 +4,7 @@
 # FIX #3: Import Context Completeness
 # ═══════════════════════════════════════════════════════════════════
 
+
 class TestImportExtraction:
     """Test that ALL module-level imports are extracted, not just first N lines."""
 

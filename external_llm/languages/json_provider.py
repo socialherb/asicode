@@ -1,8 +1,8 @@
 """JSON syntax provider — validates JSON/JSONC files via stdlib json module."""
+
 from __future__ import annotations
 
 import json
-from typing import Optional
 
 from .base import SyntaxProvider
 from .models import (
@@ -51,12 +51,14 @@ class JsonSyntaxProvider(SyntaxProvider):
         except json.JSONDecodeError as e:
             return SyntaxValidationResult(
                 ok=False,
-                errors=[SyntaxError_(
-                    file=file_path,
-                    line=e.lineno,
-                    col=e.colno,
-                    message=e.msg,
-                )],
+                errors=[
+                    SyntaxError_(
+                        file=file_path,
+                        line=e.lineno,
+                        col=e.colno,
+                        message=e.msg,
+                    )
+                ],
                 language=LanguageId.JSON,
             )
 
@@ -72,16 +74,12 @@ class JsonSyntaxProvider(SyntaxProvider):
         lines = []
         in_block_comment = False
         for line in content.splitlines():
-            stripped, in_block_comment = JsonSyntaxProvider._strip_comment_from_line(
-                line, in_block_comment
-            )
+            stripped, in_block_comment = JsonSyntaxProvider._strip_comment_from_line(line, in_block_comment)
             lines.append(stripped)
         return "\n".join(lines)
 
     @staticmethod
-    def _strip_comment_from_line(
-        line: str, in_block_comment: bool = False
-    ) -> tuple[str, bool]:
+    def _strip_comment_from_line(line: str, in_block_comment: bool = False) -> tuple[str, bool]:
         """Strip ``//`` and ``/* */`` comments outside of strings.
 
         Returns ``(stripped_line, new_in_block_comment_state)``. The caller threads
@@ -95,7 +93,7 @@ class JsonSyntaxProvider(SyntaxProvider):
         n = len(line)
         while i < n:
             ch = line[i]
-            pair = line[i:i + 2]
+            pair = line[i : i + 2]
             if in_block_comment:
                 # Inside a block comment: only the closer ends it.
                 if pair == "*/":
@@ -138,17 +136,13 @@ class JsonSyntaxProvider(SyntaxProvider):
     def get_file_globs(self) -> list[str]:
         return ["*.json", "*.jsonc"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

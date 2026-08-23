@@ -1,6 +1,7 @@
 """
 Tests for Claude SDK config entries.
 """
+
 from __future__ import annotations
 
 import os
@@ -18,6 +19,7 @@ class TestClaudeSdkConfig:
 
         # Reload config to test defaults
         import importlib
+
         importlib.reload(config)
 
         assert config.CLAUDE_SDK_MAX_TURNS == 100
@@ -26,6 +28,7 @@ class TestClaudeSdkConfig:
         os.environ["CLAUDE_SDK_MAX_TURNS"] = "20"
 
         import importlib
+
         importlib.reload(config)
 
         assert config.CLAUDE_SDK_MAX_TURNS == 20

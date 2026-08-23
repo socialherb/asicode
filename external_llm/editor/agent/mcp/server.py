@@ -7,6 +7,7 @@ Two modes:
   2. Standalone stdio/SSE MCP server: for external MCP clients, via the
      'asicode mcp start --mode stdio|sse' CLI subcommand.
 """
+
 from __future__ import annotations
 
 import itertools
@@ -16,7 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.tool_registry import ToolRegistry
 from external_llm.repl.collaborate.asi_mcp_adapter import build_asr_mcp_server
@@ -70,17 +71,18 @@ def _log_scanner_freshness_at_startup() -> None:
                 "[SCANNER_REGISTRY] freshness self-check: %d module(s) loaded "
                 "with stale source (changed on disk after load) — restart "
                 "required: %s",
-                len(stale), ", ".join(sorted(stale)),
+                len(stale),
+                ", ".join(sorted(stale)),
             )
         else:
             logger.info(
-                "[SCANNER_REGISTRY] freshness self-check: %d scanner module(s) "
-                "loaded, all match on-disk source",
+                "[SCANNER_REGISTRY] freshness self-check: %d scanner module(s) loaded, all match on-disk source",
                 len(registry.source_versions()),
             )
     except Exception:  # pragma: no cover - best-effort diagnostics
         logger.debug(
-            "[SCANNER_REGISTRY] freshness self-check unavailable", exc_info=True,
+            "[SCANNER_REGISTRY] freshness self-check unavailable",
+            exc_info=True,
         )
 
 
@@ -114,7 +116,7 @@ def run_mcp_server(
 
 
 def list_mcp_tools(
-    registry: Optional[ToolRegistry] = None,
+    registry: ToolRegistry | None = None,
 ) -> list[dict[str, Any]]:
     """List all tools exposed by the MCP server."""
     from external_llm.agent.tool_schemas import AGENT_TOOL_SCHEMAS
@@ -132,11 +134,13 @@ def list_mcp_tools(
         name = schema["name"]
         if name in EXCLUDED:
             continue
-        tools.append({
-            "name": name,
-            "description": schema.get("description", ""),
-            "parameters": schema.get("parameters", {}),
-        })
+        tools.append(
+            {
+                "name": name,
+                "description": schema.get("description", ""),
+                "parameters": schema.get("parameters", {}),
+            }
+        )
     return tools
 
 
@@ -200,11 +204,13 @@ def _run_stdio_server(registry: ToolRegistry) -> None:
             try:
                 request = json.loads(line)
             except json.JSONDecodeError:
-                _write({
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "Parse error"},
-                })
+                _write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    }
+                )
                 continue
 
             method = request.get("method", "") if isinstance(request, dict) else ""
@@ -248,9 +254,9 @@ def _run_stdio_server(registry: ToolRegistry) -> None:
                     break
                 if time.monotonic() >= deadline:
                     logger.warning(
-                        "MCP stdio: %d in-flight tool call(s) still running after "
-                        "%.0fs; exiting without them",
-                        len(remaining), _DRAIN_TIMEOUT_SECONDS,
+                        "MCP stdio: %d in-flight tool call(s) still running after %.0fs; exiting without them",
+                        len(remaining),
+                        _DRAIN_TIMEOUT_SECONDS,
                     )
                     break
                 for thread in remaining:
@@ -356,8 +362,7 @@ def _run_http_server(
     """
     server = server_factory(registry, host, port, handle=_handle_jsonrpc)
     print(
-        f"Starting asicode MCP server ({label} mode) on "
-        f"http://{host}:{port}{endpoint}",
+        f"Starting asicode MCP server ({label} mode) on http://{host}:{port}{endpoint}",
         file=sys.stderr,
     )
     try:
@@ -366,6 +371,8 @@ def _run_http_server(
         print(f"Shutting down asicode MCP server ({label} mode)", file=sys.stderr)
     finally:
         server.shutdown()
+
+
 def _run_sse_server(registry: ToolRegistry, host: str, port: int) -> None:
     """Run MCP server in SSE mode (HTTP-based).
 
@@ -378,8 +385,12 @@ def _run_sse_server(registry: ToolRegistry, host: str, port: int) -> None:
     from external_llm.editor.agent.mcp.sse_server import SSEMcpServer
 
     _run_http_server(
-        registry, host, port,
-        server_factory=SSEMcpServer, endpoint="/sse", label="SSE",
+        registry,
+        host,
+        port,
+        server_factory=SSEMcpServer,
+        endpoint="/sse",
+        label="SSE",
     )
 
 
@@ -395,7 +406,10 @@ def _run_streamable_server(registry: ToolRegistry, host: str, port: int) -> None
     from external_llm.editor.agent.mcp.streamable_server import StreamableHttpMcpServer
 
     _run_http_server(
-        registry, host, port,
-        server_factory=StreamableHttpMcpServer, endpoint="/mcp",
+        registry,
+        host,
+        port,
+        server_factory=StreamableHttpMcpServer,
+        endpoint="/mcp",
         label="Streamable-HTTP",
     )

@@ -38,23 +38,26 @@ def _shapes(source: str) -> list[str]:
 
 # ── path normalization (shared contract with the other gates) ────────────────
 
+
 def test_resolve_scan_paths_normalizes_abs_and_relative():
     rel = "scripts/check_missing_global.py"
     assert g._resolve_scan_paths([str(_SCRIPT)]) == [rel]
     assert g._resolve_scan_paths([rel]) == [rel]
-    assert g._resolve_scan_paths([]) is None          # no args → full-repo scan
+    assert g._resolve_scan_paths([]) is None  # no args → full-repo scan
     assert g._resolve_scan_paths(["--flag"]) is None  # flags filtered by main
 
 
 def test_resolve_scan_paths_rejects_out_of_repo_and_non_python():
-    assert g._resolve_scan_paths(["/etc/passwd"]) is None   # '..' → rejected
-    assert g._resolve_scan_paths(["README.md"]) is None     # not .py
+    assert g._resolve_scan_paths(["/etc/passwd"]) is None  # '..' → rejected
+    assert g._resolve_scan_paths(["README.md"]) is None  # not .py
 
 
 # ── what counts as module state ──────────────────────────────────────────────
 
+
 def test_only_module_scope_assignments_count_as_globals():
     import ast
+
     tree = ast.parse(
         "import os\n"
         "from pathlib import Path\n"
@@ -67,13 +70,18 @@ def test_only_module_scope_assignments_count_as_globals():
         "class Cls: pass\n"
     )
     assert g._module_assigned_names(tree) == {
-        "PLAIN", "ANNOTATED", "AUGMENTED", "TUPLE_A", "TUPLE_B",
+        "PLAIN",
+        "ANNOTATED",
+        "AUGMENTED",
+        "TUPLE_A",
+        "TUPLE_B",
     }
     # imports / def / class are NOT module state for this gate
     assert {"os", "Path", "fn", "Cls"}.isdisjoint(g._module_assigned_names(tree))
 
 
 # ── violations ───────────────────────────────────────────────────────────────
+
 
 def test_write_only_assignment_is_flagged():
     """The shape ruff cannot see: no read, so no F823, so no diagnostic."""
@@ -125,6 +133,7 @@ def test_every_violating_function_is_reported_separately():
 
 
 # ── deliberate non-violations ────────────────────────────────────────────────
+
 
 def test_declared_global_is_clean():
     src = "_dirty = False\ndef f():\n    global _dirty\n    _dirty = True\n"
@@ -188,10 +197,9 @@ def test_syntax_error_defers_to_the_syntax_gates():
 
 # ── end-to-end main() (the branch the manual probe originally missed) ────────
 
+
 def test_main_fails_on_a_planted_violation(tmp_path, monkeypatch, capsys):
-    (tmp_path / "mod.py").write_text(
-        "_dirty = False\ndef f():\n    _dirty = True\n", encoding="utf-8"
-    )
+    (tmp_path / "mod.py").write_text("_dirty = False\ndef f():\n    _dirty = True\n", encoding="utf-8")
     monkeypatch.setattr(g, "REPO", tmp_path)
     monkeypatch.setattr(sys, "argv", ["check_missing_global.py"])
     assert g.main() == 1

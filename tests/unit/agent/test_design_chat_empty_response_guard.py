@@ -7,6 +7,7 @@ _EMPTY_RESPONSE_FALLBACK so the REPL / webapp / subagent summary / session
 history never receive an empty turn. is_error stays False (budget exhaustion
 with partial progress is not a failure).
 """
+
 import subprocess
 
 import pytest
@@ -25,8 +26,8 @@ class _StubClient:
     """Scripted stub: per-scenario tool-loop and plain-chat behaviors."""
 
     def __init__(self, tool_loop=None, plain=None, tool_loop_raise=None):
-        self._tool_loop = tool_loop            # callable(messages) -> ToolCallResponse
-        self._plain = plain                    # callable(messages) -> LLMResponse
+        self._tool_loop = tool_loop  # callable(messages) -> ToolCallResponse
+        self._plain = plain  # callable(messages) -> LLMResponse
         self._tool_loop_raise = tool_loop_raise
         self.tool_calls = 0
         self.plain_calls = 0
@@ -48,16 +49,24 @@ class _StubClient:
 
 def _tool_response(content: str, tool_calls=None):
     return ToolCallResponse(
-        content=content, model="m", provider="stub", tokens_used=1,
+        content=content,
+        model="m",
+        provider="stub",
+        tokens_used=1,
         finish_reason="tool_calls" if tool_calls else "stop",
-        raw_response=None, tool_calls=tool_calls or [],
+        raw_response=None,
+        tool_calls=tool_calls or [],
     )
 
 
 def _plain_response(content: str, raw=None):
     return LLMResponse(
-        content=content, model="m", provider="stub", tokens_used=1,
-        finish_reason="stop", raw_response=raw,
+        content=content,
+        model="m",
+        provider="stub",
+        tokens_used=1,
+        finish_reason="stop",
+        raw_response=raw,
     )
 
 
@@ -75,6 +84,7 @@ def _run(client, _repo, **kw):
 
 
 # ── PATH 1: normal termination, empty content twice ─────────────────────────
+
 
 def test_path1_normal_termination_empty_injects_fallback(_repo):
     """Empty response with no tool calls: one auto-retry (_empty_retried),
@@ -101,14 +111,22 @@ def test_passthrough_non_empty_response_untouched(_repo):
 
 # ── PATH 2: max-iterations tail, final + retry both empty ──────────────────
 
+
 def test_path2_max_iterations_empty_injects_fallback(_repo):
     """Budget exhausted (every turn asks for a tool, budget=1) and the final
     text-only call AND its retry both return empty ⇒ funnel injects the
     fallback; hit_max_iterations stays True, is_error stays False."""
     client = _StubClient(
-        tool_loop=lambda m: _tool_response("", tool_calls=[ToolCallRequest(
-            call_id="c1", name="read_file", args={"file_path": "README.md"},
-        )]),
+        tool_loop=lambda m: _tool_response(
+            "",
+            tool_calls=[
+                ToolCallRequest(
+                    call_id="c1",
+                    name="read_file",
+                    args={"file_path": "README.md"},
+                )
+            ],
+        ),
         plain=lambda m: _plain_response(""),
     )
     r = _run(client, _repo, max_tool_iterations=1)
@@ -120,6 +138,7 @@ def test_path2_max_iterations_empty_injects_fallback(_repo):
 
 
 # ── PATH 3: tool-loop fallback plain chat ───────────────────────────────────
+
 
 def test_path3_fallback_plain_chat_empty_injects_fallback(_repo):
     """Non-LLM exception in the tool loop degrades to plain chat; if that also

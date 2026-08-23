@@ -3,9 +3,11 @@
 Verifies that Python keywords (None, True, False, ...) and single-letter
 placeholder names extracted from intent text are NOT treated as missing symbols.
 """
+
 import keyword
 
 # ── helper: invoke the filtering logic in isolation ──────────────────────────
+
 
 def _apply_keyword_filter(candidate_names: set) -> set:
     """Replicate the filtering step from _find_missing_callees_for_guard."""
@@ -19,6 +21,7 @@ def _simulate_placeholder_filter(candidate_names: set, regex_names: set, contrac
 
 
 # ── Part A: keyword/literal tokens are removed ───────────────────────────────
+
 
 class TestKeywordFilter:
     def test_none_is_filtered(self):
@@ -34,8 +37,22 @@ class TestKeywordFilter:
         assert "Ellipsis" in result  # builtin, not a keyword
 
     def test_python_keywords_filtered(self):
-        kws = {"return", "if", "for", "while", "class", "def", "import",
-               "from", "as", "pass", "break", "continue", "raise", "yield"}
+        kws = {
+            "return",
+            "if",
+            "for",
+            "while",
+            "class",
+            "def",
+            "import",
+            "from",
+            "as",
+            "pass",
+            "break",
+            "continue",
+            "raise",
+            "yield",
+        }
         result = _apply_keyword_filter(kws)
         assert result == set(), f"Keyword names should all be filtered: {result}"
 
@@ -64,6 +81,7 @@ class TestKeywordFilter:
 
 
 # ── Part C: single-letter placeholder filter ─────────────────────────────────
+
 
 class TestPlaceholderFilter:
     """Verifies single-letter names from regex are filtered out.
@@ -115,6 +133,7 @@ class TestPlaceholderFilter:
 # The agent_loop status expression:
 #   "partial_success" if (failed > 0 or _is_blocking_verdict) else "success"
 # where _is_blocking_verdict = exec_final_status in {"failed", ...}
+
 
 def _compute_sse_status(failed: int, exec_final_status: str) -> str:
     """Replicate the status computation from agent_loop._run_planner_lane."""

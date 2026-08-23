@@ -12,6 +12,7 @@ an interactive prompt), so this is pinned as an AST contract rather than by
 executing the loop: the retry must be reachable from OUTSIDE the branch whose
 ``else:`` owns the renderer.
 """
+
 from __future__ import annotations
 
 import ast
@@ -21,7 +22,7 @@ import pytest
 
 REPL = pathlib.Path(__file__).resolve().parents[2] / "external_llm" / "repl" / "repl_impl.py"
 
-RENDER_MARKER = "_split_work_state"      # first thing the render branch does
+RENDER_MARKER = "_split_work_state"  # first thing the render branch does
 RETRY_MARKER = "_prompt_auth_retry_key"  # entry point of the auth retry
 
 
@@ -51,10 +52,9 @@ def render_ifs():
     """Every ``if`` whose else-branch contains the design-chat renderer."""
     tree = ast.parse(REPL.read_text(encoding="utf-8"))
     found = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.If)
-        and n.orelse
-        and any(_mentions(s, RENDER_MARKER) for s in n.orelse)
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If) and n.orelse and any(_mentions(s, RENDER_MARKER) for s in n.orelse)
     ]
     assert found, (
         f"no if/else owning {RENDER_MARKER!r} found — the design-chat render "
@@ -86,13 +86,16 @@ def test_retry_result_can_still_reach_the_renderer():
         for i, stmt in enumerate(body):
             if retry_at is None and _calls_named(stmt, RETRY_MARKER):
                 retry_at = i
-            if render_at is None and isinstance(stmt, ast.If) and stmt.orelse \
-                    and any(_mentions(s, RENDER_MARKER) for s in stmt.orelse):
+            if (
+                render_at is None
+                and isinstance(stmt, ast.If)
+                and stmt.orelse
+                and any(_mentions(s, RENDER_MARKER) for s in stmt.orelse)
+            ):
                 render_at = i
         if retry_at is not None and render_at is not None:
             assert retry_at < render_at, (
-                "the auth retry runs after the render branch — a recovered "
-                "answer would never be displayed"
+                "the auth retry runs after the render branch — a recovered answer would never be displayed"
             )
             return
     pytest.fail(

@@ -1,6 +1,7 @@
 """
 Tests for StreamingDisplay.
 """
+
 from __future__ import annotations
 
 import io
@@ -99,12 +100,8 @@ class TestToolInputFormatting:
         assert out == "asi.py:120-340"
 
     def test_read_file_partial_range(self):
-        assert _format_tool_input(
-            "mcp__asr__read_file", {"path": "a.py", "start_line": 120}
-        ) == "a.py:120-end"
-        assert _format_tool_input(
-            "mcp__asr__read_file", {"path": "a.py", "end_line": 340}
-        ) == "a.py:1-340"
+        assert _format_tool_input("mcp__asr__read_file", {"path": "a.py", "start_line": 120}) == "a.py:120-end"
+        assert _format_tool_input("mcp__asr__read_file", {"path": "a.py", "end_line": 340}) == "a.py:1-340"
 
     def test_read_file_whole_file_no_range(self):
         # No range args → path only (full read)
@@ -112,9 +109,7 @@ class TestToolInputFormatting:
 
     def test_other_tools_use_key_arg_under_mcp_prefix(self):
         assert _format_tool_input("mcp__asr__grep", {"pattern": "def foo"}) == "def foo"
-        assert _format_tool_input(
-            "mcp__asr__find_relevant_files", {"query": "streaming"}
-        ) == "streaming"
+        assert _format_tool_input("mcp__asr__find_relevant_files", {"query": "streaming"}) == "streaming"
 
     def test_long_command_not_pre_truncated(self):
         # Width adaptation is the renderer's job (_truncate(hint, hint_avail)
@@ -125,9 +120,9 @@ class TestToolInputFormatting:
         assert _format_tool_input("bash", {"command": long_cmd}) == long_cmd
         long_path = "a" * 200 + ".py"
         assert _format_tool_input("read_file", {"path": long_path}) == long_path
-        assert _format_tool_input(
-            "read_file", {"path": long_path, "start_line": 1, "end_line": 5}
-        ) == f"{long_path}:1-5"
+        assert (
+            _format_tool_input("read_file", {"path": long_path, "start_line": 1, "end_line": 5}) == f"{long_path}:1-5"
+        )
 
 
 class TestTruncateSingleRow:
@@ -204,6 +199,7 @@ class TestMarkdownRendering:
         lines = _markdown_lines(md, width=80)
         assert lines is not None
         import re
+
         plain = "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in lines)
         # Literal markdown symbols are rendered away
         assert "###" not in plain
@@ -219,6 +215,7 @@ class TestMarkdownRendering:
         # to be meaningful.
         import re
         import unicodedata
+
         md = "긴 한국어 텍스트가 " * 20
         lines = _markdown_lines(md, width=40)
         assert lines is not None
@@ -239,21 +236,29 @@ class TestMarkdownRendering:
         old = sys.stdout
         sys.stdout = buf
         try:
-            display.handle_event(SessionEvent(
-                type="verdict", content="",
-                metadata={"verdict": {
-                    "status": "needs_review", "summary": "review", "confidence": 0.9,
-                    "details": "## Title\n\n```python\nx = 1\n```\n",
-                }},
-            ))
+            display.handle_event(
+                SessionEvent(
+                    type="verdict",
+                    content="",
+                    metadata={
+                        "verdict": {
+                            "status": "needs_review",
+                            "summary": "review",
+                            "confidence": 0.9,
+                            "details": "## Title\n\n```python\nx = 1\n```\n",
+                        }
+                    },
+                )
+            )
             display.stop()
         finally:
             sys.stdout = old
         import re
+
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
         assert "```python" not in plain
         assert "## Title" not in plain  # header symbol gets rendered away
-        assert "x = 1" in plain         # code body is preserved
+        assert "x = 1" in plain  # code body is preserved
 
 
 class TestTickerConcurrency:
@@ -361,16 +366,13 @@ class TestVerdictConfidenceGuard:
         old = sys.stdout
         sys.stdout = buf
         try:
-            display._print_verdict(
-                {"status": "success", "summary": "ok", "confidence": "0.9"}
-            )
-            display._print_verdict(
-                {"status": "success", "summary": "ok", "confidence": "bad"}
-            )
+            display._print_verdict({"status": "success", "summary": "ok", "confidence": "0.9"})
+            display._print_verdict({"status": "success", "summary": "ok", "confidence": "bad"})
         finally:
             sys.stdout = old
             display.stop()
         import re
+
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
         assert "90%" in plain  # "0.9" → 90%
 
@@ -380,13 +382,12 @@ class TestVerdictConfidenceGuard:
         old = sys.stdout
         sys.stdout = buf
         try:
-            display._print_verdict(
-                {"status": "success", "summary": "ok", "confidence": 1.5}
-            )
+            display._print_verdict({"status": "success", "summary": "ok", "confidence": 1.5})
         finally:
             sys.stdout = old
             display.stop()
         import re
+
         plain = re.sub(r"\x1b\[[0-9;]*m", "", buf.getvalue())
         assert "100%" in plain
         assert "150%" not in plain
@@ -414,15 +415,17 @@ class TestMarkdownTableFoldPatch:
         ``Markdown`` directly — otherwise the fold patch is silently bypassed.
         """
         import subprocess
+
         proc = subprocess.run(
-            ["grep", "-rn", r'from rich\.markdown import', "external_llm", "asi.py", "webapp"],
-            capture_output=True, text=True, timeout=10,
+            ["grep", "-rn", r"from rich\.markdown import", "external_llm", "asi.py", "webapp"],
+            capture_output=True,
+            text=True,
+            timeout=10,
             check=False,
         )
         # Only legitimate site: the shared module itself (which uses it inside markdown_cls)
         lines = [line for line in proc.stdout.splitlines() if line.strip() and "rich_markdown.py" not in line]
         assert not lines, (
             "Direct `from rich.markdown import` bypasses the shared module — "
-            "use `markdown_cls()` from `external_llm.common.rich_markdown` instead. Found:\n"
-            + "\n".join(lines)
+            "use `markdown_cls()` from `external_llm.common.rich_markdown` instead. Found:\n" + "\n".join(lines)
         )

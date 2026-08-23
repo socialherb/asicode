@@ -6,21 +6,21 @@ Supports Python (import-based) and Kotlin (symbol-based) expansion.
 
 FIXED: Uses common.unique_keep_order instead of local duplicate.
 """
+
 from __future__ import annotations
 
 import itertools
 import logging
 import re
 from pathlib import Path
-from typing import Optional
 
-from common import normalize_rel_path_fast, unique_keep_order  # FIXED: use shared utility
+from common import unique_keep_order  # FIXED: use shared utility
 from config import (
     CTX_MAX_FILES,
     KOTLIN_MAX_SYMBOLS,
     KOTLIN_SYMBOL_SCAN_LIMIT,
 )
-from path_security import resolve_inside_repo
+from path_security import normalize_rel_path, resolve_inside_repo
 from utils.string_helper import utf8_trailing_incomplete_len
 
 logger = logging.getLogger(__name__)
@@ -189,9 +189,7 @@ def _module_to_repo_paths(repo_root: str, module: str) -> list[str]:
     if len(parts) == 1:
         candidates.append(str(Path(parts[0]) / "__init__.py").replace("\\", "/"))
 
-    return unique_keep_order([
-        r for r in candidates if (repo / r).exists() and (repo / r).is_file()
-    ])
+    return unique_keep_order([r for r in candidates if (repo / r).exists() and (repo / r).is_file()])
 
 
 # ============================================================
@@ -221,9 +219,7 @@ def _parse_kotlin_import_symbols(text: str) -> list[str]:
     return unique_keep_order(out)
 
 
-def _find_kotlin_files_for_symbol(
-    repo_root: str, target_rel: str, symbol: str, limit: int = 8
-) -> list[str]:
+def _find_kotlin_files_for_symbol(repo_root: str, target_rel: str, symbol: str, limit: int = 8) -> list[str]:
     """Find Kotlin files matching **/<symbol>.kt, preferring nearby paths."""
     if not symbol:
         return []
@@ -249,9 +245,7 @@ def _find_kotlin_files_for_symbol(
 # ============================================================
 # Shallow multi-file context collector
 # ============================================================
-def collect_related_files_shallow(
-    repo_root: str, target_rel: Optional[str]
-) -> tuple[list[str], dict]:
+def collect_related_files_shallow(repo_root: str, target_rel: str | None) -> tuple[list[str], dict]:
     """
     Collect related files for context expansion.
     - Always includes target_rel
@@ -274,13 +268,13 @@ def collect_related_files_shallow(
     # {'.','/'} that would strip a dotfile's leading dot (".config.py" ->
     # "config.py"), making the file appear missing.  lstrip("/") handles a
     # leading slash.  See go_provider.py for the same fix.
-    rel = normalize_rel_path_fast(target_rel)
+    rel = normalize_rel_path(target_rel)
     if not rel:
         meta["reason"] = "empty_target"
         return [], meta
 
-    # P20-1: strict resolution + containment check. normalize_rel_path_fast
-    # strips leading ./ and / but does NOT reject ".." — a prompt-supplied
+    # P20-1: strict resolution + containment check. normalize_rel_path
+    # strips leading ./ and / and rejects ".." — prompt-supplied — a prompt-supplied
     # "Target file: ../sibling/app.py" used to read outside the repo here
     # (external-LLM / plan-json paths already refused it; instruction and
     # legacy-diff modes did not). resolve_inside_repo also rejects symlink
@@ -366,7 +360,7 @@ def read_file_snippet_context(
         "range": None,
     }
 
-    reln = normalize_rel_path_fast(rel_path)
+    reln = normalize_rel_path(rel_path)
     if not repo_root or not reln:
         meta["reason"] = "missing_args"
         return "", meta

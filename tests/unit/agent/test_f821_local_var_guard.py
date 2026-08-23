@@ -5,6 +5,7 @@ Core guarantees:
 2. Truly undefined names (never assigned anywhere in the function) are handled normally
 3. Various assignment forms are recognized: walrus operator / for target / with...as target
 """
+
 from __future__ import annotations
 
 import ast
@@ -33,7 +34,7 @@ def _collect_local_assigned_names(source: str) -> set:
                         if isinstance(t, ast.Name):
                             local_assigned_names.add(t.id)
                 elif isinstance(child, (ast.AugAssign, ast.AnnAssign)):
-                    at = getattr(child, 'target', None)
+                    at = getattr(child, "target", None)
                     if isinstance(at, ast.Name):
                         local_assigned_names.add(at.id)
                 elif isinstance(child, (ast.NamedExpr, ast.For)):
@@ -41,7 +42,7 @@ def _collect_local_assigned_names(source: str) -> set:
                         local_assigned_names.add(child.target.id)
                 elif isinstance(child, ast.With):
                     for wi in child.items:
-                        wv = getattr(wi, 'optional_vars', None)
+                        wv = getattr(wi, "optional_vars", None)
                         if isinstance(wv, ast.Name):
                             local_assigned_names.add(wv.id)
     except Exception:

@@ -1,6 +1,7 @@
 """
 OpenAI (ChatGPT) client for asicode
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -10,7 +11,7 @@ import random
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -61,8 +62,7 @@ def _norm_base(base: str) -> str:
 
 def _model_rejects_images(model: str, base: str = "") -> bool:
     return bool(model) and (
-        text_only_model(model)
-        or (_norm_base(base), _bare_model_name(model)) in _IMAGE_REJECTING_MODELS
+        text_only_model(model) or (_norm_base(base), _bare_model_name(model)) in _IMAGE_REJECTING_MODELS
     )
 
 
@@ -78,22 +78,26 @@ def _openai_content(msg: LLMMessage, model: str = "", base: str = ""):
         return msg.content
     if _model_rejects_images(model, base):
         from .providers import _images_to_text  # lazy: providers is a heavy module
+
         logger.warning(
-            "Model %s does not accept image input — sending OCR/placeholder text "
-            "for %d attached image(s) instead",
-            model, len(images),
+            "Model %s does not accept image input — sending OCR/placeholder text for %d attached image(s) instead",
+            model,
+            len(images),
         )
         text = _images_to_text(images)
         return text + ("\n" + msg.content if msg.content else "")
-    parts: list[dict[str, Any]] = [{
+    parts: list[dict[str, Any]] = [
+        {
             "type": "image_url",
             "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"},
-        } for img in images]
+        }
+        for img in images
+    ]
     parts.append({"type": "text", "text": msg.content})
     return parts
 
 
-def _strip_image_parts(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _strip_image_parts(payload: dict[str, Any]) -> dict[str, Any] | None:
     """Copy of ``payload`` with image_url parts replaced by OCR/placeholder text.
 
     Returns None when the payload contains no image parts (nothing to strip).
@@ -128,6 +132,7 @@ def _strip_image_parts(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
             continue
         stripped_any = True
         from .providers import _images_to_text  # lazy: providers is a heavy module
+
         text = "\n".join(t for t in texts if t)
         nm = dict(m)
         nm["content"] = _images_to_text(images) + ("\n" + text if text else "")
@@ -199,7 +204,7 @@ def _is_kimi_k3(model: str) -> bool:
     return "kimi-k3" in _bare  # substring to match variants (kimi-k3-0711, kimi-k3-turbo, etc.)
 
 
-def _parse_error_code(response: requests.Response) -> Optional[int]:
+def _parse_error_code(response: requests.Response) -> int | None:
     """Extract provider-specific error code (e.g., 1302, 1305) from JSON body.
 
     GLM API returns ``{"error":{"code":1305,"message":"..."}}`` — parse the
@@ -272,8 +277,8 @@ def _reasoning_effort_value(model: str, thinking_mode: bool) -> str:
 def _apply_thinking_mode(
     payload: dict[str, Any],
     model: str,
-    thinking_mode: Optional[bool],
-    effort_override: Optional[str],
+    thinking_mode: bool | None,
+    effort_override: str | None,
     *,
     is_reasoning: bool,
 ) -> None:
@@ -318,8 +323,7 @@ def _apply_thinking_mode(
         payload["reasoning_effort"] = "max"  # K3 only supports "max"; override is always ignored
     elif is_reasoning:
         payload["reasoning_effort"] = (
-            effort_override if (thinking_mode and effort_override)
-            else _reasoning_effort_value(model, thinking_mode)
+            effort_override if (thinking_mode and effort_override) else _reasoning_effort_value(model, thinking_mode)
         )
     elif effort_override:
         # Non-reasoning model but subclass explicitly requested reasoning_effort
@@ -328,7 +332,7 @@ def _apply_thinking_mode(
         payload["reasoning_effort"] = effort_override
 
 
-def _extract_cached_tokens(usage: Optional[dict[str, Any]]) -> Optional[int]:
+def _extract_cached_tokens(usage: dict[str, Any] | None) -> int | None:
     """Pull cached-prompt token count from OpenAI-style usage details.
 
     OpenAI, DeepSeek, Z.AI and OpenRouter all report the prompt-cache hit as
@@ -408,6 +412,7 @@ class OpenAIClient(LLMClient):
         _max_retries = 3
         _skip_next_backoff = False  # one-shot: consumed by the next attempt
         t0 = time.monotonic()
+        response: requests.Response | None = None  # bound in the loop below
         for _retry in range(_max_retries):
             if _retry > 0:
                 if _skip_next_backoff:
@@ -417,26 +422,34 @@ class OpenAIClient(LLMClient):
                     _delay += random.uniform(0, _delay * 0.5)  # jitter: avoid retry storms
                     logger.info(
                         "API retry %d/%d after %.1fs delay (%s)",
-                        _retry, _max_retries - 1, _delay, tag,
+                        _retry,
+                        _max_retries - 1,
+                        _delay,
+                        tag,
                     )
                     if interruptible_sleep(_delay, self.cancel_event):
                         raise LLMCancelled("cancelled during retry backoff")
             try:
                 response = self._session.post(
-                    url, headers=headers, json=payload,
-                    timeout=self.timeout, stream=stream,
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                    stream=stream,
                 )
             except (requests.ConnectionError, requests.Timeout) as e:
                 logger.warning(
                     "API connection attempt %d/%d failed: %s (%s)",
-                    _retry + 1, _max_retries, type(e).__name__, tag,
+                    _retry + 1,
+                    _max_retries,
+                    type(e).__name__,
+                    tag,
                 )
                 if _retry == _max_retries - 1:
                     _elapsed_ms = (time.monotonic() - t0) * 1000
                     if isinstance(e, requests.Timeout):
                         raise LLMServerUnavailableError(
-                            f"API request timed out after {_max_retries} attempts "
-                            f"({_elapsed_ms:.0f}ms total) ({tag})"
+                            f"API request timed out after {_max_retries} attempts ({_elapsed_ms:.0f}ms total) ({tag})"
                         ) from e
                     raise LLMServerUnavailableError(
                         f"Cannot connect to API after {_max_retries} attempts "
@@ -452,8 +465,7 @@ class OpenAIClient(LLMClient):
                 # a misleading "rate limit / try again" (or auth) message.
                 if _is_balance_quota_response(response):
                     raise LLMQuotaExceededError(
-                        f"Account balance/quota exhausted (429): "
-                        f"{_short_error_reason(response.text)}"
+                        f"Account balance/quota exhausted (429): {_short_error_reason(response.text)}"
                     )
                 error_body = _short_error_reason(response.text)
                 if _retry < _max_retries - 1:
@@ -461,7 +473,10 @@ class OpenAIClient(LLMClient):
                     if _retry_after is not None:
                         logger.info(
                             "API rate limited (429), waiting %ds (Retry-After), retry %d/%d (%s)",
-                            _retry_after, _retry + 1, _max_retries - 1, tag,
+                            _retry_after,
+                            _retry + 1,
+                            _max_retries - 1,
+                            tag,
                         )
                         if interruptible_sleep(_retry_after, self.cancel_event):
                             raise LLMCancelled("cancelled during Retry-After wait")
@@ -469,7 +484,9 @@ class OpenAIClient(LLMClient):
                     else:
                         logger.info(
                             "API rate limited (429), retry %d/%d (%s)",
-                            _retry + 1, _max_retries - 1, tag,
+                            _retry + 1,
+                            _max_retries - 1,
+                            tag,
                         )
                     continue
                 raise LLMRateLimitError(
@@ -482,11 +499,18 @@ class OpenAIClient(LLMClient):
                 if _retry < _max_retries - 1:
                     logger.info(
                         "API server error %d, retry %d/%d (%s)",
-                        response.status_code, _retry + 1, _max_retries - 1, tag,
+                        response.status_code,
+                        _retry + 1,
+                        _max_retries - 1,
+                        tag,
                     )
                     continue
                 raise LLMServerUnavailableError(f"API returned HTTP {response.status_code}: {error_body}")
             break  # Success (non-retryable) — exit retry loop
+        # _max_retries is a constant 3, so the loop always runs at least once
+        # and response is bound; assert narrows for pyright and guards future
+        # callers that might configure max_retries=0.
+        assert response is not None
         if response.status_code == 400:
             # Some models reject image_url parts outright (e.g. DeepSeek family:
             # HTTP 400 even for a 1x1 PNG). When the 400 request carried images,
@@ -504,14 +528,19 @@ class OpenAIClient(LLMClient):
                 # underlying connection back to the pool (see #840-843 invariant).
                 response.close()
                 retry_resp = self._request_with_retry(
-                    url, headers, stripped, tag=f"{tag}+noimg", stream=stream,
+                    url,
+                    headers,
+                    stripped,
+                    tag=f"{tag}+noimg",
+                    stream=stream,
                 )
                 if retry_resp.status_code < 400:
                     _IMAGE_REJECTING_MODELS.add((stripped_base, stripped_model))
                     logger.warning(
                         "HTTP 400 with image attachment(s) — model %s rejects "
                         "image input on this route; remembering for future calls (%s)",
-                        model, tag,
+                        model,
+                        tag,
                     )
                 return retry_resp
         return response
@@ -521,8 +550,8 @@ class OpenAIClient(LLMClient):
         messages: list[LLMMessage],
         model: str = "",
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         """
         Send chat completion request to OpenAI
@@ -539,10 +568,7 @@ class OpenAIClient(LLMClient):
 
         # Convert to OpenAI format (with optional image support)
         _base = self.base_url or self.DEFAULT_BASE_URL
-        api_messages = [
-            {"role": msg.role, "content": _openai_content(msg, model, _base)}
-            for msg in messages
-        ]
+        api_messages = [{"role": msg.role, "content": _openai_content(msg, model, _base)} for msg in messages]
 
         is_reasoning = _is_reasoning_model(model)
 
@@ -602,26 +628,17 @@ class OpenAIClient(LLMClient):
             if response.status_code == 401:
                 error_body = response.text[:500]
                 logger.error("OpenAI authentication failed (401): %s", error_body)
-                raise LLMAuthenticationError(
-                    f"Invalid API key (401): {error_body}"
-                )
+                raise LLMAuthenticationError(f"Invalid API key (401): {error_body}")
 
             if response.status_code == 402:
                 error_body = response.text[:500]
                 logger.error("Insufficient credits (402): %s", error_body)
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (402): {error_body}")
 
             if response.status_code != 200:
                 error_body = response.text[:500]
-                logger.debug(
-                    "OpenAI API error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMAPIError(
-                    f"API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.debug("OpenAI API error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMAPIError(f"API returned HTTP {response.status_code}: {error_body}")
 
             data = response.json()
 
@@ -629,12 +646,7 @@ class OpenAIClient(LLMClient):
             choices = data.get("choices", [])
             if not choices:
                 logger.warning("OpenAI response has no choices")
-                return LLMResponse(
-                    content="",
-                    model=model,
-                    provider=self.get_provider_name(),
-                    raw_response=data
-                )
+                return LLMResponse(content="", model=model, provider=self.get_provider_name(), raw_response=data)
 
             choice = choices[0]
             message = choice.get("message", {})
@@ -648,10 +660,7 @@ class OpenAIClient(LLMClient):
             completion_tokens = usage.get("completion_tokens")
             cached_tokens = _extract_cached_tokens(usage)
 
-            logger.info(
-                "OpenAI %s: %.0fms, tok=%s, finish_reason=%s",
-                model, elapsed_ms, tokens_used, finish_reason
-            )
+            logger.info("OpenAI %s: %.0fms, tok=%s, finish_reason=%s", model, elapsed_ms, tokens_used, finish_reason)
 
             return LLMResponse(
                 content=content,
@@ -673,11 +682,7 @@ class OpenAIClient(LLMClient):
             raise LLMAPIError(f"API request failed: {e}") from e
 
     def chat_with_tools(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]],
-        model: str = "",
-        **kwargs
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
     ) -> ToolCallResponse:
         """
         Send chat completion request with tool calling support.
@@ -767,9 +772,7 @@ class OpenAIClient(LLMClient):
                 raise LLMAuthenticationError(f"Invalid API key (401): {error_body}")
             if response.status_code == 402:
                 error_body = response.text[:500]
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (402): {error_body}")
             if response.status_code != 200:
                 error_body = response.text[:500]
                 raise LLMAPIError(f"API returned HTTP {response.status_code}: {error_body}")
@@ -778,8 +781,12 @@ class OpenAIClient(LLMClient):
             choices = data.get("choices", [])
             if not choices:
                 return ToolCallResponse(
-                    content="", model=model, provider=self.get_provider_name(),
-                    raw_response=data, tool_calls=[], is_final=True,
+                    content="",
+                    model=model,
+                    provider=self.get_provider_name(),
+                    raw_response=data,
+                    tool_calls=[],
+                    is_final=True,
                 )
 
             choice = choices[0]
@@ -797,21 +804,25 @@ class OpenAIClient(LLMClient):
             tool_calls: list[ToolCallRequest] = []
             raw_tool_calls = message.get("tool_calls") or []
 
-
             for tc in raw_tool_calls:
-
                 func = tc.get("function", {})
                 args = parse_tool_args(func.get("arguments", "{}"))
-                tool_calls.append(ToolCallRequest(
-                    call_id=tc.get("id", ""),
-                    name=func.get("name", ""),
-                    args=args,
-                ))
+                tool_calls.append(
+                    ToolCallRequest(
+                        call_id=tc.get("id", ""),
+                        name=func.get("name", ""),
+                        args=args,
+                    )
+                )
 
             is_final = finish_reason == "stop" or not tool_calls
             logger.info(
                 "OpenAI %s (tools): %.0fms, tok=%s, finish=%s (%d)",
-                model, elapsed_ms, tokens_used, finish_reason, len(tool_calls),
+                model,
+                elapsed_ms,
+                tokens_used,
+                finish_reason,
+                len(tool_calls),
             )
             return ToolCallResponse(
                 content=content,
@@ -853,7 +864,11 @@ class OpenAIClient(LLMClient):
         t0 = time.monotonic()
 
         response = self._request_with_retry(
-            url, headers, stream_payload, tag="stream", stream=True,
+            url,
+            headers,
+            stream_payload,
+            tag="stream",
+            stream=True,
         )
 
         # Status checks live INSIDE the try/finally so a non-200 streaming
@@ -866,9 +881,7 @@ class OpenAIClient(LLMClient):
                 raise LLMAuthenticationError(f"Invalid API key (401): {error_body}")
             if response.status_code == 402:
                 error_body = response.text[:500]
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (402): {error_body}")
             if response.status_code != 200:
                 raise LLMAPIError(f"API returned HTTP {response.status_code}: {response.text[:500]}")
 
@@ -880,7 +893,6 @@ class OpenAIClient(LLMClient):
             reasoning_content = ""
 
             for ev in guard_sse_iteration(iter_sse_data_events(response)):
-
                 # Usage chunk (stream_options)
                 if ev.get("usage"):
                     u = ev["usage"]
@@ -930,19 +942,22 @@ class OpenAIClient(LLMClient):
             _trimmed = text_content.strip()
             if _trimmed.startswith(("{", "[")):
                 from .providers import _count_delimiters
+
                 _dc = _count_delimiters(_trimmed)
                 if _trimmed.startswith("{") and _dc["open_curly"] > _dc["close_curly"]:
                     logger.warning(
                         "OpenAI stream content appears truncated: %d unclosed braces "
                         "in %d chars (finish_reason='stop' is misleading)",
-                        _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                        _dc["open_curly"] - _dc["close_curly"],
+                        len(_trimmed),
                     )
                     finish_reason = "truncated"
                 elif _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
                     logger.warning(
                         "OpenAI stream content appears truncated: %d unclosed brackets "
                         "in %d chars (finish_reason='stop' is misleading)",
-                        _dc["open_square"] - _dc["close_square"], len(_trimmed),
+                        _dc["open_square"] - _dc["close_square"],
+                        len(_trimmed),
                     )
                     finish_reason = "truncated"
 
@@ -950,20 +965,25 @@ class OpenAIClient(LLMClient):
         tokens_used = (prompt_tokens or 0) + (completion_tokens or 0) or None
         logger.info(
             "OpenAI %s (stream): %.0fms, tok=%s, finish=%s",
-            model, elapsed_ms, tokens_used, finish_reason,
+            model,
+            elapsed_ms,
+            tokens_used,
+            finish_reason,
         )
 
         raw_response: dict[str, Any] = {
             "id": "stream",
             "model": model,
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": text_content,
-                    **({"reasoning_content": reasoning_content} if reasoning_content else {}),
-                },
-                "finish_reason": finish_reason,
-            }],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": text_content,
+                        **({"reasoning_content": reasoning_content} if reasoning_content else {}),
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
             "usage": {
                 "prompt_tokens": prompt_tokens or 0,
                 "completion_tokens": completion_tokens or 0,
@@ -1003,7 +1023,11 @@ class OpenAIClient(LLMClient):
         t0 = time.monotonic()
 
         response = self._request_with_retry(
-            url, headers, stream_payload, tag="stream", stream=True,
+            url,
+            headers,
+            stream_payload,
+            tag="stream",
+            stream=True,
         )
 
         # Status checks inside try/finally (see _chat_streaming): guarantees the
@@ -1015,9 +1039,7 @@ class OpenAIClient(LLMClient):
                 raise LLMAuthenticationError(f"Invalid API key (401): {error_body}")
             if response.status_code == 402:
                 error_body = response.text[:500]
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (402): {error_body}")
             if response.status_code != 200:
                 raise LLMAPIError(f"API returned HTTP {response.status_code}: {response.text[:500]}")
 
@@ -1031,7 +1053,6 @@ class OpenAIClient(LLMClient):
             _tool_acc: dict[int, dict] = {}
 
             for ev in guard_sse_iteration(iter_sse_data_events(response)):
-
                 # Usage chunk (stream_options)
                 if ev.get("usage"):
                     u = ev["usage"]
@@ -1057,7 +1078,7 @@ class OpenAIClient(LLMClient):
                         logger.debug("streaming callback failed: %s", _exc)
 
                 # Tool call deltas
-                for tc_delta in (delta.get("tool_calls") or []):
+                for tc_delta in delta.get("tool_calls") or []:
                     idx = tc_delta.get("index", 0)
                     if idx not in _tool_acc:
                         _tool_acc[idx] = {"id": "", "name": "", "args_json": ""}
@@ -1093,14 +1114,16 @@ class OpenAIClient(LLMClient):
                     logger.warning(
                         "OpenAI stream content appears truncated: %d unclosed braces "
                         "in %d chars (finish_reason='stop' is misleading)",
-                        _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                        _dc["open_curly"] - _dc["close_curly"],
+                        len(_trimmed),
                     )
                     finish_reason = "truncated"
                 elif _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
                     logger.warning(
                         "OpenAI stream content appears truncated: %d unclosed brackets "
                         "in %d chars (finish_reason='stop' is misleading)",
-                        _dc["open_square"] - _dc["close_square"], len(_trimmed),
+                        _dc["open_square"] - _dc["close_square"],
+                        len(_trimmed),
                     )
                     finish_reason = "truncated"
 
@@ -1125,7 +1148,8 @@ class OpenAIClient(LLMClient):
                         "OpenAI tool call '%s' arguments appear truncated: %d unclosed "
                         "braces in %d chars (finish_reason='tool_calls' may be misleading)",
                         _acc.get("name", "tool_call"),
-                        _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                        _dc["open_curly"] - _dc["close_curly"],
+                        len(_trimmed),
                     )
             if _tc_truncated:
                 finish_reason = "truncated"
@@ -1139,18 +1163,24 @@ class OpenAIClient(LLMClient):
                 args = json.loads(acc["args_json"] or "{}")
             except Exception:
                 args = {}
-            tool_calls.append(ToolCallRequest(
-                call_id=acc["id"],
-                name=acc["name"],
-                args=args,
-            ))
+            tool_calls.append(
+                ToolCallRequest(
+                    call_id=acc["id"],
+                    name=acc["name"],
+                    args=args,
+                )
+            )
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         tokens_used = (prompt_tokens or 0) + (completion_tokens or 0) or None
         is_final = finish_reason == "stop" or not tool_calls
         logger.info(
             "OpenAI %s (tools): %.0fms, tok=%s, finish=%s (%d)",
-            model, elapsed_ms, tokens_used, finish_reason, len(tool_calls),
+            model,
+            elapsed_ms,
+            tokens_used,
+            finish_reason,
+            len(tool_calls),
         )
         return ToolCallResponse(
             content=text_content,
@@ -1163,7 +1193,7 @@ class OpenAIClient(LLMClient):
             is_final=is_final,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-                cache_read_input_tokens=cached_tokens,
+            cache_read_input_tokens=cached_tokens,
         )
 
 
@@ -1187,6 +1217,7 @@ class ZAIClient(OpenAIClient):
       reasoning_effort: "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none"
     Thinking is ENABLED by default on GLM-5.2+ — send thinking.type="disabled" to turn off.
     """
+
     DEFAULT_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
     DEFAULT_MODEL = "glm-5.3"
 
@@ -1217,7 +1248,8 @@ class ZAIClient(OpenAIClient):
         _pct = (cached / prompt_tokens * 100) if prompt_tokens else 0
         logger.info(
             "Z.AI cache: %s cached tokens (%.0f%% of prompt — Coding Plan: no discount)",
-            cached, _pct,
+            cached,
+            _pct,
         )
         return resp
 
@@ -1255,8 +1287,8 @@ class ZAIClient(OpenAIClient):
         messages: list[LLMMessage],
         model: str = "",
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         # Pop z.ai-specific params before passing to parent
         thinking_mode = kwargs.pop("thinking_mode", None)
@@ -1293,9 +1325,9 @@ class ZAIClient(OpenAIClient):
         messages: list[LLMMessage],
         tools: list[dict[str, Any]],
         model: str = "",
-        max_tokens: Optional[int] = None,
-        token_callback: Optional[Callable[[str], None]] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        token_callback: Callable[[str], None] | None = None,
+        **kwargs,
     ) -> ToolCallResponse:
         # Pop z.ai-specific params before passing to parent
         thinking_mode = kwargs.pop("thinking_mode", None)
@@ -1315,9 +1347,7 @@ class ZAIClient(OpenAIClient):
             kwargs["reasoning_effort"] = _effort_override
 
         resp = super().chat_with_tools(
-            messages, tools, model=model,
-            max_tokens=max_tokens, token_callback=token_callback,
-            **kwargs
+            messages, tools, model=model, max_tokens=max_tokens, token_callback=token_callback, **kwargs
         )
 
         # Normalize OpenAI subset cache → zai separate-accounting (see _normalize).
@@ -1330,7 +1360,6 @@ class ZAIClient(OpenAIClient):
         # .content directly; without this they silently get an empty string and
         # the model's decision is lost (multi-path fallback parity, insight A36).
         return self._apply_glm_reasoning_fallback(resp)
-
 
 
 class OpenRouterClient(OpenAIClient):
@@ -1384,11 +1413,12 @@ class OpenRouterClient(OpenAIClient):
         m = (model or "").strip()
         low = m.lower()
         if low.startswith("openrouter/"):
-            return m[len("openrouter/"):]
+            return m[len("openrouter/") :]
         return m
 
     def _build_headers(self) -> dict[str, str]:
         import os
+
         headers = super()._build_headers()
         site_url = (os.getenv("OPENROUTER_SITE_URL", "") or "").strip()
         app_title = (os.getenv("OPENROUTER_APP_TITLE", "") or "").strip()
@@ -1400,7 +1430,7 @@ class OpenRouterClient(OpenAIClient):
         return headers
 
     @staticmethod
-    def _provider_preference() -> Optional[dict[str, Any]]:
+    def _provider_preference() -> dict[str, Any] | None:
         """Build the OpenRouter ``provider`` request field from env vars.
 
         Returns ``None`` when nothing is configured, leaving routing to
@@ -1418,6 +1448,7 @@ class OpenRouterClient(OpenAIClient):
           availability — hence it is opt-in.
         """
         import os
+
         pref: dict[str, Any] = {}
 
         order_raw = (os.getenv("OPENROUTER_PROVIDER_ORDER", "") or "").strip()
@@ -1445,7 +1476,7 @@ class OpenRouterClient(OpenAIClient):
             kwargs["provider"] = pref
 
     @staticmethod
-    def _log_cache(raw_response: Optional[dict[str, Any]]) -> None:
+    def _log_cache(raw_response: dict[str, Any] | None) -> None:
         """Log the cached-token fraction from OpenRouter usage details."""
         if not raw_response:
             return
@@ -1466,7 +1497,8 @@ class OpenRouterClient(OpenAIClient):
         cache_pct = (cached_tokens / prompt_tokens * 100) if prompt_tokens else 0
         logger.info(
             "OpenRouter cache: %s cached tokens (%.1f%% of prompt)",
-            cached_tokens, cache_pct,
+            cached_tokens,
+            cache_pct,
         )
 
     def chat(
@@ -1474,8 +1506,8 @@ class OpenRouterClient(OpenAIClient):
         messages: list[LLMMessage],
         model: str = "",
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         self._inject_provider_preference(kwargs)
         resp = super().chat(messages, self._strip_internal_prefix(model), temperature, max_tokens, **kwargs)
@@ -1487,15 +1519,18 @@ class OpenRouterClient(OpenAIClient):
         messages: list[LLMMessage],
         tools: list[dict[str, Any]],
         model: str = "",
-        max_tokens: Optional[int] = None,
-        token_callback: Optional[Callable[[str], None]] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        token_callback: Callable[[str], None] | None = None,
+        **kwargs,
     ) -> ToolCallResponse:
         self._inject_provider_preference(kwargs)
         resp = super().chat_with_tools(
-            messages, tools, model=self._strip_internal_prefix(model),
-            max_tokens=max_tokens, token_callback=token_callback,
-            **kwargs
+            messages,
+            tools,
+            model=self._strip_internal_prefix(model),
+            max_tokens=max_tokens,
+            token_callback=token_callback,
+            **kwargs,
         )
         self._log_cache(resp.raw_response)
         return resp

@@ -7,6 +7,7 @@ split char into U+FFFD(s). For a one-shot snippet it is a cosmetic trailing
 U+FFFD; the shared helper (utils.string_helper.utf8_trailing_incomplete_len)
 trims the partial bytes so the cut lands on a character boundary.
 """
+
 from __future__ import annotations
 
 
@@ -22,10 +23,10 @@ def test_canonical_helper_lives_in_string_helper():
     h = string_helper.utf8_trailing_incomplete_len
     assert h(b"") == 0
     assert h(b"ascii") == 0
-    assert h("한".encode()) == 0          # complete 3-byte
-    assert h("한".encode()[:1]) == 1      # leading only → defer 1
-    assert h("한".encode()[:2]) == 2      # leading + 1 cont → defer 2
-    assert h(b"\x80\x80") == 0            # orphan continuations → 0 (no stall)
+    assert h("한".encode()) == 0  # complete 3-byte
+    assert h("한".encode()[:1]) == 1  # leading only → defer 1
+    assert h("한".encode()[:2]) == 2  # leading + 1 cont → defer 2
+    assert h(b"\x80\x80") == 0  # orphan continuations → 0 (no stall)
 
 
 def test_snippet_byte_cap_does_not_corrupt_multibyte():
@@ -63,8 +64,8 @@ def test_snippet_byte_cap_does_not_corrupt_multibyte():
 
     out = b.decode("utf-8", errors="replace")
     assert "\ufffd" not in out, "byte-cap cut leaked a replacement char"
-    assert out.endswith("한")           # ends on a COMPLETE character
-    assert len(out) == 1666             # 4998 bytes / 3
+    assert out.endswith("한")  # ends on a COMPLETE character
+    assert len(out) == 1666  # 4998 bytes / 3
 
 
 def test_snippet_byte_cap_newline_backoff_already_safe_for_multiline():

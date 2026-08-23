@@ -15,14 +15,15 @@ IMPORTANT:
 - external_llm.__init__ expects module-level function:
   - extract_diff(llm_output) -> diff
 """
+
 from __future__ import annotations
 
 import logging
 import re
 from contextlib import suppress
-from typing import Any, Optional
+from typing import Any
 
-from common import normalize_rel_path_fast
+from path_security import normalize_rel_path
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +377,6 @@ class EnhancedOutputParser:
             kept += "\n"
         return kept
 
-
     def _fix_hunk_body_prefixes(self, diff: str) -> str:
         """
         LLMs sometimes emit unified diff hunks without the required per-line prefix.
@@ -471,7 +471,11 @@ class EnhancedOutputParser:
             saw_any_hunk = True
             # Allow truncation (cur <= exp) but not excess (cur > exp)
             # Also require at least one line unless exp is 0 (unlikely)
-            ok = (cur_old <= exp_old) and (cur_new <= exp_new) and (cur_old > 0 or cur_new > 0 or exp_old == 0 or exp_new == 0)
+            ok = (
+                (cur_old <= exp_old)
+                and (cur_new <= exp_new)
+                and (cur_old > 0 or cur_new > 0 or exp_old == 0 or exp_new == 0)
+            )
             in_hunk = False
             exp_old = exp_new = 0
             cur_old = cur_new = 0
@@ -572,12 +576,12 @@ class EnhancedOutputParser:
         p = (p or "").strip()
         if p.startswith(("a/", "b/")):
             p = p[2:]
-        return normalize_rel_path_fast(p)
+        return normalize_rel_path(p)
 
     def validate_diff(
         self,
         diff: str,
-        target_file: Optional[str] = None,
+        target_file: str | None = None,
         require_additions: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -597,10 +601,7 @@ class EnhancedOutputParser:
 
         # 🔥 CREATE enforcement: must contain at least one real added line
         if require_additions:
-            has_added_line = any(
-                line.startswith("+") and not line.startswith("+++")
-                for line in str(diff).splitlines()
-            )
+            has_added_line = any(line.startswith("+") and not line.startswith("+++") for line in str(diff).splitlines())
             if not has_added_line:
                 return False, "no_added_lines"
 
@@ -748,7 +749,6 @@ class EnhancedOutputParser:
         return out
 
 
-
 # -----------------------------
 # Module-level API (REQUIRED)
 # -----------------------------
@@ -772,7 +772,7 @@ def parse_llm_output(llm_output: str) -> dict[str, str]:
     return _parser.parse_llm_output_dict(llm_output)
 
 
-def validate_diff(diff: str, target_file: Optional[str] = None) -> tuple[bool, str]:
+def validate_diff(diff: str, target_file: str | None = None) -> tuple[bool, str]:
     """Backward-compatible helper used by external_llm.service."""
     return _parser.validate_diff(diff, target_file=target_file)
 
@@ -780,6 +780,7 @@ def validate_diff(diff: str, target_file: Optional[str] = None) -> tuple[bool, s
 def parse_file_blocks(llm_output: str) -> list[dict[str, str]]:
     """Module-level helper for services that want full-file rewrite blocks."""
     return _parser.parse_file_blocks(llm_output)
+
 
 def parse_tool_args(raw: Any) -> dict[str, Any]:
     """

@@ -1,6 +1,7 @@
 """
 Integration test helpers for asicode.
 """
+
 import json
 import os
 import re
@@ -38,7 +39,7 @@ def apply_patch_and_verify(repo_root: str, patch_content: str, expected_changes:
         True if patch applied successfully and all expected changes are present
     """
     # Write patch to temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as f:
         f.write(patch_content)
         patch_file = f.name
 
@@ -205,8 +206,7 @@ def assert_file_contains(repo_root: str, filepath: str, expected_content: str) -
 def assert_file_matches(repo_root: str, filepath: str, pattern: str) -> None:
     """Assert that a file matches a regex pattern."""
     content = get_file_content(repo_root, filepath)
-    assert re.search(pattern, content, re.MULTILINE | re.DOTALL) is not None, \
-        f"Pattern not found in {filepath}"
+    assert re.search(pattern, content, re.MULTILINE | re.DOTALL) is not None, f"Pattern not found in {filepath}"
 
 
 def cleanup_test_files(*paths: str) -> None:

@@ -1,4 +1,5 @@
 """Unit tests for external_llm.graph.graph_facade.RepositoryGraphFacade."""
+
 import shutil
 import tempfile
 import textwrap
@@ -18,6 +19,7 @@ def _make_repo(files: dict) -> str:
 
 
 # ── Lazy initialization ────────────────────────────────────────────────────────
+
 
 def test_facade_lazy_init_no_graph_at_start():
     repo = _make_repo({"a.py": "def foo(): pass\n"})
@@ -64,6 +66,7 @@ def test_facade_py_files_returns_uncapped_walked_list():
 
 # ── get_symbol() ───────────────────────────────────────────────────────────────
 
+
 def test_get_symbol_simple_name():
     repo = _make_repo({"m.py": "def my_func(): pass\n"})
     try:
@@ -76,12 +79,14 @@ def test_get_symbol_simple_name():
 
 
 def test_get_symbol_qualname():
-    repo = _make_repo({
-        "m.py": """
+    repo = _make_repo(
+        {
+            "m.py": """
             class MyClass:
                 def method(self): pass
         """
-    })
+        }
+    )
     try:
         facade = RepositoryGraphFacade(repo_root=repo)
         sym = facade.get_symbol("MyClass.method")
@@ -92,10 +97,12 @@ def test_get_symbol_qualname():
 
 
 def test_get_symbol_with_file_hint():
-    repo = _make_repo({
-        "a.py": "def helper(): pass\n",
-        "b.py": "def helper(): pass\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def helper(): pass\n",
+            "b.py": "def helper(): pass\n",
+        }
+    )
     try:
         facade = RepositoryGraphFacade(repo_root=repo)
         sym_a = facade.get_symbol("helper", "a.py")
@@ -120,14 +127,17 @@ def test_get_symbol_not_found():
 
 # ── get_symbols_in_file() ──────────────────────────────────────────────────────
 
+
 def test_get_symbols_in_file():
-    repo = _make_repo({
-        "svc.py": """
+    repo = _make_repo(
+        {
+            "svc.py": """
             def alpha(): pass
             def beta(): pass
             class Gamma: pass
         """
-    })
+        }
+    )
     try:
         facade = RepositoryGraphFacade(repo_root=repo)
         syms = facade.get_symbols_in_file("svc.py")
@@ -154,16 +164,20 @@ def test_get_symbols_in_file_constants_indexed():
 
 # ── get_callers() / get_callees() via CallGraphIndexer ────────────────────────
 
+
 def test_get_callers_via_call_graph_indexer():
     from external_llm.agent.call_graph import CallGraphIndexer
-    repo = _make_repo({
-        "foo.py": """
+
+    repo = _make_repo(
+        {
+            "foo.py": """
             def b():
                 pass
             def a():
                 b()
         """
-    })
+        }
+    )
     try:
         cgi = CallGraphIndexer(repo)
         facade = RepositoryGraphFacade(call_graph_indexer=cgi, repo_root=repo)
@@ -176,14 +190,17 @@ def test_get_callers_via_call_graph_indexer():
 
 def test_get_callees_via_call_graph_indexer():
     from external_llm.agent.call_graph import CallGraphIndexer
-    repo = _make_repo({
-        "foo.py": """
+
+    repo = _make_repo(
+        {
+            "foo.py": """
             def b():
                 pass
             def a():
                 b()
         """
-    })
+        }
+    )
     try:
         cgi = CallGraphIndexer(repo)
         facade = RepositoryGraphFacade(call_graph_indexer=cgi, repo_root=repo)
@@ -196,13 +213,15 @@ def test_get_callees_via_call_graph_indexer():
 
 def test_get_callers_fallback_to_repository_graph():
     """When no call_graph_indexer is provided, fallback to RepositoryGraph."""
-    repo = _make_repo({
-        "x.py": """
+    repo = _make_repo(
+        {
+            "x.py": """
             def inner(): pass
             def outer():
                 inner()
         """
-    })
+        }
+    )
     try:
         facade = RepositoryGraphFacade(repo_root=repo)
         callers = facade.get_callers("inner")
@@ -218,15 +237,19 @@ def test_get_callers_fallback_to_repository_graph():
 
 # ── get_related_symbols() ─────────────────────────────────────────────────────
 
+
 def test_get_related_symbols_with_indexer():
     from external_llm.agent.call_graph import CallGraphIndexer
-    repo = _make_repo({
-        "svc.py": """
+
+    repo = _make_repo(
+        {
+            "svc.py": """
             def helper(): pass
             def main():
                 helper()
         """
-    })
+        }
+    )
     try:
         cgi = CallGraphIndexer(repo)
         facade = RepositoryGraphFacade(call_graph_indexer=cgi, repo_root=repo)
@@ -250,6 +273,7 @@ def test_get_related_symbols_without_indexer_returns_empty():
 
 # ── get_symbol_file() ─────────────────────────────────────────────────────────
 
+
 def test_get_symbol_file():
     repo = _make_repo({"pkg/mod.py": "def my_fn(): pass\n"})
     try:
@@ -263,6 +287,7 @@ def test_get_symbol_file():
 
 # ── Batched incremental invalidation (P3, 2026-08-11) ─────────────────────────
 
+
 def test_facade_invalidate_files_handles_mixed_reparse_and_deleted():
     """invalidate_files splits paths into reparse (existing) + remove (deleted).
 
@@ -271,11 +296,13 @@ def test_facade_invalidate_files_handles_mixed_reparse_and_deleted():
     files' NEW symbols and the deleted files' symbols gone — same observable
     state as the per-path loop, but built with one _remove_files pass.
     """
-    repo = _make_repo({
-        "a.py": "def a():\n    return 1\n",
-        "b.py": "def b():\n    return 2\n",
-        "c.py": "def c():\n    return 3\n",
-    })
+    repo = _make_repo(
+        {
+            "a.py": "def a():\n    return 1\n",
+            "b.py": "def b():\n    return 2\n",
+            "c.py": "def c():\n    return 3\n",
+        }
+    )
     try:
         facade = RepositoryGraphFacade(repo_root=repo)
         facade._ensure_graph()

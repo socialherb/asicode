@@ -24,6 +24,7 @@ the flush belongs.  ``__del__`` keeps only the live-interpreter case.
 
 These tests stub faiss so they run everywhere.
 """
+
 from __future__ import annotations
 
 import gc
@@ -227,6 +228,4 @@ def test_process_exit_flushes_without_deallocator_noise(tmp_path):
     assert "meta_path is None" not in proc.stderr, proc.stderr
     meta = cache_dir / "metadata.json"
     assert meta.exists(), "dirty cache was lost at process exit"
-    assert json.loads(meta.read_text(encoding="utf-8")) == {
-        "0": {"file_path": "src/a.py", "doc_id": "doc0"}
-    }
+    assert json.loads(meta.read_text(encoding="utf-8")) == {"0": {"file_path": "src/a.py", "doc_id": "doc0"}}

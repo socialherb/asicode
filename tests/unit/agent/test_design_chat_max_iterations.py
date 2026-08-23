@@ -5,6 +5,7 @@ returns is_error=False, so the IPC worker used to map an UNFINISHED task to
 status="success". The flag lets the worker report status="max_turns" instead,
 matching the in-process AgentLoop path (max_turns_reached signal).
 """
+
 import subprocess
 
 import pytest
@@ -32,23 +33,37 @@ class _StubClient:
     def chat_with_tools(self, messages, tools, model, **kw):
         if self.always:
             return ToolCallResponse(
-                content="", model=model, provider="stub", tokens_used=1,
-                finish_reason="tool_calls", raw_response=None,
-                tool_calls=[ToolCallRequest(
-                    call_id="c1", name="read_file",
-                    args={"file_path": "README.md"},
-                )],
+                content="",
+                model=model,
+                provider="stub",
+                tokens_used=1,
+                finish_reason="tool_calls",
+                raw_response=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        call_id="c1",
+                        name="read_file",
+                        args={"file_path": "README.md"},
+                    )
+                ],
             )
         return ToolCallResponse(
-            content="done, no tools needed", model=model, provider="stub",
-            tokens_used=1, finish_reason="stop", raw_response=None,
+            content="done, no tools needed",
+            model=model,
+            provider="stub",
+            tokens_used=1,
+            finish_reason="stop",
+            raw_response=None,
             tool_calls=[],
         )
 
     def chat(self, messages, model, **kw):
         return LLMResponse(
-            content="final answer after exhaustion", model=model,
-            provider="stub", tokens_used=1, finish_reason="stop",
+            content="final answer after exhaustion",
+            model=model,
+            provider="stub",
+            tokens_used=1,
+            finish_reason="stop",
             raw_response=None,
         )
 
@@ -67,13 +82,13 @@ def test_exhaustion_sets_hit_max_iterations(_repo):
     reg = ToolRegistry(_repo, AgentConfig())
     loop = DesignChatLoop(_StubClient(True), reg, "stub-model")
     r = loop.respond(
-        [LLMMessage(role="user", content="do stuff")], max_tool_iterations=1,
+        [LLMMessage(role="user", content="do stuff")],
+        max_tool_iterations=1,
     )
     assert r.hit_max_iterations is True
     assert r.is_error is False
     # The worker's mapping (asi run_subagent_worker): max_turns wins.
-    status = ("max_turns" if r.hit_max_iterations
-              else "error" if r.is_error else "success")
+    status = "max_turns" if r.hit_max_iterations else "error" if r.is_error else "success"
     assert status == "max_turns"
 
 
@@ -94,7 +109,8 @@ def test_final_response_generation_failure_sets_error(_repo, monkeypatch):
     reg = ToolRegistry(_repo, AgentConfig())
     loop = DesignChatLoop(_StubClient(True), reg, "stub-model")
     r = loop.respond(
-        [LLMMessage(role="user", content="do stuff")], max_tool_iterations=1,
+        [LLMMessage(role="user", content="do stuff")],
+        max_tool_iterations=1,
     )
     # Must NOT raise UnboundLocalError — _final_t0 is bound before try
     assert r.is_error is True
@@ -111,7 +127,8 @@ def test_normal_completion_leaves_flag_false(_repo):
     reg = ToolRegistry(_repo, AgentConfig())
     loop = DesignChatLoop(_StubClient(False), reg, "stub-model")
     r = loop.respond(
-        [LLMMessage(role="user", content="do stuff")], max_tool_iterations=5,
+        [LLMMessage(role="user", content="do stuff")],
+        max_tool_iterations=5,
     )
     assert r.hit_max_iterations is False
     assert r.is_error is False

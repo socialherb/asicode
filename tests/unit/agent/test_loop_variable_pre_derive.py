@@ -11,10 +11,12 @@ Spec:
   Multi-loop, ≥2 matches → LLM route (preferred_mode left unset)
   File parse error  → graceful fallback (derive-at-apply-time, deterministic path kept)
 """
+
 import ast
 import textwrap
 
 # ─── Isolated derivation logic (mirrors _attach_edit_contracts internals) ──────
+
 
 def _derive_loop_var_pre(
     func_src: str,
@@ -30,10 +32,7 @@ def _derive_loop_var_pre(
     """
     try:
         tree = ast.parse(func_src)
-        func_node = next(
-            n for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
+        func_node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
     except (SyntaxError, StopIteration):
         return "", False  # parse error → graceful fallback
 
@@ -45,11 +44,7 @@ def _derive_loop_var_pre(
 
     # Multiple loops → derive now
     try:
-        gs_names: set = {
-            n.id
-            for n in ast.walk(ast.parse(guard_stmt, mode="exec"))
-            if isinstance(n, ast.Name)
-        }
+        gs_names: set = {n.id for n in ast.walk(ast.parse(guard_stmt, mode="exec")) if isinstance(n, ast.Name)}
     except SyntaxError:
         gs_names = set()
 
@@ -61,11 +56,12 @@ def _derive_loop_var_pre(
 
     matches = gs_names & loop_target_vars
     if len(matches) == 1:
-        return matches.pop(), False   # unique → embed
-    return "", True                   # 0 or ≥2 → ambiguous
+        return matches.pop(), False  # unique → embed
+    return "", True  # 0 or ≥2 → ambiguous
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _func(body: str) -> str:
     """Wrap body lines in a minimal function definition."""
@@ -75,8 +71,8 @@ def _func(body: str) -> str:
 
 # ─── Single for-loop → no pre-derivation needed ───────────────────────────────
 
-class TestSingleLoop:
 
+class TestSingleLoop:
     def test_single_loop_no_pre_derive(self):
         src = _func("""
             for item in items:
@@ -100,8 +96,8 @@ class TestSingleLoop:
 
 # ─── Multiple for-loops, unique match ─────────────────────────────────────────
 
-class TestMultiLoopUniqueMatch:
 
+class TestMultiLoopUniqueMatch:
     def test_guard_uses_inner_loop_var(self):
         src = _func("""
             for item in items:
@@ -154,8 +150,8 @@ class TestMultiLoopUniqueMatch:
 
 # ─── Multiple for-loops, ambiguous (0 matches) ────────────────────────────────
 
-class TestMultiLoopZeroMatches:
 
+class TestMultiLoopZeroMatches:
     def test_guard_uses_no_loop_var(self):
         """Guard uses only module-level names — 0 intersection with loop targets."""
         src = _func("""
@@ -183,8 +179,8 @@ class TestMultiLoopZeroMatches:
 
 # ─── Multiple for-loops, ambiguous (≥2 matches) ───────────────────────────────
 
-class TestMultiLoopTwoMatches:
 
+class TestMultiLoopTwoMatches:
     def test_guard_uses_both_loop_vars(self):
         """Guard references variables from both loops → ambiguous."""
         src = _func("""
@@ -212,8 +208,8 @@ class TestMultiLoopTwoMatches:
 
 # ─── Edge cases ────────────────────────────────────────────────────────────────
 
-class TestEdgeCases:
 
+class TestEdgeCases:
     def test_tuple_unpack_loop_target_unique(self):
         """for (k, v) in pairs: guard uses v → unique."""
         src = textwrap.dedent("""\

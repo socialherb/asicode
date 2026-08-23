@@ -5,6 +5,7 @@ the handler is what changed (timeout source, cancel_check wiring, cancelled
 result contract), and a real ToolRegistry would drag in a full git-repo fixture
 for no extra signal.
 """
+
 from __future__ import annotations
 
 import sys
@@ -92,9 +93,7 @@ class _FakeRunner:
 def host(monkeypatch):
     # _tool_run_tests lazy-imports TestRunner from ..test_runner, so patch the
     # class on that module (not on tool_handlers.test_tools).
-    monkeypatch.setattr(
-        "external_llm.agent.test_runner.TestRunner", _FakeRunner
-    )
+    monkeypatch.setattr("external_llm.agent.test_runner.TestRunner", _FakeRunner)
     _FakeRunner.calls = []
     return _Host(AgentConfig())
 

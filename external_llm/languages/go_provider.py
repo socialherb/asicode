@@ -4,13 +4,13 @@ Go syntax provider.
 Uses ``go build`` for validation and regex-based symbol detection.
 Gracefully degrades when Go toolchain is not installed.
 """
+
 from __future__ import annotations
 
 import logging
 import os
 import re
 import subprocess
-from typing import Optional
 
 from .base import (
     SyntaxProvider,
@@ -53,15 +53,13 @@ def _make_capabilities() -> LanguageCapabilities:
 
 
 # go build error: file.go:10:5: expected ';', found 'EOF'
-_GO_ERROR_RE = re.compile(
-    r"^(.+?):(\d+):(\d+):\s+(.+)$"
-)
+_GO_ERROR_RE = re.compile(r"^(.+?):(\d+):(\d+):\s+(.+)$")
 
 
 class GoSyntaxProvider(SyntaxProvider):
     """Go language support (regex + tree-sitter symbols, go build validation)."""
 
-    _caps: Optional[LanguageCapabilities] = None
+    _caps: LanguageCapabilities | None = None
 
     def language_id(self) -> LanguageId:
         return LanguageId.GO
@@ -94,7 +92,8 @@ class GoSyntaxProvider(SyntaxProvider):
             return SyntaxValidationResult(ok=True, language=LanguageId.GO)
         _cmd = _replace_last_cmd_path(
             ["go", "build", "-o", os.devnull, file_path],
-            file_path, _tmp_path,
+            file_path,
+            _tmp_path,
         )
         # Run from the Go MODULE root when available so imports resolve via the
         # module's dependency graph (command-line-arguments build mode). Without
@@ -110,7 +109,9 @@ class GoSyntaxProvider(SyntaxProvider):
             try:
                 proc = subprocess.run(
                     _cmd,
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                     cwd=_cwd,
                     env=_compile_env(),
                     check=False,
@@ -140,18 +141,18 @@ class GoSyntaxProvider(SyntaxProvider):
                     # that follows "not enough arguments" / "too many arguments" errors
                     if "not enough arguments" in msg or "too many arguments" in msg:
                         j = i + 1
-                        while j < len(raw_lines) and (
-                            raw_lines[j].startswith("\t") or raw_lines[j].startswith("    ")
-                        ):
+                        while j < len(raw_lines) and (raw_lines[j].startswith("\t") or raw_lines[j].startswith("    ")):
                             msg += "\n" + raw_lines[j]
                             j += 1
                         i = j - 1  # -1 because i will be incremented after loop
-                    errors.append(SyntaxError_(
-                        file=m.group(1),
-                        line=int(m.group(2)),
-                        col=int(m.group(3)),
-                        message=msg,
-                    ))
+                    errors.append(
+                        SyntaxError_(
+                            file=m.group(1),
+                            line=int(m.group(2)),
+                            col=int(m.group(3)),
+                            message=msg,
+                        )
+                    )
                 i += 1
             # Drop module/import-resolution failures (no syntax error in the
             # proposed content); the isolated temp file lacks the module graph
@@ -189,7 +190,8 @@ class GoSyntaxProvider(SyntaxProvider):
         return self.validate_semantics_batch([file_path])[file_path]
 
     def validate_semantics_batch(
-        self, file_paths: list[str],
+        self,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """Semantic-check *file_paths* with one ``go build`` per package.
 
@@ -205,6 +207,7 @@ class GoSyntaxProvider(SyntaxProvider):
         modules, and package paths are only meaningful relative to their own
         ``go.mod``.
         """
+
         # A fresh result per file, never one shared instance: the dataclass is
         # mutable and carries a list, so sharing would let one consumer's
         # append surface on every other skipped file.
@@ -228,14 +231,16 @@ class GoSyntaxProvider(SyntaxProvider):
         return out
 
     def _build_package(
-        self, module_root: str, pkg_dir_abs: str, file_paths: list[str],
+        self,
+        module_root: str,
+        pkg_dir_abs: str,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """One ``go build`` of the package, split back out per file in *file_paths*."""
+
         def _skip(reason: str) -> dict[str, SyntaxValidationResult]:
-            return {
-                p: SyntaxValidationResult.unchecked(LanguageId.GO, reason)
-                for p in file_paths
-            }
+            return {p: SyntaxValidationResult.unchecked(LanguageId.GO, reason) for p in file_paths}
+
         # Package dir relative to module root
         try:
             pkg_rel = os.path.relpath(pkg_dir_abs, module_root)
@@ -247,7 +252,8 @@ class GoSyntaxProvider(SyntaxProvider):
         try:
             proc = subprocess.run(
                 cmd,
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
                 # One build covers the whole package regardless of how many of
                 # its files were edited, so the budget only needs a little head
                 # room over the single-file case.
@@ -271,10 +277,7 @@ class GoSyntaxProvider(SyntaxProvider):
             # the skip constructor here would report a genuinely checked file
             # as unchecked, which is the same conflation in the other
             # direction.
-            return {
-                p: SyntaxValidationResult(ok=True, language=LanguageId.GO)
-                for p in file_paths
-            }
+            return {p: SyntaxValidationResult(ok=True, language=LanguageId.GO) for p in file_paths}
 
         # Parse: ./pkg/file.go:10:5: undefined: foo
         by_norm = {os.path.normpath(os.path.abspath(p)): p for p in file_paths}
@@ -294,13 +297,16 @@ class GoSyntaxProvider(SyntaxProvider):
             owner = by_norm.get(resolve_tool_path(module_root, _file)) if _file else None
             if owner is None:
                 continue
-            collected[owner].append(SyntaxError_(
-                file=owner,
-                line=int(_line), col=int(_col),
-                message=_msg,
-                severity="error",
-                code="",
-            ))
+            collected[owner].append(
+                SyntaxError_(
+                    file=owner,
+                    line=int(_line),
+                    col=int(_col),
+                    message=_msg,
+                    severity="error",
+                    code="",
+                )
+            )
             failed.add(owner)
         return {
             p: SyntaxValidationResult(
@@ -316,38 +322,50 @@ class GoSyntaxProvider(SyntaxProvider):
     def get_symbol_patterns(self, kind: str = "any") -> list[SymbolPattern]:
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"func\s+{name}\s*\(",
-                description="Go function declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"func\s+\([^)]+\)\s+{name}\s*\(",
-                description="Go method declaration (receiver)",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"func\s+{name}\s*\(",
+                    description="Go function declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"func\s+\([^)]+\)\s+{name}\s*\(",
+                    description="Go method declaration (receiver)",
+                )
+            )
         if kind in ("type", "class", "any"):
-            patterns.append(SymbolPattern(
-                kind="type",
-                regex=r"type\s+{name}\s+struct\s*\{",
-                description="Go struct type",
-            ))
-            patterns.append(SymbolPattern(
-                kind="interface",
-                regex=r"type\s+{name}\s+interface\s*\{",
-                description="Go interface type",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="type",
+                    regex=r"type\s+{name}\s+struct\s*\{",
+                    description="Go struct type",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="interface",
+                    regex=r"type\s+{name}\s+interface\s*\{",
+                    description="Go interface type",
+                )
+            )
         if kind in ("variable", "constant", "any"):
-            patterns.append(SymbolPattern(
-                kind="variable",
-                regex=r"var\s+{name}\b",
-                description="Go var declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="constant",
-                regex=r"const\s+{name}\b",
-                description="Go const declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="variable",
+                    regex=r"var\s+{name}\b",
+                    description="Go var declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="constant",
+                    regex=r"const\s+{name}\b",
+                    description="Go const declaration",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -357,19 +375,15 @@ class GoSyntaxProvider(SyntaxProvider):
 
     # ── Lint / test commands ──────────────────────────────────────────────
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return ["golangci-lint", "run", file_path]
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return ["go", "test", "./..."] + (test_args or [])
 
     # ── Symbol finder (tree-sitter → regex fallback) ──────────────────────
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         """Find symbol using tree-sitter (precise) or regex + brace counting (fallback)."""
         from .tree_sitter_utils import find_symbol_range, is_available
 
@@ -399,24 +413,25 @@ class GoSyntaxProvider(SyntaxProvider):
     # ── Regex fallback for structural queries ─────────────────────────────
 
     def _find_top_level_definitions_regex(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Regex fallback: find all top-level Go definitions via pattern + brace counting."""
         results: list[tuple[str, str, int, int]] = []
         nl = build_line_index(content)
-        for m in re.finditer(r'^func\s+(\w+)\s*\(', content, re.MULTILINE):
+        for m in re.finditer(r"^func\s+(\w+)\s*\(", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "function", start_line, end_line))
-        for m in re.finditer(r'^func\s+\([^)]*\)\s+(\w+)\s*\(', content, re.MULTILINE):
+        for m in re.finditer(r"^func\s+\([^)]*\)\s+(\w+)\s*\(", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), "method", start_line, end_line))
-        for m in re.finditer(r'^type\s+(\w+)\s+(struct|interface)\s*\{', content, re.MULTILINE):
+        for m in re.finditer(r"^type\s+(\w+)\s+(struct|interface)\s*\{", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
             results.append((m.group(1), m.group(2), start_line, end_line))
-        for m in re.finditer(r'^var\s+(\w+)\b', content, re.MULTILINE):
+        for m in re.finditer(r"^var\s+(\w+)\b", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             # var declarations are single-line or grouped with parens
             end_pos = content.find("\n", m.end())
@@ -424,7 +439,7 @@ class GoSyntaxProvider(SyntaxProvider):
                 end_pos = len(content)
             end_line = line_at_offset(nl, end_pos)
             results.append((m.group(1), "variable", start_line, end_line))
-        for m in re.finditer(r'^const\s+(\w+)\b', content, re.MULTILINE):
+        for m in re.finditer(r"^const\s+(\w+)\b", content, re.MULTILINE):
             start_line = line_at_offset(nl, m.start())
             end_pos = content.find("\n", m.end())
             if end_pos == -1:
@@ -434,7 +449,8 @@ class GoSyntaxProvider(SyntaxProvider):
         return results
 
     def _find_all_class_methods_regex(
-        self, content: str,
+        self,
+        content: str,
     ) -> dict[str, list[tuple[str, int, int]]]:
         """Regex fallback: group methods by normalized receiver type (batch).
 
@@ -448,8 +464,9 @@ class GoSyntaxProvider(SyntaxProvider):
         grouped: dict[str, list[tuple[str, int, int]]] = {}
         nl = build_line_index(content)
         for m in re.finditer(
-            r'^func\s+\(([^)]*)\)\s+(\w+)\s*\(',
-            content, re.MULTILINE,
+            r"^func\s+\(([^)]*)\)\s+(\w+)\s*\(",
+            content,
+            re.MULTILINE,
         ):
             _recv = m.group(1).strip()
             _parts = _recv.split()
@@ -459,24 +476,26 @@ class GoSyntaxProvider(SyntaxProvider):
                 continue
             start_line = line_at_offset(nl, m.start())
             end_line = self._find_block_end(content, m.start(), nl)
-            grouped.setdefault(_recv_type, []).append(
-                (m.group(2), start_line, end_line)
-            )
+            grouped.setdefault(_recv_type, []).append((m.group(2), start_line, end_line))
         return grouped
 
     # ── Structural query methods (tree-sitter → regex fallback) ────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         from .tree_sitter_utils import find_all_symbols, is_available
+
         result = find_all_symbols(content, "go") if is_available() else None
         if result:
             return result
         return self._find_top_level_definitions_regex(content)
 
     def find_class_methods(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         """Return ``[(method_name, start_line, end_line), ...]`` for a Go struct.
 
@@ -486,7 +505,8 @@ class GoSyntaxProvider(SyntaxProvider):
         return self.find_all_class_methods(content).get(class_name, [])
 
     def find_all_class_methods(
-        self, content: str,
+        self,
+        content: str,
     ) -> dict[str, list[tuple[str, int, int]]]:
         """Return ``{class_name: [(method_name, start_line, end_line), ...]}``.
 
@@ -496,6 +516,7 @@ class GoSyntaxProvider(SyntaxProvider):
         otherwise (same split as :meth:`find_class_methods`).
         """
         from .tree_sitter_utils import extract_all_class_methods, is_available
+
         if is_available():
             grouped = extract_all_class_methods(content, "go")
             if grouped is not None:
@@ -503,9 +524,12 @@ class GoSyntaxProvider(SyntaxProvider):
         return self._find_all_class_methods_regex(content)
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         from .tree_sitter_utils import extract_symbol_body, is_available
+
         result = extract_symbol_body(content, symbol_name, "go") if is_available() else None
         if result:
             return result

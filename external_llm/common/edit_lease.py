@@ -52,7 +52,6 @@ import platform
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from external_llm.common.atomic_io import atomic_write_json
 
@@ -71,7 +70,7 @@ LEASE_TTL_CROSS_HOST_S = 30 * 60
 # common.file_lock.sweep_stale_lock_files' 7-day age gate).
 SWEEP_MAX_AGE_S = 7 * 24 * 3600
 
-_IDENTITY: Optional[dict] = None
+_IDENTITY: dict | None = None
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -86,17 +85,17 @@ def pid_is_alive(pid: int) -> bool:
     if os.name == "nt":
         import ctypes
 
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
+        _process_query_limited_information = 0x1000
+        _still_active = 259
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        handle = kernel32.OpenProcess(_process_query_limited_information, False, pid)
         if not handle:
             return False
         try:
             exit_code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return False
-            return exit_code.value == STILL_ACTIVE
+            return exit_code.value == _still_active
         finally:
             kernel32.CloseHandle(handle)
     try:
@@ -155,7 +154,7 @@ def _lease_file(repo_root: str, key: str) -> Path:
     return _lease_dir(repo_root) / f"{stem}.json"
 
 
-def _sweep_stale_leases(directory: Path, *, now: Optional[float] = None) -> None:
+def _sweep_stale_leases(directory: Path, *, now: float | None = None) -> None:
     """Remove lease files untouched for ``SWEEP_MAX_AGE_S`` (best-effort).
 
     A live lease is rewritten (mtime bumped) on every acquire, so a 7-day-old
@@ -177,7 +176,7 @@ def _sweep_stale_leases(directory: Path, *, now: Optional[float] = None) -> None
             logger.debug("edit-lease sweep skipped %s (%s)", path, err)
 
 
-def acquire_edit_lease(repo_root: str, file_path: str, *, tool: str = "", now: Optional[float] = None) -> None:
+def acquire_edit_lease(repo_root: str, file_path: str, *, tool: str = "", now: float | None = None) -> None:
     """Record/refresh this process's lease on ``file_path``. Never raises.
 
     Called after a successful write; overwriting a stale/dead owner's record
@@ -209,7 +208,7 @@ def acquire_edit_lease(repo_root: str, file_path: str, *, tool: str = "", now: O
         logger.debug("edit-lease acquire failed for %s (%s)", key, err)
 
 
-def read_edit_lease(repo_root: str, file_path: str) -> Optional[dict]:
+def read_edit_lease(repo_root: str, file_path: str) -> dict | None:
     """Load the lease record for ``file_path``; None when absent/unreadable."""
     rr = (repo_root or "").strip()
     if not rr:
@@ -226,7 +225,7 @@ def read_edit_lease(repo_root: str, file_path: str) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-def _conflict_from_lease(lease: dict, key: str, *, now: float) -> Optional[dict]:
+def _conflict_from_lease(lease: dict, key: str, *, now: float) -> dict | None:
     """Live-foreign classification for one lease record (None = no conflict)."""
     ident = session_identity()
     try:
@@ -257,7 +256,7 @@ def _conflict_from_lease(lease: dict, key: str, *, now: float) -> Optional[dict]
     return {"path": key, "pid": pid, "host": host, "age_s": round(age, 1)}
 
 
-def find_live_foreign_leases(repo_root: str, paths, *, now: Optional[float] = None) -> list:
+def find_live_foreign_leases(repo_root: str, paths, *, now: float | None = None) -> list:
     """Return conflict records for every path carrying a live foreign lease.
 
     Each record: ``{"path", "pid", "host", "age_s", "lease_file"}``. Empty list

@@ -13,6 +13,7 @@ corrupts files for side-effecting decorators like @property / @lru_cache /
 Same harness pattern as test_semantic_patch.py (SP-B1); the only divergence is
 that ASTRewriter raises ValueError on not-found instead of returning None.
 """
+
 from __future__ import annotations
 
 import ast

@@ -20,6 +20,7 @@ Two tiers, because display and validation want different sets:
   Validation (kp verify) accepts these; display surfaces do not show them.
   Move an ID here (rather than deleting) when a provider deprecates it.
 """
+
 from __future__ import annotations
 
 # ── Current, recommended model IDs per provider ────────────────────────────
@@ -186,14 +187,20 @@ def valid_models(provider: str) -> list[str]:
 # listed here are CLI-only (opencode/zai direct, openai) until the webapp
 # grows a client for them.
 WEBAPP_PROVIDER_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
-    ("External", [
-        ("deepseek", "DeepSeek API"),
-        ("anthropic", "Anthropic"),
-        ("google", "Google Gemini"),
-    ]),
-    ("OpenRouter", [
-        ("openrouter", "OpenRouter"),
-    ]),
+    (
+        "External",
+        [
+            ("deepseek", "DeepSeek API"),
+            ("anthropic", "Anthropic"),
+            ("google", "Google Gemini"),
+        ],
+    ),
+    (
+        "OpenRouter",
+        [
+            ("openrouter", "OpenRouter"),
+        ],
+    ),
 ]
 
 # Providers whose webapp offering differs from KNOWN_MODELS. DeepSeek's API
@@ -216,10 +223,13 @@ def webapp_external_model_groups() -> list[dict]:
         options: list[dict] = []
         for provider, provider_label in providers:
             models = WEBAPP_MODEL_OVERRIDES.get(provider) or KNOWN_MODELS.get(provider, [])
-            options.extend({
+            options.extend(
+                {
                     "value": f"external_{provider}:{m}",
                     "label": f"{provider_label} · {m}",
-                } for m in models)
+                }
+                for m in models
+            )
         groups.append({"label": group_label, "options": options})
     return groups
 

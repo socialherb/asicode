@@ -91,7 +91,6 @@ import logging
 import os
 import threading
 from collections import OrderedDict, namedtuple
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +118,7 @@ _MAX_CACHE_BYTES = 384 << 20
 
 # Cache state.  Each entry is ``key -> (payload, cost)`` where payload is
 # ``(src, tree_or_None)``; ``cost`` is the byte weight used by the budget.
-_cache: OrderedDict[tuple, tuple[tuple[Optional[str], Optional[ast.Module]], int]] = OrderedDict()
+_cache: OrderedDict[tuple, tuple[tuple[str | None, ast.Module | None], int]] = OrderedDict()
 _bytes = 0  # Sum of entry costs currently resident.
 _max_entries = _DEFAULT_CACHE_SIZE  # Entry-count ceiling (ensure_capacity).
 _hits = 0
@@ -136,7 +135,7 @@ _misses = 0
 _lock = threading.RLock()
 
 
-def _stat_key(abs_path: str) -> Optional[tuple]:
+def _stat_key(abs_path: str) -> tuple | None:
     try:
         st = os.stat(abs_path)
     except OSError:
@@ -145,7 +144,7 @@ def _stat_key(abs_path: str) -> Optional[tuple]:
     return (abs_path, st.st_mtime_ns, st.st_size)
 
 
-def _read_impl(abs_path: str, mtime_ns: int, size: int) -> Optional[str]:
+def _read_impl(abs_path: str, mtime_ns: int, size: int) -> str | None:
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as fh:
             return fh.read()
@@ -154,7 +153,7 @@ def _read_impl(abs_path: str, mtime_ns: int, size: int) -> Optional[str]:
         return None
 
 
-def _parse_src(src: str, abs_path: str) -> Optional[ast.Module]:
+def _parse_src(src: str, abs_path: str) -> ast.Module | None:
     try:
         return ast.parse(src, filename=abs_path)
     except SyntaxError:
@@ -162,7 +161,7 @@ def _parse_src(src: str, abs_path: str) -> Optional[ast.Module]:
         return None
 
 
-def _get(key: tuple) -> Optional[tuple[Optional[str], Optional[ast.Module]]]:
+def _get(key: tuple) -> tuple[str | None, ast.Module | None] | None:
     """Look up *key*, refreshing LRU order.  Returns None on miss."""
     global _hits, _misses
     with _lock:
@@ -175,7 +174,7 @@ def _get(key: tuple) -> Optional[tuple[Optional[str], Optional[ast.Module]]]:
         return entry[0]
 
 
-def _put(key: tuple, payload: tuple[Optional[str], Optional[ast.Module]], cost: int) -> None:
+def _put(key: tuple, payload: tuple[str | None, ast.Module | None], cost: int) -> None:
     """Insert *payload* under *key* with byte weight *cost*, evicting LRU-first.
 
     A single entry heavier than the whole budget is not cached at all — it
@@ -202,7 +201,7 @@ def _evict_lru() -> None:
     _bytes -= cost
 
 
-def _read_ast(abs_path: str) -> Optional[tuple[Optional[str], Optional[ast.Module]]]:
+def _read_ast(abs_path: str) -> tuple[str | None, ast.Module | None] | None:
     """Stat once, then return ``(src, tree)`` — None values mean the file is
     missing/unreadable (src) or unparseable (tree).  Populates the cache when
     the entry was absent or only held the source string."""
@@ -213,8 +212,10 @@ def _read_ast(abs_path: str) -> Optional[tuple[Optional[str], Optional[ast.Modul
     if entry is not None:
         src, tree = entry
         if tree is not None:
+            assert src is not None  # A parsed tree always has source text
             return src, tree
         # Source-only entry (read_source populated it): parse and upgrade.
+        assert src is not None  # Source-only entry stored src before tree
         tree = _parse_src(src, key[0])
         _put(key, (src, tree), len(src) * (1 + _AST_BYTES_PER_SOURCE_BYTE))
         return src, tree
@@ -242,7 +243,7 @@ def _read_ast(abs_path: str) -> Optional[tuple[Optional[str], Optional[ast.Modul
 # instead of re-deriving it.
 
 
-def stat_fingerprint(abs_path: str) -> Optional[tuple[int, int]]:
+def stat_fingerprint(abs_path: str) -> tuple[int, int] | None:
     """Canonical ``(st_mtime_ns, st_size)`` cache fingerprint, or None.
 
     One stat code path for every per-file disk cache (replaces the five
@@ -259,7 +260,7 @@ def stat_fingerprint(abs_path: str) -> Optional[tuple[int, int]]:
 
 def read_with_fingerprint(
     abs_path: str,
-) -> Optional[tuple[str, tuple[int, int]]]:
+) -> tuple[str, tuple[int, int]] | None:
     """Fused read: ``(content, fingerprint)`` captured under ONE stat.
 
     The stat precedes the read, so the returned pair can never pair a
@@ -297,7 +298,7 @@ def ensure_capacity(n: int) -> None:
             _evict_lru()
 
 
-def read_source(abs_path: str) -> Optional[str]:
+def read_source(abs_path: str) -> str | None:
     """Cached file read.  Returns None when the file is missing/unreadable."""
     key = _stat_key(abs_path)
     if key is None:
@@ -312,7 +313,7 @@ def read_source(abs_path: str) -> Optional[str]:
     return src
 
 
-def parse_ast(abs_path: str) -> Optional[ast.Module]:
+def parse_ast(abs_path: str) -> ast.Module | None:
     """Cached ``ast.parse``.  Returns None on read failure or SyntaxError."""
     pair = _read_ast(abs_path)
     if pair is None:
@@ -320,7 +321,7 @@ def parse_ast(abs_path: str) -> Optional[ast.Module]:
     return pair[1]
 
 
-def read_and_parse(abs_path: str) -> tuple[Optional[str], Optional[ast.Module]]:
+def read_and_parse(abs_path: str) -> tuple[str | None, ast.Module | None]:
     """Cached read + parse under a SINGLE stat.
 
     ``read_source`` and ``parse_ast`` each stat independently, so calling both

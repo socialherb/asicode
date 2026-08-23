@@ -41,12 +41,7 @@ class TestPerformanceMetrics:
         """Test recording LLM call metrics."""
         collector = PerformanceCollector()
 
-        collector.record_llm_call(
-            prompt_tokens=100,
-            completion_tokens=50,
-            execution_time_ms=2000,
-            failed=False
-        )
+        collector.record_llm_call(prompt_tokens=100, completion_tokens=50, execution_time_ms=2000, failed=False)
 
         summary = collector.get_summary()
         assert "llm_metrics" in summary
@@ -69,7 +64,7 @@ class TestPerformanceMetrics:
         cache_metrics = summary["cache_metrics"]
         assert cache_metrics["rag_cache"]["hits"] == 2
         assert cache_metrics["rag_cache"]["misses"] == 1
-        assert cache_metrics["rag_cache"]["hit_rate"] == 2/3
+        assert cache_metrics["rag_cache"]["hit_rate"] == 2 / 3
 
     def test_record_agent_result(self):
         """Test recording agent result metrics."""
@@ -108,8 +103,8 @@ class TestPerformanceMetrics:
         assert agent_result["turns"] == 3
         assert agent_result["failed_turns"] == 2
         assert agent_result["truncated_turns"] == 1
-        assert agent_result["failure_rate"] == 2/3
-        assert agent_result["truncation_rate"] == 1/3
+        assert agent_result["failure_rate"] == 2 / 3
+        assert agent_result["truncation_rate"] == 1 / 3
         assert agent_result["avg_time_ms"] == 1500.0
         assert agent_result["recent_turns"] == 3
         # 3-value window encoding (0=success, 1=failed, 2=truncated): the
@@ -117,8 +112,8 @@ class TestPerformanceMetrics:
         # window breakdown is 1 failed + 1 truncated + 1 success.
         assert agent_result["recent_failed_turns"] == 1
         assert agent_result["recent_truncated_turns"] == 1
-        assert agent_result["recent_failure_rate"] == 1/3
-        assert agent_result["recent_truncation_rate"] == 1/3
+        assert agent_result["recent_failure_rate"] == 1 / 3
+        assert agent_result["recent_truncation_rate"] == 1 / 3
 
     def test_agent_result_truncation_storm_recent_window(self):
         """B1 regression: a truncation storm must NOT read as success in the
@@ -181,7 +176,7 @@ class TestPerformanceMetrics:
         collector = PerformanceCollector()
 
         tools = [
-            ("find_symbol", 0.05, False),   # execution_time in seconds
+            ("find_symbol", 0.05, False),  # execution_time in seconds
             ("find_symbol", 0.03, False),
             ("apply_patch", 0.2, False),
             ("apply_patch", 0.1, False),
@@ -209,19 +204,9 @@ class TestPerformanceMetrics:
         """Test LLM call metrics."""
         collector = PerformanceCollector()
 
-        collector.record_llm_call(
-            prompt_tokens=200,
-            completion_tokens=150,
-            execution_time_ms=3000,
-            failed=False
-        )
+        collector.record_llm_call(prompt_tokens=200, completion_tokens=150, execution_time_ms=3000, failed=False)
 
-        collector.record_llm_call(
-            prompt_tokens=200,
-            completion_tokens=150,
-            execution_time_ms=50,
-            failed=False
-        )
+        collector.record_llm_call(prompt_tokens=200, completion_tokens=150, execution_time_ms=50, failed=False)
 
         summary = collector.get_summary()
         llm_metrics = summary["llm_metrics"]
@@ -331,12 +316,7 @@ class TestPerformanceMetrics:
         collector = PerformanceCollector()
 
         # Record LLM calls with tokens
-        collector.record_llm_call(
-            prompt_tokens=1000,
-            completion_tokens=500,
-            execution_time_ms=2000,
-            failed=False
-        )
+        collector.record_llm_call(prompt_tokens=1000, completion_tokens=500, execution_time_ms=2000, failed=False)
 
         # Check if cost is calculated (depends on implementation)
         summary = collector.get_summary()

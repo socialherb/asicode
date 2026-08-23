@@ -7,6 +7,7 @@ to it (``_try_apply_patch_create_file_fallback`` /
 every gap. These tests pin the three safety nets every other write handler
 (edit_text / modify_symbol / edit_ast / anchor_edit) already had.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -69,9 +70,7 @@ class TestSyntaxGate:
 
     def test_overwrite_with_broken_python_is_refused(self, repo: Path):
         """overwrite=True must still pass the syntax gate."""
-        r = _registry(repo)._tool_create_file(
-            {"path": "existing.py", "content": "def (:\n", "overwrite": True}
-        )
+        r = _registry(repo)._tool_create_file({"path": "existing.py", "content": "def (:\n", "overwrite": True})
         assert r.ok is False
         assert "syntax error" in (r.error or "").lower()
         # Existing file untouched.
@@ -86,9 +85,7 @@ class TestCreateOverwriteSemantics:
         assert (repo / "existing.py").read_text() == "x = 1\n"
 
     def test_overwrite_replaces_content(self, repo: Path):
-        r = _registry(repo)._tool_create_file(
-            {"path": "existing.py", "content": "y = 2\n", "overwrite": True}
-        )
+        r = _registry(repo)._tool_create_file({"path": "existing.py", "content": "y = 2\n", "overwrite": True})
         assert r.ok is True
         assert (repo / "existing.py").read_text() == "y = 2\n"
         assert (r.metadata or {}).get("file_path") == "existing.py"
@@ -117,6 +114,7 @@ class TestApplyPatchFallbackReachesGate:
 
     def test_broken_new_file_patch_is_refused_via_fallback(self, repo: Path):
         import time as _time
+
         reg = _registry(repo)
         # A clean creation patch (--- /dev/null + new file mode + pure '+' body)
         # whose body is invalid Python. _extract_new_file_target routes this to
@@ -140,6 +138,7 @@ class TestApplyPatchFallbackReachesGate:
 
     def test_valid_new_file_patch_succeeds_via_fallback(self, repo: Path):
         import time as _time
+
         reg = _registry(repo)
         patch = (
             "diff --git a/ok_fallback.py b/ok_fallback.py\n"
@@ -155,4 +154,3 @@ class TestApplyPatchFallbackReachesGate:
         assert r is not None
         assert r.ok is True
         assert (repo / "ok_fallback.py").read_text().rstrip() == "x = 1"
-

@@ -1,4 +1,5 @@
 """Agent delegation and memory tool handlers for ToolRegistry."""
+
 from __future__ import annotations
 
 import logging
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 _SNIPPET_RETAIN_CHARS = 16 * 1024
 
 
-def _read_local_snippet(abs_fp: "Path", start_line: int, end_line: int) -> str:
+def _read_local_snippet(abs_fp: Path, start_line: int, end_line: int) -> str:
     """Numbered lines ``[start_line, end_line]`` of *abs_fp*, streamed and bounded.
 
     The helper context asks for at most ~80 lines; reading the whole file to
@@ -37,16 +38,27 @@ def _read_local_snippet(abs_fp: "Path", start_line: int, end_line: int) -> str:
     from .read_tools import _stream_split_window
 
     with abs_fp.open("rb") as fh:
-        _total, lines = _stream_split_window(
-            fh, b"", start_line, end_line, _SNIPPET_RETAIN_CHARS, stop_after_last=True
-        )
+        _total, lines = _stream_split_window(fh, b"", start_line, end_line, _SNIPPET_RETAIN_CHARS, stop_after_last=True)
     return "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=start_line))
 
 
 class AgentToolsMixin:
     """Mixin providing agent-level tool implementations for ToolRegistry."""
 
-    def _tool_update_plan(self, args: dict[str, Any]) -> "ToolResult":
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry (and duck-typed test hosts) own the real
+    # values, so these are pure typing scaffolding.
+    #   _make_result                — ToolRegistry._make_result(**kwargs) -> ToolResult
+    #   _ensure_asicode_gitignored  — ToolRegistry._ensure_asicode_gitignored()
+    #   local_assistant             — optional delegate (LocalAssistant | None)
+    #   repo_root                   — repository root path (str)
+    _make_result: Any
+    _ensure_asicode_gitignored: Any
+    local_assistant: Any | None
+    repo_root: str
+
+    def _tool_update_plan(self, args: dict[str, Any]) -> ToolResult:
         """Create/replace the work plan for the current goal.
 
         The plan lives on the registry instance (``self.session_plan``);
@@ -69,10 +81,7 @@ class AgentToolsMixin:
         summary = diff_plans(prev, plan)
         # Previous plan's title→status map — used by CLI to render per-item changes (new items,
         # status transitions, deletions) as annotations. None for the first plan ("Plan created").
-        prev_statuses = (
-            {it.get("title", ""): it.get("status", "") for it in prev.get("items", [])}
-            if prev else None
-        )
+        prev_statuses = {it.get("title", ""): it.get("status", "") for it in prev.get("items", [])} if prev else None
         self.session_plan = plan
         n_open = len(open_items(plan))
         return self._make_result(
@@ -87,7 +96,7 @@ class AgentToolsMixin:
             },
         )
 
-    def _tool_update_memory(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_update_memory(self, args: dict[str, Any]) -> ToolResult:
         """Append a timestamped note to .asicode/memory.md."""
         import os
 
@@ -115,7 +124,7 @@ class AgentToolsMixin:
         except Exception as e:
             return self._make_result(ok=False, content="", error=f"Failed to update memory: {e}")
 
-    def _tool_delegate_to_helper(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_delegate_to_helper(self, args: dict[str, Any]) -> ToolResult:
         """Delegate an isolated code generation subtask to the helper model."""
         if self.local_assistant is None:
             return self._make_result(
@@ -147,7 +156,7 @@ class AgentToolsMixin:
                 from external_llm.agent.symbol_search import get_symbol_searcher
                 from external_llm.context.context_packs import HelperContextBuilder
 
-                builder = HelperContextBuilder(self.repo_root)
+                builder = HelperContextBuilder(Path(self.repo_root))
 
                 if not function_signature and target_symbol:
                     with suppress(AttributeError, TypeError):
@@ -167,11 +176,15 @@ class AgentToolsMixin:
                                 searcher = get_symbol_searcher(str(self.repo_root))
                                 symbol_info = searcher.get_symbol_info(target_symbol, file_path=file_path)
                                 if symbol_info and symbol_info.get("line"):
-                                    line_no = int(symbol_info.get("line"))
-                                    start_line = max(1, line_no - 12)
-                                    end_line = line_no + 28
+                                    _line_val = symbol_info.get("line")
+                                    if _line_val is not None:
+                                        line_no = int(_line_val)
+                                        start_line = max(1, line_no - 12)
+                                        end_line = line_no + 28
 
-                        abs_fp = Path(self.repo_root) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+                        abs_fp = (
+                            Path(self.repo_root) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+                        )
                         try:
                             local_snippet = _read_local_snippet(abs_fp, start_line, end_line)
                         except Exception:
@@ -225,7 +238,7 @@ class AgentToolsMixin:
                 error=f"Local assistant delegation raised an exception: {e}",
             )
 
-    def _tool_ask_user(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_ask_user(self, args: dict[str, Any]) -> ToolResult:
         """Ask the user a clarification question. Blocks until response or timeout."""
         question = str(args.get("question", "")).strip()
         q_type = str(args.get("type", "free_text")).strip()
@@ -300,4 +313,3 @@ class AgentToolsMixin:
                 content=f"Checkpoint error, using default: {default}",
                 metadata={"status": "error", "answer": default},
             )
-

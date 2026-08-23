@@ -8,6 +8,7 @@ Builds a repo-wide call graph from Python AST, enabling:
 
 MVP scope: Python only.
 """
+
 from __future__ import annotations
 
 import ast
@@ -18,7 +19,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.graph.models import CallEdge
 from external_llm.graph.root_cache import RootCache
@@ -117,7 +118,10 @@ def _too_big_to_index(path: Path, max_bytes: int) -> bool:
     if size <= max_bytes:
         return False
     logger.debug(
-        "call_graph: skipping %s (%d bytes > %d)", path, size, max_bytes,
+        "call_graph: skipping %s (%d bytes > %d)",
+        path,
+        size,
+        max_bytes,
     )
     return True
 
@@ -148,21 +152,22 @@ def _walk_ts_js_files(root: Path) -> list[Path]:
 # Data classes
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class CallGraphNode:
-    symbol: str          # "foo" or "ClassName.method"
-    file: str            # relative to repo root
+    symbol: str  # "foo" or "ClassName.method"
+    file: str  # relative to repo root
     line: int
-    kind: str            # function | async_function | method
+    kind: str  # function | async_function | method
 
 
 # CallEdge is imported from external_llm.graph.models (canonical definition)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Indexer
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class CallGraphIndexer:
     """Repo-wide call graph index for Python files.
@@ -175,7 +180,7 @@ class CallGraphIndexer:
     def __init__(
         self,
         repo_root: str,
-        cancel_event: Optional[threading.Event] = None,
+        cancel_event: threading.Event | None = None,
         config: Any = None,
     ):
         self._root = Path(repo_root).resolve()
@@ -256,7 +261,7 @@ class CallGraphIndexer:
         # by RG builds with collect_imported_names=True — graph_builder does
         # this on every agent-side build).
         self._rg_cache_path: Path = _rg_default_cache_path(self._root)
-        self._rg_cache: Optional[dict] = None
+        self._rg_cache: dict | None = None
         self._rg_cache_mtime_ns = 0
         # Per-build accounting (mirrors RepositoryGraph.cache_stats):
         #   total   = walked py files with a payload
@@ -270,7 +275,7 @@ class CallGraphIndexer:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def _get_cancel_event(self) -> Optional[threading.Event]:
+    def _get_cancel_event(self) -> threading.Event | Any:  # composite cancel duck-types is_set()
         """Return the live cooperative-cancel event.
 
         Reads ``config.cancel_event`` FRESH (call-time, not construction-time)
@@ -402,10 +407,12 @@ class CallGraphIndexer:
             self.cache_stats["changed"] = len(self._fresh_parsed)
             self._built = True
             logger.debug(
-                "call_graph: indexed %d symbols from %d py + %d ts files "
-                "(cache %d hit / %d changed / %d rg-served)",
-                len(self._nodes), len(self._py_stamps), _ts_count,
-                self.cache_stats["hit"], self.cache_stats["changed"],
+                "call_graph: indexed %d symbols from %d py + %d ts files (cache %d hit / %d changed / %d rg-served)",
+                len(self._nodes),
+                len(self._py_stamps),
+                _ts_count,
+                self.cache_stats["hit"],
+                self.cache_stats["changed"],
                 self.cache_stats["rg_served"],
             )
             # P1 (2026-08-12): an agent session that only queries CGI-routed
@@ -504,7 +511,9 @@ class CallGraphIndexer:
                         self._index_file(Path(abs_path))
                 except SyntaxError:
                     logger.debug(
-                        "call_graph: incremental skip unparseable %s", abs_path, exc_info=True,
+                        "call_graph: incremental skip unparseable %s",
+                        abs_path,
+                        exc_info=True,
                     )
                 except Exception as e:
                     logger.debug("call_graph: incremental skip %s: %s", abs_path, e)
@@ -572,7 +581,10 @@ class CallGraphIndexer:
                     nxt = min(srcs, key=self._owner_rank)
                     ln, kd = srcs[nxt]
                     self._nodes[sym] = CallGraphNode(
-                        symbol=sym, file=nxt, line=ln, kind=kd,
+                        symbol=sym,
+                        file=nxt,
+                        line=ln,
+                        kind=kd,
                     )
                     # Ownership moved — track it so a later removal of *nxt*
                     # still finds the node (see the _file_nodes pop above).
@@ -715,12 +727,16 @@ class CallGraphIndexer:
                         # removal, so make it visible.
                         logger.debug(
                             "call_graph: ownership record for %s missing in %s",
-                            symbol, node.file,
+                            symbol,
+                            node.file,
                         )
                     if not _prev:
                         del self._file_nodes[node.file]
             self._nodes[symbol] = CallGraphNode(
-                symbol=symbol, file=rel, line=line, kind=kind,
+                symbol=symbol,
+                file=rel,
+                line=line,
+                kind=kind,
             )
             self._file_nodes.setdefault(rel, []).append(symbol)
 
@@ -729,7 +745,7 @@ class CallGraphIndexer:
         forward: bool,
         file_attr: str,
         symbol: str,
-        file_path: Optional[str] = None,
+        file_path: str | None = None,
     ) -> list[CallEdge]:
         """Resolve edges under the index lock, ensuring the graph is built.
 
@@ -745,12 +761,13 @@ class CallGraphIndexer:
         with self._lock:
             index = self._forward if forward else self._reverse
             return self._lookup_edges(index, file_attr, symbol, file_path)
+
     def _lookup_edges(
         self,
         index: dict[str, list[CallEdge]],
         file_attr: str,
         symbol: str,
-        file_path: Optional[str] = None,
+        file_path: str | None = None,
     ) -> list[CallEdge]:
         """Resolve edges from *index* with exact-then-suffix matching.
 
@@ -780,9 +797,7 @@ class CallGraphIndexer:
                 return matching
         return edges
 
-    def get_callees(
-        self, symbol: str, file_path: Optional[str] = None
-    ) -> list[CallEdge]:
+    def get_callees(self, symbol: str, file_path: str | None = None) -> list[CallEdge]:
         """Return edges where symbol is the caller.
 
         Suffix fallback: ``execute_plan_canonical`` matches the index key
@@ -790,9 +805,7 @@ class CallGraphIndexer:
         """
         return self._lookup_edges_locked(True, "caller_file", symbol, file_path)
 
-    def get_callers(
-        self, symbol: str, file_path: Optional[str] = None
-    ) -> list[CallEdge]:
+    def get_callers(self, symbol: str, file_path: str | None = None) -> list[CallEdge]:
         """Return edges where symbol is the callee.
 
         Same suffix-fallback logic as get_callees(): ``_schedule_operations``
@@ -803,7 +816,7 @@ class CallGraphIndexer:
     def get_related_symbols(
         self,
         symbol: str,
-        file_path: Optional[str] = None,
+        file_path: str | None = None,
         depth: int = 1,
         limit: int = 20,
     ) -> dict[str, Any]:
@@ -835,41 +848,26 @@ class CallGraphIndexer:
 
             for e in callees:
                 if e.callee_file:
-                    _upd(file_scores, file_reasons, e.callee_file,
-                         e.confidence * 0.95, "direct callee")
+                    _upd(file_scores, file_reasons, e.callee_file, e.confidence * 0.95, "direct callee")
 
             for e in callers:
                 if e.caller_file:
-                    _upd(file_scores, file_reasons, e.caller_file,
-                         e.confidence * 0.70, "caller")
+                    _upd(file_scores, file_reasons, e.caller_file, e.confidence * 0.70, "caller")
 
             for e in extra_callees:
                 if e.callee_file:
-                    _upd(file_scores, file_reasons, e.callee_file,
-                         e.confidence * 0.50, "transitive callee")
+                    _upd(file_scores, file_reasons, e.callee_file, e.confidence * 0.50, "transitive callee")
 
             candidates = sorted(
-                [
-                    {"path": f, "reason": file_reasons[f], "score": round(s, 3)}
-                    for f, s in file_scores.items()
-                ],
+                [{"path": f, "reason": file_reasons[f], "score": round(s, 3)} for f, s in file_scores.items()],
                 key=lambda x: -x["score"],
             )[:5]
 
-            related_syms = sorted(
-                set(
-                    [e.callee_symbol for e in callees]
-                    + [e.caller_symbol for e in callers]
-                )
-            )[:limit]
+            related_syms = sorted(set([e.callee_symbol for e in callees] + [e.caller_symbol for e in callers]))[:limit]
 
             return {
                 "symbol": symbol,
-                "node": (
-                    {"file": node.file, "line": node.line, "kind": node.kind}
-                    if node
-                    else None
-                ),
+                "node": ({"file": node.file, "line": node.line, "kind": node.kind} if node else None),
                 "callees": [
                     {
                         "symbol": e.callee_symbol,
@@ -1018,44 +1016,45 @@ class CallGraphIndexer:
             return
         self._rg_cache = _load_rg_snapshot(path)
         self._rg_cache_mtime_ns = st.st_mtime_ns
+
     def _maybe_self_heal_rg_snapshot(self) -> None:
-            """P1 (2026-08-12): create RG's snapshot when this build couldn't use it.
+        """P1 (2026-08-12): create RG's snapshot when this build couldn't use it.
 
-            The RG snapshot is the SSOT disk tier (P3 Stage 2/3).  It is written
-            by ``RepositoryGraph`` builds with ``collect_imported_names=True``
-            (release gate / ``GraphBuilder.build_repo_graph``), but an agent
-            session that only queries CGI-routed methods (``get_callers`` /
-            ``get_callees`` / ``get_related_symbols``) never builds RG — in a
-            gate-less repo the snapshot never exists and EVERY fresh process pays
-            a full cold parse (measured 0.87s -> 4.08s on asicode, 818 py files).
+        The RG snapshot is the SSOT disk tier (P3 Stage 2/3).  It is written
+        by ``RepositoryGraph`` builds with ``collect_imported_names=True``
+        (release gate / ``GraphBuilder.build_repo_graph``), but an agent
+        session that only queries CGI-routed methods (``get_callers`` /
+        ``get_callees`` / ``get_related_symbols``) never builds RG — in a
+        gate-less repo the snapshot never exists and EVERY fresh process pays
+        a full cold parse (measured 0.87s -> 4.08s on asicode, 818 py files).
 
-            When this build served ZERO files from the RG tier and the snapshot
-            file does not exist, trigger one ``GraphBuilder`` build to create it
-            (fail-open: any error leaves the CGI index as-is; the snapshot
-            rewrite is hint-gated, so a warm/served build pays ~0 for it).  A
-            present-but-stale snapshot is NOT healed here — tree edits are the
-            normal incremental path and the next RG build refreshes it.
-            """
-            if self.cache_stats.get("rg_served", 0) > 0:
-                return
-            if os.path.exists(self._rg_cache_path):
-                return  # exists but stale (tree changed) — RG build refreshes it
-            # Lazy import: graph_builder -> repository_graph, and call_graph is
-            # imported by tool_registry which graph_builder must not depend on.
-            from external_llm.graph.graph_builder import GraphBuilder
+        When this build served ZERO files from the RG tier and the snapshot
+        file does not exist, trigger one ``GraphBuilder`` build to create it
+        (fail-open: any error leaves the CGI index as-is; the snapshot
+        rewrite is hint-gated, so a warm/served build pays ~0 for it).  A
+        present-but-stale snapshot is NOT healed here — tree edits are the
+        normal incremental path and the next RG build refreshes it.
+        """
+        if self.cache_stats.get("rg_served", 0) > 0:
+            return
+        if os.path.exists(self._rg_cache_path):
+            return  # exists but stale (tree changed) — RG build refreshes it
+        # Lazy import: graph_builder -> repository_graph, and call_graph is
+        # imported by tool_registry which graph_builder must not depend on.
+        from external_llm.graph.graph_builder import GraphBuilder
 
-            logger.warning(
-                "call_graph: RG snapshot missing at %s — self-healing with one "
-                "GraphBuilder build (subsequent cold builds serve from it)",
-                self._rg_cache_path,
-            )
-            try:
-                GraphBuilder(str(self._root)).build_repo_graph()
-                self.cache_stats["rg_self_healed"] = 1
-            except Exception as exc:  # fail-open: keep the already-built CGI index
-                logger.debug("call_graph: RG snapshot self-heal failed: %s", exc)
+        logger.warning(
+            "call_graph: RG snapshot missing at %s — self-healing with one "
+            "GraphBuilder build (subsequent cold builds serve from it)",
+            self._rg_cache_path,
+        )
+        try:
+            GraphBuilder(str(self._root)).build_repo_graph()
+            self.cache_stats["rg_self_healed"] = 1
+        except Exception as exc:  # fail-open: keep the already-built CGI index
+            logger.debug("call_graph: RG snapshot self-heal failed: %s", exc)
 
-    def _rg_file_data(self, rel: str, st: os.stat_result) -> Optional[dict]:
+    def _rg_file_data(self, rel: str, st: os.stat_result) -> dict | None:
         """One file's CGI-converted payload from the RG snapshot, or None.
 
         Serves only files whose manifest stamp matches the CURRENT stat — the
@@ -1079,7 +1078,7 @@ class CallGraphIndexer:
             return None
         return _rg_payload_to_cgi(payload)
 
-    def _extract_file(self, path: Path) -> Optional[tuple[str, dict]]:
+    def _extract_file(self, path: Path) -> tuple[str, dict] | None:
         """Pure per-file extraction: parse → JSON-ready payload (P2).
 
         Returns ``(rel, payload)`` or None on the size gate / parse failure
@@ -1167,11 +1166,7 @@ class CallGraphIndexer:
                 kind = "method"
             else:
                 symbol = node.name
-                kind = (
-                    "async_function"
-                    if isinstance(node, ast.AsyncFunctionDef)
-                    else "function"
-                )
+                kind = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
             defs.append([symbol, node.lineno, kind])
         return defs
 
@@ -1190,14 +1185,10 @@ class CallGraphIndexer:
         calls: list[CallEdge] = []
         for node in func_nodes:
             class_name = class_names.get(id(node))
-            caller_sym = (
-                f"{class_name}.{node.name}" if class_name else node.name
-            )
+            caller_sym = f"{class_name}.{node.name}" if class_name else node.name
             seen: set[str] = set()
             for child in _iter_calls(node):
-                edge = self._parse_call(
-                    child, caller_sym, rel, child.lineno, class_name
-                )
+                edge = self._parse_call(child, caller_sym, rel, child.lineno, class_name)
                 if edge and edge.callee_display not in seen:
                     seen.add(edge.callee_display)
                     calls.append(edge)
@@ -1209,8 +1200,8 @@ class CallGraphIndexer:
         caller_sym: str,
         caller_file: str,
         caller_line: int,
-        class_name: Optional[str],
-    ) -> Optional[CallEdge]:
+        class_name: str | None,
+    ) -> CallEdge | None:
         func = call.func
         if isinstance(func, ast.Name):
             # foo()
@@ -1233,8 +1224,8 @@ class CallGraphIndexer:
                 return None
             parts.append(n.id)
             dotted = ".".join(reversed(parts))
-            root_name = parts[-1]   # outermost name (e.g. "self", "obj")
-            attr = parts[0]         # the actual method/function name
+            root_name = parts[-1]  # outermost name (e.g. "self", "obj")
+            attr = parts[0]  # the actual method/function name
             if root_name == "self" and class_name:
                 # self.method() -> ClassName.method (high confidence)
                 return CallEdge(
@@ -1278,7 +1269,8 @@ class CallGraphIndexer:
         for fn in module.functions:
             if fn.name:
                 self._register_node(
-                    fn.name, rel,
+                    fn.name,
+                    rel,
                     fn.meta.start_line if fn.meta else fn.start_line,
                     "async_function" if fn.is_async else "function",
                 )
@@ -1288,7 +1280,8 @@ class CallGraphIndexer:
             for method in cls.methods:
                 symbol = f"{cls.name}.{method.name}"
                 self._register_node(
-                    symbol, rel,
+                    symbol,
+                    rel,
                     method.meta.start_line if method.meta else method.start_line,
                     "method",
                 )
@@ -1297,9 +1290,7 @@ class CallGraphIndexer:
         for cs in module.call_sites:
             if not cs.caller or not cs.callee:
                 continue
-            callee_display = (
-                f"{cs.receiver}.{cs.callee}" if cs.receiver else cs.callee
-            )
+            callee_display = f"{cs.receiver}.{cs.callee}" if cs.receiver else cs.callee
             edge = CallEdge(
                 caller_symbol=cs.caller,
                 caller_file=rel,
@@ -1314,9 +1305,7 @@ class CallGraphIndexer:
 
     def _resolve_callees(self) -> None:
         """Fill callee_file / callee_line using the collected node index."""
-        self._resolve_edges(
-            [e for edges in self._forward.values() for e in edges]
-        )
+        self._resolve_edges([e for edges in self._forward.values() for e in edges])
 
     def _resolve_edges(self, edges: list[CallEdge]) -> None:
         """Resolve callee_file / callee_line for a subset of edges (A4).
@@ -1342,6 +1331,7 @@ class CallGraphIndexer:
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal utility
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _rg_payload_to_cgi(payload: dict) -> dict:
     """Convert one RepositoryGraph per-file payload to a CGI payload (P3 Stage 2).
@@ -1372,21 +1362,14 @@ def _rg_payload_to_cgi(payload: dict) -> dict:
       order.  ``call_args``/``is_mutating`` are carried over from RG (richer
       than CGI's always-empty; consumers get the same fields RG computed).
     """
-    symbols = [
-        s for s in payload.get("symbols", [])
-        if s.get("kind") in ("function", "method")
-    ]
+    symbols = [s for s in payload.get("symbols", []) if s.get("kind") in ("function", "method")]
     # ast.walk BFS order == (ast_depth, start_line); ast_depth is stored by RG.
     symbols.sort(key=lambda s: (s.get("ast_depth", 0), s.get("start_line", 0)))
     defs: list[list] = []
     fn_order: dict[tuple[str, int], int] = {}
     for i, s in enumerate(symbols):
         sym = s.get("cgi_symbol") or s.get("name")
-        kind = (
-            "method"
-            if sym != s.get("name")
-            else ("async_function" if s.get("is_async") else "function")
-        )
+        kind = "method" if sym != s.get("name") else ("async_function" if s.get("is_async") else "function")
         defs.append([sym, s.get("start_line"), kind])
         fn_order[(s.get("qualname"), s.get("start_line"))] = i
 
@@ -1401,9 +1384,7 @@ def _rg_payload_to_cgi(payload: dict) -> dict:
         groups.setdefault((q, d), []).append(c)
 
     kept: list[dict] = []
-    for (_q, _d), clist in sorted(
-        groups.items(), key=lambda kv: fn_order.get((kv[0][0], kv[0][1]), 1 << 30)
-    ):
+    for (_q, _d), clist in sorted(groups.items(), key=lambda kv: fn_order.get((kv[0][0], kv[0][1]), 1 << 30)):
         seen: set[str] = set()
         for c in clist:
             if c.get("callee_display") in seen:
@@ -1442,10 +1423,7 @@ def _iter_calls(func_node: ast.AST) -> Iterator[ast.Call]:
         node = todo.pop()
         if isinstance(node, ast.Call):
             yield node
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node is not func_node
-        ):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not func_node:
             continue  # nested function — its body belongs to a separate caller
         todo.extend(ast.iter_child_nodes(node))
 

@@ -9,6 +9,7 @@ These tests pin the equivalence against a reference implementation of the
 legacy scan and verify index invalidation on mutation (via the public
 reparse_file / remove_file paths, not the private invalidators).
 """
+
 import os
 import random
 import shutil
@@ -55,16 +56,16 @@ def _synthetic_edges():
     """Weird-but-legal edge shapes the extractors never emit."""
     return [
         ImportEdge("pkg/a.py", "pkg.operation_models.ModelX", "from"),  # dotted from-import
-        ImportEdge("pkg/a.py", "operation_models", "from"),          # bare relative form
-        ImportEdge("other/c.py", "operation_models.ModelX", "from"), # same basename, wrong dir
-        ImportEdge("main.py", "utils.helper", "from"),               # ancestor prefix match
-        ImportEdge("x.py", "", "import"),                            # empty imported: skipped
-        ImportEdge("", "utils", "import"),                           # empty importer: dedupable
-        ImportEdge("web/use.ts", "./helper", "js_require"),          # non-py, same-dir dot import
-        ImportEdge("web/use.ts", "../utils", "js_require"),          # non-py, parent-dir dot import
+        ImportEdge("pkg/a.py", "operation_models", "from"),  # bare relative form
+        ImportEdge("other/c.py", "operation_models.ModelX", "from"),  # same basename, wrong dir
+        ImportEdge("main.py", "utils.helper", "from"),  # ancestor prefix match
+        ImportEdge("x.py", "", "import"),  # empty imported: skipped
+        ImportEdge("", "utils", "import"),  # empty importer: dedupable
+        ImportEdge("web/use.ts", "./helper", "js_require"),  # non-py, same-dir dot import
+        ImportEdge("web/use.ts", "../utils", "js_require"),  # non-py, parent-dir dot import
         ImportEdge("deep/a/b/c/d.py", "very.deep.module.path", "import"),  # depth 4 dotted
-        ImportEdge("main.py", "utils", "import"),                    # dup importer in bucket
-        ImportEdge("main.py", "utils.x", "from"),                    # second edge, same importer
+        ImportEdge("main.py", "utils", "import"),  # dup importer in bucket
+        ImportEdge("main.py", "utils.x", "from"),  # second edge, same importer
     ]
 
 
@@ -110,14 +111,37 @@ def _legacy_get_importers(graph, file_path):
 
 _QUERIES = [
     # every real file in the fixture
-    "utils.py", "mod.py", "pkg/__init__.py", "pkg/operation_models.py",
-    "pkg/a.py", "pkg/sub/b.py", "other/operation_models.py", "other/c.py",
-    "main.ts", "__tests__/t.ts", "web/use.ts", "web/helper.ts",
+    "utils.py",
+    "mod.py",
+    "pkg/__init__.py",
+    "pkg/operation_models.py",
+    "pkg/a.py",
+    "pkg/sub/b.py",
+    "other/operation_models.py",
+    "other/c.py",
+    "main.ts",
+    "__tests__/t.ts",
+    "web/use.ts",
+    "web/helper.ts",
     # module/dir forms and extensionless candidates
-    "utils", "pkg", "pkg/", "pkg/operation_models", "pkg/sub/b", "other/operation_models",
-    "web/helper", "web/use", "main", "operation_models.py", "operation_models",
+    "utils",
+    "pkg",
+    "pkg/",
+    "pkg/operation_models",
+    "pkg/sub/b",
+    "other/operation_models",
+    "web/helper",
+    "web/use",
+    "main",
+    "operation_models.py",
+    "operation_models",
     # edge cases
-    "", "nonexistent.py", "nonexistent", "deep/a/b/c/d.py", "x.y.z", "a/b/c/d/e/f.py",
+    "",
+    "nonexistent.py",
+    "nonexistent",
+    "deep/a/b/c/d.py",
+    "x.y.z",
+    "a/b/c/d/e/f.py",
 ]
 
 
@@ -154,7 +178,9 @@ def test_index_matches_legacy_with_synthetic_edges():
         importers = g.get_importers("pkg/operation_models.py")
         assert "other/c.py" not in importers, importers
         # ... but the decoy DOES import its own same-named module.
-        assert "other/c.py" in g.get_importers("other/operation_models.py"), g.get_importers("other/operation_models.py")
+        assert "other/c.py" in g.get_importers("other/operation_models.py"), g.get_importers(
+            "other/operation_models.py"
+        )
         # Non-Python path-resolved matching fires only for NON-Python queries
         # (the Python branch never sees "../utils" — legacy semantics).
         importers = g.get_importers("utils.ts")
@@ -170,14 +196,35 @@ def test_random_edges_parity_with_legacy():
     """Seeded fuzz: random importers/values must never diverge from the scan."""
     rng = random.Random(20260811)
     files = [
-        "a.py", "pkg/b.py", "pkg/sub/c.py", "x/__init__.py", "y/z.py",
-        "main.ts", "__tests__/t.ts", "web/helper.ts", "",
+        "a.py",
+        "pkg/b.py",
+        "pkg/sub/c.py",
+        "x/__init__.py",
+        "y/z.py",
+        "main.ts",
+        "__tests__/t.ts",
+        "web/helper.ts",
+        "",
     ]
     values = [
-        "utils", "utils.x", "pkg.b", "pkg.b.y", "pkg.sub.c", "x.y",
-        "a.b.c.d.e", ".", "..", "../utils", "./helper", "helper",
-        "operation_models", "operation_models.X", "", "web/helper",
-        "web/helper.ts", "x.y.z.w.v.u",
+        "utils",
+        "utils.x",
+        "pkg.b",
+        "pkg.b.y",
+        "pkg.sub.c",
+        "x.y",
+        "a.b.c.d.e",
+        ".",
+        "..",
+        "../utils",
+        "./helper",
+        "helper",
+        "operation_models",
+        "operation_models.X",
+        "",
+        "web/helper",
+        "web/helper.ts",
+        "x.y.z.w.v.u",
     ]
     d = tempfile.mkdtemp(prefix="test_rii_")
     try:

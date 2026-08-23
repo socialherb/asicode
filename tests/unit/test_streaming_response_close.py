@@ -12,6 +12,7 @@ check — _request_with_retry returns them as-is (or, for Anthropic, post() is
 called directly). 429/5xx are retried inside _request_with_retry and never reach
 this code path, so they are out of scope here.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -54,9 +55,7 @@ def test_openai_streaming_closes_response_on_401(monkeypatch, method):
     fake = _FakeStreamResponse(401)
     _patch_post(monkeypatch, client, fake)
     with pytest.raises(LLMAuthenticationError):
-        getattr(client, method)(
-            "http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None
-        )
+        getattr(client, method)("http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None)
     assert fake.close_count == 1
 
 
@@ -66,9 +65,7 @@ def test_openai_streaming_closes_response_on_402(monkeypatch, method):
     fake = _FakeStreamResponse(402)
     _patch_post(monkeypatch, client, fake)
     with pytest.raises(LLMQuotaExceededError):
-        getattr(client, method)(
-            "http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None
-        )
+        getattr(client, method)("http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None)
     assert fake.close_count == 1
 
 
@@ -81,9 +78,7 @@ def test_anthropic_streaming_closes_response_on_401(monkeypatch, method):
     fake = _FakeStreamResponse(401)
     _patch_post(monkeypatch, client, fake)
     with pytest.raises(LLMAuthenticationError):
-        getattr(client, method)(
-            "http://x/v1/messages", {}, {"model": "m"}, "claude-3-5-sonnet", lambda c: None
-        )
+        getattr(client, method)("http://x/v1/messages", {}, {"model": "m"}, "claude-3-5-sonnet", lambda c: None)
     assert fake.close_count == 1
 
 
@@ -93,7 +88,5 @@ def test_anthropic_streaming_closes_response_on_non200(monkeypatch, method):
     fake = _FakeStreamResponse(418)  # generic non-200 (not 401/429/>=500)
     _patch_post(monkeypatch, client, fake)
     with pytest.raises(LLMAPIError):
-        getattr(client, method)(
-            "http://x/v1/messages", {}, {"model": "m"}, "claude-3-5-sonnet", lambda c: None
-        )
+        getattr(client, method)("http://x/v1/messages", {}, {"model": "m"}, "claude-3-5-sonnet", lambda c: None)
     assert fake.close_count == 1

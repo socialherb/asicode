@@ -7,6 +7,7 @@ Handles:
 - Conflict marker detection and rollback
 - Safety guards (large files, binary files, path traversal)
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -19,7 +20,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common import normalize_rel_path_fast
 from config import (
     BINARY_SNIFF_BYTES,
     CONFLICT_MARKER_MAX_BYTES,
@@ -27,7 +27,7 @@ from config import (
     STRICT_CLEAN,
 )
 from patch_synth import synthesize_append_line_unified_diff
-from path_security import normalize_rel_path
+from path_security import normalize_rel_path, resolve_inside_repo
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +429,7 @@ def _classify_git_apply_output(out: str) -> str:
 # Public helpers
 # =========================================================
 
+
 def extract_touched_files_from_diff(diff_text: str) -> list[str]:
     """Parse touched files from unified diff."""
     touched: list[str] = []
@@ -448,6 +449,7 @@ def extract_touched_files_from_diff(diff_text: str) -> list[str]:
 # Git apply execution
 # =========================================================
 
+
 def _run_git_apply(repo: Path, args: list[str], input_text: str | None = None) -> tuple[int, str]:
     cmd = ["git", "apply", *args]
     try:
@@ -465,6 +467,7 @@ def _run_git_apply(repo: Path, args: list[str], input_text: str | None = None) -
         return -1, "git apply timeout after 30 seconds"
     except Exception as e:
         return -1, f"git apply exception: {e}"
+
 
 _GIT_STATUS_TIMEOUT_MARKER = "[git-status-timeout]"
 
@@ -512,7 +515,8 @@ def _git_status_porcelain(repo: Path, *, include_untracked: bool = True) -> str 
         logger.warning(
             "git status failed (repo=%s); returning None — callers must treat "
             "an unverifiable status as unknown, never as 'clean': %s",
-            repo, e,
+            repo,
+            e,
         )
         return None
 
@@ -537,12 +541,12 @@ def _is_worktree_clean(repo: Path) -> bool | None:
     return raw.strip() == ""
 
 
-
 def _cleanup_reject_files(repo: Path, touched_files: list[str]) -> None:
     """Clean up .rej and .orig files for touched files only (no global rglob)."""
     for rel in touched_files:
         p = repo / rel
         for suffix in (".rej", ".orig"):
+            candidate: Path | None = None
             try:
                 candidate = Path(str(p) + suffix)
                 if candidate.exists():
@@ -632,19 +636,20 @@ def _has_conflict_markers(path: Path, max_bytes: int) -> bool:
 
 
 def _resolve_inside_repo_path(repo: Path, rel: str) -> Path:
-    """Resolve repo/rel and ensure result stays inside repo."""
-    base = repo.resolve()
-    p = (base / rel).resolve()
-    try:
-        p.relative_to(base)
-    except ValueError as e:
-        raise ValueError(f"path_outside_repo: {rel}") from e
-    return p
+    """Resolve repo/rel and ensure result stays inside repo.
+
+    Delegates to the ``path_security`` SSOT (same normalized-relative
+    contract as every other containment check in the codebase) so a
+    hardening fix lands in exactly one place.  Callers pass already
+    normalized rels; ``resolve_inside_repo`` re-normalizes idempotently.
+    """
+    return resolve_inside_repo(str(repo), rel)
 
 
 # =========================================================
 # 3-way fallback logic (deduplicated)
 # =========================================================
+
 
 def _git_status_untracked(repo: Path) -> set[str] | None:
     """
@@ -706,7 +711,8 @@ def _git_status_untracked(repo: Path) -> set[str] | None:
         logger.warning(
             "git status -z failed (repo=%s); returning None — rollback must "
             "fail closed (nothing provably pre-existing untracked): %s",
-            repo, e,
+            repo,
+            e,
         )
         return None
     else:
@@ -723,7 +729,7 @@ def _capture_rollback_snapshot(repo: Path, touched_files: list[str]) -> dict[str
     """
     pre_untracked = _git_status_untracked(repo)
     pre_exists: dict[str, bool] = {}
-    for rel in (touched_files or []):
+    for rel in touched_files or []:
         try:
             p = _resolve_inside_repo_path(repo, rel)
             pre_exists[rel] = p.exists()
@@ -832,7 +838,7 @@ def _rollback(repo: Path, touched_files: list[str], snapshot: dict[str, Any] | N
 
     # 2) Delete newly-created paths among touched files (covers new files and dirs)
     try:
-        for rel in (touched_files or []):
+        for rel in touched_files or []:
             try:
                 if pre_exists.get(rel) is False:
                     p = _resolve_inside_repo_path(repo, rel)
@@ -857,8 +863,7 @@ def _rollback(repo: Path, touched_files: list[str], snapshot: dict[str, Any] | N
             # touched (post-apply status unknown). Fail closed: skip cleanup.
             reason = "pre_untracked_unknown" if pre_unknown else "post_untracked_unknown"
             logger.warning(
-                "rollback: %s (git status timed out); skipping newly-created-"
-                "untracked cleanup (fail-closed)",
+                "rollback: %s (git status timed out); skipping newly-created-untracked cleanup (fail-closed)",
                 reason,
             )
             report["cleanup_skipped_reason"] = reason
@@ -870,9 +875,9 @@ def _rollback(repo: Path, touched_files: list[str], snapshot: dict[str, Any] | N
                 report["attempted"] = True
                 # Use git clean with explicit pathspecs (safer than global clean)
                 # Batch to avoid argv limits
-                BATCH = 50
-                for i in range(0, len(created), BATCH):
-                    batch = created[i : i + BATCH]
+                _batch_size = 50
+                for i in range(0, len(created), _batch_size):
+                    batch = created[i : i + _batch_size]
                     subprocess.run(
                         ["git", "clean", "-fd", "--", *batch],
                         cwd=str(repo),
@@ -913,9 +918,11 @@ def _rollback(repo: Path, touched_files: list[str], snapshot: dict[str, Any] | N
                 else:
                     report["verified"] = True
             else:
-                logger.warning("git status verification failed (rc=%d): %s",
-                               result.returncode,
-                               (result.stderr or b"").decode("utf-8", errors="replace"))
+                logger.warning(
+                    "git status verification failed (rc=%d): %s",
+                    result.returncode,
+                    (result.stderr or b"").decode("utf-8", errors="replace"),
+                )
         except Exception as e:
             logger.warning("Rollback verification failed: %s", e)
 
@@ -945,14 +952,21 @@ def _try_3way_fallback(
     Returns (ok, msg, reason, details).
     """
     rc3, out3 = _run_git_apply(
-        repo, ["--3way", "--recount", "--whitespace=nowarn"], input_text=cleaned,
+        repo,
+        ["--3way", "--recount", "--whitespace=nowarn"],
+        input_text=cleaned,
     )
     if rc3 != 0:
-        return False, out3.strip() or "3way also failed", _classify_git_apply_output(out3), {
-            "touched_files": touched_files,
-            "used_strategy": "git-apply-3way-failed",
-            "returncode": rc3,
-        }
+        return (
+            False,
+            out3.strip() or "3way also failed",
+            _classify_git_apply_output(out3),
+            {
+                "touched_files": touched_files,
+                "used_strategy": "git-apply-3way-failed",
+                "returncode": rc3,
+            },
+        )
 
     # Check for conflict markers
     marker_hits: list[str] = []
@@ -965,30 +979,43 @@ def _try_3way_fallback(
         rollback_report = _rollback(repo, touched_files, snapshot=snapshot)
         _cleanup_reject_files(repo, touched_files)
         msg = f"3way produced conflict markers in: {', '.join(marker_hits[:8])}"
-        return False, msg, REASON_CONFLICT_MARKERS, {
-            "touched_files": touched_files,
-            "failed_files": sorted(set(touched_files)),
-            "rollback_performed": rollback_report["attempted"],
-            "rollback_verified": rollback_report["verified"],
-            "rollback_remaining_dirty": rollback_report["remaining_dirty"],
-            "used_strategy": "git-apply-3way-marker-guard",
-            "marker_files": marker_hits,
-        }
+        return (
+            False,
+            msg,
+            REASON_CONFLICT_MARKERS,
+            {
+                "touched_files": touched_files,
+                "failed_files": sorted(set(touched_files)),
+                "rollback_performed": rollback_report["attempted"],
+                "rollback_verified": rollback_report["verified"],
+                "rollback_remaining_dirty": rollback_report["remaining_dirty"],
+                "used_strategy": "git-apply-3way-marker-guard",
+                "marker_files": marker_hits,
+            },
+        )
 
-    return True, "applied", REASON_OK, {
-        "touched_files": touched_files,
-        "failed_files": [],
-        "rollback_performed": False,
-        "used_strategy": "git-apply-3way",
-    }
+    return (
+        True,
+        "applied",
+        REASON_OK,
+        {
+            "touched_files": touched_files,
+            "failed_files": [],
+            "rollback_performed": False,
+            "used_strategy": "git-apply-3way",
+        },
+    )
 
 
 # =========================================================
 # Patch apply (main entry point)
 # =========================================================
 
+
 def apply_patch(
-    repo_root: str, diff_text: str, file_path_hint: str | None = None,
+    repo_root: str,
+    diff_text: str,
+    file_path_hint: str | None = None,
     skip_3way: bool = False,
 ) -> tuple[bool, str, str, dict[str, Any]]:
     """
@@ -1086,10 +1113,12 @@ def apply_patch(
     # Without these, a patch with minor hunk-counter drift or trailing whitespace
     # fails the pre-check even though the actual apply (or tolerant fallback)
     # would succeed — causing unnecessary rollback and retry (P3, HIGH).
-    step_check = {"step": "git_apply_check", "status": "pending"}
+    step_check: dict[str, Any] = {"step": "git_apply_check", "status": "pending"}
     t0_check = time.monotonic()
     rc, out = _run_git_apply(
-        repo, ["--check", "--recount", "--whitespace=nowarn"], input_text=cleaned,
+        repo,
+        ["--check", "--recount", "--whitespace=nowarn"],
+        input_text=cleaned,
     )
     step_check["duration_ms"] = int((time.monotonic() - t0_check) * 1000)
     if rc == 0:
@@ -1116,14 +1145,19 @@ def apply_patch(
                 # _rollback's new-file cleanup (steps 2/3) is also a no-op here since
                 # --check creates nothing. So: skip _rollback, only sweep stale .rej.
                 _cleanup_reject_files(repo, touched_files)
-                return False, out.strip() or "git apply --check failed (3way skipped: no pre-image blob)", reason, {
-                    "touched_files": touched_files,
-                    "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out))),
-                    "rollback_performed": False,
-                    "rollback_skipped_reason": "check_is_dryrun_worktree_unchanged",
-                    "used_strategy": "git-apply-check-3way-skipped",
-                    "execution_steps": execution_steps,
-                }
+                return (
+                    False,
+                    out.strip() or "git apply --check failed (3way skipped: no pre-image blob)",
+                    reason,
+                    {
+                        "touched_files": touched_files,
+                        "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out))),
+                        "rollback_performed": False,
+                        "rollback_skipped_reason": "check_is_dryrun_worktree_unchanged",
+                        "used_strategy": "git-apply-check-3way-skipped",
+                        "execution_steps": execution_steps,
+                    },
+                )
 
             # SAFETY: refuse 3-way merge when working tree is dirty.
             # Otherwise conflict markers may be written into files and left behind.
@@ -1144,20 +1178,20 @@ def apply_patch(
                 # here; fall back to the generic conflict failure so
                 # patch_engine can run its repair ladder.
                 _cleanup_reject_files(repo, touched_files)
-                return False, (
-                    "3-way merge skipped: worktree cleanliness unverifiable "
-                    "(git status timed out)"
-                ), REASON_3WAY_SKIPPED_UNVERIFIABLE, {
-                    "touched_files": touched_files,
-                    "failed_files": sorted(
-                        set(touched_files) | set(_extract_files_from_git_apply_output(out))
-                    ),
-                    "rollback_performed": False,
-                    "rollback_skipped_reason": "worktree_clean_unverifiable",
-                    "used_strategy": "git-apply-3way-skipped-unverifiable",
-                    "git_status_porcelain_before": _clip_git_status(dirty_before),
-                    "execution_steps": execution_steps,
-                }
+                return (
+                    False,
+                    ("3-way merge skipped: worktree cleanliness unverifiable (git status timed out)"),
+                    REASON_3WAY_SKIPPED_UNVERIFIABLE,
+                    {
+                        "touched_files": touched_files,
+                        "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out))),
+                        "rollback_performed": False,
+                        "rollback_skipped_reason": "worktree_clean_unverifiable",
+                        "used_strategy": "git-apply-3way-skipped-unverifiable",
+                        "git_status_porcelain_before": _clip_git_status(dirty_before),
+                        "execution_steps": execution_steps,
+                    },
+                )
             if clean_state is False:
                 try:
                     # Stash tracked changes (untracked are ignored by our cleanliness policy anyway)
@@ -1174,7 +1208,9 @@ def apply_patch(
                         autostash_used = True
                         execution_steps.append({"step": "autostash_push", "status": "ok"})
                     else:
-                        execution_steps.append({"step": "autostash_push", "status": "failed", "stdout_clip": out_s[:800]})
+                        execution_steps.append(
+                            {"step": "autostash_push", "status": "failed", "stdout_clip": out_s[:800]}
+                        )
                 except Exception as e:
                     execution_steps.append({"step": "autostash_push", "status": "exception", "error": str(e)})
 
@@ -1196,10 +1232,14 @@ def apply_patch(
                         execution_steps.append({"step": "autostash_pop", "status": "ok"})
                     else:
                         autostash_pop_error = out_p[:800]
-                        execution_steps.append({"step": "autostash_pop", "status": "failed", "stdout_clip": autostash_pop_error})
+                        execution_steps.append(
+                            {"step": "autostash_pop", "status": "failed", "stdout_clip": autostash_pop_error}
+                        )
                 except Exception as e:
                     autostash_pop_error = str(e)
-                    execution_steps.append({"step": "autostash_pop", "status": "exception", "error": autostash_pop_error})
+                    execution_steps.append(
+                        {"step": "autostash_pop", "status": "exception", "error": autostash_pop_error}
+                    )
 
             if isinstance(d, dict):
                 d["autostash_used"] = bool(autostash_used)
@@ -1225,23 +1265,30 @@ def apply_patch(
         # user-WIP) is unchanged here. _rollback() would `git restore --worktree`
         # and silently revert user-WIP to HEAD. Skip it; only sweep stale .rej.
         _cleanup_reject_files(repo, touched_files)
-        return False, out.strip() or "git apply --check failed", reason, {
-            "touched_files": touched_files,
-            "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out))),
-            "rollback_performed": False,
-            "rollback_skipped_reason": "check_is_dryrun_worktree_unchanged",
-            "used_strategy": "git-apply-check",
-            "execution_steps": execution_steps,
-        }
+        return (
+            False,
+            out.strip() or "git apply --check failed",
+            reason,
+            {
+                "touched_files": touched_files,
+                "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out))),
+                "rollback_performed": False,
+                "rollback_skipped_reason": "check_is_dryrun_worktree_unchanged",
+                "used_strategy": "git-apply-check",
+                "execution_steps": execution_steps,
+            },
+        )
 
     # 2) Apply
-    step_apply = {"step": "git_apply", "status": "pending"}
+    step_apply: dict[str, Any] = {"step": "git_apply", "status": "pending"}
     t0 = time.monotonic()
     # Use --recount --whitespace=nowarn to match pre-check flags (P3).
     # Without them, a patch that passed pre-check with recount could fail
     # here because the actual apply uses raw line numbers.
     rc2, out2 = _run_git_apply(
-        repo, ["--recount", "--whitespace=nowarn"], input_text=cleaned,
+        repo,
+        ["--recount", "--whitespace=nowarn"],
+        input_text=cleaned,
     )
     step_apply["duration_ms"] = int((time.monotonic() - t0) * 1000)
     if rc2 == 0:
@@ -1255,24 +1302,24 @@ def apply_patch(
     execution_steps.append(step_apply)
     if rc2 != 0:
         reason = _classify_git_apply_output(out2)
-            # Why no autostash here (unlike the `--check`-failure branch, Fix 2)?
+        # Why no autostash here (unlike the `--check`-failure branch, Fix 2)?
         #  (a) It would be a NON-FIX: autostash would pop user-WIP back AFTER the 3-way
-            #      attempt, only for `_rollback()` to `git restore --staged
+        #      attempt, only for `_rollback()` to `git restore --staged
         #      --worktree` it right back to HEAD. Protecting WIP on this path would
-            #      require SKIPPING `_rollback()` (mirroring Fix 2), not adding autostash.
-            #  (b) Reachability is TOCTOU-only: `git apply --check` and the `git apply`
-            #      call use identical flags (`--recount --whitespace=nowarn`) and
-            #      equivalent logic on a static tree, so check-pass + apply-fail implies
-            #      a concurrent edit in the ms-window between the two subprocess calls.
-            #      Rare in practice (intra-process writes are serialized by the write
-            #      lock; only external/IPC-subagent edits can race it).
+        #      require SKIPPING `_rollback()` (mirroring Fix 2), not adding autostash.
+        #  (b) Reachability is TOCTOU-only: `git apply --check` and the `git apply`
+        #      call use identical flags (`--recount --whitespace=nowarn`) and
+        #      equivalent logic on a static tree, so check-pass + apply-fail implies
+        #      a concurrent edit in the ms-window between the two subprocess calls.
+        #      Rare in practice (intra-process writes are serialized by the write
+        #      lock; only external/IPC-subagent edits can race it).
         #  (c) Plain `git apply` (no --3way) is transactional on failure — it leaves the
         #      worktree UNMUTATED (verified: multi-file partial patches apply nothing) —
-            #      so `_rollback()` is effectively a no-op that guarantees a clean known
+        #      so `_rollback()` is effectively a no-op that guarantees a clean known
         #      state (asserted by test_rollback_on_failure: "file == original"). Skipping
         #      it would trade a rare TOCTOU WIP-loss for a rare corruption risk; not
         #      clearly better, hence the deliberate asymmetry. Do NOT "symmetrize" by
-            #      adding autostash — it is defeated by `_rollback()`.
+        #      adding autostash — it is defeated by `_rollback()`.
         if reason == REASON_CONFLICT and not skip_3way:
             ok, msg, r, d = _try_3way_fallback(repo, cleaned, touched_files, snapshot=rollback_snapshot)
             if ok:
@@ -1281,15 +1328,20 @@ def apply_patch(
         rollback_report = _rollback(repo, touched_files, snapshot=rollback_snapshot)
         _cleanup_reject_files(repo, touched_files)
         msg = (out2.strip() or "git apply failed") + _rollback_warning(rollback_report)
-        return False, msg, reason, {
-            "touched_files": touched_files,
-            "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out2))),
-            "rollback_performed": rollback_report["attempted"],
-            "rollback_verified": rollback_report["verified"],
-            "rollback_remaining_dirty": rollback_report["remaining_dirty"],
-            "used_strategy": "git-apply",
-            "execution_steps": execution_steps,
-        }
+        return (
+            False,
+            msg,
+            reason,
+            {
+                "touched_files": touched_files,
+                "failed_files": sorted(set(touched_files) | set(_extract_files_from_git_apply_output(out2))),
+                "rollback_performed": rollback_report["attempted"],
+                "rollback_verified": rollback_report["verified"],
+                "rollback_remaining_dirty": rollback_report["remaining_dirty"],
+                "used_strategy": "git-apply",
+                "execution_steps": execution_steps,
+            },
+        )
 
     # 3) Post-apply guard: python syntax check (py_compile) for touched .py files
     py_files = [p for p in (touched_files or []) if str(p).endswith(".py")]
@@ -1330,9 +1382,7 @@ def apply_patch(
                 indent_heal_enabled = os.environ.get("ASICODE_INDENT_HEAL") == "1"
                 healed = False
                 try:
-                    if indent_heal_enabled and (
-                        ("IndentationError" in (out3 or "")) or ("TabError" in (out3 or ""))
-                    ):
+                    if indent_heal_enabled and (("IndentationError" in (out3 or "")) or ("TabError" in (out3 or ""))):
 
                         def _indent_len(s: str) -> int:
                             """Return indentation width (tab=8)."""
@@ -1387,7 +1437,9 @@ def apply_patch(
                                     if file_lines[k].strip() == "":
                                         k += 1
                                         continue
-                                    if _indent_len(file_lines[k]) <= def_indent and _looks_like_toplevel_start(file_lines[k]):
+                                    if _indent_len(file_lines[k]) <= def_indent and _looks_like_toplevel_start(
+                                        file_lines[k]
+                                    ):
                                         break
                                     if _indent_len(file_lines[k]) <= def_indent:
                                         file_lines[k] = (" " * body_indent) + file_lines[k].lstrip(" ")
@@ -1409,15 +1461,20 @@ def apply_patch(
                         )
                         out_heal = (p2.stdout or b"").decode("utf-8", errors="replace")
                         if p2.returncode == 0:
-                            return True, "applied", REASON_OK, {
-                                "touched_files": touched_files,
-                                "failed_files": [],
-                                "rollback_performed": False,
-                                "used_strategy": "git-apply+pycompile-guard+indent-heal",
-                                "py_files": py_files,
-                                "pycompile_returncode": int(p2.returncode),
-                                "indent_heal_performed": True,
-                            }
+                            return (
+                                True,
+                                "applied",
+                                REASON_OK,
+                                {
+                                    "touched_files": touched_files,
+                                    "failed_files": [],
+                                    "rollback_performed": False,
+                                    "used_strategy": "git-apply+pycompile-guard+indent-heal",
+                                    "py_files": py_files,
+                                    "pycompile_returncode": int(p2.returncode),
+                                    "indent_heal_performed": True,
+                                },
+                            )
 
                         # Still failing: use latest output for excerpt below
                         out3 = out_heal
@@ -1458,7 +1515,7 @@ def apply_patch(
                             err["column"] = ln.index("^") + 1
                         break
 
-                m2 = re.search(r'(\w+(?:Error|Exception)):\s*(.+?)(?:\n|$)', raw)
+                m2 = re.search(r"(\w+(?:Error|Exception)):\s*(.+?)(?:\n|$)", raw)
                 if m2:
                     err["type"] = m2.group(1)
                     err["message"] = m2.group(2).strip()
@@ -1472,26 +1529,88 @@ def apply_patch(
                         fp = (repo / err["file"]).resolve()
                         if fp.exists() and fp.is_file():
                             lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
-                            L = int(err["line"])
-                            start = max(0, L - 4)
-                            end = min(len(lines), L + 3)
+                            _line_no = int(err["line"])
+                            start = max(0, _line_no - 4)
+                            end = min(len(lines), _line_no + 3)
                             out_lines = []
                             for i in range(start, end):
-                                marker = ">>>" if (i + 1) == L else "   "
-                                out_lines.append(f"{marker} {i+1:4d} | {lines[i]}")
+                                marker = ">>>" if (i + 1) == _line_no else "   "
+                                out_lines.append(f"{marker} {i + 1:4d} | {lines[i]}")
                             err["excerpt"] = "\n".join(out_lines)
                 except (OSError, ValueError) as e:
                     logger.debug("py_compile excerpt enrichment failed: %s", e)
 
-                execution_steps.append({
+                execution_steps.append(
+                    {
+                        "step": "pycompile",
+                        "status": "failed",
+                        "duration_ms": pyc_duration_ms,
+                        "checked_files": py_files,
+                        "error": err,
+                    }
+                )
+
+                return (
+                    False,
+                    msg_heal,
+                    "PYCOMPILE_FAILED",
+                    {
+                        "touched_files": touched_files,
+                        "failed_files": py_files,
+                        "rollback_performed": rollback_report["attempted"],
+                        "rollback_verified": rollback_report["verified"],
+                        "rollback_remaining_dirty": rollback_report["remaining_dirty"],
+                        "used_strategy": "git-apply+pycompile-guard",
+                        "py_files": py_files,
+                        "pycompile_returncode": int(p.returncode),
+                        "pycompile_output_excerpt": excerpt,
+                        "indent_heal_performed": bool(healed),
+                        "pycompile_error": err,
+                        "execution_steps": execution_steps,
+                    },
+                )
+
+            execution_steps.append(
+                {
                     "step": "pycompile",
-                    "status": "failed",
+                    "status": "ok",
                     "duration_ms": pyc_duration_ms,
                     "checked_files": py_files,
-                    "error": err,
-                })
+                }
+            )
+            return (
+                True,
+                "applied",
+                REASON_OK,
+                {
+                    "touched_files": touched_files,
+                    "failed_files": [],
+                    "rollback_performed": False,
+                    "used_strategy": "git-apply+pycompile-guard",
+                    "py_files": py_files,
+                    "pycompile_returncode": int(p.returncode),
+                    "execution_steps": execution_steps,
+                },
+            )
 
-                return False, msg_heal, "PYCOMPILE_FAILED", {
+        except Exception as e:
+            # Even if the guard itself crashes, we MUST rollback to preserve atomicity.
+            rollback_report = _rollback(repo, touched_files, snapshot=rollback_snapshot)
+            _cleanup_reject_files(repo, touched_files)
+            execution_steps.append(
+                {
+                    "step": "pycompile",
+                    "status": "failed",
+                    "duration_ms": 0,
+                    "checked_files": py_files,
+                    "error": {"type": type(e).__name__, "message": str(e)[:240]},
+                }
+            )
+            return (
+                False,
+                "py_compile failed" + _rollback_warning(rollback_report),
+                "PYCOMPILE_FAILED",
+                {
                     "touched_files": touched_files,
                     "failed_files": py_files,
                     "rollback_performed": rollback_report["attempted"],
@@ -1499,65 +1618,30 @@ def apply_patch(
                     "rollback_remaining_dirty": rollback_report["remaining_dirty"],
                     "used_strategy": "git-apply+pycompile-guard",
                     "py_files": py_files,
-                    "pycompile_returncode": int(p.returncode),
-                    "pycompile_output_excerpt": excerpt,
-                    "indent_heal_performed": bool(healed),
-                    "pycompile_error": err,
+                    "pycompile_returncode": -1,
+                    "pycompile_output_excerpt": f"exception:{type(e).__name__}:{str(e)[:240]}",
                     "execution_steps": execution_steps,
-                }
+                },
+            )
 
-            execution_steps.append({
-                "step": "pycompile",
-                "status": "ok",
-                "duration_ms": pyc_duration_ms,
-                "checked_files": py_files,
-            })
-            return True, "applied", REASON_OK, {
-                "touched_files": touched_files,
-                "failed_files": [],
-                "rollback_performed": False,
-                "used_strategy": "git-apply+pycompile-guard",
-                "py_files": py_files,
-                "pycompile_returncode": int(p.returncode),
-                "execution_steps": execution_steps,
-            }
-
-        except Exception as e:
-            # Even if the guard itself crashes, we MUST rollback to preserve atomicity.
-            rollback_report = _rollback(repo, touched_files, snapshot=rollback_snapshot)
-            _cleanup_reject_files(repo, touched_files)
-            execution_steps.append({
-                "step": "pycompile",
-                "status": "failed",
-                "duration_ms": 0,
-                "checked_files": py_files,
-                "error": {"type": type(e).__name__, "message": str(e)[:240]},
-            })
-            return False, "py_compile failed" + _rollback_warning(rollback_report), "PYCOMPILE_FAILED", {
-                "touched_files": touched_files,
-                "failed_files": py_files,
-                "rollback_performed": rollback_report["attempted"],
-                "rollback_verified": rollback_report["verified"],
-                "rollback_remaining_dirty": rollback_report["remaining_dirty"],
-                "used_strategy": "git-apply+pycompile-guard",
-                "py_files": py_files,
-                "pycompile_returncode": -1,
-                "pycompile_output_excerpt": f"exception:{type(e).__name__}:{str(e)[:240]}",
-                "execution_steps": execution_steps,
-            }
-
-    return True, "applied", REASON_OK, {
-        "touched_files": touched_files,
-        "failed_files": [],
-        "rollback_performed": False,
-        "used_strategy": "git-apply",
-        "execution_steps": execution_steps,
-    }
+    return (
+        True,
+        "applied",
+        REASON_OK,
+        {
+            "touched_files": touched_files,
+            "failed_files": [],
+            "rollback_performed": False,
+            "used_strategy": "git-apply",
+            "execution_steps": execution_steps,
+        },
+    )
 
 
 # =========================================================
 # Salvage: non-diff LLM outputs -> synthesize minimal diff
 # =========================================================
+
 
 def salvage_unified_diff_from_llm_output(
     llm_text: str,
@@ -1604,9 +1688,11 @@ def salvage_unified_diff_from_llm_output(
         return [b for b in blocks if b]
 
     code_blocks = _extract_fenced_code_blocks(text)
-    body = "\n\n".join(code_blocks).strip() if code_blocks else "\n".join(
-        [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
-    ).strip()
+    body = (
+        "\n\n".join(code_blocks).strip()
+        if code_blocks
+        else "\n".join([ln for ln in text.splitlines() if not ln.strip().startswith("```")]).strip()
+    )
 
     line = (insert_line_hint or "").strip().strip('"').strip("'")
     if not line:
@@ -1629,8 +1715,10 @@ def salvage_unified_diff_from_llm_output(
     if not line:
         return ""
 
-    rel = normalize_rel_path_fast(file_path_hint or "")
+    rel = normalize_rel_path(file_path_hint or "")
     return synthesize_append_line_unified_diff(repo_root or ".", rel, line) if rel else ""
+
+
 # autostash test
 # dirty-for-autostash
 # DIRTY_FOR_AUTOSTASH

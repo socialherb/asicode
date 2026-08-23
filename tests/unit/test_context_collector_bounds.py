@@ -16,6 +16,7 @@ P20-5: a byte-cap cut that splits a multi-byte char used to fail all 4 strict
 decodes and fall back to replace (4x slower + potential cp949/euc-kr mojibake).
 Fix: trim the incomplete trailing UTF-8 sequence before the strict ladder.
 """
+
 from __future__ import annotations
 
 import os
@@ -33,6 +34,7 @@ def _repo_with_files(tmp_path) -> Path:
 
 # ---------- P20-1: path containment ----------
 
+
 def test_snippet_rejects_dotdot_traversal(tmp_path):
     repo = _repo_with_files(tmp_path)
     outside = tmp_path / "SECRET.txt"
@@ -40,7 +42,8 @@ def test_snippet_rejects_dotdot_traversal(tmp_path):
     ctx, meta = cc.read_file_snippet_context(str(repo), "../SECRET.txt", around_regex="^")
     assert ctx == ""
     assert meta["included"] is False
-    assert meta["reason"] == "path_outside_repo"
+    assert meta["reason"] == "missing_args"  # SSOT rejects .. at normalize → reln empty
+    # (snippet path reports missing_args; shallow reports empty_target)
 
 
 def test_snippet_rejects_symlink_escape(tmp_path):
@@ -76,7 +79,7 @@ def test_collect_shallow_rejects_dotdot_traversal(tmp_path):
     outside.write_text("x = 1\n", encoding="utf-8")
     sel, meta = cc.collect_related_files_shallow(str(repo), "../SECRET.txt")
     assert sel == []
-    assert meta["reason"] == "path_outside_repo"
+    assert meta["reason"] == "empty_target"  # SSOT rejects .. at normalize; resolve never reached
 
 
 def test_collect_shallow_normal_path_ok(tmp_path):
@@ -97,6 +100,7 @@ def test_collect_shallow_rejects_symlink_escape(tmp_path):
 
 
 # ---------- P20-4: bounded reads ----------
+
 
 def _write_big(p: Path):
     p.write_bytes(b"x = 1\n" * 200_000)  # ~1.2 MiB — beyond the 1 MiB window
@@ -150,6 +154,7 @@ def test_read_text_best_effort_no_max_bytes_unchanged(tmp_path):
 
 
 # ---------- P20-5: UTF-8 safe cut ----------
+
 
 def test_read_text_best_effort_trims_incomplete_trailing_char(tmp_path):
     # 1 MiB boundary splits a 3-byte Korean char (1 MiB % 3 == 1): the strict

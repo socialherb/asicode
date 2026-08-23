@@ -9,6 +9,7 @@ Strategy:
 The execute() pipeline and _fallback_to_main_agent() were removed as dead
 code (R7) — delegate_single_task is the only live entry point.
 """
+
 from __future__ import annotations
 
 from unittest.mock import Mock
@@ -121,6 +122,7 @@ class TestOutputValidator:
         # same output text a second time just to re-derive the SyntaxError
         # object. ast.parse must run exactly once on the failing output.
         import ast
+
         calls = []
         orig_parse = ast.parse
 

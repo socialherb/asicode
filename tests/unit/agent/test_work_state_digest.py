@@ -163,9 +163,7 @@ class TestBuildWorkStateDigest:
         assert "read" in digest
 
     def test_read_symbol(self):
-        results = [
-            {"tool": "read_symbol", "args": {"name": "MyClass", "file_path": "models.py"}, "ok": True}
-        ]
+        results = [{"tool": "read_symbol", "args": {"name": "MyClass", "file_path": "models.py"}, "ok": True}]
         digest = build_work_state_digest(results)
         assert "models.py:MyClass" in digest
 
@@ -241,16 +239,18 @@ class TestBuildWorkStateDigest:
 
     def test_many_unique_reads_triggers_cap(self):
         """More than MAX_ITEMS_PER_SECTION unique entries → cap with overflow marker."""
-        results = [
-            {"tool": "read_file", "args": {"path": f"file_{i}.py"}, "ok": True}
-            for i in range(15)
-        ]
+        results = [{"tool": "read_file", "args": {"path": f"file_{i}.py"}, "ok": True} for i in range(15)]
         digest = build_work_state_digest(results)
         assert "(+5 more)" in digest  # 10 shown + "(+5 more)"
 
     def test_failure_section_with_excerpt(self):
         results = [
-            {"tool": "bash", "args": {"command": "failing_command"}, "ok": False, "content": "error: permission denied"},
+            {
+                "tool": "bash",
+                "args": {"command": "failing_command"},
+                "ok": False,
+                "content": "error: permission denied",
+            },
         ]
         digest = build_work_state_digest(results)
         assert "failed" in digest

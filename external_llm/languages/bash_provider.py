@@ -12,9 +12,8 @@ plain ``[A-Za-z_][\\w]*`` identifiers — no leading-dash rg shell-arg
 trap exists, so the fallback is safe and keeps symbol search working
 without the tree-sitter binding.
 """
-from __future__ import annotations
 
-from typing import Optional
+from __future__ import annotations
 
 from .base import SyntaxProvider, tree_sitter_syntax_fallback
 from .models import (
@@ -59,17 +58,21 @@ class BashSyntaxProvider(SyntaxProvider):
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
             # POSIX form: name() { ... }   (the { may sit on the next line)
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"\b{name}\s*\(\)\s*(?:\{|\n|$)",
-                description="Bash POSIX function definition (name())",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"\b{name}\s*\(\)\s*(?:\{|\n|$)",
+                    description="Bash POSIX function definition (name())",
+                )
+            )
             # C-style/Bash keyword form: function name { ... }
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"\bfunction\s+{name}\s*(?:\{|\n|$)",
-                description="Bash keyword function definition (function name)",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"\bfunction\s+{name}\s*(?:\{|\n|$)",
+                    description="Bash keyword function definition (function name)",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -81,17 +84,13 @@ class BashSyntaxProvider(SyntaxProvider):
         # see TestGrammarMapConsistency.test_provider_globs_cover_ext_map.
         return ["*.sh", "*.bash", "*.zsh", "*.ksh"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

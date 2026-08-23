@@ -34,6 +34,7 @@ Usage:
     python scripts/check_dead_params.py --write-baseline  # regen
     python scripts/check_dead_params.py <file>.py ...     # per-file
 """
+
 from __future__ import annotations
 
 import ast
@@ -44,10 +45,22 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "scripts" / "dead_params_baseline.txt"
 
-_SKIP_DIRS = frozenset({
-    "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules",
-    ".venv", "venv", "env", ".tox", "dist", "build", ".eggs", ".git",
-})
+_SKIP_DIRS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        ".git",
+    }
+)
 _SCAN_ROOTS = ("external_llm", "services", "webapp")
 
 _MIN_BODY_LINES = 4
@@ -59,11 +72,7 @@ def _should_skip(path: Path) -> bool:
 
 def _in_scope(rel: str) -> bool:
     p = Path(rel)
-    return (
-        p.suffix == ".py"
-        and not _should_skip(p)
-        and (p == Path("asi.py") or p.parts[0] in _SCAN_ROOTS)
-    )
+    return p.suffix == ".py" and not _should_skip(p) and (p == Path("asi.py") or p.parts[0] in _SCAN_ROOTS)
 
 
 class _UseCollector(ast.NodeVisitor):

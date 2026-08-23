@@ -15,11 +15,13 @@ are the branch/edge machinery of the collector itself:
 - read_file_snippet_context: missing_args / read_error / invalid regex /
   regex-not-found fallback / byte-truncated body marker
 """
+
 from __future__ import annotations
 
 import context_collector as cc
 
 # ---------- decode / truncate hardening ----------
+
 
 def test_decode_all_strict_decodes_fail_falls_back_to_replace():
     # \xfe\xff is invalid in utf-8/utf-8-sig AND in cp949/euc-kr (bad trail).
@@ -42,13 +44,10 @@ def test_truncate_utf8_mid_multibyte_cut_is_char_safe():
 
 # ---------- python import parsing ----------
 
+
 def test_parse_python_from_import_and_relative_resolution():
     mods = cc._parse_python_imports(
-        "from os import path\n"
-        "from .pkg import x\n"
-        "from ..lib import y\n"
-        "from . import z\n"
-        "import a, b.c as cc2\n",
+        "from os import path\nfrom .pkg import x\nfrom ..lib import y\nfrom . import z\nimport a, b.c as cc2\n",
         "src/mods/app.py",
     )
     assert mods == ["os", "src.mods.pkg", "src.lib", "src.mods", "a", "b.c"]
@@ -79,6 +78,7 @@ def test_module_to_repo_paths_resolves_real_files(tmp_path):
 
 
 # ---------- kotlin symbol machinery ----------
+
 
 def test_parse_kotlin_import_symbols():
     syms = cc._parse_kotlin_import_symbols(
@@ -112,6 +112,7 @@ def test_find_kotlin_files_for_symbol_empty_and_no_match(tmp_path):
 
 
 # ---------- collect_related_files_shallow edge states ----------
+
 
 def test_collect_no_target():
     sel, meta = cc.collect_related_files_shallow("", "app.py")
@@ -195,6 +196,7 @@ def test_collect_kotlin_selection_cap_break(tmp_path, monkeypatch):
 
 
 # ---------- read_file_snippet_context edge states ----------
+
 
 def test_snippet_missing_args(tmp_path):
     repo = tmp_path / "repo"

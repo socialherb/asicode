@@ -1,6 +1,7 @@
 """
 Google (Gemini), DeepSeek, and Ollama clients for asicode
 """
+
 from __future__ import annotations
 
 import json as _json
@@ -8,7 +9,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -46,8 +47,11 @@ def _safe_callback(cb, *args):
         cb(*args)
     except Exception as _exc:
         logger.debug(
-            "streaming callback %r failed: %s", getattr(cb, "__name__", cb), _exc,
+            "streaming callback %r failed: %s",
+            getattr(cb, "__name__", cb),
+            _exc,
         )
+
 
 _num_ctx_overshoot_warned: set[tuple[str, int]] = set()
 """Tracks (model, cap) pairs that have already logged the overshoot warning
@@ -66,7 +70,8 @@ _GEMINI_FINISH_REASON_MAP: dict[str, str] = {
     "OTHER": "stop",
 }
 
-def _normalize_gemini_finish_reason(raw: Optional[str]) -> Optional[str]:
+
+def _normalize_gemini_finish_reason(raw: str | None) -> str | None:
     """Map Gemini UPPERCASE finishReason to the lowercase OpenAI convention.
 
     All consumers (agent_loop, intent_resolver, agent_phase_manager) check for
@@ -80,7 +85,8 @@ def _normalize_gemini_finish_reason(raw: Optional[str]) -> Optional[str]:
 
 # ── Ollama vision helpers ─────────────────────────────────────────────────────
 
-def _is_ollama_vision_model(model: str, base_url_hint: Optional[str] = None) -> bool:
+
+def _is_ollama_vision_model(model: str, base_url_hint: str | None = None) -> bool:
     """Return True if the model name suggests multimodal (vision) support.
 
     ``base_url_hint`` is forwarded to the runtime capability slow path
@@ -88,6 +94,7 @@ def _is_ollama_vision_model(model: str, base_url_hint: Optional[str] = None) -> 
     what ``_num_ctx_for_model`` already does for num_ctx.
     """
     from external_llm.model_registry import ollama_vision
+
     return ollama_vision(model, base_url_hint=base_url_hint)
 
 
@@ -116,8 +123,7 @@ def _is_gpt_oss(model: str) -> bool:
     return "gpt-oss" in (model or "").lower()
 
 
-def _ollama_think_value(model: str, thinking_mode: Optional[bool],
-                        reasoning_effort: Optional[str] = None) -> Any:
+def _ollama_think_value(model: str, thinking_mode: bool | None, reasoning_effort: str | None = None) -> Any:
     """Compute the 'think' value for Ollama API.
 
     GPT-OSS requires string levels ('low'|'medium'|'high') instead of boolean.
@@ -158,7 +164,7 @@ def _normalize_ollama_system_messages(messages: list[dict[str, Any]]) -> list[di
     """
     system_parts: list[str] = []
     rest: list[dict[str, Any]] = []
-    first_sys: Optional[dict[str, Any]] = None
+    first_sys: dict[str, Any] | None = None
     sys_count = 0
     for m in messages:
         if m.get("role") == "system":
@@ -178,9 +184,7 @@ def _normalize_ollama_system_messages(messages: list[dict[str, Any]]) -> list[di
     merged: dict[str, Any] = {"role": "system", "content": "\n".join(system_parts)}
     # Preserve non-payload keys (e.g. 'images') from the first system message.
     if first_sys:
-        merged.update(
-            {k: v for k, v in first_sys.items() if k not in ("role", "content")}
-        )
+        merged.update({k: v for k, v in first_sys.items() if k not in ("role", "content")})
     return [merged, *rest]
 
 
@@ -204,7 +208,7 @@ _OCR_RESOLVED_LANG: str | None = None
 # cache closes that gap for the process lifetime: identical base64 always
 # short-circuits before pytesseract.  Bounded by ``_OCR_TEXT_CACHE_MAX``;
 # ``None``-valued failures are cached too (a textless image must not re-run).
-_OCR_TEXT_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_OCR_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
 _OCR_TEXT_CACHE_MAX = 128
 
 
@@ -341,11 +345,7 @@ def _detect_image_ocr_lang(b64_data: str) -> tuple:
                 # traineddata is an expected, recoverable condition.
                 logger.debug("OCR lang pack %r unavailable, skipping", lang, exc_info=True)
                 continue
-            texts = [
-                (data["text"][i] or "").strip()
-                for i in range(len(data["text"]))
-                if int(data["conf"][i]) >= 20
-            ]
+            texts = [(data["text"][i] or "").strip() for i in range(len(data["text"])) if int(data["conf"][i]) >= 20]
             joined = " ".join(texts).strip()
             if joined:
                 _OCR_RESOLVED_LANG = lang  # cache winner for the next image
@@ -380,7 +380,7 @@ def _try_ocr_base64(b64_data: str) -> str:
 
     def _compute() -> str:
         _lang, img_w, img_h, data = _detect_image_ocr_lang(b64_data)
-        if data is None or not data.get('text'):
+        if data is None or not data.get("text"):
             return ""
 
         # Collect words with sufficient confidence
@@ -390,13 +390,15 @@ def _try_ocr_base64(b64_data: str) -> str:
             conf = int(data["conf"][i])
             if not text or conf < 20:
                 continue
-            words.append({
-                "text": text,
-                "x": data["left"][i],
-                "y": data["top"][i],
-                "w": data["width"][i],
-                "h": data["height"][i],
-            })
+            words.append(
+                {
+                    "text": text,
+                    "x": data["left"][i],
+                    "y": data["top"][i],
+                    "w": data["width"][i],
+                    "h": data["height"][i],
+                }
+            )
 
         # No `if not words: return ""` guard here: `_detect_image_ocr_lang` only
         # returns non-None data when at least one word passed the identical
@@ -438,7 +440,6 @@ def _try_ocr_base64(b64_data: str) -> str:
         return "\n".join(result)
 
     return _cached_ocr_text(b64_data, _compute)
-
 
 
 def _images_to_text(images: list[dict[str, str]]) -> str:
@@ -503,7 +504,7 @@ def _count_delimiters(s: str) -> dict[str, int]:
         "close_square": 0,
     }
     in_str = False
-    str_char: Optional[str] = None
+    str_char: str | None = None
     escaped = False
     for ch in s:
         if in_str:
@@ -551,8 +552,8 @@ class GoogleClient(LLMClient):
     @staticmethod
     def _build_gemini_thinking_config(
         model: str,
-        thinking_mode: Optional[bool],
-        reasoning_effort: Optional[str],
+        thinking_mode: bool | None,
+        reasoning_effort: str | None,
     ) -> dict[str, Any]:
         """Build Gemini thinkingConfig dict based on model version and thinking_mode.
 
@@ -581,8 +582,8 @@ class GoogleClient(LLMClient):
         messages: list[LLMMessage],
         model: str = "",
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         """
         Send request to Google Gemini
@@ -598,7 +599,7 @@ class GoogleClient(LLMClient):
         headers = {"Content-Type": "application/json"}
 
         # Convert to Gemini format
-        contents = []
+        contents: list[dict[str, Any]] = []
         system_instruction = None
 
         for msg in messages:
@@ -610,12 +611,15 @@ class GoogleClient(LLMClient):
                 images = getattr(msg, "images", None)
                 if images:
                     parts: list[dict[str, Any]] = [{"text": msg.content or ""}]
-                    parts.extend({
+                    parts.extend(
+                        {
                             "inlineData": {
                                 "mimeType": img.get("media_type", "image/png"),
                                 "data": img.get("data", ""),
                             }
-                        } for img in images)
+                        }
+                        for img in images
+                    )
                     contents.append({"role": role, "parts": parts})
                 else:
                     contents.append({"role": role, "parts": [{"text": msg.content}]})
@@ -650,20 +654,14 @@ class GoogleClient(LLMClient):
         t0 = time.monotonic()
 
         try:
-            response = self._session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=self.timeout
-            )
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
             if response.status_code in {401, 403}:
                 logger.error("Google API authentication failed (%d)", response.status_code)
                 raise LLMAuthenticationError(
-                    "Invalid Google API key. "
-                    "Please check your GOOGLE_API_KEY environment variable."
+                    "Invalid Google API key. Please check your GOOGLE_API_KEY environment variable."
                 )
 
             if response.status_code == 429:
@@ -676,31 +674,17 @@ class GoogleClient(LLMClient):
             if response.status_code == 402:
                 error_body = response.text[:500]
                 logger.error("Google API quota exceeded (402): %s", error_body)
-                raise LLMQuotaExceededError(
-                    f"Google API quota exceeded (HTTP 402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Google API quota exceeded (HTTP 402): {error_body}")
 
-            if response.status_code == 503 or (
-                response.status_code >= 500 and response.status_code != 501
-            ):
+            if response.status_code == 503 or (response.status_code >= 500 and response.status_code != 501):
                 error_body = response.text[:500]
-                logger.error(
-                    "Google API error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMServerUnavailableError(
-                    f"Google API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.error("Google API error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMServerUnavailableError(f"Google API returned HTTP {response.status_code}: {error_body}")
 
             if response.status_code != 200:
                 error_body = response.text[:500]
-                logger.error(
-                    "Google API error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMAPIError(
-                    f"Google API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.error("Google API error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMAPIError(f"Google API returned HTTP {response.status_code}: {error_body}")
 
             data = response.json()
 
@@ -708,12 +692,7 @@ class GoogleClient(LLMClient):
             candidates = data.get("candidates", [])
             if not candidates:
                 logger.warning("Google response has no candidates")
-                return LLMResponse(
-                    content="",
-                    model=model,
-                    provider=self.get_provider_name(),
-                    raw_response=data
-                )
+                return LLMResponse(content="", model=model, provider=self.get_provider_name(), raw_response=data)
 
             candidate = candidates[0]
             content_data = candidate.get("content", {})
@@ -729,10 +708,7 @@ class GoogleClient(LLMClient):
             usage_metadata = data.get("usageMetadata", {})
             tokens_used = usage_metadata.get("totalTokenCount")
 
-            logger.info(
-                "Google %s: %.0fms, tok=%s, finish_reason=%s",
-                model, elapsed_ms, tokens_used, finish_reason
-            )
+            logger.info("Google %s: %.0fms, tok=%s, finish_reason=%s", model, elapsed_ms, tokens_used, finish_reason)
 
             return LLMResponse(
                 content=content,
@@ -740,32 +716,23 @@ class GoogleClient(LLMClient):
                 provider=self.get_provider_name(),
                 tokens_used=tokens_used,
                 finish_reason=finish_reason,
-                raw_response=data
+                raw_response=data,
             )
 
         except requests.ConnectionError as e:
             logger.exception("Cannot connect to Google API: %s", e)
-            raise LLMConnectionError(
-                "Cannot connect to Google API. "
-                "Please check your internet connection."
-            ) from e
+            raise LLMConnectionError("Cannot connect to Google API. Please check your internet connection.") from e
 
         except requests.Timeout as e:
             logger.exception("Google request timed out after %ds", self.timeout)
-            raise LLMConnectionError(
-                f"Google request timed out after {self.timeout}s"
-            ) from e
+            raise LLMConnectionError(f"Google request timed out after {self.timeout}s") from e
 
         except requests.RequestException as e:
             logger.exception("Google request failed: %s", e)
             raise LLMAPIError(f"Google request failed: {e}") from e
 
     def chat_with_tools(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]],
-        model: str = "",
-        **kwargs
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
     ) -> ToolCallResponse:
         """
         Send request to Google Gemini with function calling support.
@@ -780,7 +747,7 @@ class GoogleClient(LLMClient):
         url = f"{base_url.rstrip('/')}/models/{model}:generateContent?key={self.api_key}"
         headers = {"Content-Type": "application/json"}
 
-        contents = []
+        contents: list[dict[str, Any]] = []
         system_instruction = None
         for msg in messages:
             if msg.role == "system":
@@ -788,10 +755,12 @@ class GoogleClient(LLMClient):
             elif msg.role == "tool":
                 # Single tool result: wrap in functionResponse part
                 tool_name = getattr(msg, "name", "") or ""
-                contents.append({
-                    "role": "user",
-                    "parts": [{"functionResponse": {"name": tool_name, "response": {"content": msg.content}}}],
-                })
+                contents.append(
+                    {
+                        "role": "user",
+                        "parts": [{"functionResponse": {"name": tool_name, "response": {"content": msg.content}}}],
+                    }
+                )
             else:
                 role = "model" if msg.role == "assistant" else "user"
                 raw_content = getattr(msg, "raw_content", None)
@@ -805,7 +774,10 @@ class GoogleClient(LLMClient):
                     # and the streaming path. image_utils normally fills
                     # both keys, but a malformed/foreign image dict must not
                     # KeyError here; it degrades to image/png + "" instead.
-                    parts = [{"inlineData": {"mimeType": img.get("media_type", "image/png"), "data": img.get("data", "")}} for img in images]
+                    parts: list[dict[str, Any]] = [
+                        {"inlineData": {"mimeType": img.get("media_type", "image/png"), "data": img.get("data", "")}}
+                        for img in images
+                    ]
                     parts.append({"text": msg.content})
                     contents.append({"role": role, "parts": parts})
                 else:
@@ -817,11 +789,13 @@ class GoogleClient(LLMClient):
             function_declarations = []
             for t in tools:
                 params = t.get("parameters", {})
-                function_declarations.append({
-                    "name": t["name"],
-                    "description": t.get("description", ""),
-                    "parameters": params,
-                })
+                function_declarations.append(
+                    {
+                        "name": t["name"],
+                        "description": t.get("description", ""),
+                        "parameters": params,
+                    }
+                )
             gemini_tools = [{"functionDeclarations": function_declarations}]
 
         # Consume non-serializable kwargs
@@ -856,7 +830,11 @@ class GoogleClient(LLMClient):
         if token_callback:
             stream_url = f"{base_url.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse&key={self.api_key}"
             return self._chat_with_tools_streaming_gemini(
-                stream_url, headers, payload, model, token_callback,
+                stream_url,
+                headers,
+                payload,
+                model,
+                token_callback,
             )
 
         t0 = time.monotonic()
@@ -873,14 +851,10 @@ class GoogleClient(LLMClient):
                 )
             if response.status_code == 402:
                 error_body = response.text[:500]
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (HTTP 402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (HTTP 402): {error_body}")
             if response.status_code >= 500:
                 error_body = response.text[:500]
-                raise LLMServerUnavailableError(
-                    f"Google API server error (HTTP {response.status_code}): {error_body}"
-                )
+                raise LLMServerUnavailableError(f"Google API server error (HTTP {response.status_code}): {error_body}")
             if response.status_code != 200:
                 error_body = response.text[:500]
                 raise LLMAPIError(f"Google API returned HTTP {response.status_code}: {error_body}")
@@ -889,8 +863,12 @@ class GoogleClient(LLMClient):
             candidates = data.get("candidates", [])
             if not candidates:
                 return ToolCallResponse(
-                    content="", model=model, provider=self.get_provider_name(),
-                    raw_response=data, tool_calls=[], is_final=True,
+                    content="",
+                    model=model,
+                    provider=self.get_provider_name(),
+                    raw_response=data,
+                    tool_calls=[],
+                    is_final=True,
                 )
 
             candidate = candidates[0]
@@ -910,16 +888,22 @@ class GoogleClient(LLMClient):
                     text_content += part["text"]
                 elif "functionCall" in part:
                     fc = part["functionCall"]
-                    tool_calls.append(ToolCallRequest(
-                        call_id=f"gemini_{len(tool_calls)}",
-                        name=fc.get("name", ""),
-                        args=fc.get("args", {}),
-                    ))
+                    tool_calls.append(
+                        ToolCallRequest(
+                            call_id=f"gemini_{len(tool_calls)}",
+                            name=fc.get("name", ""),
+                            args=fc.get("args", {}),
+                        )
+                    )
 
             is_final = not tool_calls
             logger.info(
                 "Google %s (tools): %.0fms, tok=%s, finish=%s (%d)",
-                model, elapsed_ms, tokens_used, finish_reason, len(tool_calls),
+                model,
+                elapsed_ms,
+                tokens_used,
+                finish_reason,
+                len(tool_calls),
             )
             return ToolCallResponse(
                 content=text_content,
@@ -958,8 +942,11 @@ class GoogleClient(LLMClient):
         t0 = time.monotonic()
         try:
             response = self._session.post(
-                url, headers=headers, json=payload,
-                timeout=self.timeout, stream=True,
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+                stream=True,
             )
         except requests.ConnectionError as e:
             raise LLMConnectionError("Cannot connect to Google API.") from e
@@ -976,9 +963,7 @@ class GoogleClient(LLMClient):
                 )
             if response.status_code == 402:
                 error_body = response.text[:500]
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (HTTP 402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (HTTP 402): {error_body}")
             if response.status_code >= 500:
                 raise LLMServerUnavailableError(
                     f"Google API server error (HTTP {response.status_code}): {response.text[:500]}"
@@ -995,7 +980,6 @@ class GoogleClient(LLMClient):
 
             try:
                 for ev in guard_sse_iteration(iter_sse_data_events(response)):
-
                     candidates = ev.get("candidates", [])
                     if candidates:
                         candidate = candidates[0]
@@ -1009,11 +993,13 @@ class GoogleClient(LLMClient):
                                     _safe_callback(token_callback, chunk)
                             elif "functionCall" in part:
                                 fc = part["functionCall"]
-                                tool_calls.append(ToolCallRequest(
-                                    call_id=f"gemini_{len(tool_calls)}",
-                                    name=fc.get("name", ""),
-                                    args=fc.get("args", {}),
-                                ))
+                                tool_calls.append(
+                                    ToolCallRequest(
+                                        call_id=f"gemini_{len(tool_calls)}",
+                                        name=fc.get("name", ""),
+                                        args=fc.get("args", {}),
+                                    )
+                                )
 
                     usage = ev.get("usageMetadata", {})
                     if usage:
@@ -1021,11 +1007,8 @@ class GoogleClient(LLMClient):
                         completion_tokens = usage.get("candidatesTokenCount") or completion_tokens
                         tokens_used = usage.get("totalTokenCount") or tokens_used
 
-            except (requests.ConnectionError, requests.Timeout,
-                    requests.exceptions.ChunkedEncodingError) as e:
-                raise LLMServerUnavailableError(
-                    f"Google streaming request interrupted: {e}"
-                ) from e
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+                raise LLMServerUnavailableError(f"Google streaming request interrupted: {e}") from e
             except requests.RequestException as e:
                 raise LLMAPIError(f"Google streaming request failed: {e}") from e
             except LLMClientError:
@@ -1039,7 +1022,11 @@ class GoogleClient(LLMClient):
             is_final = not tool_calls
             logger.info(
                 "Google %s (tools): %.0fms, tok=%s, finish=%s (%d)",
-                model, elapsed_ms, tokens_used, finish_reason, len(tool_calls),
+                model,
+                elapsed_ms,
+                tokens_used,
+                finish_reason,
+                len(tool_calls),
             )
             return ToolCallResponse(
                 content=text_content,
@@ -1073,14 +1060,14 @@ def _deepseek_non_stream_events(response: Any) -> Iterator[dict[str, Any]]:
         delta["reasoning_content"] = _message["reasoning_content"]
     if _message.get("tool_calls"):
         # Final-form tool_calls → index-based deltas understood by the loop.
-        delta["tool_calls"] = [
-            {"index": i, **tc} for i, tc in enumerate(_message["tool_calls"])
-        ]
+        delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(_message["tool_calls"])]
     chunk: dict[str, Any] = {
-        "choices": [{
-            "delta": delta,
-            "finish_reason": _choice.get("finish_reason"),
-        }],
+        "choices": [
+            {
+                "delta": delta,
+                "finish_reason": _choice.get("finish_reason"),
+            }
+        ],
     }
     if data.get("usage"):
         chunk["usage"] = data["usage"]
@@ -1105,8 +1092,8 @@ class DeepSeekClient(LLMClient):
         messages: list[LLMMessage],
         model: str = "",
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         """
         Send chat completion request to DeepSeek
@@ -1119,20 +1106,17 @@ class DeepSeekClient(LLMClient):
         base_url = self.base_url or self.DEFAULT_BASE_URL
         url = f"{base_url.rstrip('/')}/chat/completions"
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
         # Convert to DeepSeek format (same as OpenAI)
         is_reasoner = "reasoner" in (model or "").lower()
-        api_messages = []
+        api_messages: list[dict[str, Any]] = []
         for msg in messages:
             images = getattr(msg, "images", None)
             content = msg.content
             if images:
                 content = _images_to_text(images) + ("\n" + content if content else "")
-            d = {"role": msg.role, "content": content}
+            d: dict[str, Any] = {"role": msg.role, "content": content}
             # DeepSeek Reasoner: reasoning_content is REQUIRED on all assistant messages
             if msg.role == "assistant":
                 rc = getattr(msg, "reasoning_content", None) or ""
@@ -1152,11 +1136,13 @@ class DeepSeekClient(LLMClient):
         # thinking_mode → reasoning suppression (shared logic with reasoning_ab_kwargs)
         _thinking_mode = kwargs.pop("thinking_mode", None)
         _reasoning_effort = kwargs.pop("reasoning_effort", None)
-        _NON_SERIALIZABLE_KEYS = {
-            "reasoning_callback", "think", "token_callback",
+        _non_serializable_keys = {
+            "reasoning_callback",
+            "think",
+            "token_callback",
             "cache_breakpoint_offset",  # Internal cache control key — DeepSeek uses automatic prefix caching, so payload serialization is forbidden (same as OpenAI client)
         }
-        payload.update({k: v for k, v in kwargs.items() if k not in _NON_SERIALIZABLE_KEYS})
+        payload.update({k: v for k, v in kwargs.items() if k not in _non_serializable_keys})
         if _thinking_mode is not None and not _thinking_mode:
             payload["thinking"] = {"type": "disabled"}
         elif _thinking_mode:
@@ -1174,19 +1160,18 @@ class DeepSeekClient(LLMClient):
         _reasoning_cb = kwargs.get("reasoning_callback")
         if _token_cb or _reasoning_cb:
             return self._chat_streaming(
-                url, headers, payload, model,
-                token_callback=_token_cb, reasoning_callback=_reasoning_cb,
+                url,
+                headers,
+                payload,
+                model,
+                token_callback=_token_cb,
+                reasoning_callback=_reasoning_cb,
             )
 
         t0 = time.monotonic()
 
         try:
-            response = self._session.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=self.timeout
-            )
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -1194,16 +1179,13 @@ class DeepSeekClient(LLMClient):
                 err_label = "authentication" if response.status_code == 401 else "forbidden"
                 logger.error("DeepSeek %s failed (%d)", err_label, response.status_code)
                 raise LLMAuthenticationError(
-                    "Invalid DeepSeek API key. "
-                    "Please check your DEEPSEEK_API_KEY environment variable."
+                    "Invalid DeepSeek API key. Please check your DEEPSEEK_API_KEY environment variable."
                 )
 
             if response.status_code == 402:
                 error_body = response.text[:500]
                 logger.error("DeepSeek quota exceeded (402): %s", error_body)
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (HTTP 402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (HTTP 402): {error_body}")
 
             if response.status_code == 429:
                 logger.error("DeepSeek rate limit exceeded (429)")
@@ -1212,27 +1194,15 @@ class DeepSeekClient(LLMClient):
                     retry_after=parse_retry_after(response.headers),
                 )
 
-            if response.status_code == 503 or (
-                response.status_code >= 500 and response.status_code != 501
-            ):
+            if response.status_code == 503 or (response.status_code >= 500 and response.status_code != 501):
                 error_body = response.text[:500]
-                logger.error(
-                    "DeepSeek API error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMServerUnavailableError(
-                    f"DeepSeek API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.error("DeepSeek API error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMServerUnavailableError(f"DeepSeek API returned HTTP {response.status_code}: {error_body}")
 
             if response.status_code != 200:
                 error_body = response.text[:500]
-                logger.error(
-                    "DeepSeek API error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMAPIError(
-                    f"DeepSeek API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.error("DeepSeek API error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMAPIError(f"DeepSeek API returned HTTP {response.status_code}: {error_body}")
 
             data = response.json()
 
@@ -1240,12 +1210,7 @@ class DeepSeekClient(LLMClient):
             choices = data.get("choices", [])
             if not choices:
                 logger.warning("DeepSeek response has no choices")
-                return LLMResponse(
-                    content="",
-                    model=model,
-                    provider=self.get_provider_name(),
-                    raw_response=data
-                )
+                return LLMResponse(content="", model=model, provider=self.get_provider_name(), raw_response=data)
 
             choice = choices[0]
             message = choice.get("message", {})
@@ -1262,14 +1227,17 @@ class DeepSeekClient(LLMClient):
             _prompt_tokens = usage.get("prompt_tokens")
             _completion_tokens = usage.get("completion_tokens")
             _cache_read = usage.get("prompt_cache_hit_tokens")
-            _reasoning_tokens = (
-                (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-            )
+            _reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
 
             logger.info(
                 "DeepSeek %s: %.0fms, tok=%s, completion=%s, reasoning=%s, cache_read=%s, finish_reason=%s",
-                model, elapsed_ms, tokens_used, _completion_tokens,
-                _reasoning_tokens, _cache_read, finish_reason
+                model,
+                elapsed_ms,
+                tokens_used,
+                _completion_tokens,
+                _reasoning_tokens,
+                _cache_read,
+                finish_reason,
             )
 
             return LLMResponse(
@@ -1288,15 +1256,12 @@ class DeepSeekClient(LLMClient):
         except requests.ConnectionError as e:
             logger.exception("Cannot connect to DeepSeek API: %s", e)
             raise LLMServerUnavailableError(
-                "Cannot connect to DeepSeek API. "
-                "Please check your internet connection."
+                "Cannot connect to DeepSeek API. Please check your internet connection."
             ) from e
 
         except requests.Timeout as e:
             logger.exception("DeepSeek request timed out after %ds", self.timeout)
-            raise LLMServerUnavailableError(
-                f"DeepSeek request timed out after {self.timeout}s"
-            ) from e
+            raise LLMServerUnavailableError(f"DeepSeek request timed out after {self.timeout}s") from e
 
         except requests.RequestException as e:
             logger.exception("DeepSeek request failed: %s", e)
@@ -1324,9 +1289,7 @@ class DeepSeekClient(LLMClient):
         t0 = time.monotonic()
         response = None
         try:
-            response = self._session.post(
-                url, headers=headers, json=payload, timeout=self.timeout, stream=True
-            )
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout, stream=True)
 
             if response.status_code in (401, 403):
                 err_label = "authentication" if response.status_code == 401 else "forbidden"
@@ -1335,29 +1298,21 @@ class DeepSeekClient(LLMClient):
             if response.status_code == 402:
                 error_body = response.text[:500]
                 logger.error("DeepSeek quota exceeded (402): %s", error_body)
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (HTTP 402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (HTTP 402): {error_body}")
             if response.status_code == 429:
                 logger.error("DeepSeek rate limit exceeded (429)")
                 raise LLMRateLimitError(
                     "DeepSeek rate limit exceeded. Please try again later.",
                     retry_after=parse_retry_after(response.headers),
                 )
-            if response.status_code == 503 or (
-                response.status_code >= 500 and response.status_code != 501
-            ):
+            if response.status_code == 503 or (response.status_code >= 500 and response.status_code != 501):
                 error_body = response.text[:500]
                 logger.error("DeepSeek API error %d: %s", response.status_code, error_body)
-                raise LLMServerUnavailableError(
-                    f"DeepSeek API returned HTTP {response.status_code}: {error_body}"
-                )
+                raise LLMServerUnavailableError(f"DeepSeek API returned HTTP {response.status_code}: {error_body}")
             if response.status_code != 200:
                 error_body = response.text[:500]
                 logger.error("DeepSeek API error %d: %s", response.status_code, error_body)
-                raise LLMAPIError(
-                    f"DeepSeek API returned HTTP {response.status_code}: {error_body}"
-                )
+                raise LLMAPIError(f"DeepSeek API returned HTTP {response.status_code}: {error_body}")
 
             full_content = ""
             reasoning_parts: list[str] = []
@@ -1365,7 +1320,6 @@ class DeepSeekClient(LLMClient):
             usage: dict[str, Any] = {}
 
             for chunk in guard_sse_iteration(iter_sse_data_events(response)):
-
                 choices = chunk.get("choices", [])
                 if not choices:
                     _usage = chunk.get("usage")
@@ -1398,13 +1352,19 @@ class DeepSeekClient(LLMClient):
             _cache_read = usage.get("prompt_cache_hit_tokens")
             _reasoning_tokens = (
                 (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-                if isinstance(usage, dict) else None
+                if isinstance(usage, dict)
+                else None
             )
 
             logger.info(
                 "DeepSeek %s (stream): %.0fms, tok=%s, completion=%s, reasoning=%s, cache_read=%s, finish_reason=%s",
-                model, elapsed_ms, tokens_used, _completion_tokens,
-                _reasoning_tokens, _cache_read, finish_reason
+                model,
+                elapsed_ms,
+                tokens_used,
+                _completion_tokens,
+                _reasoning_tokens,
+                _cache_read,
+                finish_reason,
             )
 
             # Reconstruct a non-streaming-style raw_response so reasoning_content
@@ -1438,14 +1398,10 @@ class DeepSeekClient(LLMClient):
             ) from e
         except requests.Timeout as e:
             logger.exception("DeepSeek stream timed out after %ds", self.timeout)
-            raise LLMServerUnavailableError(
-                f"DeepSeek request timed out after {self.timeout}s"
-            ) from e
+            raise LLMServerUnavailableError(f"DeepSeek request timed out after {self.timeout}s") from e
         except requests.exceptions.ChunkedEncodingError as e:
             logger.exception("DeepSeek stream interrupted: %s", e)
-            raise LLMServerUnavailableError(
-                f"DeepSeek stream interrupted: {e}"
-            ) from e
+            raise LLMServerUnavailableError(f"DeepSeek stream interrupted: {e}") from e
         except requests.RequestException as e:
             logger.exception("DeepSeek stream request failed: %s", e)
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
@@ -1458,11 +1414,7 @@ class DeepSeekClient(LLMClient):
                 response.close()
 
     def chat_with_tools(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]],
-        model: str = "",
-        **kwargs
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
     ) -> ToolCallResponse:
         """
         Send chat completion request to DeepSeek with tool calling support.
@@ -1481,13 +1433,13 @@ class DeepSeekClient(LLMClient):
 
         is_reasoner = "reasoner" in (model or "").lower()
 
-        api_messages = []
+        api_messages: list[dict[str, Any]] = []
         for m in messages:
             images = getattr(m, "images", None)
             content = m.content
             if images:
                 content = _images_to_text(images) + ("\n" + content if content else "")
-            d = {"role": m.role, "content": content}
+            d: dict[str, Any] = {"role": m.role, "content": content}
             if m.role == "assistant" and getattr(m, "tool_calls", None):
                 d["tool_calls"] = m.tool_calls
                 if d.get("content") is None:
@@ -1528,11 +1480,13 @@ class DeepSeekClient(LLMClient):
         # thinking_mode → reasoning suppression (shared logic with reasoning_ab_kwargs)
         _thinking_mode = kwargs.pop("thinking_mode", None)
         _reasoning_effort = kwargs.pop("reasoning_effort", None)
-        _NON_SERIALIZABLE_KEYS = {
-            "reasoning_callback", "think", "token_callback",
+        _non_serializable_keys = {
+            "reasoning_callback",
+            "think",
+            "token_callback",
             "cache_breakpoint_offset",  # Internal cache control key — DeepSeek uses automatic prefix caching, so payload serialization is forbidden (same as OpenAI client)
         }
-        payload.update({k: v for k, v in kwargs.items() if k not in _NON_SERIALIZABLE_KEYS})
+        payload.update({k: v for k, v in kwargs.items() if k not in _non_serializable_keys})
         if _thinking_mode is not None and not _thinking_mode:
             payload["thinking"] = {"type": "disabled"}
         elif _thinking_mode:
@@ -1547,9 +1501,7 @@ class DeepSeekClient(LLMClient):
         # callers (e.g. intent_resolver) otherwise pay SSE parsing overhead
         # and the streaming failure surface for a single-shot JSON response.
         # Placed AFTER payload.update(kwargs) so the gate always wins.
-        use_stream = callable(kwargs.get("token_callback")) or callable(
-            kwargs.get("reasoning_callback")
-        )
+        use_stream = callable(kwargs.get("token_callback")) or callable(kwargs.get("reasoning_callback"))
         if use_stream:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
@@ -1563,9 +1515,7 @@ class DeepSeekClient(LLMClient):
                 raise LLMAuthenticationError("Invalid DeepSeek API key.")
             if response.status_code == 402:
                 error_body = response.text[:500]
-                raise LLMQuotaExceededError(
-                    f"Insufficient credits or quota exceeded (HTTP 402): {error_body}"
-                )
+                raise LLMQuotaExceededError(f"Insufficient credits or quota exceeded (HTTP 402): {error_body}")
             if response.status_code == 429:
                 raise LLMRateLimitError(
                     "DeepSeek rate limit exceeded.",
@@ -1573,9 +1523,7 @@ class DeepSeekClient(LLMClient):
                 )
             if response.status_code == 403:
                 error_body = response.text[:500]
-                raise LLMAuthenticationError(
-                    f"DeepSeek API access forbidden (HTTP 403): {error_body}"
-                )
+                raise LLMAuthenticationError(f"DeepSeek API access forbidden (HTTP 403): {error_body}")
             if response.status_code >= 500:
                 error_body = response.text[:500]
                 raise LLMServerUnavailableError(
@@ -1598,13 +1546,8 @@ class DeepSeekClient(LLMClient):
             # Streaming gate: callback-less callers consume the single-shot
             # JSON body normalized into the same chunk shape the SSE loop
             # expects, so accumulation/truncation logic below is shared as-is.
-            _events = (
-                iter_sse_data_events(response)
-                if use_stream
-                else _deepseek_non_stream_events(response)
-            )
+            _events = iter_sse_data_events(response) if use_stream else _deepseek_non_stream_events(response)
             for chunk in guard_sse_iteration(_events):
-
                 choices = chunk.get("choices", [])
                 if not choices:
                     # Usage may come in the final chunk (separate from choices)
@@ -1633,7 +1576,9 @@ class DeepSeekClient(LLMClient):
                 for tc_delta in tc_deltas:
                     idx = tc_delta.get("index", 0)
                     while len(full_tool_calls_raw) <= idx:
-                        full_tool_calls_raw.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        full_tool_calls_raw.append(
+                            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        )
                     if tc_delta.get("id"):
                         full_tool_calls_raw[idx]["id"] = tc_delta["id"]
                     func_delta = tc_delta.get("function") or {}
@@ -1666,14 +1611,16 @@ class DeepSeekClient(LLMClient):
                         logger.warning(
                             "Response content appears truncated: %d unclosed braces "
                             "in %d chars (finish_reason='stop' is misleading)",
-                            _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                            _dc["open_curly"] - _dc["close_curly"],
+                            len(_trimmed),
                         )
                         finish_reason = "truncated"
                     elif _trimmed.startswith("[") and _dc["open_square"] > _dc["close_square"]:
                         logger.warning(
                             "Response content appears truncated: %d unclosed brackets "
                             "in %d chars (finish_reason='stop' is misleading)",
-                            _dc["open_square"] - _dc["close_square"], len(_trimmed),
+                            _dc["open_square"] - _dc["close_square"],
+                            len(_trimmed),
                         )
                         finish_reason = "truncated"
 
@@ -1696,7 +1643,9 @@ class DeepSeekClient(LLMClient):
                         logger.warning(
                             "Tool call '%s' arguments appear truncated: %d unclosed braces "
                             "in %d chars (finish_reason='tool_calls' may be misleading)",
-                            _tc_name, _dc["open_curly"] - _dc["close_curly"], len(_trimmed),
+                            _tc_name,
+                            _dc["open_curly"] - _dc["close_curly"],
+                            len(_trimmed),
                         )
                 if _tc_truncated:
                     finish_reason = "truncated"
@@ -1711,7 +1660,8 @@ class DeepSeekClient(LLMClient):
             completion_tokens = usage.get("completion_tokens")
             reasoning_tokens = (
                 (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-                if isinstance(usage, dict) else None
+                if isinstance(usage, dict)
+                else None
             )
             cache_read_input_tokens = usage.get("prompt_cache_hit_tokens")
 
@@ -1719,16 +1669,23 @@ class DeepSeekClient(LLMClient):
             for tc in full_tool_calls_raw:
                 func = tc.get("function", {})
                 args = parse_tool_args(func.get("arguments", "{}"))
-                tool_calls.append(ToolCallRequest(
-                    call_id=tc.get("id", ""),
-                    name=func.get("name", ""),
-                    args=args,
-                ))
+                tool_calls.append(
+                    ToolCallRequest(
+                        call_id=tc.get("id", ""),
+                        name=func.get("name", ""),
+                        args=args,
+                    )
+                )
 
             is_final = finish_reason == "stop" or not tool_calls
             logger.info(
                 "DeepSeek %s (tools): %.0fms, tok=%s, cache_read=%s, finish=%s (%d)",
-                model, elapsed_ms, tokens_used, cache_read_input_tokens, finish_reason, len(tool_calls),
+                model,
+                elapsed_ms,
+                tokens_used,
+                cache_read_input_tokens,
+                finish_reason,
+                len(tool_calls),
             )
 
             # Reconstruct a non-streaming-style raw_response so that
@@ -1765,9 +1722,7 @@ class DeepSeekClient(LLMClient):
         except requests.Timeout as e:
             raise LLMConnectionError(f"DeepSeek request timed out after {self.timeout}s") from e
         except requests.exceptions.ChunkedEncodingError as e:
-            raise LLMServerUnavailableError(
-                f"DeepSeek stream interrupted: {e}"
-            ) from e
+            raise LLMServerUnavailableError(f"DeepSeek stream interrupted: {e}") from e
         except requests.RequestException as e:
             raise LLMAPIError(f"DeepSeek request failed: {e}") from e
         except LLMClientError:
@@ -1794,7 +1749,7 @@ class OllamaClient(LLMClient):
     DEFAULT_BASE_URL = "http://127.0.0.1:11434"
     DEFAULT_MODEL = "qwen2.5-coder:3b"
 
-    def __init__(self, api_key: str = "", base_url: Optional[str] = None, timeout: int = 300):
+    def __init__(self, api_key: str = "", base_url: str | None = None, timeout: int = 300):
         """
         Initialize Ollama client with extended timeout for model loading.
 
@@ -1813,8 +1768,8 @@ class OllamaClient(LLMClient):
         messages: list[LLMMessage],
         model: str = "",
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
-        **kwargs
+        max_tokens: int | None = None,
+        **kwargs,
     ) -> LLMResponse:
         """
         Send request to Ollama /api/chat endpoint
@@ -1845,7 +1800,7 @@ class OllamaClient(LLMClient):
             "stream": False,
             "options": {
                 "temperature": temperature,
-            }
+            },
         }
 
         if max_tokens:
@@ -1895,12 +1850,19 @@ class OllamaClient(LLMClient):
             payload["stream"] = True
 
         # Add any additional kwargs to options (filter out non-Ollama keys)
-        _SKIP_KEYS = {
-            "model", "messages", "stream", "thinking_mode", "think",
-            "reasoning_effort", "reasoning_callback", "token_callback", "timeout",
+        _skip_keys = {
+            "model",
+            "messages",
+            "stream",
+            "thinking_mode",
+            "think",
+            "reasoning_effort",
+            "reasoning_callback",
+            "token_callback",
+            "timeout",
         }
         for key, value in kwargs.items():
-            if key not in _SKIP_KEYS:
+            if key not in _skip_keys:
                 payload["options"][key] = value
 
         t0 = time.monotonic()
@@ -1918,16 +1880,12 @@ class OllamaClient(LLMClient):
             if response.status_code == 404:
                 logger.error("Ollama model not found (404): %s", model)
                 raise LLMAPIError(
-                    f"Ollama model '{model}' not found. "
-                    f"Make sure you've pulled the model with 'ollama pull {model}'"
+                    f"Ollama model '{model}' not found. Make sure you've pulled the model with 'ollama pull {model}'"
                 )
 
             if response.status_code == 401:
                 logger.error("Ollama authentication failed (401)")
-                raise LLMAuthenticationError(
-                    "Ollama authentication failed. "
-                    "Check if Ollama requires authentication."
-                )
+                raise LLMAuthenticationError("Ollama authentication failed. Check if Ollama requires authentication.")
 
             if response.status_code == 429:
                 retry_after = parse_retry_after(response.headers)
@@ -1937,22 +1895,12 @@ class OllamaClient(LLMClient):
                 )
             if response.status_code >= 500:
                 error_body = response.text[:500]
-                logger.error(
-                    "Ollama server error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMServerUnavailableError(
-                    f"Ollama API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.error("Ollama server error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMServerUnavailableError(f"Ollama API returned HTTP {response.status_code}: {error_body}")
             if response.status_code != 200:
                 error_body = response.text[:500]
-                logger.error(
-                    "Ollama API error %d in %.0fms: %s",
-                    response.status_code, elapsed_ms, error_body
-                )
-                raise LLMAPIError(
-                    f"Ollama API returned HTTP {response.status_code}: {error_body}"
-                )
+                logger.error("Ollama API error %d in %.0fms: %s", response.status_code, elapsed_ms, error_body)
+                raise LLMAPIError(f"Ollama API returned HTTP {response.status_code}: {error_body}")
 
             if use_stream:
                 import json as _json
@@ -1999,7 +1947,11 @@ class OllamaClient(LLMClient):
 
                 logger.info(
                     "Ollama %s: %.0fms, finish_reason=%s, reasoning_chars=%d, tok=%s",
-                    model, elapsed_ms, finish_reason, len(thinking_text), tokens_used
+                    model,
+                    elapsed_ms,
+                    finish_reason,
+                    len(thinking_text),
+                    tokens_used,
                 )
 
                 return LLMResponse(
@@ -2030,10 +1982,7 @@ class OllamaClient(LLMClient):
             _completion_tokens = data.get("eval_count") or 0
             tokens_used = (_prompt_tokens + _completion_tokens) or None
 
-            logger.info(
-                "Ollama %s: %.0fms, finish_reason=%s, tok=%s",
-                model, elapsed_ms, finish_reason, tokens_used
-            )
+            logger.info("Ollama %s: %.0fms, finish_reason=%s, tok=%s", model, elapsed_ms, finish_reason, tokens_used)
 
             return LLMResponse(
                 content=content,
@@ -2043,21 +1992,18 @@ class OllamaClient(LLMClient):
                 prompt_tokens=_prompt_tokens or None,
                 completion_tokens=_completion_tokens or None,
                 finish_reason=finish_reason,
-                raw_response=data
+                raw_response=data,
             )
 
         except requests.ConnectionError as e:
             logger.exception("Cannot connect to Ollama at %s: %s", base_url, e)
             raise LLMConnectionError(
-                f"Cannot connect to Ollama at {base_url}. "
-                f"Is Ollama running? Try 'ollama serve'"
+                f"Cannot connect to Ollama at {base_url}. Is Ollama running? Try 'ollama serve'"
             ) from e
 
         except requests.Timeout as e:
             logger.exception("Ollama request timed out after %ds", self.timeout)
-            raise LLMConnectionError(
-                f"Ollama request timed out after {self.timeout}s"
-            ) from e
+            raise LLMConnectionError(f"Ollama request timed out after {self.timeout}s") from e
 
         except requests.RequestException as e:
             logger.exception("Ollama request failed: %s", e)
@@ -2066,10 +2012,10 @@ class OllamaClient(LLMClient):
     def _num_ctx_for_model(
         self,
         model: str,
-        messages: Optional[list] = None,
-        tools: Optional[list] = None,
+        messages: list | None = None,
+        tools: list | None = None,
         generation_budget: int = 2048,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Return appropriate num_ctx for a given model name.
 
         Priority:
@@ -2099,6 +2045,7 @@ class OllamaClient(LLMClient):
         """
         # 0. Dynamic query from Ollama API (Option B)
         from external_llm.ollama_api import query_ollama_num_ctx
+
         base_url = self.base_url or self.DEFAULT_BASE_URL
         api_ctx = query_ollama_num_ctx(model, base_url_hint=base_url)
         if api_ctx is not None:
@@ -2107,6 +2054,7 @@ class OllamaClient(LLMClient):
 
         # 1. Explicit registry override
         from external_llm.model_registry import get_ollama_num_ctx
+
         override = get_ollama_num_ctx(model)
         if override is not None:
             return override
@@ -2124,35 +2072,44 @@ class OllamaClient(LLMClient):
                     estimate_tokens_from_msgs,
                     estimate_tokens_from_tool_schemas,
                 )
+
                 est = estimate_tokens_from_msgs(messages) + generation_budget
                 if tools:
                     est += estimate_tokens_from_tool_schemas(tools)
                 if est > fallback:
                     # Round up to a 512 boundary so small per-turn token drift
                     # does not ratchet num_ctx every call (KV-cache friendliness).
-                    _CAP = 32768  # memory-safe ceiling for unknown models
+                    _cap = 32768  # memory-safe ceiling for unknown models
                     clamped = ((est + 511) // 512) * 512
-                    if est > _CAP:
-                        fallback = _CAP
-                        _warn_key = (model, _CAP)
+                    if est > _cap:
+                        fallback = _cap
+                        _warn_key = (model, _cap)
                         if _warn_key not in _num_ctx_overshoot_warned:
                             _num_ctx_overshoot_warned.add(_warn_key)
                             logger.warning(
                                 "Estimated prompt ~%d tokens exceeds memory-safe cap %d "
                                 "for model %s. Consider setting num_ctx in Modelfile via "
                                 "'ollama run /set num_ctx <higher> /save'. (clamped to %d)",
-                                est, _CAP, model, _CAP,
+                                est,
+                                _cap,
+                                model,
+                                _cap,
                             )
                         else:
                             logger.debug(
-                                "Estimated prompt ~%d tokens exceeds cap %d for model %s "
-                                "(warned once, clamped to %d)", est, _CAP, model, _CAP,
+                                "Estimated prompt ~%d tokens exceeds cap %d for model %s (warned once, clamped to %d)",
+                                est,
+                                _cap,
+                                model,
+                                _cap,
                             )
                     else:
                         fallback = clamped
                     logger.debug(
-                        "num_ctx=%d estimation-based fallback for model %s "
-                        "(est=%d: msgs+tools+budget)", fallback, model, est,
+                        "num_ctx=%d estimation-based fallback for model %s (est=%d: msgs+tools+budget)",
+                        fallback,
+                        model,
+                        est,
                     )
             except Exception:
                 # Estimation must never break num_ctx resolution — the flat
@@ -2163,11 +2120,7 @@ class OllamaClient(LLMClient):
         return fallback
 
     def chat_with_tools(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]],
-        model: str = "",
-        **kwargs
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
     ) -> ToolCallResponse:
         """
         Send request to Ollama /api/chat with native tool calling support.
@@ -2294,20 +2247,17 @@ class OllamaClient(LLMClient):
 
         try:
             response = self._session.post(
-                url, json=payload, timeout=self.timeout,
+                url,
+                json=payload,
+                timeout=self.timeout,
                 stream=bool(payload.get("stream")),
             )
             elapsed_ms = (time.monotonic() - t0) * 1000
 
             if response.status_code == 404:
-                raise LLMAPIError(
-                    f"Ollama model '{model}' not found. Pull it with 'ollama pull {model}'"
-                )
+                raise LLMAPIError(f"Ollama model '{model}' not found. Pull it with 'ollama pull {model}'")
             if response.status_code == 401:
-                raise LLMAuthenticationError(
-                    "Ollama authentication failed. "
-                    "Check if Ollama requires authentication."
-                )
+                raise LLMAuthenticationError("Ollama authentication failed. Check if Ollama requires authentication.")
             if response.status_code == 429:
                 retry_after = parse_retry_after(response.headers)
                 raise LLMRateLimitError(
@@ -2316,19 +2266,15 @@ class OllamaClient(LLMClient):
                 )
             if response.status_code >= 500:
                 error_body = response.text[:500]
-                raise LLMServerUnavailableError(
-                    f"Ollama API returned HTTP {response.status_code}: {error_body}"
-                )
+                raise LLMServerUnavailableError(f"Ollama API returned HTTP {response.status_code}: {error_body}")
             if response.status_code != 200:
                 error_body = response.text[:500]
-                raise LLMAPIError(
-                    f"Ollama API returned HTTP {response.status_code}: {error_body}"
-                )
+                raise LLMAPIError(f"Ollama API returned HTTP {response.status_code}: {error_body}")
 
             # ── Streaming path (token_callback provided) ───────────────────────
             if payload.get("stream"):
                 content_parts: list[str] = []
-                finish_reason: Optional[str] = None
+                finish_reason: str | None = None
                 _pt = _ct = 0
                 raw_tool_calls_stream: list[dict] = []
 
@@ -2387,11 +2333,13 @@ class OllamaClient(LLMClient):
                         args = {"__raw_arguments": args}
                 if not isinstance(args, dict):
                     args = {"__raw_arguments": str(args)}
-                tool_call_requests.append(ToolCallRequest(
-                    call_id=f"ollama_{i}_{func.get('name', 'tool')}",
-                    name=func.get("name", ""),
-                    args=args,
-                ))
+                tool_call_requests.append(
+                    ToolCallRequest(
+                        call_id=f"ollama_{i}_{func.get('name', 'tool')}",
+                        name=func.get("name", ""),
+                        args=args,
+                    )
+                )
 
             # Ollama returns done_reason="stop" even when tool_calls are present.
             # is_final must be False whenever there are tool calls to execute.
@@ -2399,7 +2347,11 @@ class OllamaClient(LLMClient):
 
             logger.info(
                 "Ollama %s (tools): %.0fms, tok=%s, done_reason=%s (%d)",
-                model, elapsed_ms, tokens_used, finish_reason, len(tool_call_requests),
+                model,
+                elapsed_ms,
+                tokens_used,
+                finish_reason,
+                len(tool_call_requests),
             )
 
             return ToolCallResponse(
@@ -2416,20 +2368,13 @@ class OllamaClient(LLMClient):
             )
 
         except requests.ConnectionError as e:
-            raise LLMConnectionError(
-                f"Cannot connect to Ollama at {base_url}. Is Ollama running?"
-            ) from e
+            raise LLMConnectionError(f"Cannot connect to Ollama at {base_url}. Is Ollama running?") from e
         except requests.Timeout as e:
-            raise LLMConnectionError(
-                f"Ollama request timed out after {self.timeout}s"
-            ) from e
+            raise LLMConnectionError(f"Ollama request timed out after {self.timeout}s") from e
         except requests.exceptions.ChunkedEncodingError as e:
-            raise LLMServerUnavailableError(
-                f"Ollama stream interrupted: {e}"
-            ) from e
+            raise LLMServerUnavailableError(f"Ollama stream interrupted: {e}") from e
         except requests.RequestException as e:
             raise LLMAPIError(f"Ollama request failed: {e}") from e
         finally:
             if response is not None:
                 response.close()
-

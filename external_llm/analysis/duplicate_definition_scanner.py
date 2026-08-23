@@ -25,7 +25,6 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.common.atomic_io import atomic_write_json
@@ -193,7 +192,7 @@ _validate_judge_maps()
 
 def _ts_collect_top_level_definitions(
     source: str, language: str = "python"
-) -> list[tuple[str, str, int, int, Optional[str]]]:
+) -> list[tuple[str, str, int, int, str | None]]:
     """Tree-sitter version: collect module-level definitions only.
 
     Uses per-language ``_LANG_TOP_LEVEL_NODES`` map (supports Python,
@@ -212,9 +211,9 @@ def _ts_collect_top_level_definitions(
     tree = _ts_parse_to_tree(source, language)
     if tree is None:
         return []
-    out: list[tuple[str, str, int, int, Optional[str]]] = []
+    out: list[tuple[str, str, int, int, str | None]] = []
     source_bytes = source.encode("utf-8")
-    _FRAMEWORK_NAMES = {"fixture", "hookimpl", "hookspec"}
+    _framework_names = {"fixture", "hookimpl", "hookspec"}
 
     for child in tree.root_node.children:
         node = child
@@ -238,7 +237,7 @@ def _ts_collect_top_level_definitions(
             for dec in decorators:
                 dec_name = _ts_get_text(source_bytes, dec).lstrip("@").strip()
                 dec_name = dec_name.split("(")[0].strip()
-                if dec_name == "overload" or dec_name.rpartition(".")[2] in _FRAMEWORK_NAMES:
+                if dec_name == "overload" or dec_name.rpartition(".")[2] in _framework_names:
                     skip = True
                     break
             if skip:
@@ -254,7 +253,7 @@ def _ts_collect_top_level_definitions(
             )
             if assign_node is None:
                 continue
-            left = assign_node.child_by_field_name("left")
+            left = assign_node.child_by_field_name("left")  # type: ignore[attr-defined]  # tree-sitter node
             if left is not None and left.type == "identifier":
                 name_nodes.append(left)
         elif ct in ("lexical_declaration", "variable_declaration"):
@@ -298,13 +297,13 @@ def _ts_collect_top_level_definitions(
         # ── Receiver type for Go methods (dedup disambiguation) ──────────
         # ``func (a *A) Render()`` and ``func (b *B) Render()`` are distinct
         # symbols that would collide without the receiver in the dedup key.
-        receiver: Optional[str] = None
+        receiver: str | None = None
         if ct == "method_declaration":
-            recv_node = node.child_by_field_name("receiver")
+            recv_node = node.child_by_field_name("receiver")  # type: ignore[attr-defined]  # tree-sitter node
             if recv_node is not None:
                 pdecl = _ts_child_by_type(recv_node, ("parameter_declaration",))
                 if pdecl is not None:
-                    type_node = pdecl.child_by_field_name("type")
+                    type_node = pdecl.child_by_field_name("type")  # type: ignore[attr-defined]  # tree-sitter node
                     if type_node is not None:
                         receiver = _ts_get_text(source_bytes, type_node).lstrip("*").strip() or None
         # Span includes decorators (the outer wrapper node) so deletion ops
@@ -315,7 +314,7 @@ def _ts_collect_top_level_definitions(
     return out
 
 
-def _collect_top_level_definitions(tree: ast.Module) -> list[tuple[str, str, int, int, Optional[str]]]:
+def _collect_top_level_definitions(tree: ast.Module) -> list[tuple[str, str, int, int, str | None]]:
     """Walk module.body once.  Returns list of (name, kind, lineno, end_lineno).
 
     Skips:
@@ -326,7 +325,7 @@ def _collect_top_level_definitions(tree: ast.Module) -> list[tuple[str, str, int
     # 5th element (receiver) is always None for Python — Python has no
     # Go-style receiver; ``self``/``cls`` are implicit and not part of the
     # qualified name.  Kept for return-type parity with the tree-sitter path.
-    out: list[tuple[str, str, int, int, Optional[str]]] = []
+    out: list[tuple[str, str, int, int, str | None]] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _has_overload(node):
@@ -536,5 +535,5 @@ def scan_duplicate_definitions(
     if _truncated_total:
         # Function attribute consumed by ScannerRegistry.run() (reset via
         # `del` before each invocation).
-        scan_duplicate_definitions._truncated = _truncated_total
+        scan_duplicate_definitions._truncated = _truncated_total  # type: ignore[attr-defined]  # dynamic attr consumed by ScannerRegistry.run()
     return candidates

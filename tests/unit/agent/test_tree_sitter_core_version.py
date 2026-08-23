@@ -33,6 +33,7 @@ To raise the bound: re-run the trial matrix against the newer core and require
 a full 20-trial zero. Do not raise it on the strength of release notes, and do
 not raise it on a single passing run.
 """
+
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version

@@ -4,6 +4,7 @@ import/entry-point scanners, and example-file discovery.
 
 Companion to test_project_analyzer.py (language/framework/type regressions).
 """
+
 from __future__ import annotations
 
 import os
@@ -195,8 +196,7 @@ def test_import_marker_read_failure_skipped(tmp_path: Path, monkeypatch):
 
 
 def test_pkg_dep_merges_deps_and_devdeps(tmp_path: Path):
-    _write(tmp_path, "package.json",
-           '{"dependencies": {"react": "^18"}, "devDependencies": {"vue": "^3"}}')
+    _write(tmp_path, "package.json", '{"dependencies": {"react": "^18"}, "devDependencies": {"vue": "^3"}}')
     _write(tmp_path, "x.ts", "export const x = 1")
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "react" in s.frameworks
@@ -219,8 +219,11 @@ def test_file_ext_marker_detects_astro(tmp_path: Path):
 
 
 def test_jvm_import_marker_detects_jetpack(tmp_path: Path):
-    _write(tmp_path, "app/src/main/java/com/x/Main.kt",
-           "package com.x\n\nimport androidx.compose.runtime.Composable\n\nclass Main\n")
+    _write(
+        tmp_path,
+        "app/src/main/java/com/x/Main.kt",
+        "package com.x\n\nimport androidx.compose.runtime.Composable\n\nclass Main\n",
+    )
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "kotlin" in s.languages
     assert "jetpack-compose" in s.frameworks
@@ -263,8 +266,7 @@ def test_go_mod_requires_unreadable(tmp_path: Path):
 
 
 def test_go_mod_requires_prefix_match(tmp_path: Path):
-    _write(tmp_path, "go.mod",
-           "module example.com/tool\n\nrequire (\n\tgithub.com/spf13/cobra v1.10.2\n)\n")
+    _write(tmp_path, "go.mod", "module example.com/tool\n\nrequire (\n\tgithub.com/spf13/cobra v1.10.2\n)\n")
     s = ProjectAnalyzer(str(tmp_path))
     assert s._go_mod_requires("github.com/spf13") is True
 
@@ -347,23 +349,21 @@ def test_pyproject_parse_failure_yields_empty_deps(tmp_path: Path):
 
 
 def test_pyproject_poetry_python_constraint_skipped(tmp_path: Path):
-    _write(tmp_path, "pyproject.toml", (
-        "[tool.poetry]\n"
-        'name = "demo"\n'
-        "[tool.poetry.dependencies]\n"
-        'python = "^3.9"\n'
-        'flask = "^3.0"\n'
-        'rich = "^13.0"\n'
-    ))
+    _write(
+        tmp_path,
+        "pyproject.toml",
+        ('[tool.poetry]\nname = "demo"\n[tool.poetry.dependencies]\npython = "^3.9"\nflask = "^3.0"\nrich = "^13.0"\n'),
+    )
     s = ProjectAnalyzer(str(tmp_path))
     assert s._read_pyproject_deps() == {"flask", "rich"}
 
 
 def test_setup_py_non_string_install_requires_elt_skipped(tmp_path: Path):
-    _write(tmp_path, "setup.py", (
-        "from setuptools import setup\n"
-        'setup(name="demo", install_requires=["flask>=3.0", 123, "rich>=13"])\n'
-    ))
+    _write(
+        tmp_path,
+        "setup.py",
+        ('from setuptools import setup\nsetup(name="demo", install_requires=["flask>=3.0", 123, "rich>=13"])\n'),
+    )
     s = ProjectAnalyzer(str(tmp_path))
     assert s._read_pyproject_deps() == {"flask", "rich"}
 
@@ -397,7 +397,7 @@ def test_parse_toml_fallback_full(tmp_path: Path):
     data = s._parse_toml_fallback(
         "# comment\n"
         "\n"
-        '[project]\n'
+        "[project]\n"
         'name = "demo"\n'
         'dependencies = ["fastapi>=0.110", "pydantic>=2.0"]\n'
         "[tool.poetry.dependencies]\n"
@@ -421,13 +421,17 @@ def test_parse_toml_fallback_quotes_with_commas(tmp_path: Path):
 
 def test_read_pyproject_deps_via_fallback(tmp_path: Path, monkeypatch):
     monkeypatch.setitem(sys.modules, "tomllib", None)
-    _write(tmp_path, "pyproject.toml", (
-        '[project]\n'
-        'dependencies = ["fastapi>=0.110", "PyYAML"]\n'
-        "[tool.poetry.dependencies]\n"
-        'flask = "^3.0"\n'
-        'python = "^3.9"\n'
-    ))
+    _write(
+        tmp_path,
+        "pyproject.toml",
+        (
+            "[project]\n"
+            'dependencies = ["fastapi>=0.110", "PyYAML"]\n'
+            "[tool.poetry.dependencies]\n"
+            'flask = "^3.0"\n'
+            'python = "^3.9"\n'
+        ),
+    )
     s = ProjectAnalyzer(str(tmp_path))
     assert s._read_pyproject_deps() == {"fastapi", "pyyaml", "flask"}
 
@@ -438,8 +442,7 @@ def test_read_pyproject_deps_via_fallback(tmp_path: Path, monkeypatch):
 
 
 def test_project_types_cli_via_main_guard(tmp_path: Path):
-    _write(tmp_path, "tool.py",
-           "import sys\n\nif __name__ == '__main__':\n    sys.argv\n")
+    _write(tmp_path, "tool.py", "import sys\n\nif __name__ == '__main__':\n    sys.argv\n")
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "cli" in s.project_types
 
@@ -542,8 +545,20 @@ def test_go_has_main_no_go_files(tmp_path: Path):
 
 
 def test_analyze_directories_purposes(tmp_path: Path):
-    for d in ("models", "views", "api", "services", "agents", "utils",
-              "tests", "static", "templates", "config", "misc", ".hidden"):
+    for d in (
+        "models",
+        "views",
+        "api",
+        "services",
+        "agents",
+        "utils",
+        "tests",
+        "static",
+        "templates",
+        "config",
+        "misc",
+        ".hidden",
+    ):
         _write(tmp_path, d + "/keep.txt", "x")
     s = ProjectAnalyzer(str(tmp_path))
     assert s._analyze_directories() == {
@@ -593,9 +608,19 @@ def test_naming_style_pascal_majority(tmp_path: Path):
 
 
 def test_naming_style_skips_framework_names(tmp_path: Path):
-    for name in ("index.ts", "next.ts", "vite.ts", "nuxt.ts", "astro.ts",
-                 "tailwind.ts", "postcss.ts", "package.ts", "tsconfig.ts",
-                 "eslint.ts", "prettier.ts"):
+    for name in (
+        "index.ts",
+        "next.ts",
+        "vite.ts",
+        "nuxt.ts",
+        "astro.ts",
+        "tailwind.ts",
+        "postcss.ts",
+        "package.ts",
+        "tsconfig.ts",
+        "eslint.ts",
+        "prettier.ts",
+    ):
         _write(tmp_path, name, "export const x = 1")
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert s.naming_style == "unknown"  # all skipped → no evidence
@@ -618,18 +643,18 @@ def test_naming_style_scan_exception(tmp_path: Path, monkeypatch):
 
 
 def test_common_imports_python_and_js(tmp_path: Path):
-    _write(tmp_path, "app.py",
-           "import os\n"
-           "import os\n"
-           "from django.db import models\n"
-           "from .relative import x\n"
-           "from\n")  # 'from' alone → no module token
-    _write(tmp_path, "client.ts",
-           "import { a } from 'lodash'\n"
-           "import c from './local'\n"
-           'import d from "@scope/pkg"\n'
-           "const b = require('react')\n"
-           'const e = require("./relative2")\n')
+    _write(
+        tmp_path, "app.py", "import os\nimport os\nfrom django.db import models\nfrom .relative import x\nfrom\n"
+    )  # 'from' alone → no module token
+    _write(
+        tmp_path,
+        "client.ts",
+        "import { a } from 'lodash'\n"
+        "import c from './local'\n"
+        'import d from "@scope/pkg"\n'
+        "const b = require('react')\n"
+        'const e = require("./relative2")\n',
+    )
     s = ProjectAnalyzer(str(tmp_path))
     imports = s._find_common_imports()
     assert "os" in imports
@@ -673,32 +698,20 @@ def test_common_imports_scan_exception(tmp_path: Path, monkeypatch):
 
 
 def test_entry_points_pyproject_scripts(tmp_path: Path):
-    _write(tmp_path, "pyproject.toml", (
-        "[project]\n"
-        'name = "demo"\n'
-        "[project.scripts]\n"
-        "ascii = 'pkg.cli:main'\n"
-    ))
+    _write(tmp_path, "pyproject.toml", ("[project]\nname = \"demo\"\n[project.scripts]\nascii = 'pkg.cli:main'\n"))
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "ascii (pkg.cli:main)" in s.entry_points
 
 
 def test_entry_points_poetry_scripts(tmp_path: Path):
-    _write(tmp_path, "pyproject.toml", (
-        "[tool.poetry]\n"
-        'name = "demo"\n'
-        "[tool.poetry.scripts]\n"
-        "xcli = 'pkg.x:main'\n"
-    ))
+    _write(tmp_path, "pyproject.toml", ("[tool.poetry]\nname = \"demo\"\n[tool.poetry.scripts]\nxcli = 'pkg.x:main'\n"))
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "xcli (pkg.x:main)" in s.entry_points
 
 
 def test_entry_points_tomli_fallback(tmp_path: Path, monkeypatch):
     monkeypatch.setitem(sys.modules, "tomllib", None)
-    fake_tomli = types.SimpleNamespace(
-        load=lambda f: {"project": {"scripts": {"ascii": "pkg.cli:main"}}}
-    )
+    fake_tomli = types.SimpleNamespace(load=lambda f: {"project": {"scripts": {"ascii": "pkg.cli:main"}}})
     monkeypatch.setitem(sys.modules, "tomli", fake_tomli)
     _write(tmp_path, "pyproject.toml", "[project]\n")
     s = ProjectAnalyzer(str(tmp_path)).analyze()
@@ -714,26 +727,34 @@ def test_entry_points_toml_both_fail(tmp_path: Path, monkeypatch):
 
 
 def test_entry_points_setup_py_console_scripts(tmp_path: Path):
-    _write(tmp_path, "setup.py", (
-        "from setuptools import setup\n"
-        "setup(\n"
-        '    name="demo",\n'
-        "    entry_points={\n"
-        "        'console_scripts': ['ascii=pkg.cli:main', 'xcli=pkg.x:main'],\n"
-        "    },\n"
-        ")\n"
-    ))
+    _write(
+        tmp_path,
+        "setup.py",
+        (
+            "from setuptools import setup\n"
+            "setup(\n"
+            '    name="demo",\n'
+            "    entry_points={\n"
+            "        'console_scripts': ['ascii=pkg.cli:main', 'xcli=pkg.x:main'],\n"
+            "    },\n"
+            ")\n"
+        ),
+    )
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "ascii=pkg.cli:main" in s.entry_points
     assert "xcli=pkg.x:main" in s.entry_points
 
 
 def test_entry_points_setup_py_literal_eval_failure(tmp_path: Path):
-    _write(tmp_path, "setup.py", (
-        "from setuptools import setup\n"
-        "CONFIG = {'console_scripts': ['x=1']}\n"
-        "setup(name='demo', entry_points=UNRESOLVED)\n"
-    ))
+    _write(
+        tmp_path,
+        "setup.py",
+        (
+            "from setuptools import setup\n"
+            "CONFIG = {'console_scripts': ['x=1']}\n"
+            "setup(name='demo', entry_points=UNRESOLVED)\n"
+        ),
+    )
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert s.entry_points == []
 
@@ -745,28 +766,25 @@ def test_entry_points_setup_py_parse_failure(tmp_path: Path):
 
 
 def test_entry_points_setup_cfg(tmp_path: Path):
-    _write(tmp_path, "setup.cfg", (
-        "[options.entry_points]\n"
-        "console_scripts =\n"
-        "    ascii = pkg.cli:main\n"
-        "    xcli = pkg.x:main\n"
-    ))
+    _write(
+        tmp_path,
+        "setup.cfg",
+        ("[options.entry_points]\nconsole_scripts =\n    ascii = pkg.cli:main\n    xcli = pkg.x:main\n"),
+    )
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "ascii = pkg.cli:main" in s.entry_points
     assert "xcli = pkg.x:main" in s.entry_points
 
 
 def test_entry_points_package_json_bin_str_and_main(tmp_path: Path):
-    _write(tmp_path, "package.json",
-           '{"bin": "bin/cli.js", "main": "lib/index.js"}')
+    _write(tmp_path, "package.json", '{"bin": "bin/cli.js", "main": "lib/index.js"}')
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "bin/cli.js" in s.entry_points
     assert "lib/index.js" in s.entry_points
 
 
 def test_entry_points_package_json_bin_dict(tmp_path: Path):
-    _write(tmp_path, "package.json",
-           '{"bin": {"ascii": "bin/cli.js", "xcli": "bin/x.js"}}')
+    _write(tmp_path, "package.json", '{"bin": {"ascii": "bin/cli.js", "xcli": "bin/x.js"}}')
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert "bin/cli.js" in s.entry_points
     assert "bin/x.js" in s.entry_points
@@ -780,8 +798,17 @@ def test_entry_points_package_json_invalid(tmp_path: Path):
 
 def test_entry_points_strong_candidates(tmp_path: Path):
     candidates = [
-        "main.py", "app.py", "manage.py", "wsgi.py", "asgi.py", "asi.py",
-        "__main__.py", "index.ts", "index.tsx", "index.js", "index.jsx",
+        "main.py",
+        "app.py",
+        "manage.py",
+        "wsgi.py",
+        "asgi.py",
+        "asi.py",
+        "__main__.py",
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.jsx",
         "main.go",
     ]
     for c in candidates:
@@ -915,11 +942,7 @@ def test_example_files_scan_exception(tmp_path: Path, monkeypatch):
 
 
 def test_analyze_full_pipeline(tmp_path: Path):
-    _write(tmp_path, "pyproject.toml", (
-        "[project]\n"
-        'name = "demo"\n'
-        'dependencies = ["fastapi>=0.110"]\n'
-    ))
+    _write(tmp_path, "pyproject.toml", ('[project]\nname = "demo"\ndependencies = ["fastapi>=0.110"]\n'))
     _write(tmp_path, "main.py", "x = 1\n")
     _write(tmp_path, "models/User.py", "x = 1\n")
     _write(tmp_path, "tests/test_x.py", "x = 1\n")
@@ -981,10 +1004,9 @@ def test_naming_style_snake_pascal_tie_defaults_snake(tmp_path: Path):
 
 
 def test_common_imports_unterminated_quotes(tmp_path: Path):
-    _write(tmp_path, "weird.ts",
-           "import a from 'unterminated\n"
-           "const b = require('unterminated\n"
-           "import c from 'lodash'\n")
+    _write(
+        tmp_path, "weird.ts", "import a from 'unterminated\nconst b = require('unterminated\nimport c from 'lodash'\n"
+    )
     s = ProjectAnalyzer(str(tmp_path))
     imports = s._find_common_imports()
     assert "lodash" in imports  # unterminated lines are simply skipped
@@ -1005,11 +1027,7 @@ def test_common_imports_ts_read_failure_skipped(tmp_path: Path, monkeypatch):
 
 
 def test_entry_points_setup_cfg_extra_key_ignored(tmp_path: Path):
-    _write(tmp_path, "setup.cfg", (
-        "[options.entry_points]\n"
-        "gui_scripts =\n"
-        "    gx = pkg.gx:main\n"
-    ))
+    _write(tmp_path, "setup.cfg", ("[options.entry_points]\ngui_scripts =\n    gx = pkg.gx:main\n"))
     s = ProjectAnalyzer(str(tmp_path)).analyze()
     assert s.entry_points == []  # gui_scripts is not a console script
 

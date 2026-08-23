@@ -18,6 +18,7 @@ bit-for-bit identical to a cold parse of the same tree.  These tests pin:
   CGI's own parse for that file only;
 * an absent/corrupt RG snapshot fails open to a fresh parse.
 """
+
 import textwrap
 from pathlib import Path
 from unittest import mock
@@ -63,18 +64,21 @@ def _count_computes(idx, counter):
 
 def _edge_key(e):
     return (
-        e.caller_symbol, e.caller_file, e.caller_line,
-        e.callee_symbol, e.callee_display, e.confidence,
-        tuple(e.call_args), e.is_mutating,
+        e.caller_symbol,
+        e.caller_file,
+        e.caller_line,
+        e.callee_symbol,
+        e.callee_display,
+        e.confidence,
+        tuple(e.call_args),
+        e.is_mutating,
     )
 
 
 def _graph_snapshot(idx):
     """(nodes, forward) tuples — order-sensitive, so parity is exact."""
     nodes = tuple(sorted((s, n.file, n.line, n.kind) for s, n in idx._nodes.items()))
-    fwd = tuple(
-        sorted((k, tuple(_edge_key(e) for e in v)) for k, v in idx._forward.items())
-    )
+    fwd = tuple(sorted((k, tuple(_edge_key(e) for e in v)) for k, v in idx._forward.items()))
     return nodes, fwd
 
 
@@ -154,7 +158,9 @@ def test_decorator_call_attributed_to_decorated_function(rg_indexer):
     # add a decorated function to the repo, rebuild RG snapshot, rebuild CGI
     p = Path(repo) / "app.py"
     p.write_text(
-        p.read_text(encoding="utf-8") + "\n" + textwrap.dedent("""
+        p.read_text(encoding="utf-8")
+        + "\n"
+        + textwrap.dedent("""
             def mount(app):
                 @app.get("/")
                 def ui_root():
@@ -252,32 +258,64 @@ def test_nested_same_qualname_defs_stay_distinct(rg_indexer):
 
 def test_rg_conversion_drops_unsupported_fallback_edges():
     from external_llm.agent.call_graph import _rg_payload_to_cgi
+
     payload = {
         "symbols": [
-            {"name": "f", "qualname": "f", "kind": "function", "start_line": 1,
-             "cgi_symbol": "f", "is_async": False, "ast_depth": 1},
+            {
+                "name": "f",
+                "qualname": "f",
+                "kind": "function",
+                "start_line": 1,
+                "cgi_symbol": "f",
+                "is_async": False,
+                "ast_depth": 1,
+            },
         ],
         "calls": [
             # legacy fallback for chained call obj.m()() — CGI emits nothing
             # (P2 shape: explicit resolution marker, low confidence)
-            {"caller": "f", "caller_symbol": "f", "caller_def_line": 1,
-             "file_path": "app.py", "line": 3, "callee_symbol": "obj.m",
-             "callee_display": "obj.m", "confidence": 0.2,
-             "resolution": "fallback",
-             "call_args": [], "is_mutating": False},
+            {
+                "caller": "f",
+                "caller_symbol": "f",
+                "caller_def_line": 1,
+                "file_path": "app.py",
+                "line": 3,
+                "callee_symbol": "obj.m",
+                "callee_display": "obj.m",
+                "confidence": 0.2,
+                "resolution": "fallback",
+                "call_args": [],
+                "is_mutating": False,
+            },
             # P2 (2026-08-12): confidence==1.0 WITHOUT a resolution marker is
             # now a REAL edge — the old drop clause is gone (it matched zero
             # edges and CallEdge.confidence defaults to 1.0, so it would
             # silently swallow any future edge that omits the field).
-            {"caller": "f", "caller_symbol": "f", "caller_def_line": 1,
-             "file_path": "app.py", "line": 5, "callee_symbol": "obj.n",
-             "callee_display": "obj.n", "confidence": 1.0,
-             "call_args": [], "is_mutating": False},
+            {
+                "caller": "f",
+                "caller_symbol": "f",
+                "caller_def_line": 1,
+                "file_path": "app.py",
+                "line": 5,
+                "callee_symbol": "obj.n",
+                "callee_display": "obj.n",
+                "confidence": 1.0,
+                "call_args": [],
+                "is_mutating": False,
+            },
             # normal call
-            {"caller": "f", "caller_symbol": "f", "caller_def_line": 1,
-             "file_path": "app.py", "line": 4, "callee_symbol": "g",
-             "callee_display": "g", "confidence": 0.9,
-             "call_args": [], "is_mutating": False},
+            {
+                "caller": "f",
+                "caller_symbol": "f",
+                "caller_def_line": 1,
+                "file_path": "app.py",
+                "line": 4,
+                "callee_symbol": "g",
+                "callee_display": "g",
+                "confidence": 0.9,
+                "call_args": [],
+                "is_mutating": False,
+            },
         ],
     }
     out = _rg_payload_to_cgi(payload)
@@ -288,12 +326,27 @@ def test_rg_conversion_drops_unsupported_fallback_edges():
 
 def test_rg_conversion_async_kind_and_method_kind():
     from external_llm.agent.call_graph import _rg_payload_to_cgi
+
     payload = {
         "symbols": [
-            {"name": "go", "qualname": "C.go", "kind": "method", "start_line": 2,
-             "cgi_symbol": "C.go", "is_async": False, "ast_depth": 2},
-            {"name": "run", "qualname": "run", "kind": "function", "start_line": 1,
-             "cgi_symbol": "run", "is_async": True, "ast_depth": 1},
+            {
+                "name": "go",
+                "qualname": "C.go",
+                "kind": "method",
+                "start_line": 2,
+                "cgi_symbol": "C.go",
+                "is_async": False,
+                "ast_depth": 2,
+            },
+            {
+                "name": "run",
+                "qualname": "run",
+                "kind": "function",
+                "start_line": 1,
+                "cgi_symbol": "run",
+                "is_async": True,
+                "ast_depth": 1,
+            },
         ],
         "calls": [],
     }
@@ -307,10 +360,13 @@ def test_missing_rg_snapshot_self_heals_via_graph_builder(tmp_path, monkeypatch)
     triggers ONE GraphBuilder build so the SSOT snapshot self-heals."""
     from external_llm.graph import graph_builder as gb_module
 
-    repo = _make_repo(tmp_path, {
-        "a.py": "def fa():\n    return 1\n",
-        "b.py": "def fb():\n    fa()\n",
-    })
+    repo = _make_repo(
+        tmp_path,
+        {
+            "a.py": "def fa():\n    return 1\n",
+            "b.py": "def fb():\n    fa()\n",
+        },
+    )
     calls = {"n": 0}
     orig = gb_module.GraphBuilder.build_repo_graph
 
@@ -370,15 +426,29 @@ def test_confidence_1_0_edge_without_fallback_marker_is_kept():
     from external_llm.agent.call_graph import _rg_payload_to_cgi
 
     payload = {
-        "symbols": [{
-            "name": "f", "qualname": "m.f", "kind": "function",
-            "start_line": 1, "ast_depth": 0, "cgi_symbol": "f", "is_async": False,
-        }],
-        "calls": [{
-            "caller": "m.f", "caller_symbol": "m.f", "caller_def_line": 1,
-            "file_path": "m.py", "line": 3, "callee_symbol": None,
-            "callee_display": "g", "confidence": 1.0,  # no resolution key
-        }],
+        "symbols": [
+            {
+                "name": "f",
+                "qualname": "m.f",
+                "kind": "function",
+                "start_line": 1,
+                "ast_depth": 0,
+                "cgi_symbol": "f",
+                "is_async": False,
+            }
+        ],
+        "calls": [
+            {
+                "caller": "m.f",
+                "caller_symbol": "m.f",
+                "caller_def_line": 1,
+                "file_path": "m.py",
+                "line": 3,
+                "callee_symbol": None,
+                "callee_display": "g",
+                "confidence": 1.0,  # no resolution key
+            }
+        ],
         "imports": [],
     }
     cgi = _rg_payload_to_cgi(payload)

@@ -7,6 +7,7 @@ in asi.py).  The ident_tokens Jaccard gate drops those pairs while
 keeping genuine copy-paste duplicates — including ones whose parameters
 were renamed at copy time.
 """
+
 from __future__ import annotations
 
 import textwrap
@@ -91,8 +92,7 @@ def test_copy_paste_duplicate_survives_gate(tmp_path):
     cands = scan_similarity_candidates(str(tmp_path), [fname])
     pairs = {frozenset([c.symbol_a, c.symbol_b]) for c in cands}
     assert frozenset(["load_user_config", "load_project_config"]) in pairs
-    c = next(c for c in cands
-             if {c.symbol_a, c.symbol_b} == {"load_user_config", "load_project_config"})
+    c = next(c for c in cands if {c.symbol_a, c.symbol_b} == {"load_user_config", "load_project_config"})
     assert c.shadow_overlaps["ident_overlap"] >= 0.25
 
 
@@ -100,13 +100,13 @@ def test_forced_pair_bypasses_gate(tmp_path):
     """A user-specified forced pair is always included in the result, regardless of the gate."""
     fname = _write(tmp_path, "coincidental.py", _COINCIDENTAL)
     cands = scan_similarity_candidates(
-        str(tmp_path), [fname],
+        str(tmp_path),
+        [fname],
         forced_pairs=[("collect_retry_hosts", "collect_stale_caches")],
     )
     forced = [c for c in cands if c.forced]
     assert len(forced) == 1
-    assert {forced[0].symbol_a, forced[0].symbol_b} == {
-        "collect_retry_hosts", "collect_stale_caches"}
+    assert {forced[0].symbol_a, forced[0].symbol_b} == {"collect_retry_hosts", "collect_stale_caches"}
     # ident_overlap is still recorded as an observational signal (even though the gate wasn't applied)
     assert "ident_overlap" in forced[0].shadow_overlaps
 

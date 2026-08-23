@@ -21,6 +21,7 @@ Pinned here:
   7. every outline row carries the symbol's END line, not just its start, and
      the range it prints is one a follow-up read_file accepts verbatim.
 """
+
 from __future__ import annotations
 
 import re
@@ -100,18 +101,18 @@ class TestOutlineExtent:
 
     # alpha spans 5-7, Beta spans 9-11, VERSION is one line (3).
     _HEAD: ClassVar[list] = [
-        "import os",          # 1
-        "",                   # 2
-        "VERSION = 3",        # 3
-        "",                   # 4
-        "def alpha(a, b):",   # 5
-        "    x = a + b",      # 6
-        "    return x",       # 7
-        "",                   # 8
-        "class Beta:",        # 9
+        "import os",  # 1
+        "",  # 2
+        "VERSION = 3",  # 3
+        "",  # 4
+        "def alpha(a, b):",  # 5
+        "    x = a + b",  # 6
+        "    return x",  # 7
+        "",  # 8
+        "class Beta:",  # 9
         "    def gamma(self):",  # 10
-        "        return 2",   # 11
-        "",                   # 12
+        "        return 2",  # 11
+        "",  # 12
     ]
 
     def _big_module(self, tmp_path):
@@ -145,7 +146,7 @@ class TestOutlineExtent:
         assert "class Beta" not in res.content, "range must stop at the symbol's end"
 
     def test_one_line_symbol_prints_a_bare_line_number(self, tmp_path):
-        """"3-3" reads like a mistake and says nothing "3" does not."""
+        """ "3-3" reads like a mistake and says nothing "3" does not."""
         self._big_module(tmp_path)
         res = _reg(tmp_path).dispatch("read_file", {"path": "big.py"})
         assert re.search(r"lines\s+3\s+\[constant\] VERSION", res.content), res.content[:400]
@@ -155,6 +156,7 @@ class TestOutlineExtent:
         """``_outline_ripgrep`` matches a declaration by regex and never sets
         ``end_line``. That path must print the start alone rather than invent an
         end — a wrong range is worse than a missing one."""
+
         class _NoExtent:
             line = 42
             end_line = None
@@ -187,18 +189,14 @@ class TestCharBudget:
         budget = _cfg.lines.READ_FILE_MAX_CHARS
         self._wide_file(tmp_path, lines=4000, width=200)  # ~800K chars raw
 
-        res = _reg(tmp_path).dispatch(
-            "read_file", {"path": "wide.py", "start_line": 1, "end_line": 999999}
-        )
+        res = _reg(tmp_path).dispatch("read_file", {"path": "wide.py", "start_line": 1, "end_line": 999999})
         assert res.ok
         assert len(res.content) < budget * 1.2, "explicit range must respect the output budget"
         assert res.metadata["truncated"] is True
 
     def test_truncation_names_the_resume_line(self, tmp_path):
         self._wide_file(tmp_path, lines=4000, width=200)
-        res = _reg(tmp_path).dispatch(
-            "read_file", {"path": "wide.py", "start_line": 1, "end_line": 999999}
-        )
+        res = _reg(tmp_path).dispatch("read_file", {"path": "wide.py", "start_line": 1, "end_line": 999999})
         resume = res.metadata["resume_line"]
         assert resume > 1
         assert f"start_line={resume}" in res.content
@@ -216,9 +214,7 @@ class TestCharBudget:
         """A single line wider than the budget must not pin resume_line at itself."""
         budget = _cfg.lines.READ_FILE_MAX_CHARS
         _write(tmp_path, "one.py", "z" * (budget * 2) + "\ntail = 1\n")
-        res = _reg(tmp_path).dispatch(
-            "read_file", {"path": "one.py", "start_line": 1, "end_line": 999999}
-        )
+        res = _reg(tmp_path).dispatch("read_file", {"path": "one.py", "start_line": 1, "end_line": 999999})
         assert res.ok
         assert res.metadata["resume_line"] == 2, "must move past the oversized line"
         assert len(res.content) < budget * 1.2
@@ -270,9 +266,7 @@ def test_oversized_single_line_signals_partial_line(tmp_path):
     JSON, base64 blobs)."""
     budget = _cfg.lines.READ_FILE_MAX_CHARS
     _write(tmp_path, "one.py", "x" * (budget * 2) + "\ntail = 1\n")
-    res = _reg(tmp_path).dispatch(
-        "read_file", {"path": "one.py", "start_line": 1, "end_line": 999999}
-    )
+    res = _reg(tmp_path).dispatch("read_file", {"path": "one.py", "start_line": 1, "end_line": 999999})
     assert res.ok
     # Still advances past the oversized line (pinned by the existing test).
     assert res.metadata["resume_line"] == 2
@@ -287,9 +281,7 @@ def test_multi_line_truncation_has_no_partial_line_flag(tmp_path):
     ``partial_line`` — only the single-oversized-line path does, so the flag's
     presence is a reliable signal of mid-line data loss."""
     _write(tmp_path, "many.py", "\n".join("a" * 200 for _ in range(4000)))
-    res = _reg(tmp_path).dispatch(
-        "read_file", {"path": "many.py", "start_line": 1, "end_line": 999999}
-    )
+    res = _reg(tmp_path).dispatch("read_file", {"path": "many.py", "start_line": 1, "end_line": 999999})
     assert res.ok
     assert res.metadata["truncated"] is True
     assert "partial_line" not in res.metadata
@@ -339,9 +331,7 @@ class TestMalformedRange:
 
     def test_well_formed_range_still_works(self, tmp_path):
         self._long_file(tmp_path)
-        res = _reg(tmp_path).dispatch(
-            "read_file", {"path": "long.py", "start_line": 10, "end_line": 20}
-        )
+        res = _reg(tmp_path).dispatch("read_file", {"path": "long.py", "start_line": 10, "end_line": 20})
         assert res.ok and "lines 10–20" in res.content
 
 
@@ -377,15 +367,14 @@ class TestReadSymbolCharBudget:
         res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
         assert res.ok, res.error
         import re as _re
+
         resume = int(_re.search(r"start_line=(\d+)", res.content).group(1))
-        emitted = [int(m.group(1)) for m in
-                   _re.finditer(r"^\s*(\d+) │", res.content, _re.M)]
+        emitted = [int(m.group(1)) for m in _re.finditer(r"^\s*(\d+) │", res.content, _re.M)]
         assert emitted, res.content
         assert resume == emitted[-1] + 1, (
-            f"resume must be the first line NOT emitted: emitted through "
-            f"{emitted[-1]}, resume={resume}")
-        assert f"Lines {resume}–" in res.content, (
-            "the prose range must start at the first un-emitted line")
+            f"resume must be the first line NOT emitted: emitted through {emitted[-1]}, resume={resume}"
+        )
+        assert f"Lines {resume}–" in res.content, "the prose range must start at the first un-emitted line"
 
     def test_oversized_single_line_advances_and_flags_partial(self, tmp_path):
         """An over-wide line must advance PAST itself and say the tail is gone.
@@ -395,8 +384,7 @@ class TestReadSymbolCharBudget:
         unrecoverable-tail warning, so the caller believed re-reading would
         recover the rest."""
         budget = _cfg.lines.READ_FILE_MAX_CHARS
-        _write(tmp_path, "one.py",
-               "def target():\n    x = '" + "z" * (budget * 2) + "'\n    return x\n")
+        _write(tmp_path, "one.py", "def target():\n    x = '" + "z" * (budget * 2) + "'\n    return x\n")
         res = _reg(tmp_path).dispatch("read_symbol", {"name": "target"})
         assert res.ok, res.error
         assert len(res.content) < budget * 1.2

@@ -14,7 +14,6 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
 
 from ..common.atomic_io import atomic_write_json
 from ..languages.tree_sitter_utils import (
@@ -424,7 +423,7 @@ class DeadBlockMember:
     symbol_kind: str  # "function" | "class" | "assignment" | "class_assignment"
     lineno: int
     end_lineno: int
-    enclosing_class: Optional[str] = None
+    enclosing_class: str | None = None
 
 
 @dataclass
@@ -520,7 +519,7 @@ def _ts_extract_all_list(source: str, language: str = "python") -> set:
 def _ts_collect_all_defs(
     source: str,
     language: str = "python",
-) -> list[tuple[str, str, int, int, Optional[str]]]:
+) -> list[tuple[str, str, int, int, str | None]]:
     """Tree-sitter version of ``_collect_all_defs``.
 
     Uses per-language ``_LANG_DEF_NODES`` map (supports Python, TypeScript,
@@ -538,10 +537,10 @@ def _ts_collect_all_defs(
     tree = _ts_parse_to_tree(source, language)
     if tree is None:
         return []
-    out: list[tuple[str, str, int, int, Optional[str]]] = []
+    out: list[tuple[str, str, int, int, str | None]] = []
     root = tree.root_node
 
-    def _walk(node, enclosing_class: Optional[str] = None):
+    def _walk(node, enclosing_class: str | None = None):
         if not node:
             return
         node_type = node.type
@@ -578,10 +577,10 @@ def _ts_collect_all_defs(
             if language == "python" and _ts_has_overload_or_framework(node, source):
                 return
             start = node.start_point[0] + 1
-            end = node.end_point[0] + 1
+            end = node.end_point[0] + 1  # type: ignore[attr-defined]  # tree-sitter node
             decorator_node = _ts_child_by_type(node, ("decorator",))
             if decorator_node is not None:
-                start = decorator_node.start_point[0] + 1
+                start = decorator_node.start_point[0] + 1  # type: ignore[attr-defined]  # tree-sitter node
             out.append((name, kind, start, end, enclosing_class))
             if is_container:
                 for child in node.children or []:
@@ -598,7 +597,7 @@ def _ts_collect_all_defs(
     return out
 
 
-def _ts_child_by_type(node, type_names: tuple[str, ...]) -> Optional[object]:
+def _ts_child_by_type(node, type_names: tuple[str, ...]) -> object | None:
     """Find first child with one of *type_names* (tree-sitter node helper)."""
     for child in node.children or []:
         if child.type in type_names:
@@ -646,7 +645,7 @@ _NAME_NODE_TYPES = ("identifier", "type_identifier", "field_identifier", "simple
 _NAME_HOLDER_CHILD_TYPES = frozenset({"variable_declaration", "binding_pattern_kind"})
 
 
-def _ts_name_inside(node) -> Optional[object]:
+def _ts_name_inside(node) -> object | None:
     """First identifier-like child of a kotlin name-holder node (fwcd grammar)."""
     for child in node.children or []:
         if child.type in _NAME_NODE_TYPES:
@@ -658,7 +657,7 @@ def _ts_name_inside(node) -> Optional[object]:
     return None
 
 
-def _ts_def_name_node(node, fields_only: bool = False) -> Optional[object]:
+def _ts_def_name_node(node, fields_only: bool = False) -> object | None:
     """Return the binding-side identifier node of a definition node.
 
     Prefers field-aware lookup (``name`` for declarations, ``left`` for
@@ -681,7 +680,7 @@ def _ts_def_name_node(node, fields_only: bool = False) -> Optional[object]:
 
 def _ts_has_overload_or_framework(node, source: str) -> bool:
     """Check if node has @overload or @fixture/@hookimpl/@hookspec decorator."""
-    _FRAMEWORK_NAMES = {"fixture", "hookimpl", "hookspec"}
+    _framework_names = {"fixture", "hookimpl", "hookspec"}
     for child in node.children or []:
         if child.type != "decorator":
             continue
@@ -693,9 +692,9 @@ def _ts_has_overload_or_framework(node, source: str) -> bool:
             return True
         if "." in dec_name:
             _, _, attr = dec_name.rpartition(".")
-            if attr in _FRAMEWORK_NAMES:
+            if attr in _framework_names:
                 return True
-        if dec_name in _FRAMEWORK_NAMES:
+        if dec_name in _framework_names:
             return True
     return False
 
@@ -874,8 +873,8 @@ def _extract_all_list(tree: ast.Module) -> set:
 def _is_dead_candidate(
     name: str,
     all_names: set,
-    cross_file_referenced_names: Optional[set] = None,
-    include_public: Optional[bool] = None,
+    cross_file_referenced_names: set | None = None,
+    include_public: bool | None = None,
 ) -> bool:
     """Decide whether a symbol can be considered for dead-code removal.
 
@@ -939,14 +938,14 @@ def _is_dynamic_invocation_file(rel_path: str) -> bool:
     return False
 
 
-def _collect_all_defs(tree: ast.Module) -> list[tuple[str, str, int, int, Optional[str]]]:
+def _collect_all_defs(tree: ast.Module) -> list[tuple[str, str, int, int, str | None]]:
     """Collect module-level AND class-level definitions.
 
     Returns (name, kind, lineno, end_lineno, enclosing_class_or_None).
     """
-    out: list[tuple[str, str, int, int, Optional[str]]] = []
+    out: list[tuple[str, str, int, int, str | None]] = []
 
-    def _collect_from_body(body: list, enclosing_class: Optional[str] = None):
+    def _collect_from_body(body: list, enclosing_class: str | None = None):
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if enclosing_class is not None:
@@ -1016,7 +1015,7 @@ def _is_externally_referenced(
     def_start: int,
     def_end: int,
     references: dict,
-    cross_file_referenced_names: Optional[set] = None,
+    cross_file_referenced_names: set | None = None,
     is_class_attr: bool = False,
 ) -> bool:
     """True iff ``name`` is referenced outside [def_start, def_end]."""
@@ -1165,7 +1164,7 @@ def _dbx_save(repo_root: str, cache: dict) -> None:
         logger.debug("dead-block extraction cache write failed", exc_info=True)
 
 
-def _dbx_stat(abs_path: str) -> Optional[tuple[int, int]]:
+def _dbx_stat(abs_path: str) -> tuple[int, int] | None:
     """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
     (single stat code path; order contract documented there, B1)."""
     from . import parse_cache as _pc
@@ -1225,12 +1224,12 @@ def scan_dead_block_core(
     repo_root: str,
     file_paths: list[str],
     max_per_file: int,
-    cluster_gap_tolerance: Optional[int],
-    cross_file_referenced_names: Optional[set],
+    cluster_gap_tolerance: int | None,
+    cross_file_referenced_names: set | None,
     singleton_confidence: float,
     mark_public: bool,
     log_tag: str,
-    include_public: Optional[bool] = None,
+    include_public: bool | None = None,
 ) -> tuple[list[DeadBlockCandidate], int]:
     """Shared scan loop behind ``scan_dead_blocks`` and ``scan_public_dead_blocks``.
 
@@ -1269,10 +1268,13 @@ def scan_dead_block_core(
             _dbx_entry = (_dbx_fp, _extract_dead_block_file(abs_path, rel_path))
             _dbx_cache[abs_path] = _dbx_entry
             _dbx_dirty = True
-        if _dbx_entry[1] is None:
+        if _dbx_entry is None:
+            continue  # unreachable (assigned above), but keeps the type checker honest
+        _dbx_analysis = _dbx_entry[1]
+        if _dbx_analysis is None:
             continue  # cached skip decision (unreadable / broken / dynamic __all__)
 
-        _lang, all_names, defs, references = _dbx_entry[1]
+        _lang, all_names, defs, references = _dbx_analysis
         _dynamic_invocation = _is_dynamic_invocation_file(rel_path)
 
         _effective_cross = cross_file_referenced_names

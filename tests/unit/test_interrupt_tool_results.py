@@ -14,6 +14,7 @@ Covers the three-part chain:
 Determinism (byte-identical across rebuilds) is asserted because the rendered
 text enters the prompt-cache prefix.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -29,16 +30,19 @@ def _entry(tool, args=None, content="", ok=True):
 
 # ── render_interrupt_tool_results ───────────────────────────────────────────
 
+
 class TestRender:
     def test_empty_returns_empty(self):
         assert render_interrupt_tool_results([]) == ""
         assert render_interrupt_tool_results(None) == ""
 
     def test_renders_tool_args_content_status(self):
-        out = render_interrupt_tool_results([
-            _entry("read_file", {"path": "foo.py"}, "def bar():\n    return 1"),
-            _entry("bash", "ls", "", ok=False),
-        ])
+        out = render_interrupt_tool_results(
+            [
+                _entry("read_file", {"path": "foo.py"}, "def bar():\n    return 1"),
+                _entry("bash", "ls", "", ok=False),
+            ]
+        )
         assert "read_file (ok)" in out
         assert "def bar():\n    return 1" in out
         assert "bash (FAIL)" in out
@@ -51,7 +55,8 @@ class TestRender:
     def test_per_result_budget_caps_content(self):
         out = render_interrupt_tool_results(
             [_entry("read_file", {"path": "x"}, "A" * 20000)],
-            per_result_chars=100, total_chars=10_000,
+            per_result_chars=100,
+            total_chars=10_000,
         )
         assert "truncated" in out
         # 100 chars of content + header/args overhead, well under 20000
@@ -60,7 +65,8 @@ class TestRender:
     def test_total_budget_stops_early(self):
         out = render_interrupt_tool_results(
             [_entry("read_file", {"path": f"f{i}.py"}, "C" * 9000) for i in range(10)],
-            per_result_chars=8000, total_chars=15000,
+            per_result_chars=8000,
+            total_chars=15000,
         )
         # Not all 10 fit within the total budget
         assert "of 10" in out
@@ -77,6 +83,7 @@ class TestRender:
 
 
 # ── Integration: add_turn persistence ────────────────────────────────────────
+
 
 @pytest.fixture
 def session_mgr(tmp_path):
@@ -104,9 +111,11 @@ class TestPersistAndRender:
 
 # ── Integration: build_context_messages renders ─────────────────────────────
 
+
 def _build_ctx(tmp_path, turns, compressed_up_to=0):
     class _S:
         pass
+
     s = _S()
     s.turns = turns
     s.compressed_up_to = compressed_up_to
@@ -123,8 +132,7 @@ class TestContextRender:
         trs = [_entry("read_file", {"path": "foo.py"}, "def bar():\n    return 42")]
         turns = [
             {"role": "user", "content": "go", "model": ""},
-            {"role": "assistant", "content": "[Interrupted]", "model": "",
-             "tool_results": trs},
+            {"role": "assistant", "content": "[Interrupted]", "model": "", "tool_results": trs},
         ]
         msgs = _build_ctx(tmp_path, turns)
         asst = [m for m in msgs if m["role"] == "assistant"]
@@ -159,6 +167,7 @@ class TestContextRender:
 # turn (the resumed turn's own completion) clears them — symmetric with normal
 # completed turns whose tool messages are discarded at turn end.
 
+
 class TestNextTurnDropsPriorToolResults:
     def test_next_assistant_turn_drops_prior_tool_results(self, session_mgr):
         # Turn 0: ESC-interrupted assistant turn with full tool_results.
@@ -172,8 +181,9 @@ class TestNextTurnDropsPriorToolResults:
 
         sess = session_mgr.get_or_create("t1")
         # Prior (interrupted) turn no longer carries tool_results.
-        assert "tool_results" not in sess.turns[0], \
+        assert "tool_results" not in sess.turns[0], (
             "prior turn's tool_results must be dropped once the resumed turn completes"
+        )
         # The resumed turn itself carries nothing (normal completion).
         assert "tool_results" not in sess.turns[-1]
 
@@ -192,7 +202,11 @@ class TestNextTurnDropsPriorToolResults:
         # digest must survive the tool_results drop (long-term file/tool metadata).
         trs = [_entry("read_file", {"path": "d.py"}, "d code")]
         session_mgr.add_turn(
-            "t1", "assistant", "interrupted", digest="read: d.py", tool_results=trs,
+            "t1",
+            "assistant",
+            "interrupted",
+            digest="read: d.py",
+            tool_results=trs,
         )
         session_mgr.add_turn("t1", "assistant", "resumed")
         sess = session_mgr.get_or_create("t1")

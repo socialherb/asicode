@@ -13,6 +13,7 @@ tests pin:
 * the memo shares one result object across callers, so the public
   list-returning wrapper must hand out a fresh copy each call.
 """
+
 from __future__ import annotations
 
 import random

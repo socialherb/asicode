@@ -13,6 +13,7 @@ reported as "no lint issues":
 - stderr snippet truncated to 200 chars; full stderr still attached
 - npx missing (FileNotFoundError) → graceful skip preserved
 """
+
 from __future__ import annotations
 
 import json
@@ -28,7 +29,9 @@ def _eslint_run(stdout: str, returncode: int = 0, stderr: str = ""):
     return mock.patch(
         "external_llm.agent.lint_runner.subprocess.run",
         return_value=types.SimpleNamespace(
-            returncode=returncode, stdout=stdout, stderr=stderr,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
         ),
     )
 
@@ -49,13 +52,22 @@ def test_eslint_clean_run(tmp_path, ts_file):
 
 
 def test_eslint_findings_parsed_from_json(tmp_path, ts_file):
-    raw = json.dumps([{
-        "filePath": str(ts_file),
-        "messages": [{
-            "ruleId": "no-unused-vars", "severity": 2, "line": 1, "column": 5,
-            "message": "'x' is assigned a value but never used",
-        }],
-    }])
+    raw = json.dumps(
+        [
+            {
+                "filePath": str(ts_file),
+                "messages": [
+                    {
+                        "ruleId": "no-unused-vars",
+                        "severity": 2,
+                        "line": 1,
+                        "column": 5,
+                        "message": "'x' is assigned a value but never used",
+                    }
+                ],
+            }
+        ]
+    )
     with _eslint_run(stdout=raw, returncode=1):
         result = LintRunner(str(tmp_path)).run_lint(str(ts_file))
     assert result.ok is False
@@ -68,8 +80,7 @@ def test_eslint_findings_parsed_from_json(tmp_path, ts_file):
 
 def test_eslint_fatal_exit_code_surfaces_error(tmp_path, ts_file):
     # rc=2 = fatal (invalid config / file not found) → previously silent pass
-    with _eslint_run(stdout="", returncode=2,
-                     stderr="Oops! Something went wrong! ... ConfigError"):
+    with _eslint_run(stdout="", returncode=2, stderr="Oops! Something went wrong! ... ConfigError"):
         result = LintRunner(str(tmp_path)).run_lint(str(ts_file))
     assert result.ok is False
     assert result.error is not None
@@ -82,8 +93,7 @@ def test_eslint_fatal_exit_code_surfaces_error(tmp_path, ts_file):
 def test_eslint_npx_resolution_failure_surfaces_error(tmp_path, ts_file):
     # npx cannot resolve the eslint package: rc=1, JSON absent, stderr only.
     # A findings run always emits JSON, so this must NOT read as "no lint issues".
-    with _eslint_run(stdout="", returncode=1,
-                     stderr="npm ERR! Could not find eslint"):
+    with _eslint_run(stdout="", returncode=1, stderr="npm ERR! Could not find eslint"):
         result = LintRunner(str(tmp_path)).run_lint(str(ts_file))
     assert result.ok is False
     assert result.error is not None
@@ -104,8 +114,8 @@ def test_eslint_error_stderr_truncated_to_200(tmp_path, ts_file):
 def test_eslint_not_installed_skips_gracefully(tmp_path, ts_file, monkeypatch):
     def _raise(*args, **kwargs):
         raise FileNotFoundError("npx")
-    monkeypatch.setattr(
-        "external_llm.agent.lint_runner.subprocess.run", _raise)
+
+    monkeypatch.setattr("external_llm.agent.lint_runner.subprocess.run", _raise)
     result = LintRunner(str(tmp_path)).run_lint(str(ts_file))
     assert result.ok is True
     assert result.skipped is True

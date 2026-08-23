@@ -7,6 +7,7 @@ gets its own budget). Misclassifying DeepSeek v4 as non-reasoning caused
 on the OpenCode Go endpoint — reasoning tokens ate the whole ``max_tokens``
 budget and content got nothing.
 """
+
 from __future__ import annotations
 
 import pytest

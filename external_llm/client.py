@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, NoReturn, Optional
+from typing import Any, NoReturn
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -45,14 +45,14 @@ class LLMMessage:
     role: str  # "system", "user", "assistant", "tool"
     content: str
     # Optional fields for tool-calling (OpenAI-compatible providers)
-    name: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    tool_calls: Optional[list[dict[str, Any]]] = None
+    name: str | None = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
     # Provider-native content blocks (Anthropic content[], Gemini parts[]).
     # When set, providers use this directly instead of the plain `content` string.
-    raw_content: Optional[list[dict[str, Any]]] = None
+    raw_content: list[dict[str, Any]] | None = None
     # DeepSeek Reasoner: chain-of-thought content that must be echoed back in multi-turn
-    reasoning_content: Optional[str] = None
+    reasoning_content: str | None = None
     # Attached images (provider-agnostic). Each item: {"media_type": "image/png", "data": "<base64>"}
     # Each provider client converts these to its native format (Anthropic content blocks, Gemini inlineData).
     #
@@ -64,7 +64,7 @@ class LLMMessage:
     # If a persistence path is ever added, move the OCR cache out FIRST and make
     # ``_msg_token_fingerprint`` track wherever it moved to — otherwise the
     # estimator silently returns a stale pre-OCR under-count.
-    images: Optional[list[dict[str, str]]] = None
+    images: list[dict[str, str]] | None = None
 
 
 @dataclass
@@ -84,17 +84,17 @@ class LLMResponse:
     content: str
     model: str
     provider: str
-    tokens_used: Optional[int] = None
-    finish_reason: Optional[str] = None
-    raw_response: Optional[dict[str, Any]] = None
+    tokens_used: int | None = None
+    finish_reason: str | None = None
+    raw_response: dict[str, Any] | None = None
     # Separated token counts + prompt-cache fields. Populated by providers that
     # expose usage detail on the plain chat() path too (e.g. DeepSeek), so that
     # non-tool callers (the planner) can account cache savings. ToolCallResponse
     # redeclares these for backward compat; the defaults match.
-    prompt_tokens: Optional[int] = None  # input tokens
-    completion_tokens: Optional[int] = None  # output tokens
-    cache_read_input_tokens: Optional[int] = None
-    reasoning_tokens: Optional[int] = None
+    prompt_tokens: int | None = None  # input tokens
+    completion_tokens: int | None = None  # output tokens
+    cache_read_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
 
 
 @dataclass
@@ -119,13 +119,13 @@ class ToolCallResponse(LLMResponse):
     is_final: bool = False
     # Separated token counts (input/output) for cost estimation.
     # tokens_used (from LLMResponse) = prompt_tokens + completion_tokens.
-    prompt_tokens: Optional[int] = None  # input tokens
-    completion_tokens: Optional[int] = None  # output tokens
+    prompt_tokens: int | None = None  # input tokens
+    completion_tokens: int | None = None  # output tokens
     # Prompt caching fields (populated by providers that support them, e.g. Anthropic).
-    cache_read_input_tokens: Optional[int] = None
-    cache_creation_input_tokens: Optional[int] = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
     # Reasoning tokens (populated by DeepSeek — completion_tokens = reasoning + visible).
-    reasoning_tokens: Optional[int] = None
+    reasoning_tokens: int | None = None
 
 
 def effective_content(response) -> str:
@@ -160,7 +160,7 @@ def effective_content(response) -> str:
 RETRY_AFTER_MAX_WAIT = 60
 
 
-def parse_retry_after(headers: "Any") -> Optional[int]:
+def parse_retry_after(headers: Any) -> int | None:
     """Parse a ``Retry-After`` header value into seconds, or ``None``.
 
     Accepts any mapping with ``.get`` (e.g. ``requests.Response.headers``).
@@ -212,7 +212,7 @@ _BALANCE_QUOTA_PHRASES: tuple[str, ...] = (
 )
 
 
-def is_balance_quota_signal(error_code: Optional[int], body_text: str = "") -> bool:
+def is_balance_quota_signal(error_code: int | None, body_text: str = "") -> bool:
     """Return True when a 429 response is actually an exhausted balance/quota.
 
     Checks both the provider error ``code`` (e.g. zai 1113) and the lowercased
@@ -238,7 +238,7 @@ def is_balance_quota_signal(error_code: Optional[int], body_text: str = "") -> b
 _SSE_MAX_LINE_BYTES = 4 * 1024 * 1024
 
 
-def _parse_sse_line(line: bytes) -> Optional[dict[str, Any]]:
+def _parse_sse_line(line: bytes) -> dict[str, Any] | None:
     """Parse one physical SSE line (no trailing ``\\n``) into an event dict.
 
     Returns ``None`` for keep-alive/blank lines, non-``data:`` frames
@@ -270,7 +270,7 @@ def _parse_sse_line(line: bytes) -> Optional[dict[str, Any]]:
         return None
 
 
-def _iter_response_chunks(response: "Any") -> Iterator[bytes]:
+def _iter_response_chunks(response: Any) -> Iterator[bytes]:
     """Yield raw byte chunks from a streaming HTTP response, transport-agnostic.
 
     Every LLM client builds its HTTP layer with ``requests.Session``
@@ -292,7 +292,7 @@ def _iter_response_chunks(response: "Any") -> Iterator[bytes]:
     yield from response.iter_content(chunk_size=512, decode_unicode=False)
 
 
-def iter_sse_data_events(response: "Any") -> Iterator[dict[str, Any]]:
+def iter_sse_data_events(response: Any) -> Iterator[dict[str, Any]]:
     """Yield parsed JSON events from an SSE ``data:`` stream.
 
     Shared SSE framing used by the OpenAI-, DeepSeek-, Gemini- and
@@ -423,7 +423,7 @@ class LLMRateLimitError(LLMClientError):
     instead of a fixed backoff. ``None`` means the server gave no hint.
     """
 
-    def __init__(self, *args: object, retry_after: "Optional[int]" = None, error_code: "Optional[int]" = None) -> None:
+    def __init__(self, *args: object, retry_after: int | None = None, error_code: int | None = None) -> None:
         super().__init__(*args)
         # Clamp at construction so every consumer sees a bounded hint. The
         # header parser (parse_retry_after) already clamps to
@@ -475,7 +475,7 @@ class LLMCancelled(LLMClientError):  # noqa: N818 — Cancelled-suffix conventio
     """
 
 
-def interruptible_sleep(seconds: float, cancel_event: "Optional[Any]" = None) -> bool:
+def interruptible_sleep(seconds: float, cancel_event: Any | None = None) -> bool:
     """Sleep *seconds*, waking early (returning True) when *cancel_event* is set.
 
     Returns True when the wait was interrupted by cancellation — the caller
@@ -496,7 +496,7 @@ class LLMClient(ABC):
     All external LLM providers must implement this interface
     """
 
-    def __init__(self, api_key: str, base_url: Optional[str] = None, timeout: int = DEFAULT_LLM_TIMEOUT):
+    def __init__(self, api_key: str, base_url: str | None = None, timeout: int = DEFAULT_LLM_TIMEOUT):
         """
         Initialize LLM client
 
@@ -512,7 +512,7 @@ class LLMClient(ABC):
         # interruptible_sleep).  Wired by agent loops (agent_loop /
         # design_chat_loop) from their config.cancel_event so ESC stays
         # responsive during client-internal retries; None = plain sleeps.
-        self.cancel_event: "Optional[Any]" = None
+        self.cancel_event: Any | None = None
         # HTTP connection pooling: reuse TCP/TLS handshake to save 50-200ms per call
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
@@ -525,7 +525,7 @@ class LLMClient(ABC):
         messages: list[LLMMessage],
         model: str,
         temperature: float = 0.0,
-        max_tokens: Optional[int] = None,
+        max_tokens: int | None = None,
         **kwargs,
     ) -> LLMResponse:
         """
@@ -554,7 +554,7 @@ class LLMClient(ABC):
 
     def chat_with_tools(
         self, messages: list[LLMMessage], tools: list[dict[str, Any]], model: str = "", **kwargs
-    ) -> "ToolCallResponse":
+    ) -> ToolCallResponse:
         """
         Chat with tool calling support.
 
@@ -590,7 +590,7 @@ class LLMClient(ABC):
             logger.debug("LLMClient session closed for %s", self.get_provider_name())
 
 
-def resolve_provider_base_url(provider: str) -> Optional[str]:
+def resolve_provider_base_url(provider: str) -> str | None:
     """Resolve the base URL override for ``provider`` in a provider-scoped way.
 
     Resolution order:
@@ -626,7 +626,7 @@ def resolve_provider_base_url(provider: str) -> Optional[str]:
 def create_llm_client(
     provider: str,
     api_key: str,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     timeout: int = DEFAULT_LLM_TIMEOUT,
 ) -> LLMClient:
     """

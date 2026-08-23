@@ -6,6 +6,7 @@ pure functions over the single source of truth (_LANGUAGE_EXTENSION_GROUPS,
 DERIVED from _EXT_MAP via the language-level _LANGUAGE_FAMILIES partition), so
 the tests pin the contract both consumers rely on.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -18,6 +19,7 @@ from external_llm.languages.models import (
 )
 
 # ── caller_search_extensions ───────────────────────────────────────────────
+
 
 def test_known_language_returns_own_family():
     # A definition is only callable from its own family.
@@ -66,8 +68,7 @@ def test_c_cpp_family_is_mutually_callable():
     # function CAN be called from .c/.h (extern "C"), and headers (.h/.hpp/.hh)
     # declare symbols consumed by both .c and .cpp translation units.
     c_cpp = {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh"}
-    for f in ("main.c", "lib.h", "core.cpp", "impl.cc", "view.cxx",
-              "hdr.hpp", "raw.hh"):
+    for f in ("main.c", "lib.h", "core.cpp", "impl.cc", "view.cxx", "hdr.hpp", "raw.hh"):
         assert set(caller_search_extensions(f)) == c_cpp, f
 
 
@@ -101,10 +102,11 @@ def test_result_is_sorted_for_determinism():
 
 # ── _get_language_group (cross-language resolution guard) ──────────────────
 
+
 def test_group_indices_are_stable():
     # The cross-language resolution guard compares group INDICES; the indices
     # must stay stable (see _LANGUAGE_EXTENSION_GROUPS in models.py).
-    assert _get_language_group(".ts") == _get_language_group(".js") == 0   # JS/TS
+    assert _get_language_group(".ts") == _get_language_group(".js") == 0  # JS/TS
     assert _get_language_group(".py") == 1
     assert _get_language_group(".go") == 2
     assert _get_language_group(".java") == 3
@@ -112,12 +114,18 @@ def test_group_indices_are_stable():
     assert _get_language_group(".rs") == 5
     assert _get_language_group(".rb") == 6
     assert _get_language_group(".c") == _get_language_group(".cpp") == 7  # C/C++
-    assert _get_language_group(".php") == 8                              # PHP
-    assert _get_language_group(".cs") == 9                               # C#
-    assert _get_language_group(".swift") == 10                           # Swift
+    assert _get_language_group(".php") == 8  # PHP
+    assert _get_language_group(".cs") == 9  # C#
+    assert _get_language_group(".swift") == 10  # Swift
     assert _get_language_group(".scala") == _get_language_group(".sc") == 11  # Scala
-    assert _get_language_group(".lua") == 12                             # Lua
-    assert _get_language_group(".sh") == _get_language_group(".bash") == _get_language_group(".zsh") == _get_language_group(".ksh") == 13  # Bash
+    assert _get_language_group(".lua") == 12  # Lua
+    assert (
+        _get_language_group(".sh")
+        == _get_language_group(".bash")
+        == _get_language_group(".zsh")
+        == _get_language_group(".ksh")
+        == 13
+    )  # Bash
 
 
 def test_unknown_extension_returns_minus_one():
@@ -126,6 +134,7 @@ def test_unknown_extension_returns_minus_one():
 
 
 # ── derivation (single source) ───────────────────────────────────────────────
+
 
 def test_family_groups_are_derived_from_ext_map():
     """Recomputing the derivation must reproduce the live groups — a manual

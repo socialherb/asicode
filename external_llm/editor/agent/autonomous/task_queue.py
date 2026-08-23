@@ -16,7 +16,6 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.editor.agent.autonomous.trigger_engine import TriggerEvent
@@ -27,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(order=True)
 class AutonomousTask:
-    priority: int                                      # sort key: lower = higher priority
+    priority: int  # sort key: lower = higher priority
     created_at: float = field(compare=False)
     event: TriggerEvent = field(compare=False)
     action: ActionDecision = field(compare=False)
@@ -37,7 +36,7 @@ class AutonomousTask:
 class AutonomousTaskQueue:
     """Thread-safe priority queue for autonomous tasks."""
 
-    MAX_CONCURRENT = 2   # max tasks executing simultaneously
+    MAX_CONCURRENT = 2  # max tasks executing simultaneously
     # Defense-in-depth cap on pending tasks. Superseded/orphaned tasks are purged
     # by get_nowait() regardless of the concurrency limit (see below), so under
     # normal operation the queue holds at most a handful of *live* tasks. This cap
@@ -92,13 +91,14 @@ class AutonomousTaskQueue:
         if purged:
             logger.debug(
                 "Purged %d tombstone task(s) during cap-check (live=%d)",
-                purged, len(live),
+                purged,
+                len(live),
             )
         return purged
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
-    def enqueue(self, event: TriggerEvent, action: ActionDecision) -> Optional[str]:
+    def enqueue(self, event: TriggerEvent, action: ActionDecision) -> str | None:
         """
         Enqueue a task. Returns task_id or None if ignored or rejected at cap.
 
@@ -128,9 +128,10 @@ class AutonomousTaskQueue:
                 if self._pq.qsize() >= self.MAX_PENDING:
                     self._dropped_count += 1
                     logger.warning(
-                        "AutonomousTaskQueue at cap (%d); dropping new task for %s "
-                        "(dropped_total=%d)",
-                        self.MAX_PENDING, event.source_file, self._dropped_count,
+                        "AutonomousTaskQueue at cap (%d); dropping new task for %s (dropped_total=%d)",
+                        self.MAX_PENDING,
+                        event.source_file,
+                        self._dropped_count,
                     )
                     return None
 
@@ -157,7 +158,7 @@ class AutonomousTaskQueue:
 
     # ── Dequeue ───────────────────────────────────────────────────────────────
 
-    def get_nowait(self) -> Optional[AutonomousTask]:
+    def get_nowait(self) -> AutonomousTask | None:
         """
         Get next task if concurrency limit not reached. Non-blocking.
         Returns None if queue is empty or at MAX_CONCURRENT.
@@ -169,7 +170,7 @@ class AutonomousTaskQueue:
         free); remaining live tasks are re-queued for subsequent calls.
         """
         with self._lock:
-            result: Optional[AutonomousTask] = None
+            result: AutonomousTask | None = None
             held_live: list[AutonomousTask] = []
             while True:
                 try:
@@ -190,7 +191,9 @@ class AutonomousTaskQueue:
                         # so stale tasks cannot accumulate during long runs.
                         logger.debug(
                             "Dropping superseded task %s for %s (current=%s)",
-                            task.task_id, sf, current,
+                            task.task_id,
+                            sf,
+                            current,
                         )
                         continue
                     del self._pending_file_map[sf]
@@ -209,9 +212,7 @@ class AutonomousTaskQueue:
                 if tsf:
                     self._pending_file_map[tsf] = t.task_id
             if result is not None:
-                logger.debug(
-                    "Dequeued task %s. Running: %d", result.task_id, self._running_count
-                )
+                logger.debug("Dequeued task %s. Running: %d", result.task_id, self._running_count)
             return result
 
     # ── Completion ────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 """
 Tests for llm_utils.py — simple_llm_call.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock

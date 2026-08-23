@@ -15,6 +15,7 @@ and a correct answer could be reported as status="error".
 ``intent_undetermined`` separates permission (still fails open toward editing)
 from expectation (the gate). These tests pin both directions.
 """
+
 from __future__ import annotations
 
 from unittest import mock

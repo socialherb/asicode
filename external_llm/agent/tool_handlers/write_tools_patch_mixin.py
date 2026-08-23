@@ -4,6 +4,7 @@
 and anchor_edit. Split out of ``WriteToolsMixin`` in ``write_tools.py``;
 recombined there via ``class WriteToolsMixin(WriteToolsPatchMixin, ...)``.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +15,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from diff_apply import _clean_diff, extract_touched_files_from_diff
 from services.patch_helpers import normalize_patch_text
@@ -73,13 +74,15 @@ logger = logging.getLogger(__name__)
 # ── Precompiled regexes used on the hot apply_patch path ─────────────────────
 # Module-level so each call reuses the compiled pattern instead of recompiling.
 _PATCH_PATH_PREFIX_RE = re.compile(r"^(?:a/|b/)")  # strip git diff a// b/ prefixes
-_HUNK_HEADER_RE = re.compile(r'^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@')
+_HUNK_HEADER_RE = re.compile(r"^@@ -([0-9]+),([0-9]+) \+([0-9]+),([0-9]+) @@")
 _RE_LINE_NUMBER_PREFIX = re.compile(r"^\d+:\s?")
 
 
 def _resolve_ast_anchor_line(
-    anchor_ast_lineno: Any, lines: list[str], anchor_pattern: Optional[str],
-) -> Optional[int]:
+    anchor_ast_lineno: Any,
+    lines: list[str],
+    anchor_pattern: str | None,
+) -> int | None:
     """Resolve a caller-supplied 1-indexed ``anchor_ast_lineno`` to a 0-indexed
     line, or None when absent/out of range (P5-3 extraction from
     ``_tool_anchor_edit`` — pure computation, no self)."""
@@ -88,21 +91,42 @@ def _resolve_ast_anchor_line(
     _candidate = anchor_ast_lineno - 1  # 1-indexed → 0-indexed
     if 0 <= _candidate < len(lines):
         logger.info(
-            "[ANCHOR_AST] tool anchor_edit using caller-supplied line %d "
-            "(pattern=%r bypassed)",
-            anchor_ast_lineno, (anchor_pattern or "")[:40],
+            "[ANCHOR_AST] tool anchor_edit using caller-supplied line %d (pattern=%r bypassed)",
+            anchor_ast_lineno,
+            (anchor_pattern or "")[:40],
         )
         return _candidate
     logger.warning(
-        "[ANCHOR_AST] tool anchor_edit line %d out of range "
-        "(file=%d lines) — falling back to string search",
-        anchor_ast_lineno, len(lines),
+        "[ANCHOR_AST] tool anchor_edit line %d out of range (file=%d lines) — falling back to string search",
+        anchor_ast_lineno,
+        len(lines),
     )
     return None
 
 
 class WriteToolsPatchMixin:
     """Patch-family write handlers: write_plan, apply_patch, anchor_edit."""
+
+    # ── Host-class attributes (provided by ToolRegistry, not set here) ──
+    # Class-level annotations give pyright the host contract WITHOUT runtime
+    # assignment: ToolRegistry.__init__ owns the real values, so these are pure
+    # typing scaffolding (no setattr, no __getattr__). Mirrors the docstring
+    # contracts in the sibling mixins; keep the two in sync.
+    repo_root: str
+    _make_result: Any
+    _effective_repo_root: Any
+    _secure_path: Any
+    _invalidate_cache_after_write: Any
+    _run_syntax_check_for_file: Any
+    _should_soft_fail_verify: Any
+    _tool_create_file: Any
+    _recover_args_from_raw: Any
+    _suggest_missing_paths: Any
+    _record_text_edit: Any
+    _norm_repo_rel: Any
+    _text_edited_files: set[str]
+    _applied_patches: list[str]
+    _patch_failure_snippet: Any
 
     # ── Plan normalizer class variables ─────────────────────────────── #
     _ACTION_TO_OP: ClassVar[dict[str, str]] = {
@@ -124,14 +148,16 @@ class WriteToolsPatchMixin:
         "delete_content": "edit_blocks",
     }
 
-    _WRITE_PLAN_OP_TYPES = frozenset({
-        "create_file",
-        "replace_file",
-        "edit_blocks",
-        "insert_after",
-        "insert_before",
-        "insert_after_line",
-    })
+    _WRITE_PLAN_OP_TYPES = frozenset(
+        {
+            "create_file",
+            "replace_file",
+            "edit_blocks",
+            "insert_after",
+            "insert_before",
+            "insert_after_line",
+        }
+    )
 
     _OP_TYPE_ALIASES: ClassVar[dict[str, str]] = {
         "createfile": "create_file",
@@ -146,16 +172,32 @@ class WriteToolsPatchMixin:
     # (e.g. "..." Python ellipsis, "old_code"/"new_code" as actual identifiers,
     # "old text"/"new text"/"new code" inside docstrings) are excluded to avoid
     # rejecting valid edits.
-    _PLACEHOLDER_BEFORE = frozenset({
-        "OLD TEXT", "ORIGINAL CODE", "EXISTING CODE", "CURRENT CODE",
-        "YOUR CODE HERE", "REPLACE THIS", "...\n...", "old code",
-        "existing code", "current content", "put old code here",
-    })
-    _PLACEHOLDER_AFTER = frozenset({
-        "NEW TEXT", "UPDATED CODE", "NEW CODE", "REPLACEMENT CODE",
-        "YOUR NEW CODE HERE", "updated content",
-        "put new code here",
-    })
+    _PLACEHOLDER_BEFORE = frozenset(
+        {
+            "OLD TEXT",
+            "ORIGINAL CODE",
+            "EXISTING CODE",
+            "CURRENT CODE",
+            "YOUR CODE HERE",
+            "REPLACE THIS",
+            "...\n...",
+            "old code",
+            "existing code",
+            "current content",
+            "put old code here",
+        }
+    )
+    _PLACEHOLDER_AFTER = frozenset(
+        {
+            "NEW TEXT",
+            "UPDATED CODE",
+            "NEW CODE",
+            "REPLACEMENT CODE",
+            "YOUR NEW CODE HERE",
+            "updated content",
+            "put new code here",
+        }
+    )
 
     # ── Path normalizer helpers ──────────────────────────────────────── #
 
@@ -165,7 +207,7 @@ class WriteToolsPatchMixin:
         p = raw_path.replace("\\", "/")
         repo = str(self.repo_root).rstrip("/") + "/"
         if p.startswith(repo):
-            rel = p[len(repo):]
+            rel = p[len(repo) :]
             repairs.append(f"abs path stripped repo prefix→{rel!r}")
             return rel
         if p.startswith("/"):
@@ -202,7 +244,9 @@ class WriteToolsPatchMixin:
                             op["anchor"] = anchor_line
                             repairs.append(f"line {line_no}→anchor:{op['anchor']!r}")
                 except Exception:
-                    logger.debug("<module>::WriteToolsPatchMixin::_normalize_plan_op:0 suppressed Exception", exc_info=True)
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_normalize_plan_op:0 suppressed Exception", exc_info=True
+                    )
                 op.pop("start_line", None)
                 op.pop("end_line", None)
                 op.pop("line", None)
@@ -230,8 +274,9 @@ class WriteToolsPatchMixin:
             if "line" not in op and "start_line" in op:
                 op["line"] = int(op.pop("start_line"))
                 repairs.append("insert_after_line: start_line→line")
-            if isinstance(op.get("lines"), str):
-                op["lines"] = op["lines"].splitlines() or [op["lines"]]
+            _ins_lines = op.get("lines")
+            if isinstance(_ins_lines, str):
+                op["lines"] = _ins_lines.splitlines() or [_ins_lines]
                 repairs.append("insert_after_line: lines string→list")
 
         if op_type == "edit_blocks" and "before" in op and "blocks" not in op and "edits" not in op:
@@ -247,10 +292,18 @@ class WriteToolsPatchMixin:
                 repairs.append("blocks dict→list")
 
             # 2. blocks alias normalization + line→before
-            _BEFORE_ALIASES = ("old", "original", "from", "search",
-                               "replace_this", "find", "source", "existing")
-            _AFTER_ALIASES  = ("new", "new_content", "replacement", "to", "with",
-                               "replace_with", "substitute", "target", "updated")
+            _before_aliases = ("old", "original", "from", "search", "replace_this", "find", "source", "existing")
+            _after_aliases = (
+                "new",
+                "new_content",
+                "replacement",
+                "to",
+                "with",
+                "replace_with",
+                "substitute",
+                "target",
+                "updated",
+            )
             blocks = op.get("blocks") or op.get("edits") or []
             if isinstance(blocks, list) and blocks:
                 new_blocks = []
@@ -260,13 +313,13 @@ class WriteToolsPatchMixin:
                         continue
                     blk = dict(blk)
                     if not blk.get("before"):
-                        for alias in _BEFORE_ALIASES:
+                        for alias in _before_aliases:
                             if alias in blk:
                                 blk["before"] = blk.pop(alias)
                                 repairs.append(f"{alias}→before")
                                 break
                     if blk.get("after") is None:
-                        for alias in _AFTER_ALIASES:
+                        for alias in _after_aliases:
                             if alias in blk:
                                 blk["after"] = blk.pop(alias)
                                 repairs.append(f"{alias}→after")
@@ -279,15 +332,16 @@ class WriteToolsPatchMixin:
                         try:
                             _fp = Path(self.repo_root) / _path
                             if _fp.exists():
-                                blk["before"] = "\n".join(
-                                    _file_line_window(_fp, _start - 1, _end - _start + 1)
-                                )
+                                blk["before"] = "\n".join(_file_line_window(_fp, _start - 1, _end - _start + 1))
                                 blk.pop("start_line", None)
                                 blk.pop("end_line", None)
                                 blk.pop("line", None)
                                 repairs.append(f"blk line {_start}-{_end}→before")
                         except Exception:
-                            logger.debug("<module>::WriteToolsPatchMixin::_normalize_plan_op:1 suppressed Exception", exc_info=True)
+                            logger.debug(
+                                "<module>::WriteToolsPatchMixin::_normalize_plan_op:1 suppressed Exception",
+                                exc_info=True,
+                            )
                     new_blocks.append(blk)
                 op["blocks"] = new_blocks
                 op.pop("edits", None)
@@ -331,10 +385,7 @@ class WriteToolsPatchMixin:
                             before = blk.get("before", "")
                             if before and isinstance(before, str):
                                 before_lines = before.splitlines()
-                                if (
-                                    len(before_lines) == 1
-                                    and before[:1] not in (" ", "\t")
-                                ):
+                                if len(before_lines) == 1 and before[:1] not in (" ", "\t"):
                                     stripped = before.strip()
                                     matches: list[tuple[int, str]] = []
                                     for _i, _ln in enumerate(_iter_file_lines(fp)):
@@ -343,9 +394,7 @@ class WriteToolsPatchMixin:
                                     if len(matches) == 1:
                                         blk = dict(blk)
                                         blk["before"] = matches[0][1]
-                                        repairs.append(
-                                            f"before+indent (unique): {blk['before']!r:.60}"
-                                        )
+                                        repairs.append(f"before+indent (unique): {blk['before']!r:.60}")
                                         any_enriched = True
                                     # multi-match: do NOT silently prepend context — let LLM
                                     # provide a more specific before block via error feedback
@@ -353,7 +402,9 @@ class WriteToolsPatchMixin:
                         if any_enriched:
                             op["blocks"] = new_blocks
                 except Exception:
-                    logger.debug("<module>::WriteToolsPatchMixin::_normalize_plan_op:2 suppressed Exception", exc_info=True)
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_normalize_plan_op:2 suppressed Exception", exc_info=True
+                    )
                     # non-critical enrichment — never block patch application
 
         if (
@@ -388,13 +439,13 @@ class WriteToolsPatchMixin:
 
         return op
 
-    def _detect_placeholder_op(self, op: dict[str, Any]) -> Optional[str]:
+    def _detect_placeholder_op(self, op: dict[str, Any]) -> str | None:
         if not isinstance(op, dict):
             return None
         op_type = normalize_key(str(op.get("op") or op.get("type") or ""))
         if op_type != "edit_blocks":
             return None
-        for blk in (op.get("blocks") or []):
+        for blk in op.get("blocks") or []:
             if not isinstance(blk, dict):
                 continue
             before = str(blk.get("before") or "").strip()
@@ -446,16 +497,19 @@ class WriteToolsPatchMixin:
                             f"a 'lines' list instead."
                         )
                 except Exception:
-                    logger.debug("<module>::WriteToolsPatchMixin::_enrich_plan_error:0 suppressed Exception", exc_info=True)
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_enrich_plan_error:0 suppressed Exception", exc_info=True
+                    )
                     # non-critical: error message building must not block
 
             if op_type == "edit_blocks" and "not found" in error_str.lower():
                 try:
                     import difflib
+
                     fp = Path(self.repo_root) / path
                     if fp.exists():
                         before_text = ""
-                        for blk in (op.get("blocks") or []):
+                        for blk in op.get("blocks") or []:
                             if isinstance(blk, dict) and blk.get("before"):
                                 before_text = str(blk["before"])
                                 break
@@ -470,9 +524,7 @@ class WriteToolsPatchMixin:
                             best_idx = -1
                             best_ratio = 0.0
                             for _i, _ln in enumerate(_iter_file_lines(fp)):
-                                _r = difflib.SequenceMatcher(
-                                    None, before_first, _ln, autojunk=False
-                                ).ratio()
+                                _r = difflib.SequenceMatcher(None, before_first, _ln, autojunk=False).ratio()
                                 if _r > best_ratio:
                                     best_ratio = _r
                                     best_idx = _i
@@ -483,12 +535,9 @@ class WriteToolsPatchMixin:
                                 # is immediately followed by "copy the EXACT
                                 # text", and a bare listing hides the one
                                 # column the mismatch is usually about.
-                                ctx = "\n".join(
-                                    format_numbered_line(_start + j + 1, _w[j])
-                                    for j in range(len(_w))
-                                )
+                                ctx = "\n".join(format_numbered_line(_start + j + 1, _w[j]) for j in range(len(_w)))
                                 ctx_hint = (
-                                    f"\nClosest match found near line {best_idx+1} "
+                                    f"\nClosest match found near line {best_idx + 1} "
                                     f"(│N│ = leading-whitespace count; copy the code after it, "
                                     f"not the gutter):\n```\n{ctx}\n```\n"
                                     f"Copy the EXACT text from this block into 'before'."
@@ -512,7 +561,9 @@ class WriteToolsPatchMixin:
                                 f"First 60 lines:\n```\n{preview}\n```"
                             )
                 except Exception:
-                    logger.debug("<module>::WriteToolsPatchMixin::_enrich_plan_error:1 suppressed Exception", exc_info=True)
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_enrich_plan_error:1 suppressed Exception", exc_info=True
+                    )
                     # non-critical: error message building must not block
 
             if op_type == "create_file" and "already exists" in error_str.lower():
@@ -532,23 +583,27 @@ class WriteToolsPatchMixin:
                             f"the file. First 10 lines:\n```\n{preview}\n```"
                         )
                 except Exception:
-                    logger.debug("<module>::WriteToolsPatchMixin::_enrich_plan_error:2 suppressed Exception", exc_info=True)
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_enrich_plan_error:2 suppressed Exception", exc_info=True
+                    )
                     # non-critical: error message building must not block
 
         return "\n".join(hints)
 
     def _looks_like_unified_diff(self, text: str) -> bool:
-        t = str(text or '')
+        t = str(text or "")
         if not t.strip():
             return False
-        has_header = any(s in t for s in ('diff --git ', '--- a/', '+++ b/')) or t.lstrip().startswith('--- ')
-        has_hunk = ('@@ ' in t)
-                # Allow hunk-only patches (starting with @@, no header) — git apply handles them
-        return bool(has_hunk and (has_header or t.lstrip().startswith('@@')))
+        has_header = any(s in t for s in ("diff --git ", "--- a/", "+++ b/")) or t.lstrip().startswith("--- ")
+        has_hunk = "@@ " in t
+        # Allow hunk-only patches (starting with @@, no header) — git apply handles them
+        return bool(has_hunk and (has_header or t.lstrip().startswith("@@")))
 
     def _write_staged_files_directly(
-        self, staged: dict[str, str], picked_files: list[str],
-    ) -> "ToolResult":
+        self,
+        staged: dict[str, str],
+        picked_files: list[str],
+    ) -> ToolResult:
         """Apply a compiled plan by writing each file's final content directly.
 
         plan_compiler already computed the exact post-edit content of every
@@ -562,10 +617,11 @@ class WriteToolsPatchMixin:
         Files whose content is unchanged are skipped (not touched, not counted).
         """
         import os as _os
+
         repo = str(self._effective_repo_root)
-        snapshots: dict[str, str] = {}   # abs_path -> original content (existing files)
-        created: list[str] = []          # abs_paths that did not exist before
-        written: list[str] = []          # rel_paths actually written (changed)
+        snapshots: dict[str, str] = {}  # abs_path -> original content (existing files)
+        created: list[str] = []  # abs_paths that did not exist before
+        written: list[str] = []  # rel_paths actually written (changed)
 
         def _rollback() -> None:
             for _ap, _orig in snapshots.items():
@@ -580,7 +636,7 @@ class WriteToolsPatchMixin:
                     logger.debug("write_plan rollback remove failed for %s: %s", _ap, _re)
 
         try:
-            for rel in (picked_files or list(staged.keys())):
+            for rel in picked_files or list(staged.keys()):
                 if rel not in staged:
                     continue
                 new_content = staged[rel]
@@ -595,9 +651,7 @@ class WriteToolsPatchMixin:
                         # overwriting would break the rollback contract (a later
                         # syntax error could not restore it). Abort; the outer
                         # handler rolls back everything written so far.
-                        raise OSError(
-                            f"cannot read existing file {rel} for snapshot: {_re}"
-                        ) from _re
+                        raise OSError(f"cannot read existing file {rel} for snapshot: {_re}") from _re
                     if cur == new_content:
                         continue  # unchanged — don't touch
                     snapshots[ap] = cur
@@ -611,7 +665,8 @@ class WriteToolsPatchMixin:
         except Exception as exc:
             _rollback()
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Direct write failed: {type(exc).__name__}: {exc}",
                 metadata={"rolled_back": True},
             )
@@ -629,7 +684,8 @@ class WriteToolsPatchMixin:
         if _syntax_errors:
             _rollback()
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Plan introduced syntax errors (rolled back): {'; '.join(_syntax_errors)}",
                 metadata={"syntax_errors": _syntax_errors, "rolled_back": True},
             )
@@ -647,9 +703,10 @@ class WriteToolsPatchMixin:
 
     # ── Main write tools ─────────────────────────────────────────────── #
 
-    def _tool_write_plan(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_write_plan(self, args: dict[str, Any]) -> ToolResult:
         if "__raw_arguments" in args and "plan" not in args:
             import json as _json
+
             _raw = args["__raw_arguments"]
             if isinstance(_raw, str):
                 try:
@@ -666,10 +723,10 @@ class WriteToolsPatchMixin:
                             args = _parsed
                             logger.info("write_plan: recovered args from __raw_arguments (repaired)")
                     except (ValueError, _json.JSONDecodeError):
-                        _start = _raw.find('{')
-                    _end = _raw.rfind('}')
+                        _start = _raw.find("{")
+                    _end = _raw.rfind("}")
                     if _start != -1 and _end > _start:
-                        _sub = _raw[_start:_end + 1]
+                        _sub = _raw[_start : _end + 1]
                         try:
                             _parsed = _json.loads(_sub)
                             if isinstance(_parsed, dict):
@@ -684,7 +741,10 @@ class WriteToolsPatchMixin:
                                     args = _parsed
                                     logger.info("write_plan: recovered args from __raw_arguments (substring repaired)")
                             except (ValueError, _json.JSONDecodeError):
-                                logger.debug("<module>::WriteToolsPatchMixin::_tool_write_plan:3 suppressed (ValueError, _json.JSONDecodeError)", exc_info=True)
+                                logger.debug(
+                                    "<module>::WriteToolsPatchMixin::_tool_write_plan:3 suppressed (ValueError, _json.JSONDecodeError)",
+                                    exc_info=True,
+                                )
 
         plan = args.get("plan")
         if not plan:
@@ -707,23 +767,27 @@ class WriteToolsPatchMixin:
                         _target = _extract_truncated_op_path(_raw)
                         _target_hint = f" Truncated target: {_target}." if _target else ""
                         return self._make_result(
-                            ok=False, content="", error=(
+                            ok=False,
+                            content="",
+                            error=(
                                 f"write_plan: tool_call arguments were truncated "
                                 f"({_open_br - _close_br} unclosed braces, {len(_trimmed)} chars)."
                                 f"{_target_hint} "
                                 f"For large file creation/edits, use bash (python3/cat) to write "
                                 f"the file directly, then use write_plan to update other files."
-                            )
+                            ),
                         )
                     _raw_hint = f" (raw args: {_raw[:120]})"
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"plan is required{_raw_hint}. Correct format:\n"
                         'write_plan({"plan": {"kind": "ASICODE_PLAN_V1", "ops": ['
                         '{"op": "create_file", "path": "path/to/file.py", "content": "file content here"}'
                         "]}})\n"
                         "For new files use op='create_file'. For patches use op='patch' with unified diff."
-                    )
+                    ),
                 )
             plan = {"kind": "ASICODE_PLAN_V1", "ops": ops}
 
@@ -740,9 +804,9 @@ class WriteToolsPatchMixin:
             # Survived normalisation as text → not JSON at all. Quote the
             # (fence-stripped) input back so the model can see what we received.
             _sample = plan[:200].replace("\n", "\\n")
-            return self._make_result(ok=False, content="", error=(
-                f"plan must be a valid JSON object. Received: {_sample}"
-            ))
+            return self._make_result(
+                ok=False, content="", error=(f"plan must be a valid JSON object. Received: {_sample}")
+            )
 
         # Guard BEFORE any plan.get(...) call below: json.loads above can yield a
         # non-dict scalar (int/float/bool/str/None from inputs like {"plan": "42"}
@@ -763,7 +827,9 @@ class WriteToolsPatchMixin:
 
         kind = plan.get("kind") or plan.get("version")
         if not kind or str(kind).strip() != "ASICODE_PLAN_V1":
-            return self._make_result(ok=False, content="", error="plan must have 'kind' or 'version' field set to 'ASICODE_PLAN_V1'")
+            return self._make_result(
+                ok=False, content="", error="plan must have 'kind' or 'version' field set to 'ASICODE_PLAN_V1'"
+            )
 
         ops = plan.get("ops") or plan.get("operations")
         if not ops:
@@ -777,7 +843,9 @@ class WriteToolsPatchMixin:
             # ── Phase 1: op must be a dict ───────────────────────────────
             if not isinstance(op, dict):
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"write_plan rejected: ops[{op_idx}] is not a JSON object "
                         f"(type={type(op).__name__!r}).\n"
                         "ACTION: Each op must be a JSON object with 'op', 'path', "
@@ -789,7 +857,9 @@ class WriteToolsPatchMixin:
             ph_err = self._detect_placeholder_op(op)
             if ph_err:
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"write_plan rejected: {ph_err}\n"
                         "ACTION: Use read_file on the target file first, then use the actual "
                         "text from the file in 'before', and your desired replacement in 'after'. "
@@ -803,7 +873,9 @@ class WriteToolsPatchMixin:
             if path_val is None or str(path_val).strip() == "":
                 op_type_info = str(op.get("op") or op.get("type") or "(unknown)")
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"write_plan rejected: ops[{op_idx}] (type={op_type_info!r}) has missing or empty 'path'.\n"
                         "ACTION: Every op must include a 'path' field with the relative file path "
                         "(e.g. 'external_llm/agent/example.py'). Add the correct path and retry write_plan."
@@ -811,7 +883,9 @@ class WriteToolsPatchMixin:
                 )
             if ".." in str(path_val).split("/"):
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"write_plan rejected: ops[{op_idx}] has path traversal ('..') in "
                         f"path={path_val!r}.\n"
                         "ACTION: Use a relative path within the repository, without '..' segments."
@@ -822,7 +896,9 @@ class WriteToolsPatchMixin:
             raw_op_type = str(op.get("op") or op.get("type") or "").strip()
             if not raw_op_type:
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"write_plan rejected: ops[{op_idx}] is missing 'op' or 'type' field.\n"
                         f"ACTION: Add an 'op' field. Supported types: "
                         f"{', '.join(sorted(self._WRITE_PLAN_OP_TYPES))}."
@@ -834,7 +910,9 @@ class WriteToolsPatchMixin:
             op_type = self._OP_TYPE_ALIASES.get(op_type, op_type)
             if op_type not in self._WRITE_PLAN_OP_TYPES:
                 return self._make_result(
-                    ok=False, content="", error=(
+                    ok=False,
+                    content="",
+                    error=(
                         f"write_plan rejected: ops[{op_idx}] has unsupported op type "
                         f"{raw_op_type!r} (normalized={op_type!r}).\n"
                         f"ACTION: Use one of the supported types: "
@@ -858,7 +936,9 @@ class WriteToolsPatchMixin:
                 edits = op.get("edits") or op.get("blocks")
                 if not isinstance(edits, list) or not edits:
                     return self._make_result(
-                        ok=False, content="", error=(
+                        ok=False,
+                        content="",
+                        error=(
                             f"write_plan rejected: ops[{op_idx}] (edit_blocks) is missing "
                             f"non-empty 'edits' or 'blocks' list.\n"
                             "ACTION: Add an 'edits' list with 'before'/'after' pairs."
@@ -868,7 +948,9 @@ class WriteToolsPatchMixin:
             if op_type in ("insert_after", "insert_before"):
                 if not op.get("anchor"):
                     return self._make_result(
-                        ok=False, content="", error=(
+                        ok=False,
+                        content="",
+                        error=(
                             f"write_plan rejected: ops[{op_idx}] ({op_type}) is missing "
                             f"'anchor' field.\n"
                             "ACTION: Add an 'anchor' field with an exact line from the target "
@@ -878,7 +960,9 @@ class WriteToolsPatchMixin:
                 lines = op.get("lines")
                 if not isinstance(lines, list) or not lines:
                     return self._make_result(
-                        ok=False, content="", error=(
+                        ok=False,
+                        content="",
+                        error=(
                             f"write_plan rejected: ops[{op_idx}] ({op_type}) has missing or "
                             f"non-list 'lines' field.\n"
                             "ACTION: Add a 'lines' list with the text to insert."
@@ -889,7 +973,9 @@ class WriteToolsPatchMixin:
                 op_line = op.get("line")
                 if not isinstance(op_line, int) or op_line < 1:
                     return self._make_result(
-                        ok=False, content="", error=(
+                        ok=False,
+                        content="",
+                        error=(
                             f"write_plan rejected: ops[{op_idx}] (insert_after_line) is missing "
                             f"or invalid 'line' field. Must be a positive integer.\n"
                             "ACTION: Add a 'line' field with the 1-based line number."
@@ -898,7 +984,9 @@ class WriteToolsPatchMixin:
                 lines = op.get("lines")
                 if not isinstance(lines, list) or not lines:
                     return self._make_result(
-                        ok=False, content="", error=(
+                        ok=False,
+                        content="",
+                        error=(
                             f"write_plan rejected: ops[{op_idx}] (insert_after_line) has missing or "
                             f"non-list 'lines' field.\n"
                             "ACTION: Add a 'lines' list with the text to insert."
@@ -907,11 +995,7 @@ class WriteToolsPatchMixin:
 
         # F1 cross-process edit-lease guard: refuse when a parallel session
         # holds a live lease on any op target (pre-check before compile/apply).
-        _lease_paths = [
-            str(op.get("path") or "")
-            for op in (ops or [])
-            if isinstance(op, dict) and op.get("path")
-        ]
+        _lease_paths = [str(op.get("path") or "") for op in (ops or []) if isinstance(op, dict) and op.get("path")]
         _lease_refused = self._refuse_foreign_leased(_lease_paths)
         if _lease_refused is not None:
             return _lease_refused
@@ -919,7 +1003,7 @@ class WriteToolsPatchMixin:
         # plan_compiler is a first-party root module — import cannot fail.
         from plan_compiler import compile_plan_to_unified_diff
 
-        def _compile_and_apply(p: dict[str, Any]) -> "ToolResult":
+        def _compile_and_apply(p: dict[str, Any]) -> ToolResult:
             try:
                 result = compile_plan_to_unified_diff(
                     repo_root=str(self._effective_repo_root),
@@ -928,7 +1012,8 @@ class WriteToolsPatchMixin:
                 )
             except Exception as exc:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=f"Plan compilation failed: {type(exc).__name__}: {exc}",
                 )
             patch = result.diff_patch or ""
@@ -947,7 +1032,8 @@ class WriteToolsPatchMixin:
             # applied_patches record. Snapshot + py_compile + rollback preserve the
             # same safety the git-apply path provided.
             apply_result = self._write_staged_files_directly(
-                result.staged, result.picked_files,
+                result.staged,
+                result.picked_files,
             )
             if not apply_result.ok:
                 _err_content = f"Plan compiled successfully but apply failed: {apply_result.error}"
@@ -956,8 +1042,10 @@ class WriteToolsPatchMixin:
                     for _k, _v in apply_result.metadata.items():
                         _err_metadata.setdefault(_k, _v)
                 return self._make_result(
-                    ok=False, content=_err_content,
-                    error=apply_result.error, metadata=_err_metadata,
+                    ok=False,
+                    content=_err_content,
+                    error=apply_result.error,
+                    metadata=_err_metadata,
                 )
 
             # Line counts come from the diff (display only).
@@ -971,7 +1059,10 @@ class WriteToolsPatchMixin:
                     elif line.startswith("-"):
                         removed_lines += 1
             except (AttributeError, TypeError):
-                logger.debug("<module>::WriteToolsPatchMixin::_tool_write_plan::_compile_and_apply:1 suppressed (AttributeError, TypeError)", exc_info=True)
+                logger.debug(
+                    "<module>::WriteToolsPatchMixin::_tool_write_plan::_compile_and_apply:1 suppressed (AttributeError, TypeError)",
+                    exc_info=True,
+                )
 
             touched_files = (apply_result.metadata or {}).get("touched_files") or result.picked_files or []
             display_file = touched_files[0] if touched_files else "unknown"
@@ -1028,9 +1119,7 @@ class WriteToolsPatchMixin:
     # modify_symbol, which is AST-based and needs no git blob. This eliminates
     # the manual LLM retry loop for the most common single-symbol patch failure.
 
-    _FALLBACK_PATCH_HUNK_RE = re.compile(
-        r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$'
-    )
+    _FALLBACK_PATCH_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$")
 
     def _parse_unified_diff_files(self, patch_text: str) -> list[dict[str, Any]]:
         """Split a unified diff into per-file hunks.
@@ -1043,22 +1132,26 @@ class WriteToolsPatchMixin:
         if not patch_text:
             return []
         # Reject rename/copy/mode-only patches — out of scope for symbol edit.
-        if re.search(r'^(rename from|rename to|copy from|copy to|similarity index|new file mode|deleted file mode|old mode|new mode)\b', patch_text, re.MULTILINE):
+        if re.search(
+            r"^(rename from|rename to|copy from|copy to|similarity index|new file mode|deleted file mode|old mode|new mode)\b",
+            patch_text,
+            re.MULTILINE,
+        ):
             return []
 
         files: list[dict[str, Any]] = []
-        cur_file: Optional[dict[str, Any]] = None
-        cur_hunk: Optional[dict[str, Any]] = None
+        cur_file: dict[str, Any] | None = None
+        cur_hunk: dict[str, Any] | None = None
 
         for raw_line in patch_text.splitlines():
-            if raw_line.startswith('diff --git '):
+            if raw_line.startswith("diff --git "):
                 # New file boundary. Defer file path to +++ header.
                 cur_file = {"file": None, "hunks": []}
                 files.append(cur_file)
                 cur_hunk = None
                 continue
-            m_path = re.match(r'^\+\+\+ (?:b/)?(.+?)(?:\t.*)?$', raw_line)
-            if m_path and raw_line != '+++ /dev/null':
+            m_path = re.match(r"^\+\+\+ (?:b/)?(.+?)(?:\t.*)?$", raw_line)
+            if m_path and raw_line != "+++ /dev/null":
                 if cur_file is None:
                     cur_file = {"file": None, "hunks": []}
                     files.append(cur_file)
@@ -1079,11 +1172,11 @@ class WriteToolsPatchMixin:
                 }
                 cur_file["hunks"].append(cur_hunk)
                 continue
-            if cur_hunk is not None and (raw_line.startswith(('+', '-', ' '))):
+            if cur_hunk is not None and (raw_line.startswith(("+", "-", " "))):
                 # Context/added/removed line. Skip '--- '/'+++ ' file headers
                 # (marker + space); content lines like '---x'/'+++x' (no space)
                 # are real body lines and must NOT be dropped (WP-B1).
-                if raw_line.startswith(('--- ', '+++ ')):
+                if raw_line.startswith(("--- ", "+++ ")):
                     continue
                 cur_hunk["lines"].append((raw_line[0], raw_line[1:]))
                 continue
@@ -1092,7 +1185,7 @@ class WriteToolsPatchMixin:
         # Drop files with no resolved path or no hunks.
         return [f for f in files if f["file"] and f["hunks"]]
 
-    def _extract_new_file_target(self, patch_text: str, path_hint: Optional[str]) -> Optional[dict[str, Any]]:
+    def _extract_new_file_target(self, patch_text: str, path_hint: str | None) -> dict[str, Any] | None:
         """Detect a new-file unified diff and extract its full content.
 
         A creation patch has no pre-image (``--- /dev/null`` and/or a
@@ -1110,18 +1203,17 @@ class WriteToolsPatchMixin:
             return None
         lines = patch_text.splitlines()
         is_creation_signal = any(
-            _item_.strip() == "--- /dev/null" or _item_.startswith("new file mode")
-            for _item_ in lines
+            _item_.strip() == "--- /dev/null" or _item_.startswith("new file mode") for _item_ in lines
         )
         if not is_creation_signal:
             return None
 
         # Resolve the created path from the +++ header (ignore /dev/null).
-        new_path: Optional[str] = None
+        new_path: str | None = None
         plus_headers = 0
         for raw in lines:
-            m = re.match(r'^\+\+\+ (?:b/)?(.+?)(?:\t.*)?$', raw)
-            if m and raw != '+++ /dev/null':
+            m = re.match(r"^\+\+\+ (?:b/)?(.+?)(?:\t.*)?$", raw)
+            if m and raw != "+++ /dev/null":
                 plus_headers += 1
                 new_path = m.group(1).strip()
         if plus_headers != 1:
@@ -1136,17 +1228,17 @@ class WriteToolsPatchMixin:
         for raw in lines:
             # Skip '+++ '/'--- ' file headers only; '+++x' (content starting
             # with '++') is a real added line and must survive (WP-B1).
-            if raw.startswith(('+++ ', '--- ')):
+            if raw.startswith(("+++ ", "--- ")):
                 continue
             if self._FALLBACK_PATCH_HUNK_RE.match(raw):
                 in_hunk = True
                 continue
             if not in_hunk:
                 continue
-            if raw.startswith('\\'):
+            if raw.startswith("\\"):
                 # "\ No newline at end of file" marker — note and skip.
                 continue
-            if raw.startswith('+'):
+            if raw.startswith("+"):
                 content_lines.append(raw[1:])
                 continue
             if raw.strip() == "":
@@ -1162,14 +1254,16 @@ class WriteToolsPatchMixin:
             return None
         content = "\n".join(content_lines)
         # Preserve trailing newline unless a "no newline" marker was present.
-        no_newline = any(_item_.startswith('\\') for _item_ in lines)
+        no_newline = any(_item_.startswith("\\") for _item_ in lines)
         if not no_newline:
             content += "\n"
         return {"file_path": file_path, "content": content}
 
     def _analyze_patch_symbol_change(
-        self, patch_text: str, path_hint: Optional[str] = None,
-    ) -> Optional[dict[str, Any]]:
+        self,
+        patch_text: str,
+        path_hint: str | None = None,
+    ) -> dict[str, Any] | None:
         """Apply a failed patch to the on-disk file in memory and diff symbols.
 
         Shared core for the single- and multi-symbol fallbacks. Requires exactly
@@ -1204,7 +1298,9 @@ class WriteToolsPatchMixin:
                     f"--- a/{path_hint}\n+++ b/{path_hint}\n" + patch_text,
                 )
         except Exception:
-            logger.debug("<module>::WriteToolsPatchMixin::_analyze_patch_symbol_change:0 suppressed Exception", exc_info=True)
+            logger.debug(
+                "<module>::WriteToolsPatchMixin::_analyze_patch_symbol_change:0 suppressed Exception", exc_info=True
+            )
             return None
         if len(files) != 1:
             return None
@@ -1217,6 +1313,7 @@ class WriteToolsPatchMixin:
         locator: Any
         if is_python:
             from external_llm.agent.symbol_locator import PythonAstLocator
+
             locator = PythonAstLocator()
         else:
             try:
@@ -1224,7 +1321,9 @@ class WriteToolsPatchMixin:
                 from external_llm.languages.models import LanguageId
                 from external_llm.languages.registry import LanguageRegistry
             except Exception:
-                logger.debug("<module>::WriteToolsPatchMixin::_analyze_patch_symbol_change:1 suppressed Exception", exc_info=True)
+                logger.debug(
+                    "<module>::WriteToolsPatchMixin::_analyze_patch_symbol_change:1 suppressed Exception", exc_info=True
+                )
                 return None
             lang_id = LanguageId.from_path(file_path)
             if lang_id == LanguageId.UNKNOWN:
@@ -1245,7 +1344,9 @@ class WriteToolsPatchMixin:
             with open(abs_path, encoding="utf-8") as fh:
                 existing = fh.read()
         except Exception:
-            logger.debug("<module>::WriteToolsPatchMixin::_analyze_patch_symbol_change:2 suppressed Exception", exc_info=True)
+            logger.debug(
+                "<module>::WriteToolsPatchMixin::_analyze_patch_symbol_change:2 suppressed Exception", exc_info=True
+            )
             return None
 
         old_lines = existing.split("\n")
@@ -1260,23 +1361,27 @@ class WriteToolsPatchMixin:
             return None  # unparseable / no symbols on both sides → not safe
 
         def _src(lines: list[str], span) -> str:
-            return "\n".join(lines[span.start_line - 1: span.end_line])
+            return "\n".join(lines[span.start_line - 1 : span.end_line])
 
         old_by_name = {s.qualname: _src(old_lines, s) for s in old_spans}
         new_by_name = {s.qualname: _src(new_lines, s) for s in new_spans}
         changed = {
-            name for name in (set(old_by_name) | set(new_by_name))
-            if old_by_name.get(name) != new_by_name.get(name)
+            name for name in (set(old_by_name) | set(new_by_name)) if old_by_name.get(name) != new_by_name.get(name)
         }
         return {
-            "file_path": file_path, "abs_path": abs_path,
-            "language": language, "is_python": is_python,
-            "old_lines": old_lines, "new_lines": new_lines, "new_src": new_src,
-            "old_by_name": old_by_name, "new_by_name": new_by_name,
+            "file_path": file_path,
+            "abs_path": abs_path,
+            "language": language,
+            "is_python": is_python,
+            "old_lines": old_lines,
+            "new_lines": new_lines,
+            "new_src": new_src,
+            "old_by_name": old_by_name,
+            "new_by_name": new_by_name,
             "changed": changed,
         }
 
-    def _extract_modify_symbol_target(self, patch_text: str, path_hint: Optional[str]) -> Optional[dict[str, Any]]:
+    def _extract_modify_symbol_target(self, patch_text: str, path_hint: str | None) -> dict[str, Any] | None:
         """Analyze a failed patch to see if it can route to modify_symbol.
 
         Eligible when the patch changes EXACTLY ONE top-level symbol that already
@@ -1308,7 +1413,7 @@ class WriteToolsPatchMixin:
             "reason": "single_python_symbol",
         }
 
-    def _extract_multi_symbol_rewrite(self, patch_text: str, path_hint: Optional[str]) -> Optional[dict[str, Any]]:
+    def _extract_multi_symbol_rewrite(self, patch_text: str, path_hint: str | None) -> dict[str, Any] | None:
         """See if a failed patch can be applied as a multi-symbol rewrite.
 
         Eligible when the patch changes TWO OR MORE top-level symbols (the
@@ -1335,13 +1440,18 @@ class WriteToolsPatchMixin:
         if info["is_python"]:
             try:
                 import ast as _ast
+
                 _ast.parse(info["new_src"])
             except SyntaxError:
-                logger.debug("<module>::WriteToolsPatchMixin::_extract_multi_symbol_rewrite:0 suppressed SyntaxError", exc_info=True)
+                logger.debug(
+                    "<module>::WriteToolsPatchMixin::_extract_multi_symbol_rewrite:0 suppressed SyntaxError",
+                    exc_info=True,
+                )
                 return None
         else:
             try:
                 from external_llm.languages.tree_sitter_utils import has_error
+
                 err = has_error(info["new_src"], info["language"])
             except Exception:
                 err = None
@@ -1356,7 +1466,7 @@ class WriteToolsPatchMixin:
             "symbols": sorted(changed),
         }
 
-    def _find_block(self, lines: list[str], block: list[str], hint: int = 0) -> Optional[int]:
+    def _find_block(self, lines: list[str], block: list[str], hint: int = 0) -> int | None:
         """Locate a contiguous ``block`` within ``lines``; return its start index.
 
         Tries exact match, then trailing-whitespace-insensitive, then fully
@@ -1372,15 +1482,12 @@ class WriteToolsPatchMixin:
             return None
         for key in (lambda s: s, lambda s: s.rstrip(), lambda s: s.strip()):
             keyed = [key(b) for b in block]
-            matches = [
-                i for i in range(0, len(lines) - n + 1)
-                if [key(lines[j]) for j in range(i, i + n)] == keyed
-            ]
+            matches = [i for i in range(0, len(lines) - n + 1) if [key(lines[j]) for j in range(i, i + n)] == keyed]
             if matches:
                 return min(matches, key=lambda i: abs(i - hint))
         return None
 
-    def _apply_hunks_in_memory(self, file_lines: list[str], hunks: list[dict[str, Any]]) -> Optional[list[str]]:
+    def _apply_hunks_in_memory(self, file_lines: list[str], hunks: list[dict[str, Any]]) -> list[str] | None:
         """Apply unified-diff hunks to ``file_lines`` by content matching.
 
         Pure-Python, blob-free: each hunk's old-side block (context + deleted
@@ -1400,14 +1507,17 @@ class WriteToolsPatchMixin:
             idx = self._find_block(result, old_block, hint=hint)
             if idx is None:
                 return None
-            result = result[:idx] + new_block + result[idx + len(old_block):]
+            result = result[:idx] + new_block + result[idx + len(old_block) :]
             delta += len(new_block) - len(old_block)
         return result
 
     def _try_apply_patch_create_file_fallback(
-        self, patch_text: str, path_hint: Optional[str], original_error: str,
+        self,
+        patch_text: str,
+        path_hint: str | None,
+        original_error: str,
         start_time: float,
-    ) -> "Optional[ToolResult]":
+    ) -> ToolResult | None:
         """Route a failed new-file patch to create_file.
 
         Returns None when the patch is NOT a clean creation (so the caller can
@@ -1420,18 +1530,25 @@ class WriteToolsPatchMixin:
         if nf is None:
             return None
         import time as _time
+
         try:
-            result = self._tool_create_file({
-                "path": nf["file_path"],
-                "content": nf["content"],
-            })
+            result = self._tool_create_file(
+                {
+                    "path": nf["file_path"],
+                    "content": nf["content"],
+                }
+            )
         except Exception as e:
             logger.warning("apply_patch create_file fallback raised: %s", e, exc_info=True)
             return self._make_result(
-                ok=False, content="", error=original_error,
+                ok=False,
+                content="",
+                error=original_error,
                 execution_time=_time.monotonic() - start_time,
-                metadata={"auto_fallback_attempted": "create_file",
-                          "auto_fallback_exception": f"{type(e).__name__}: {e}"},
+                metadata={
+                    "auto_fallback_attempted": "create_file",
+                    "auto_fallback_exception": f"{type(e).__name__}: {e}",
+                },
             )
         if result.ok:
             logger.info(
@@ -1439,11 +1556,13 @@ class WriteToolsPatchMixin:
                 nf["file_path"],
             )
             _meta = dict(result.metadata) if result.metadata else {}
-            _meta.update({
-                "auto_fallback_attempted": "create_file",
-                "auto_fallback_reason": "new_file_patch",
-                "file_path": nf["file_path"],
-            })
+            _meta.update(
+                {
+                    "auto_fallback_attempted": "create_file",
+                    "auto_fallback_reason": "new_file_patch",
+                    "file_path": nf["file_path"],
+                }
+            )
             return self._make_result(
                 ok=True,
                 content=(
@@ -1454,24 +1573,30 @@ class WriteToolsPatchMixin:
                 metadata=_meta,
             )
         logger.info(
-            "apply_patch auto-fallback to create_file failed: %s", result.error,
+            "apply_patch auto-fallback to create_file failed: %s",
+            result.error,
         )
         return self._make_result(
-            ok=False, content="",
+            ok=False,
+            content="",
             error=(
-                f"{original_error}\n\n"
-                f"[auto-fallback create_file also failed for {nf['file_path']}: {result.error}]"
+                f"{original_error}\n\n[auto-fallback create_file also failed for {nf['file_path']}: {result.error}]"
             ),
             execution_time=_time.monotonic() - start_time,
-            metadata={"auto_fallback_attempted": "create_file",
-                      "auto_fallback_failed": True,
-                      "auto_fallback_error": str(result.error)[:2000]},
+            metadata={
+                "auto_fallback_attempted": "create_file",
+                "auto_fallback_failed": True,
+                "auto_fallback_error": str(result.error)[:2000],
+            },
         )
 
     def _try_apply_patch_multi_symbol_fallback(
-        self, patch_text: str, path_hint: Optional[str], original_error: str,
+        self,
+        patch_text: str,
+        path_hint: str | None,
+        original_error: str,
         start_time: float,
-    ) -> "Optional[ToolResult]":
+    ) -> ToolResult | None:
         """Apply a multi-symbol patch as an atomic whole-file rewrite.
 
         Returns None when the patch is NOT a clean multi-symbol change (so the
@@ -1483,32 +1608,42 @@ class WriteToolsPatchMixin:
         if ms is None:
             return None
         import time as _time
+
         try:
-            result = self._tool_create_file({
-                "path": ms["file_path"],
-                "content": ms["new_src"],
-                "overwrite": True,
-            })
+            result = self._tool_create_file(
+                {
+                    "path": ms["file_path"],
+                    "content": ms["new_src"],
+                    "overwrite": True,
+                }
+            )
         except Exception as e:
             logger.warning("apply_patch multi-symbol fallback raised: %s", e, exc_info=True)
             return self._make_result(
-                ok=False, content="", error=original_error,
+                ok=False,
+                content="",
+                error=original_error,
                 execution_time=_time.monotonic() - start_time,
-                metadata={"auto_fallback_attempted": "multi_symbol_rewrite",
-                          "auto_fallback_exception": f"{type(e).__name__}: {e}"},
+                metadata={
+                    "auto_fallback_attempted": "multi_symbol_rewrite",
+                    "auto_fallback_exception": f"{type(e).__name__}: {e}",
+                },
             )
         if result.ok:
             logger.info(
                 "apply_patch auto-fallback to multi_symbol_rewrite succeeded: %s (%s)",
-                ms["file_path"], ", ".join(ms["symbols"]),
+                ms["file_path"],
+                ", ".join(ms["symbols"]),
             )
             _meta = dict(result.metadata) if result.metadata else {}
-            _meta.update({
-                "auto_fallback_attempted": "multi_symbol_rewrite",
-                "auto_fallback_reason": "multi_symbol_patch",
-                "file_path": ms["file_path"],
-                "symbols": ms["symbols"],
-            })
+            _meta.update(
+                {
+                    "auto_fallback_attempted": "multi_symbol_rewrite",
+                    "auto_fallback_reason": "multi_symbol_patch",
+                    "file_path": ms["file_path"],
+                    "symbols": ms["symbols"],
+                }
+            )
             _syn = self._run_syntax_check_for_file(ms["abs_path"])
             if not _syn.get("skipped"):
                 _meta["syntax_check"] = _syn
@@ -1523,19 +1658,22 @@ class WriteToolsPatchMixin:
                 metadata=_meta,
             )
         return self._make_result(
-            ok=False, content="",
+            ok=False,
+            content="",
             error=(
                 f"{original_error}\n\n"
                 f"[auto-fallback multi-symbol rewrite also failed for "
                 f"{ms['file_path']}: {result.error}]"
             ),
             execution_time=_time.monotonic() - start_time,
-            metadata={"auto_fallback_attempted": "multi_symbol_rewrite",
-                      "auto_fallback_failed": True,
-                      "auto_fallback_error": str(result.error)[:2000]},
+            metadata={
+                "auto_fallback_attempted": "multi_symbol_rewrite",
+                "auto_fallback_failed": True,
+                "auto_fallback_error": str(result.error)[:2000],
+            },
         )
 
-    def _patch_path_resolvable(self, patch_text: str, path_hint: Optional[str]) -> bool:
+    def _patch_path_resolvable(self, patch_text: str, path_hint: str | None) -> bool:
         """True when the patch text itself carries a resolvable target path.
 
         Distinguishes "no target path at all" (headerless @@-only patch with no
@@ -1551,9 +1689,12 @@ class WriteToolsPatchMixin:
             return True  # parse failure ≠ missing path — keep the generic reason
 
     def _try_apply_patch_modify_symbol_fallback(
-        self, patch_text: str, path_hint: Optional[str], original_error: str,
+        self,
+        patch_text: str,
+        path_hint: str | None,
+        original_error: str,
         start_time: float,
-    ) -> "ToolResult":
+    ) -> ToolResult:
         """Attempt modify_symbol as a fallback for a failed unified-diff patch.
 
         Returns a ToolResult. On success, metadata.auto_fallback_attempted marks
@@ -1562,14 +1703,20 @@ class WriteToolsPatchMixin:
         """
         # ── New-file patch → create_file (no symbol to modify) ──
         nf = self._try_apply_patch_create_file_fallback(
-            patch_text, path_hint, original_error, start_time,
+            patch_text,
+            path_hint,
+            original_error,
+            start_time,
         )
         if nf is not None:
             return nf
 
         # ── Multi-symbol patch → atomic whole-file rewrite ──
         ms = self._try_apply_patch_multi_symbol_fallback(
-            patch_text, path_hint, original_error, start_time,
+            patch_text,
+            path_hint,
+            original_error,
+            start_time,
         )
         if ms is not None:
             return ms
@@ -1578,28 +1725,30 @@ class WriteToolsPatchMixin:
         if target is None:
             # Not eligible — return original error with a skip marker.
             skip_reason = (
-                "not_single_python_symbol"
-                if self._patch_path_resolvable(patch_text, path_hint)
-                else "no_target_path"
+                "not_single_python_symbol" if self._patch_path_resolvable(patch_text, path_hint) else "no_target_path"
             )
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=original_error,
-                metadata={"auto_fallback_attempted": None,
-                          "auto_fallback_skipped_reason": skip_reason},
+                metadata={"auto_fallback_attempted": None, "auto_fallback_skipped_reason": skip_reason},
             )
 
         try:
             from external_llm.agent.symbol_modify_tool import modify_symbol as _do_modify
+
             sec = self._secure_path(target["file_path"], confine=True)
             if sec is None:
                 return self._make_result(ok=False, content="", error=f"Path traversal blocked: {target['file_path']}")
             abs_path = str(sec)
             success, diff_or_error, _new_content = _do_modify(
-                abs_path, target["symbol"], target["code"],
+                abs_path,
+                target["symbol"],
+                target["code"],
                 repo_root=str(self._effective_repo_root),
             )
             import time as _time
+
             execution_time = _time.monotonic() - start_time
             if success:
                 rel_path = os.path.relpath(abs_path, str(self._effective_repo_root))
@@ -1616,7 +1765,8 @@ class WriteToolsPatchMixin:
                     _meta["syntax_check"] = _syn
                 logger.info(
                     "apply_patch auto-fallback to modify_symbol succeeded: %s@%s",
-                    rel_path, target["symbol"],
+                    rel_path,
+                    target["symbol"],
                 )
                 return self._make_result(
                     ok=True,
@@ -1633,7 +1783,8 @@ class WriteToolsPatchMixin:
                 diff_or_error,
             )
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=(
                     f"{original_error}\n\n"
                     f"[auto-fallback modify_symbol also failed for "
@@ -1649,8 +1800,10 @@ class WriteToolsPatchMixin:
         except Exception as e:
             logger.warning("apply_patch auto-fallback raised: %s", e, exc_info=True)
             import time as _time
+
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=original_error,
                 execution_time=_time.monotonic() - start_time,
                 metadata={
@@ -1659,7 +1812,7 @@ class WriteToolsPatchMixin:
                 },
             )
 
-    def _tool_apply_patch(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_apply_patch(self, args: dict[str, Any]) -> ToolResult:
         """Thin wrapper adding contract metadata to EVERY apply_patch success.
 
         Two stamps, one place:
@@ -1691,6 +1844,7 @@ class WriteToolsPatchMixin:
             logger.debug("touched_files stamp failed: %s", _e)
         try:
             from external_llm.patch_engine import PatchEngine as _PE  # noqa: N814 — private lazy-import alias
+
             unverifiable = _PE.context_free_hunks(args.get("patch", "") or "")
         except Exception as _e:
             logger.debug("context-free hunk scan failed: %s", _e)
@@ -1711,47 +1865,49 @@ class WriteToolsPatchMixin:
         ).format(n=len(unverifiable), h=", ".join(unverifiable))
         return result
 
-    def _refuse_session_edited(self, touched: list[str], start_time: float) -> "Optional[ToolResult]":
-            """Opt D session-edit guard — shared by all three apply entry points.
+    def _refuse_session_edited(self, touched: list[str], start_time: float) -> ToolResult | None:
+        """Opt D session-edit guard — shared by all three apply entry points.
 
-            Returns a refusal ToolResult (ok=False) when at least one path in
-            ``touched`` was already written this session by a text-editing tool
-            (edit_text / modify_symbol / edit_ast / anchor_edit, tracked in
-            ``_text_edited_files``); returns None when nothing is session-edited so
-            the caller proceeds with the apply.
+        Returns a refusal ToolResult (ok=False) when at least one path in
+        ``touched`` was already written this session by a text-editing tool
+        (edit_text / modify_symbol / edit_ast / anchor_edit, tracked in
+        ``_text_edited_files``); returns None when nothing is session-edited so
+        the caller proceeds with the apply.
 
-            WHY refuse: apply_patch / diff_apply reconstructs hunk context from HEAD,
-            not the working tree. On a freshly-edited target (skip_3way=True) the
-            apply chain reverts the file to HEAD — silently deleting the session edit
-            while returning ok=False. The guard MUST run before any apply so the
-            working tree is never mutated; post-apply detection is meaningless (the
-            revert itself makes the file match HEAD again). Keeping the message +
-            metadata here guarantees the main entry, the diff_apply path and the pure
-            git apply path all refuse identically.
-            """
-            import time as _time
-            _session = [p for p in touched if self._norm_repo_rel(p) in self._text_edited_files]
-            if not _session:
-                return None
-            return self._make_result(
-                ok=False,
-                content="",
-                error=(
-                    "apply_patch refused: target file(s) were already edited this session "
-                    "via edit_text / modify_symbol / edit_ast / anchor_edit — those edits "
-                    "live in the working tree but apply_patch would revert to HEAD on "
-                    "conflict (silently losing them): "
-                    + ", ".join(_session)
-                    + ". Continue editing these files with a text-editing tool instead"
-                    " — edit_text (exact string match) always works here, and is the"
-                    " right retry when modify_symbol has just failed on the same file."
-                ),
-                execution_time=_time.monotonic() - start_time,
-                metadata={
-                    "refused_dirty_files": _session,
-                    "reason": "session_text_edit_overwrite_risk",
-                },
-            )
+        WHY refuse: apply_patch / diff_apply reconstructs hunk context from HEAD,
+        not the working tree. On a freshly-edited target (skip_3way=True) the
+        apply chain reverts the file to HEAD — silently deleting the session edit
+        while returning ok=False. The guard MUST run before any apply so the
+        working tree is never mutated; post-apply detection is meaningless (the
+        revert itself makes the file match HEAD again). Keeping the message +
+        metadata here guarantees the main entry, the diff_apply path and the pure
+        git apply path all refuse identically.
+        """
+        import time as _time
+
+        _session = [p for p in touched if self._norm_repo_rel(p) in self._text_edited_files]
+        if not _session:
+            return None
+        return self._make_result(
+            ok=False,
+            content="",
+            error=(
+                "apply_patch refused: target file(s) were already edited this session "
+                "via edit_text / modify_symbol / edit_ast / anchor_edit — those edits "
+                "live in the working tree but apply_patch would revert to HEAD on "
+                "conflict (silently losing them): "
+                + ", ".join(_session)
+                + ". Continue editing these files with a text-editing tool instead"
+                " — edit_text (exact string match) always works here, and is the"
+                " right retry when modify_symbol has just failed on the same file."
+            ),
+            execution_time=_time.monotonic() - start_time,
+            metadata={
+                "refused_dirty_files": _session,
+                "reason": "session_text_edit_overwrite_risk",
+            },
+        )
+
     def _acquire_edit_leases(self, paths) -> None:
         """F1: stake this session's cross-process edit lease on ``paths``.
 
@@ -1776,7 +1932,7 @@ class WriteToolsPatchMixin:
                 exc_info=True,
             )
 
-    def _refuse_foreign_leased(self, touched, start_time: "Optional[float]" = None) -> "Optional[ToolResult]":
+    def _refuse_foreign_leased(self, touched, start_time: float | None = None) -> ToolResult | None:
         """F1 cross-process edit-lease guard — sibling of _refuse_session_edited.
 
         Returns a refusal ToolResult (ok=False) when at least one path in
@@ -1795,6 +1951,7 @@ class WriteToolsPatchMixin:
         is confirmed done, or disable the guard via the env var.
         """
         import time as _time
+
         rr = str(getattr(self, "repo_root", "") or "")
         if not rr:
             return None
@@ -1857,8 +2014,10 @@ class WriteToolsPatchMixin:
                 "<module>::WriteToolsPatchMixin::_append_applied_patch:0 suppressed (AttributeError, TypeError)",
                 exc_info=True,
             )
-    def _tool_apply_patch_impl(self, args: dict[str, Any]) -> "ToolResult":
+
+    def _tool_apply_patch_impl(self, args: dict[str, Any]) -> ToolResult:
         import time as _time
+
         start_time = _time.monotonic()
         args = self._recover_args_from_raw(args, ("patch", "path"))
         patch_text = args.get("patch", "")
@@ -1868,7 +2027,9 @@ class WriteToolsPatchMixin:
             _raw = args.get("__raw_arguments", "")
             if isinstance(_raw, str) and len(_raw) > 10:
                 _raw_hint = f" (raw args: {_raw[:120]})"
-            return self._make_result(ok=False, content="", error=f"patch is empty{_raw_hint}", execution_time=execution_time)
+            return self._make_result(
+                ok=False, content="", error=f"patch is empty{_raw_hint}", execution_time=execution_time
+            )
         path = args.get("path")
 
         if isinstance(path, str):
@@ -1882,7 +2043,7 @@ class WriteToolsPatchMixin:
             if path == repo_root_str:
                 path = ""
             elif path.startswith(repo_root_str + "/"):
-                path = path[len(repo_root_str):].lstrip("/")
+                path = path[len(repo_root_str) :].lstrip("/")
             if path.startswith("/"):
                 path = path.lstrip("/")
         if path is not None and not path.strip():
@@ -1950,9 +2111,7 @@ class WriteToolsPatchMixin:
                         self._append_applied_patch(str(patch_record))
                     # F1: stake our lease on the synthesized-patch target so
                     # parallel sessions see it as actively WIP.
-                    self._acquire_edit_leases(
-                        list(_mp_touched) + ([str(path)] if path else [])
-                    )
+                    self._acquire_edit_leases(list(_mp_touched) + ([str(path)] if path else []))
 
                     _meta = dict(patch_result.metadata) if patch_result.metadata else {}
                     # P26-1: content-loss guard on the LIVE synthesize path —
@@ -1969,12 +2128,7 @@ class WriteToolsPatchMixin:
                     _syn = self._run_syntax_check_for_file(path)
                     if not _syn.get("skipped"):
                         _meta["syntax_check"] = _syn
-                    return self._make_result(
-                        ok=True,
-                        content=_content,
-                        execution_time=execution_time,
-                        metadata=_meta
-                    )
+                    return self._make_result(ok=True, content=_content, execution_time=execution_time, metadata=_meta)
 
                 logger.warning(
                     "PatchEngine synthesize_and_apply failed for non-diff input; "
@@ -1993,7 +2147,7 @@ class WriteToolsPatchMixin:
                 file_content=None,
                 llm_output=None,
                 output_mode="auto",
-                metadata={"source": "agent_apply_patch"}
+                metadata={"source": "agent_apply_patch"},
             )
             patch_result = engine.apply_patch(patch_text, target_file=path, context=context)
             execution_time = _time.monotonic() - start_time
@@ -2004,9 +2158,7 @@ class WriteToolsPatchMixin:
                     self._append_applied_patch(str(patch_record))
                 # F1: stake our lease on every file this patch touched so
                 # parallel sessions see them as actively WIP.
-                self._acquire_edit_leases(
-                    list(_mp_touched) + ([str(path)] if path else [])
-                )
+                self._acquire_edit_leases(list(_mp_touched) + ([str(path)] if path else []))
 
                 _meta2 = dict(patch_result.metadata) if patch_result.metadata else {}
                 # P26-1: content-loss guard on the MAIN PatchEngine branch —
@@ -2016,9 +2168,7 @@ class WriteToolsPatchMixin:
                 _ratio_warn = self._check_patch_content_ratio(patch_text)
                 if _ratio_warn:
                     _meta2["content_ratio_warning"] = _ratio_warn
-                _check_path = path or (
-                    patch_result.metadata.get("file") if patch_result.metadata else None
-                )
+                _check_path = path or (patch_result.metadata.get("file") if patch_result.metadata else None)
                 if _check_path:
                     _syn2 = self._run_syntax_check_for_file(_check_path)
                     if not _syn2.get("skipped"):
@@ -2026,12 +2176,7 @@ class WriteToolsPatchMixin:
                 _content_msg = patch_result.patch_applied or "Patch applied successfully"
                 if _ratio_warn:
                     _content_msg += f"\n{_ratio_warn}"
-                return self._make_result(
-                    ok=True,
-                    content=_content_msg,
-                    execution_time=execution_time,
-                    metadata=_meta2
-                )
+                return self._make_result(ok=True, content=_content_msg, execution_time=execution_time, metadata=_meta2)
             # ── Auto-fallback: try modify_symbol for single-symbol patches ──
             # PatchEngine exhausted its repair ladder (plain apply, --3way,
             # tolerant, re-anchor, AST/symbol repair). For untracked or
@@ -2040,7 +2185,8 @@ class WriteToolsPatchMixin:
             # that works. Route single-Python-symbol patches there before
             # surfacing the failure to the LLM.
             _fb = self._try_apply_patch_modify_symbol_fallback(
-                patch_text, path,
+                patch_text,
+                path,
                 patch_result.error or "Patch application failed",
                 start_time,
             )
@@ -2074,13 +2220,15 @@ class WriteToolsPatchMixin:
                 content="",
                 error=f"Patch engine error: {type(e).__name__}: {e}",
                 execution_time=execution_time,
-                metadata={"error_type": "patch_engine_exception"}
+                metadata={"error_type": "patch_engine_exception"},
             )
         else:
             return _fb
-    def _apply_patch_text(self, patch_text: str, path_hint: Optional[str] = None) -> "ToolResult":
+
+    def _apply_patch_text(self, patch_text: str, path_hint: str | None = None) -> ToolResult:
         """Shared internal method to apply a patch via git apply chain."""
         import time as _time
+
         start_time = _time.monotonic()
 
         # ── Hard guard: capture uncommitted-changes state BEFORE any apply ──
@@ -2109,6 +2257,7 @@ class WriteToolsPatchMixin:
         # The None guard stays: tests patch diff_apply.apply_patch to None to
         # exercise the pure git-apply chain below.
         from diff_apply import apply_patch
+
         if apply_patch is not None:
             ok, msg, _reason, details = apply_patch(self._effective_repo_root, patch_text, file_path_hint=path_hint)
             execution_time = _time.monotonic() - start_time
@@ -2152,7 +2301,6 @@ class WriteToolsPatchMixin:
         except OSError as _e:
             return self._make_result(ok=False, content="", error=f"Failed to create temp patch file: {_e}")
         try:
-
             if not patch_clean.strip():
                 try:
                     synthesized = None
@@ -2168,7 +2316,9 @@ class WriteToolsPatchMixin:
                             with open(patch_file, "w", encoding="utf-8") as fh:
                                 fh.write(synthesized)
                         except OSError as e:
-                            return self._make_result(ok=False, content="", error=f"Failed to write synthesized patch file: {e}")
+                            return self._make_result(
+                                ok=False, content="", error=f"Failed to write synthesized patch file: {e}"
+                            )
                         # Validate synthesized patch with git apply --check BEFORE accepting it
                         check = subprocess.run(
                             ["git", "apply", "--check", patch_file],
@@ -2203,9 +2353,11 @@ class WriteToolsPatchMixin:
             except OSError as e:
                 return self._make_result(ok=False, content="", error=f"Failed to write patch file: {e}")
 
-            _head_lines = (patch_clean.lstrip().splitlines()[:8] if patch_clean else [])
-            _has_git_header = ("diff --git " in patch_clean)
-            _looks_like_ab_paths = any(s.startswith("--- a/") for s in _head_lines) and any(s.startswith("+++ b/") for s in _head_lines)
+            _head_lines = patch_clean.lstrip().splitlines()[:8] if patch_clean else []
+            _has_git_header = "diff --git " in patch_clean
+            _looks_like_ab_paths = any(s.startswith("--- a/") for s in _head_lines) and any(
+                s.startswith("+++ b/") for s in _head_lines
+            )
             _needs_p1 = (not _has_git_header) and _looks_like_ab_paths
 
             _apply_base = ["git", "apply"]
@@ -2269,7 +2421,10 @@ class WriteToolsPatchMixin:
                                     _salvaged = True
                                     logger.info("Synthesized diff accepted by git apply")
                                 else:
-                                    logger.debug("Synthesized diff still invalid: %s", (retry.stderr or retry.stdout or "").strip())
+                                    logger.debug(
+                                        "Synthesized diff still invalid: %s",
+                                        (retry.stderr or retry.stdout or "").strip(),
+                                    )
                         except Exception as e:
                             logger.debug("Small-model diff synthesizer failed: %s", e)
 
@@ -2287,18 +2442,22 @@ class WriteToolsPatchMixin:
                                 },
                             )
             except subprocess.TimeoutExpired:
-                return self._make_result(ok=False, content="", error="git apply --check timeout after 30 seconds",
-                                         metadata={"patch_file": patch_file, "timeout": True})
+                return self._make_result(
+                    ok=False,
+                    content="",
+                    error="git apply --check timeout after 30 seconds",
+                    metadata={"patch_file": patch_file, "timeout": True},
+                )
             except Exception as e:
-                return self._make_result(ok=False, content="", error=f"git apply --check error: {e}",
-                                         metadata={"patch_file": patch_file})
+                return self._make_result(
+                    ok=False, content="", error=f"git apply --check error: {e}", metadata={"patch_file": patch_file}
+                )
 
             # ── Pre-apply snapshot for rollback ────────────────────────────
             # Extract file paths from diff BEFORE apply, snapshot their content.
             import os as _os_snap
 
             _pre_touched: list[str] = extract_files_from_patch(patch_text)
-
 
             _pre_apply_snapshot: dict[str, str] = {}
             for _tf_snap in _pre_touched:
@@ -2308,7 +2467,9 @@ class WriteToolsPatchMixin:
                         with open(_abs_snap, encoding="utf-8", errors="replace") as _fsnap:
                             _pre_apply_snapshot[_abs_snap] = _fsnap.read()
                     except OSError:
-                        logger.debug("<module>::WriteToolsPatchMixin::_apply_patch_text:15 suppressed OSError", exc_info=True)
+                        logger.debug(
+                            "<module>::WriteToolsPatchMixin::_apply_patch_text:15 suppressed OSError", exc_info=True
+                        )
 
             # Hard guard: capture uncommitted-changes state BEFORE apply (post-apply
             # detection is meaningless — the patch itself makes files differ from
@@ -2354,11 +2515,16 @@ class WriteToolsPatchMixin:
                         },
                     )
             except subprocess.TimeoutExpired:
-                return self._make_result(ok=False, content="", error="git apply timeout after 30 seconds",
-                                         metadata={"patch_file": patch_file, "timeout": True})
+                return self._make_result(
+                    ok=False,
+                    content="",
+                    error="git apply timeout after 30 seconds",
+                    metadata={"patch_file": patch_file, "timeout": True},
+                )
             except Exception as e:
-                return self._make_result(ok=False, content="", error=f"git apply error: {e}",
-                                         metadata={"patch_file": patch_file})
+                return self._make_result(
+                    ok=False, content="", error=f"git apply error: {e}", metadata={"patch_file": patch_file}
+                )
 
             ratio_warning = self._check_patch_content_ratio(patch_clean)
 
@@ -2366,7 +2532,10 @@ class WriteToolsPatchMixin:
             try:
                 touched = extract_touched_files_from_diff(patch_clean)
             except (ValueError, TypeError, AttributeError):
-                logger.debug("<module>::WriteToolsPatchMixin::_apply_patch_text:18 suppressed (ValueError, TypeError, AttributeError)", exc_info=True)
+                logger.debug(
+                    "<module>::WriteToolsPatchMixin::_apply_patch_text:18 suppressed (ValueError, TypeError, AttributeError)",
+                    exc_info=True,
+                )
 
             if not touched:
                 try:
@@ -2384,11 +2553,14 @@ class WriteToolsPatchMixin:
                             if rel and rel not in touched:
                                 touched.append(rel)
                 except (AttributeError, TypeError):
-                    logger.debug("<module>::WriteToolsPatchMixin::_apply_patch_text:19 suppressed (AttributeError, TypeError)", exc_info=True)
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_apply_patch_text:19 suppressed (AttributeError, TypeError)",
+                        exc_info=True,
+                    )
 
             # ── Post-apply syntax validation + snapshot-based rollback ────────
             _syntax_errors: list[str] = []
-            for _tf_chk in (touched or _pre_touched):
+            for _tf_chk in touched or _pre_touched:
                 _abs_chk = _os_snap.path.join(self._effective_repo_root, _tf_chk)
                 if LanguageId.from_path(_abs_chk) is LanguageId.PYTHON and _os_snap.path.isfile(_abs_chk):
                     try:
@@ -2427,8 +2599,7 @@ class WriteToolsPatchMixin:
             content_msg = f"Patch applied successfully. Touched files: {', '.join(touched) or 'unknown'}"
             if ratio_warning:
                 content_msg += f"\n{ratio_warning}"
-            _fallback_meta = {"touched_files": touched, "patch": patch_clean,
-                              "content_ratio_warning": ratio_warning}
+            _fallback_meta = {"touched_files": touched, "patch": patch_clean, "content_ratio_warning": ratio_warning}
             return self._make_result(
                 ok=True,
                 content=content_msg,
@@ -2444,6 +2615,7 @@ class WriteToolsPatchMixin:
         import re
 
         from ..failure_context import analyze_failure
+
         failure_ctx = analyze_failure(
             stage="git_apply_check",
             raw_text=git_error,
@@ -2452,27 +2624,27 @@ class WriteToolsPatchMixin:
         file_path = None
         hunks = []
 
-        lines = patch_text.split('\n')
+        lines = patch_text.split("\n")
         for i, line in enumerate(lines):
-            if line.startswith('--- a/'):
-                file_path = line[6:].split('\t')[0].strip()
-                if file_path == '/dev/null':
+            if line.startswith("--- a/"):
+                file_path = line[6:].split("\t")[0].strip()
+                if file_path == "/dev/null":
                     file_path = None
-                if i + 1 < len(lines) and lines[i + 1].startswith('+++ b/'):
-                    new_file_path = lines[i + 1][6:].split('\t')[0].strip()
-                    if new_file_path != '/dev/null':
+                if i + 1 < len(lines) and lines[i + 1].startswith("+++ b/"):
+                    new_file_path = lines[i + 1][6:].split("\t")[0].strip()
+                    if new_file_path != "/dev/null":
                         file_path = new_file_path
                 break
-            if line.startswith('+++ b/'):
-                file_path = line[6:].split('\t')[0].strip()
-                if file_path == '/dev/null':
+            if line.startswith("+++ b/"):
+                file_path = line[6:].split("\t")[0].strip()
+                if file_path == "/dev/null":
                     file_path = None
                 break
-            if line.startswith('diff --git a/'):
+            if line.startswith("diff --git a/"):
                 parts = line.split()
                 if len(parts) >= 4:
                     b_path = parts[3]
-                    file_path = b_path[2:] if b_path.startswith('b/') else b_path
+                    file_path = b_path[2:] if b_path.startswith("b/") else b_path
                     break
 
         current_hunk = None
@@ -2483,24 +2655,24 @@ class WriteToolsPatchMixin:
                 if current_hunk:
                     hunks.append(current_hunk)
                 current_hunk = {
-                    'old_start': int(hunk_match.group(1)),
-                    'old_lines': int(hunk_match.group(2)),
-                    'new_start': int(hunk_match.group(3)),
-                    'new_lines': int(hunk_match.group(4)),
-                    'context_lines': [],
-                    'original_lines': []
+                    "old_start": int(hunk_match.group(1)),
+                    "old_lines": int(hunk_match.group(2)),
+                    "new_start": int(hunk_match.group(3)),
+                    "new_lines": int(hunk_match.group(4)),
+                    "context_lines": [],
+                    "original_lines": [],
                 }
             elif current_hunk:
-                if line.startswith(' '):
+                if line.startswith(" "):
                     content = line[1:]
-                    current_hunk['context_lines'].append(content)
-                    current_hunk['original_lines'].append(('context', content))
-                elif line.startswith('-'):
+                    current_hunk["context_lines"].append(content)
+                    current_hunk["original_lines"].append(("context", content))
+                elif line.startswith("-"):
                     content = line[1:]
-                    current_hunk['original_lines'].append(('remove', content))
-                elif line.startswith('+'):
+                    current_hunk["original_lines"].append(("remove", content))
+                elif line.startswith("+"):
                     content = line[1:]
-                    current_hunk['original_lines'].append(('add', content))
+                    current_hunk["original_lines"].append(("add", content))
 
         if current_hunk:
             hunks.append(current_hunk)
@@ -2520,11 +2692,11 @@ class WriteToolsPatchMixin:
             reason = "context_mismatch"
             hint = "Patch context does not match the current file content."
 
-            line_match = re.search(r'at line\s+(\d+)', git_error)
+            line_match = re.search(r"at line\s+(\d+)", git_error)
             if not line_match:
-                line_match = re.search(r'line\s+(\d+)', git_error)
+                line_match = re.search(r"line\s+(\d+)", git_error)
             if not line_match:
-                line_match = re.search(r'hunk\s+(\d+)', git_error)
+                line_match = re.search(r"hunk\s+(\d+)", git_error)
 
             if line_match:
                 conflicting_line = int(line_match.group(1))
@@ -2534,46 +2706,52 @@ class WriteToolsPatchMixin:
                     try:
                         file_full_path = Path(self.repo_root) / file_path
                         if file_full_path.exists():
-                            with open(file_full_path, encoding='utf-8') as f:
+                            with open(file_full_path, encoding="utf-8") as f:
                                 file_content = f.read()
-                                file_lines_list = file_content.split('\n')
+                                file_lines_list = file_content.split("\n")
 
                                 if 0 <= conflicting_line - 1 < len(file_lines_list):
                                     actual_line = file_lines_list[conflicting_line - 1]
 
                                     expected_line = None
                                     for hunk in hunks:
-                                        if hunk['old_start'] <= conflicting_line <= hunk['old_start'] + hunk['old_lines']:
-                                            offset = conflicting_line - hunk['old_start']
+                                        if (
+                                            hunk["old_start"]
+                                            <= conflicting_line
+                                            <= hunk["old_start"] + hunk["old_lines"]
+                                        ):
+                                            offset = conflicting_line - hunk["old_start"]
                                             context_counter = 0
-                                            for line_type, content in hunk['original_lines']:
-                                                if line_type == 'context':
+                                            for line_type, content in hunk["original_lines"]:
+                                                if line_type == "context":
                                                     if context_counter == offset:
                                                         expected_line = content
                                                         break
                                                     context_counter += 1
-                                                elif line_type == 'remove':
+                                                elif line_type == "remove":
                                                     context_counter += 1
                                             break
 
                                     if expected_line:
                                         if len(expected_line) > 100:
-                                            expected_line = expected_line[:97] + '...'
+                                            expected_line = expected_line[:97] + "..."
                                         if len(actual_line) > 100:
-                                            actual_line = actual_line[:97] + '...'
+                                            actual_line = actual_line[:97] + "..."
                                         hint = f"Context mismatch at line ~{conflicting_line}. Expected: '{expected_line}' but found: '{actual_line}'"
                                     else:
                                         start = max(0, conflicting_line - 3)
                                         end = min(len(file_lines_list), conflicting_line + 2)
-                                        ctx = '\n'.join(f"{i+1}: {file_lines_list[i]}" for i in range(start, end))
-                                        hint = f"Patch failed at line {conflicting_line}. File context around line:\n{ctx}"
+                                        ctx = "\n".join(f"{i + 1}: {file_lines_list[i]}" for i in range(start, end))
+                                        hint = (
+                                            f"Patch failed at line {conflicting_line}. File context around line:\n{ctx}"
+                                        )
                     except Exception as e:
                         logger.debug("Failed to read file %s for patch analysis: %s", file_path, e)
         elif "no such file" in error_lower or "cannot stat" in error_lower:
             reason = "file_not_found"
             hint = f"Target file not found: {file_path or 'unknown'}{self._suggest_missing_paths(file_path or '')}"
 
-        file_context_snippet: Optional[str] = None
+        file_context_snippet: str | None = None
         if reason == "context_mismatch" and file_path and hunks:
             try:
                 file_full_path = Path(self.repo_root) / file_path
@@ -2583,12 +2761,14 @@ class WriteToolsPatchMixin:
                     ctx_start = max(0, hunk_start - 5)
                     ctx_end = min(len(file_lines_list), hunk_start + hunks[0].get("old_lines", 10) + 5)
                     ctx_lines = [
-                        f"{ctx_start + j + 1:4d}: {file_lines_list[ctx_start + j]}"
-                        for j in range(ctx_end - ctx_start)
+                        f"{ctx_start + j + 1:4d}: {file_lines_list[ctx_start + j]}" for j in range(ctx_end - ctx_start)
                     ]
                     file_context_snippet = "\n".join(ctx_lines)
             except (IndexError, TypeError):
-                logger.debug("<module>::WriteToolsPatchMixin::_analyze_patch_failure:2 suppressed (IndexError, TypeError)", exc_info=True)
+                logger.debug(
+                    "<module>::WriteToolsPatchMixin::_analyze_patch_failure:2 suppressed (IndexError, TypeError)",
+                    exc_info=True,
+                )
 
         parts = [f"Patch failed ({reason}): {hint or git_error.strip()[:200]}"]
 
@@ -2609,7 +2789,9 @@ class WriteToolsPatchMixin:
             parts.append("```")
 
             if "```" in patch_text and "diff --git" not in patch_text:
-                parts.append("\n**Detected issue**: Your patch contains markdown code fences but not proper diff format.")
+                parts.append(
+                    "\n**Detected issue**: Your patch contains markdown code fences but not proper diff format."
+                )
                 parts.append("**Try this instead**: Remove the ``` markers and use unified diff format above.")
 
             if "before:" in patch_text.lower() or "after:" in patch_text.lower():
@@ -2655,7 +2837,7 @@ class WriteToolsPatchMixin:
 
         return result
 
-    def _check_patch_content_ratio(self, patch_text: str) -> Optional[str]:
+    def _check_patch_content_ratio(self, patch_text: str) -> str | None:
         """Detect accidental whole-file wipes in LLM-generated patches.
 
         File attribution resolves from ``diff --git`` OR the ``--- a/`` /
@@ -2671,7 +2853,7 @@ class WriteToolsPatchMixin:
         silence).
         """
         warnings_out: list[str] = []
-        current_file: Optional[str] = None
+        current_file: str | None = None
         pre_image: dict[str, int] = {}
         removals: dict[str, int] = {}
         additions: dict[str, int] = {}
@@ -2683,9 +2865,8 @@ class WriteToolsPatchMixin:
                 if current_file is not None:
                     m = re.match(r"^@@ -(\d+)(?:,(\d+))?", line)
                     if m:
-                        pre_image[current_file] = (
-                            pre_image.get(current_file, 0)
-                            + (int(m.group(2)) if m.group(2) else 1)
+                        pre_image[current_file] = pre_image.get(current_file, 0) + (
+                            int(m.group(2)) if m.group(2) else 1
                         )
                 continue
             if line.startswith("diff --git "):
@@ -2739,7 +2920,7 @@ class WriteToolsPatchMixin:
     # anchor_edit — pattern-based sub-symbol insertion/deletion
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _tool_anchor_edit(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_anchor_edit(self, args: dict[str, Any]) -> ToolResult:
         """Pattern-based file editing for precise sub-symbol insertion/deletion.
 
         Uses anchor_pattern (substring-first, regex-fallback) to locate the
@@ -2748,13 +2929,14 @@ class WriteToolsPatchMixin:
         the calling LLM provides code_snippet directly.
         """
         import time as _time
+
         start_time = _time.monotonic()
 
         args = self._recover_args_from_raw(args, ("file_path",))
         file_path = (args.get("file_path") or "").strip()
         anchor_pattern = (args.get("anchor_pattern") or "").strip()
         edit_mode = (args.get("edit_mode") or "insert_before").strip()
-        code_snippet = (args.get("code_snippet") or "").strip()
+        code_snippet = str(args.get("code_snippet") or "").strip()
         occurrence = args.get("occurrence", -1)
         context_before = (args.get("context_before") or "").strip() or None
         context_after = (args.get("context_after") or "").strip() or None
@@ -2766,7 +2948,10 @@ class WriteToolsPatchMixin:
         # ── Validate required fields ──────────────────────────────────────
         if not file_path:
             return self._make_result(
-                ok=False, content="", error="'file_path' is required", execution_time=0,
+                ok=False,
+                content="",
+                error="'file_path' is required",
+                execution_time=0,
             )
         # Repo-boundary check — see _tool_edit_text. anchor_edit is exposed to the
         # LLM in tool_schemas, so a bare `../` in a model-emitted file_path wrote
@@ -2777,8 +2962,10 @@ class WriteToolsPatchMixin:
         _secured = self._secure_path(file_path, confine=True)
         if _secured is None:
             return self._make_result(
-                ok=False, content="",
-                error=f"Path blocked (outside repo): {file_path}", execution_time=0,
+                ok=False,
+                content="",
+                error=f"Path blocked (outside repo): {file_path}",
+                execution_time=0,
             )
         # F1 cross-process edit-lease guard.
         _lease_refused = self._refuse_foreign_leased([file_path])
@@ -2787,19 +2974,22 @@ class WriteToolsPatchMixin:
         # anchor_pattern OR anchor_ast_lineno — exactly one locating strategy required.
         if not anchor_pattern and anchor_ast_lineno is None:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error="'anchor_pattern' or 'anchor_ast_lineno' is required (one of them)",
                 execution_time=0,
             )
         if edit_mode not in ("insert_before", "insert_after", "replace_line", "delete"):
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"Invalid edit_mode: {edit_mode!r} (expected insert_before, insert_after, replace_line, or delete)",
                 execution_time=0,
             )
         if edit_mode != "delete" and not code_snippet:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=f"'code_snippet' is required for edit_mode={edit_mode!r}",
                 execution_time=0,
             )
@@ -2810,14 +3000,20 @@ class WriteToolsPatchMixin:
         _norm = _secured
         if not _norm.exists():
             return self._make_result(
-                ok=False, content="", error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}", execution_time=0,
+                ok=False,
+                content="",
+                error=f"File not found: {file_path}{self._suggest_missing_paths(file_path)}",
+                execution_time=0,
             )
 
         try:
             original = _norm.read_text(encoding="utf-8")
         except Exception as e:
             return self._make_result(
-                ok=False, content="", error=f"Failed to read {file_path}: {e}", execution_time=0,
+                ok=False,
+                content="",
+                error=f"Failed to read {file_path}: {e}",
+                execution_time=0,
             )
 
         lines = original.splitlines(True)
@@ -2832,6 +3028,7 @@ class WriteToolsPatchMixin:
             resolve_multiline_anchor,
         )
         from external_llm.common.indent_utils import detect_indent_char, indent_unit
+
         # Destination file's chars-per-level — so a tab/4-space snippet rebased
         # into this file maps each level to the file's real unit, not hardcoded 4.
         _wt_dest_unit = indent_unit(original, detect_indent_char(lines))
@@ -2857,12 +3054,17 @@ class WriteToolsPatchMixin:
         _multiline_range = None  # (anchor, end) when resolved; else single-line
         if _ast_anchor is None and "\n" in (anchor_pattern or ""):
             _ml = resolve_multiline_anchor(
-                lines, anchor_pattern, occurrence,
-                ctx_before=context_before, ctx_after=context_after,
+                lines,
+                anchor_pattern,
+                occurrence,
+                ctx_before=context_before,
+                ctx_after=context_after,
             )
             if not _ml["ok"]:
                 return self._make_result(
-                    ok=False, content="", error=_ml["error"],
+                    ok=False,
+                    content="",
+                    error=_ml["error"],
                     metadata={
                         "file_path": file_path,
                         "failure_class": _ml.get("failure_class") or _FC.ANCHOR_MULTILINE_PATTERN.value,
@@ -2886,24 +3088,26 @@ class WriteToolsPatchMixin:
                     # AST lineno path — line is authoritative; pattern (if any)
                     # only supplies the line count for multi-line delete. The
                     # verify-all-pattern-lines block below still runs for count>1.
-                    _del_search_pat = (
-                        _del_pat_lines[0] if _del_pat_lines else lines[_ast_anchor].strip()
-                    )
+                    _del_search_pat = _del_pat_lines[0] if _del_pat_lines else lines[_ast_anchor].strip()
                     _del_count = len(_del_pat_lines) if _del_pat_lines else 1
                     _del_anchor = _ast_anchor
                     _del_fuzzy_match = False
                 else:
                     if not _del_pat_lines:
                         return self._make_result(
-                            ok=False, content="",
+                            ok=False,
+                            content="",
                             error="anchor_edit(delete): empty anchor pattern",
                         )
                     _del_search_pat = _del_pat_lines[0]
                     _del_count = len(_del_pat_lines)
 
                     _del_anchor = _find_anchor_line(
-                        lines, _del_search_pat, occurrence,
-                        ctx_before=context_before, ctx_after=context_after,
+                        lines,
+                        _del_search_pat,
+                        occurrence,
+                        ctx_before=context_before,
+                        ctx_after=context_after,
                     )
 
                     # ── Uniqueness guard — mirrors insert/replace path ──
@@ -2920,12 +3124,11 @@ class WriteToolsPatchMixin:
                         and not context_before
                         and not context_after
                     ):
-                        _del_match_count = sum(
-                            1 for _item_ in lines if _match_anchor(_del_search_pat, _item_)
-                        )
+                        _del_match_count = sum(1 for _item_ in lines if _match_anchor(_del_search_pat, _item_))
                         if _del_match_count > 1:
                             return self._make_result(
-                                ok=False, content="",
+                                ok=False,
+                                content="",
                                 error=(
                                     f"anchor_edit(delete): pattern {_del_search_pat!r} "
                                     f"matched {_del_match_count} times in {file_path}. "
@@ -2944,7 +3147,10 @@ class WriteToolsPatchMixin:
                 _del_fuzzy_match = False
                 if _del_anchor is None:
                     _fz_lineno, _fz_score = _fuzzy_find_anchor_line(
-                        lines, _del_search_pat, snippet_lines=None, edit_mode="delete",
+                        lines,
+                        _del_search_pat,
+                        snippet_lines=None,
+                        edit_mode="delete",
                     )
                     if _fz_lineno is not None:
                         _del_anchor = _fz_lineno
@@ -2954,7 +3160,8 @@ class WriteToolsPatchMixin:
 
                 if _del_anchor is None:
                     return self._make_result(
-                        ok=False, content="",
+                        ok=False,
+                        content="",
                         error=(
                             f"anchor_edit(delete): pattern {_del_search_pat!r} not found "
                             f"in {file_path} (searched {len(lines)} lines)"
@@ -2962,6 +3169,7 @@ class WriteToolsPatchMixin:
                     )
 
                 # ── Verify ALL pattern lines match before deleting ──────────
+                _pi = 0  # bound even when _del_count == 1 (loop body never runs)
                 _del_mismatch = False
                 for _pi in range(1, _del_count):
                     _file_lineno = _del_anchor + _pi
@@ -2979,7 +3187,8 @@ class WriteToolsPatchMixin:
                     _del_end_mismatch = min(_del_anchor + _del_count, len(lines))
                     _actual_lines = "".join(lines[_del_anchor:_del_end_mismatch])[:500]
                     return self._make_result(
-                        ok=False, content="",
+                        ok=False,
+                        content="",
                         error=(
                             f"anchor_edit(delete): pattern line {_pi + 1} mismatch after anchor "
                             f"at line {_del_anchor + 1} in {file_path}. "
@@ -3000,13 +3209,14 @@ class WriteToolsPatchMixin:
 
             if new_content == original:
                 return self._make_result(
-                  ok=True,
-                  content="The content is already as requested — nothing to delete (already_equal)",
-                  error="",
+                    ok=True,
+                    content="The content is already as requested — nothing to delete (already_equal)",
+                    error="",
                 )
 
             # Syntax validation
             from ...languages.syntax_validator import SyntaxValidator
+
             _sv = SyntaxValidator.validate_syntax(new_content, lang_id, file_path=file_path)
             _gate_soft_failed = False
             if not _sv.ok:
@@ -3019,12 +3229,11 @@ class WriteToolsPatchMixin:
                 _gate_refuse = True
                 if lang_id is not LanguageId.PYTHON:
                     _sv_detail = f"{file_path}:{_sv_err_line or 0}:0: {_sv_err_msg}"
-                    _gate_refuse = not self._should_soft_fail_verify(
-                        _sv_detail, {file_path: original}
-                    )
+                    _gate_refuse = not self._should_soft_fail_verify(_sv_detail, {file_path: original})
                 if _gate_refuse:
                     return self._make_result(
-                        ok=False, content="",
+                        ok=False,
+                        content="",
                         error=f"anchor_edit(delete) produced invalid syntax: {_sv_err_msg}",
                         metadata={"file_path": file_path, "failure_class": "syntax_invalid_after_edit"},
                     )
@@ -3051,7 +3260,11 @@ class WriteToolsPatchMixin:
                 _anchor_meta["syntax_gate"] = "soft_fail"
             logger.info(
                 "anchor_edit(delete): removed %d lines (L%d-L%d) matching %r from %s",
-                _del_count, _del_anchor + 1, _del_end, _del_search_pat[:60], file_path,
+                _del_count,
+                _del_anchor + 1,
+                _del_end,
+                _del_search_pat[:60],
+                file_path,
             )
             return self._make_result(
                 ok=True,
@@ -3073,8 +3286,11 @@ class WriteToolsPatchMixin:
             anchor_lineno, _anchor_end = _multiline_range
         else:
             anchor_lineno = _find_anchor_line(
-                lines, anchor_pattern, occurrence,
-                ctx_before=context_before, ctx_after=context_after,
+                lines,
+                anchor_pattern,
+                occurrence,
+                ctx_before=context_before,
+                ctx_after=context_after,
             )
 
             # ── Too-many-matches guard (mirrors editor path's ANCHOR_MAX_MATCHES) ──
@@ -3084,16 +3300,12 @@ class WriteToolsPatchMixin:
             # try/except block). Fail loudly instead so the caller supplies
             # `occurrence` or `context_before`/`context_after` to disambiguate.
             # This matches edit_text's "old_string must be UNIQUE" contract.
-            if (
-                anchor_lineno is not None
-                and occurrence in (-1, None)
-                and not context_before
-                and not context_after
-            ):
+            if anchor_lineno is not None and occurrence in (-1, None) and not context_before and not context_after:
                 _match_count = sum(1 for _item_ in lines if _match_anchor(anchor_pattern, _item_))
                 if _match_count > 1:
                     return self._make_result(
-                        ok=False, content="",
+                        ok=False,
+                        content="",
                         error=(
                             f"anchor_pattern {anchor_pattern!r} matched {_match_count} "
                             f"times in {file_path}. The default occurrence=-1 (last match) "
@@ -3111,7 +3323,8 @@ class WriteToolsPatchMixin:
             # Fuzzy fallback — conservative (margin gate + indent compatibility gate)
             if anchor_lineno is None:
                 _fz_lineno, _fz_score = _fuzzy_find_anchor_line(
-                    lines, anchor_pattern,
+                    lines,
+                    anchor_pattern,
                     snippet_lines=code_snippet.splitlines() if code_snippet else None,
                     edit_mode=edit_mode,
                 )
@@ -3121,7 +3334,8 @@ class WriteToolsPatchMixin:
 
         if anchor_lineno is None:
             return self._make_result(
-                ok=False, content="",
+                ok=False,
+                content="",
                 error=(
                     f"anchor_pattern {anchor_pattern!r} not found in {file_path} "
                     f"(searched {len(lines)} lines) — read the file first and use exact text"
@@ -3130,7 +3344,7 @@ class WriteToolsPatchMixin:
             )
 
         # ── Compute anchor indent ──────────────────────────────────────────
-        anchor_line_text = lines[anchor_lineno].rstrip('\n\r')
+        anchor_line_text = lines[anchor_lineno].rstrip("\n\r")
         anchor_indent = len(lines[anchor_lineno]) - len(lines[anchor_lineno].lstrip())
         # Track indent correction for structural feedback metadata. Populated
         # by the Python block-introducer correction below (insert/replace path);
@@ -3138,25 +3352,22 @@ class WriteToolsPatchMixin:
         _indent_correction_info = None
 
         # ── Collection-literal indentation fix ─────────────────────────────
-        if (
-            edit_mode == "insert_before"
-            and anchor_line_text.strip() in ('}', '};', '},', '})', '});')
-        ):
+        if edit_mode == "insert_before" and anchor_line_text.strip() in ("}", "};", "},", "})", "});"):
             _entry_indent = None
             _brace_depth = 0
             for _bi in range(anchor_lineno - 1, max(anchor_lineno - 200, -1), -1):
                 _bl_stripped = lines[_bi].strip()
                 for _ch in lines[_bi]:
-                    if _ch == '}':
+                    if _ch == "}":
                         _brace_depth += 1
-                    elif _ch == '{':
+                    elif _ch == "{":
                         _brace_depth -= 1
                 if _brace_depth < 0:
                     break
                 if (
                     _bl_stripped
-                    and not _bl_stripped.startswith(('//', '#', '/*', '*'))
-                    and _bl_stripped not in ('{', '}', '};', '},', '})', '});')
+                    and not _bl_stripped.startswith(("//", "#", "/*", "*"))
+                    and _bl_stripped not in ("{", "}", "};", "},", "})", "});")
                 ):
                     _detected = len(lines[_bi]) - len(lines[_bi].lstrip())
                     if _detected > anchor_indent:
@@ -3178,11 +3389,12 @@ class WriteToolsPatchMixin:
             # with the snippet. Single-line path (the common case) retains the
             # bracket-balance guard below.
             if _anchor_end is not None:
-                _old_lines = lines[anchor_lineno:_anchor_end + 1]
+                _old_lines = lines[anchor_lineno : _anchor_end + 1]
                 _replace_block = new_code.splitlines(True)
                 if _replace_block:
                     _adj_block = _inherit_anchor_indent_if_bare(
-                        _replace_block, anchor_line_text,
+                        _replace_block,
+                        anchor_line_text,
                         _wt_dest_unit,
                     )
                     _block_text = "".join(_adj_block)
@@ -3190,7 +3402,7 @@ class WriteToolsPatchMixin:
                         _block_text += "\n"
                 else:
                     _block_text = "\n"
-                lines[anchor_lineno:_anchor_end + 1] = [_block_text]
+                lines[anchor_lineno : _anchor_end + 1] = [_block_text]
             else:
                 _old_line = lines[anchor_lineno]
                 # Indent bare snippet to anchor depth — the earlier `.strip()` already
@@ -3198,7 +3410,8 @@ class WriteToolsPatchMixin:
                 _replace_lines = new_code.splitlines(True)
                 if _replace_lines:
                     _adj_lines = _inherit_anchor_indent_if_bare(
-                        _replace_lines, anchor_line_text,
+                        _replace_lines,
+                        anchor_line_text,
                         _wt_dest_unit,
                     )
                     _new_line = "".join(_adj_lines)
@@ -3234,7 +3447,8 @@ class WriteToolsPatchMixin:
                     # Guard: snippet starts with '}' → continuation fragment
                     if _new_line.strip().startswith("}"):
                         return self._make_result(
-                            ok=False, content="",
+                            ok=False,
+                            content="",
                             error=(
                                 f"anchor_edit(replace_line): snippet starts with '}}' "
                                 f"at {file_path}:{anchor_lineno + 1} — continuation fragment "
@@ -3281,10 +3495,11 @@ class WriteToolsPatchMixin:
                             _close_line - anchor_lineno + 1,
                         )
                         lines[anchor_lineno] = _new_line
-                        del lines[anchor_lineno + 1:_close_line + 1]
+                        del lines[anchor_lineno + 1 : _close_line + 1]
                     else:
                         return self._make_result(
-                            ok=False, content="",
+                            ok=False,
+                            content="",
                             error=(
                                 f"anchor_edit(replace_line): bracket imbalance "
                                 f"(old={_old_delta:+d}, new={_new_delta:+d}) at "
@@ -3319,7 +3534,10 @@ class WriteToolsPatchMixin:
                 # change. Replaces the old def-skip logic that only scanned
                 # to the signature colon (which still landed in the body).
                 _block_end = _find_block_end_line(
-                    original, lang_id.value, anchor_lineno, lines,
+                    original,
+                    lang_id.value,
+                    anchor_lineno,
+                    lines,
                 )
                 if _block_end is not None and _block_end > anchor_lineno:
                     logger.info(
@@ -3331,10 +3549,10 @@ class WriteToolsPatchMixin:
                         _block_end + 1,
                     )
                     insert_idx = _block_end + 1
-                        # anchor_indent already reflects the header's own indent,
-                        # so the new construct is placed as a sibling at the same
-                        # depth. (The old def-skip path bumped indent to the BODY
-                        # level, which is what caused the nesting bug.)
+                    # anchor_indent already reflects the header's own indent,
+                    # so the new construct is placed as a sibling at the same
+                    # depth. (The old def-skip path bumped indent to the BODY
+                    # level, which is what caused the nesting bug.)
 
             # ── Python block-introducer indent correction ────────────────
             # When the snippet STARTS a new def/class (a block introducer) but
@@ -3345,6 +3563,7 @@ class WriteToolsPatchMixin:
             # header so the new block is inserted as a sibling instead.
             # (Indentation has no structural meaning in brace-languages, so
             # this correction is Python-only — see system prompt rule 7.)
+            _snip_is_block_introducer: bool = False  # pre-bound; the PYTHON-only branch overrides
             if lang_id is LanguageId.PYTHON:
                 # Detect block-introducer using the snippet's MINIMUM-indent
                 # line (not the first non-empty line). When the LLM prepends a
@@ -3368,18 +3587,21 @@ class WriteToolsPatchMixin:
                 # startswith check, and silently skip this correction —
                 # exactly the gap that let a cache-section snippet (banner +
                 # constants + defs) inherit a nested anchor's indent.
-                _snip_is_block_introducer = any(
-                    _item_.strip() and (len(_item_) - len(_item_.lstrip())) == _snip_min_indent
-                    and _item_.lstrip().startswith(("def ", "async def ", "class ", "@"))
-                    for _item_ in _snip_lines_for_intro
-                ) if _snip_min_indent is not None else False
+                _snip_is_block_introducer = (
+                    any(
+                        _item_.strip()
+                        and (len(_item_) - len(_item_.lstrip())) == _snip_min_indent
+                        and _item_.lstrip().startswith(("def ", "async def ", "class ", "@"))
+                        for _item_ in _snip_lines_for_intro
+                    )
+                    if _snip_min_indent is not None
+                    else False
+                )
                 # Only correct when the anchor is NOT itself a def/class header:
                 # a header anchor already sits at the right sibling level, and
                 # lifting it further (e.g. first-method-of-class) would corrupt
                 # the enclosing class body by de-indenting to the class level.
-                _anchor_is_header = lines[anchor_lineno].strip().startswith(
-                    ("def ", "async def ", "class ")
-                )
+                _anchor_is_header = lines[anchor_lineno].strip().startswith(("def ", "async def ", "class "))
                 if _snip_is_block_introducer and not _anchor_is_header:
                     for _up in range(anchor_lineno - 1, -1, -1):
                         _up_text = lines[_up]
@@ -3392,7 +3614,8 @@ class WriteToolsPatchMixin:
                                 logger.debug(
                                     "anchor_edit(indent-correct): snippet is a block "
                                     "introducer; re-anchored indent %d→%d (nearest enclosing header)",
-                                    _prev, _up_indent,
+                                    _prev,
+                                    _up_indent,
                                 )
                                 _indent_correction_info = {
                                     "snippet_base_indent": _snip_min_indent if _snip_min_indent is not None else 0,
@@ -3412,7 +3635,8 @@ class WriteToolsPatchMixin:
             _dup = _detect_fragment_duplication(lines, insert_idx, new_code)
             if _dup is not None:
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=(
                         f"anchor_edit({edit_mode}): code_snippet duplicates "
                         f"{_dup['matched']}/{_dup['content_lines']} non-trivial "
@@ -3454,8 +3678,8 @@ class WriteToolsPatchMixin:
             indented_code = "\n".join(indented_lines) + "\n"
 
             # ── Newline guard: last-line insert on non-\n-terminated files ──
-            if insert_idx > 0 and insert_idx == len(lines) and not lines[-1].endswith('\n'):
-                lines[-1] += '\n'
+            if insert_idx > 0 and insert_idx == len(lines) and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
 
             lines.insert(insert_idx, indented_code)
 
@@ -3485,11 +3709,9 @@ class WriteToolsPatchMixin:
             )
             if _nest_err is not None:
                 return self._make_result(
-                    ok=False, content="",
-                    error=(
-                        f"anchor_edit({edit_mode}): {_nest_err} "
-                        f"file={file_path}, anchor_line={anchor_lineno + 1}"
-                    ),
+                    ok=False,
+                    content="",
+                    error=(f"anchor_edit({edit_mode}): {_nest_err} file={file_path}, anchor_line={anchor_lineno + 1}"),
                     metadata={
                         "file_path": file_path,
                         "failure_class": "structural_gate_violation",
@@ -3500,6 +3722,7 @@ class WriteToolsPatchMixin:
 
         # ── Syntax validation + write ──────────────────────────────────────
         from ...languages.syntax_validator import SyntaxValidator
+
         _sv = SyntaxValidator.validate_syntax(new_content, lang_id, file_path=file_path)
         _gate_soft_failed = False
         if not _sv.ok:
@@ -3515,9 +3738,7 @@ class WriteToolsPatchMixin:
             _gate_refuse = True
             if lang_id is not LanguageId.PYTHON:
                 _sv_detail = f"{file_path}:{_sv_err_line or 0}:0: {_sv_err_msg}"
-                _gate_refuse = not self._should_soft_fail_verify(
-                    _sv_detail, {file_path: original}
-                )
+                _gate_refuse = not self._should_soft_fail_verify(_sv_detail, {file_path: original})
             if _gate_refuse:
                 # Build an actionable hint: show the region around the error and
                 # the anchor context so the LLM can see WHY the edit broke syntax.
@@ -3542,7 +3763,8 @@ class WriteToolsPatchMixin:
                     "prefer apply_patch (which uses exact line ranges) over anchor_edit."
                 )
                 return self._make_result(
-                    ok=False, content="",
+                    ok=False,
+                    content="",
                     error=" ".join(_hint_parts),
                     metadata={
                         "file_path": file_path,
@@ -3595,7 +3817,9 @@ class WriteToolsPatchMixin:
                     }
                     if _il and _il[0] is not None and _il[1] != _tl[1]:
                         _anchor_meta["enclosing_scope"]["innermost"] = {
-                            "kind": _il[0], "name": _il[1], "indent": _il[2],
+                            "kind": _il[0],
+                            "name": _il[1],
+                            "indent": _il[2],
                         }
                 _anchor_meta["inserted_at_indent"] = (
                     _indent_correction_info["corrected_anchor_indent"]
@@ -3613,12 +3837,14 @@ class WriteToolsPatchMixin:
             _anchor_meta["syntax_check"] = _syn
 
         _line_desc = (
-            f"lines {anchor_lineno + 1}-{_anchor_end + 1}"
-            if _anchor_end is not None else f"line {anchor_lineno + 1}"
+            f"lines {anchor_lineno + 1}-{_anchor_end + 1}" if _anchor_end is not None else f"line {anchor_lineno + 1}"
         )
         logger.info(
             "anchor_edit: %s in %s at %s (mode=%s)",
-            edit_mode, file_path, _line_desc, edit_mode,
+            edit_mode,
+            file_path,
+            _line_desc,
+            edit_mode,
         )
 
         return self._make_result(

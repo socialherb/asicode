@@ -11,6 +11,7 @@ from common import EDIT_TARGET_MAX_BYTES
 # Result container
 # -------------------------------------------------------------
 
+
 @dataclass
 class RewriteResult:
     old_text: str
@@ -24,8 +25,8 @@ class RewriteResult:
 # AST Rewriter
 # -------------------------------------------------------------
 
-class ASTRewriter:
 
+class ASTRewriter:
     def __init__(self, repo_root: str):
         self.repo_root = Path(repo_root)
 
@@ -41,12 +42,7 @@ class ASTRewriter:
     # public API
     # ---------------------------------------------------------
 
-    def replace_function(
-        self,
-        file_path: str,
-        function_name: str,
-        new_code: str
-    ) -> RewriteResult:
+    def replace_function(self, file_path: str, function_name: str, new_code: str) -> RewriteResult:
 
         source, tree = self._load_ast(file_path)
 
@@ -56,12 +52,7 @@ class ASTRewriter:
 
         raise ValueError(f"Function not found: {function_name}")
 
-    def replace_class(
-        self,
-        file_path: str,
-        class_name: str,
-        new_code: str
-    ) -> RewriteResult:
+    def replace_class(self, file_path: str, class_name: str, new_code: str) -> RewriteResult:
 
         source, tree = self._load_ast(file_path)
 
@@ -71,13 +62,7 @@ class ASTRewriter:
 
         raise ValueError(f"Class not found: {class_name}")
 
-    def replace_method(
-        self,
-        file_path: str,
-        class_name: str,
-        method_name: str,
-        new_code: str
-    ) -> RewriteResult:
+    def replace_method(self, file_path: str, class_name: str, method_name: str, new_code: str) -> RewriteResult:
         """Replace a method inside a class.
 
         ``class_name`` may be a dotted path for nested classes, e.g.
@@ -88,7 +73,7 @@ class ASTRewriter:
 
         # Walk the class chain (supports nested classes like "A.B")
         class_chain = class_name.split(".")
-        current_body: list = tree.body
+        current_body: list = tree.body  # type: ignore[attr-defined]  # ast.Module.body present at runtime
         for cls_name in class_chain:
             found = None
             for node in current_body:
@@ -101,12 +86,7 @@ class ASTRewriter:
 
         for item in current_body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
-                return self._replace_node(
-                    source,
-                    item,
-                    new_code,
-                    f"{class_name}.{method_name}"
-                )
+                return self._replace_node(source, item, new_code, f"{class_name}.{method_name}")
 
         raise ValueError(f"Method not found: {class_name}.{method_name}")
 
@@ -122,11 +102,7 @@ class ASTRewriter:
     # patch generation
     # ---------------------------------------------------------
 
-    def generate_patch(
-        self,
-        file_path: str,
-        result: RewriteResult
-    ) -> str:
+    def generate_patch(self, file_path: str, result: RewriteResult) -> str:
 
         rel = file_path
 
@@ -135,7 +111,7 @@ class ASTRewriter:
             result.new_text.splitlines(True),
             fromfile=f"a/{rel}",
             tofile=f"b/{rel}",
-            lineterm="\n"
+            lineterm="\n",
         )
 
         # lineterm="\n" gives the control lines (---/+++/@@) their newline so a
@@ -148,7 +124,6 @@ class ASTRewriter:
 
         return f"diff --git a/{rel} b/{rel}\n{body}"
 
-
     # ---------------------------------------------------------
     # helpers
     # ---------------------------------------------------------
@@ -159,9 +134,7 @@ class ASTRewriter:
 
         try:
             if path.stat().st_size > self._MAX_EDIT_BYTES:
-                raise ValueError(
-                    f"file too large for AST rewrite (>{self._MAX_EDIT_BYTES // (1024 * 1024)}MiB)"
-                )
+                raise ValueError(f"file too large for AST rewrite (>{self._MAX_EDIT_BYTES // (1024 * 1024)}MiB)")
         except OSError as e:
             raise ValueError(f"cannot stat {file_path}: {e}") from e
 
@@ -171,13 +144,7 @@ class ASTRewriter:
 
         return source, tree
 
-    def _replace_node(
-        self,
-        source: str,
-        node: ast.AST,
-        new_code: str,
-        symbol: str
-    ) -> RewriteResult:
+    def _replace_node(self, source: str, node: ast.AST, new_code: str, symbol: str) -> RewriteResult:
         # node.lineno points at the `def`/`class` line — decorators live ABOVE
         # it and are NOT covered by lineno. Slicing at `lineno - 1` would leave
         # the original decorators in `lines[:start]`, and since new_code carries
@@ -187,8 +154,8 @@ class ASTRewriter:
         # topmost decorator when one is present. Same policy as semantic_patch.py
         # and symbol_modify_tool.py.
         decorator_list = getattr(node, "decorator_list", []) or []
-        start = (min(d.lineno for d in decorator_list) - 1) if decorator_list else (node.lineno - 1)
-        end = node.end_lineno
+        start = (min(d.lineno for d in decorator_list) - 1) if decorator_list else (node.lineno - 1)  # type: ignore[attr-defined]  # AST stmt node
+        end = node.end_lineno  # type: ignore[attr-defined]  # AST stmt node
 
         lines = source.splitlines()
 
@@ -198,10 +165,4 @@ class ASTRewriter:
 
         new_text = "\n".join(updated) + "\n"
 
-        return RewriteResult(
-            old_text=source,
-            new_text=new_text,
-            start_line=start,
-            end_line=end,
-            symbol=symbol
-        )
+        return RewriteResult(old_text=source, new_text=new_text, start_line=start, end_line=end, symbol=symbol)

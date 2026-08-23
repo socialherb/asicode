@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Any, Optional
+from typing import Any
 
 from .graph_builder import GraphBuilder
 from .models import CallEdge, ImportEdge, SymbolNode
@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class RepositoryGraphFacade:
-    def __init__(self, call_graph_indexer=None, repo_root: Optional[str] = None):
+    def __init__(self, call_graph_indexer=None, repo_root: str | None = None):
         self.call_graph_indexer = call_graph_indexer
         self.repo_root = repo_root or os.getcwd()
-        self._graph: Optional[RepositoryGraph] = None
+        self._graph: RepositoryGraph | None = None
         self._graph_builder = GraphBuilder(self.repo_root)
         # RLock (re-entrant) so the same thread can call _ensure_graph() recursively
         # without deadlock, while still blocking other threads during rebuild.
@@ -34,7 +34,7 @@ class RepositoryGraphFacade:
     def get_related_symbols(
         self,
         symbol: str,
-        file_path: Optional[str] = None,
+        file_path: str | None = None,
         depth: int = 1,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
@@ -73,6 +73,7 @@ class RepositoryGraphFacade:
                 return
 
             from ..languages import LanguageId
+
             lang_paths = [p for p in changed_paths if LanguageId.from_path(p.strip()) != LanguageId.UNKNOWN]
             if not lang_paths:
                 return
@@ -118,19 +119,19 @@ class RepositoryGraphFacade:
                 self._graph = self._graph_builder.build_repo_graph(self.repo_root)
         return self._graph
 
-    def get_symbol(self, name: str, file_path: Optional[str] = None) -> Optional[SymbolNode]:
+    def get_symbol(self, name: str, file_path: str | None = None) -> SymbolNode | None:
         """Retrieve a symbol by name, optionally scoped to a file."""
         graph = self._ensure_graph()
         return graph.get_symbol(name, file_path)
 
-    def get_callers(self, symbol_name: str, file_path: Optional[str] = None) -> list[CallEdge]:
+    def get_callers(self, symbol_name: str, file_path: str | None = None) -> list[CallEdge]:
         """Return all call edges where the given symbol is the callee (canonical CallEdge)."""
         if self.call_graph_indexer is not None:
             return self.call_graph_indexer.get_callers(symbol_name, file_path)
         graph = self._ensure_graph()
         return self._convert_repo_edges(graph.get_callers(symbol_name), graph)
 
-    def get_callees(self, symbol_name: str, file_path: Optional[str] = None) -> list[CallEdge]:
+    def get_callees(self, symbol_name: str, file_path: str | None = None) -> list[CallEdge]:
         """Return all call edges where the given symbol is the caller (canonical CallEdge)."""
         if self.call_graph_indexer is not None:
             return self.call_graph_indexer.get_callees(symbol_name, file_path)
@@ -138,7 +139,7 @@ class RepositoryGraphFacade:
         return self._convert_repo_edges(graph.get_callees(symbol_name), graph)
 
     @staticmethod
-    def _convert_repo_edges(edges: list, graph: RepositoryGraph = None) -> list[CallEdge]:
+    def _convert_repo_edges(edges: list, graph: RepositoryGraph | None = None) -> list[CallEdge]:
         """Convert RepositoryGraph internal CallEdge list to canonical CallEdge list.
 
         Direction-agnostic: both get_callers() and get_callees() return RepositoryGraph
@@ -154,20 +155,22 @@ class RepositoryGraphFacade:
             # Resolve callee_file from symbol table (e.file_path is the CALLER's file)
             _callee_node = graph.get_symbol(e.callee) if graph else None
             _callee_file = _callee_node.file_path if _callee_node else e.file_path
-            result.append(CallEdge(
-                caller_symbol=e.caller,
-                caller_file=e.file_path,
-                caller_line=e.line,
-                # P3 Stage 1: pass through the canonical attribution when the
-                # RG edge carries it (new snapshots); fall back to the legacy
-                # bare callee for pre-P3 payloads.
-                callee_symbol=getattr(e, "callee_symbol", None) or e.callee,
-                callee_display=getattr(e, "callee_display", "") or e.callee,
-                callee_file=_callee_file,
-                call_args=getattr(e, "call_args", []),
-                is_mutating=getattr(e, "is_mutating", False),
-                confidence=getattr(e, "confidence", 0.5),
-            ))
+            result.append(
+                CallEdge(
+                    caller_symbol=e.caller,
+                    caller_file=e.file_path,
+                    caller_line=e.line,
+                    # P3 Stage 1: pass through the canonical attribution when the
+                    # RG edge carries it (new snapshots); fall back to the legacy
+                    # bare callee for pre-P3 payloads.
+                    callee_symbol=getattr(e, "callee_symbol", None) or e.callee,
+                    callee_display=getattr(e, "callee_display", "") or e.callee,
+                    callee_file=_callee_file,
+                    call_args=getattr(e, "call_args", []),
+                    is_mutating=getattr(e, "is_mutating", False),
+                    confidence=getattr(e, "confidence", 0.5),
+                )
+            )
         return result
 
     def get_file_dependencies(self, file_path: str) -> list[ImportEdge]:
@@ -206,7 +209,7 @@ class RepositoryGraphFacade:
         """
         return self._ensure_graph().py_files
 
-    def get_symbol_file(self, symbol_name: str) -> Optional[str]:
+    def get_symbol_file(self, symbol_name: str) -> str | None:
         """
         Get the file path where a symbol is defined.
 

@@ -6,8 +6,10 @@ Captures stdout/stderr (raw). Optionally streams output lines via callback.
 
 Designed for asicode "Agent Mode" loops.
 """
+
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -16,14 +18,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.common.bounded_capture import _BoundedCapture
 
 logger = logging.getLogger(__name__)
 
 # Pytest output prefix constants
-_FAILED_PREFIX = 'FAILED '
+_FAILED_PREFIX = "FAILED "
 
 # Reaping a SIGKILLed group is not part of the test budget, so it gets its own
 # small grace rather than the deadline's remainder.
@@ -62,13 +64,18 @@ def _kill_process_group(proc, pgid: int) -> None:
     one ``getpgrp()`` is cheaper than a landmine under a future edit.
     """
     try:
+        if pgid is None:
+            # Leader was already reaped before resolution (see _run_cmd):
+            # no group to signal, fall through to killing the child alone.
+            raise ProcessLookupError("group not resolved (leader already exited)")
         if pgid == os.getpgrp():
             # Not an assert: in a wedged agent the useful outcome is a dead
             # child, not a traceback from the teardown path.
             logger.error(
                 "test_runner: child %s shares our process group (%s) — "
                 "start_new_session was not applied; killing the child only",
-                proc.pid, pgid,
+                proc.pid,
+                pgid,
             )
         else:
             os.killpg(pgid, signal.SIGKILL)
@@ -81,7 +88,6 @@ def _kill_process_group(proc, pgid: int) -> None:
         logger.debug("test_runner: child already gone: %s", exc)
 
 
-
 @dataclass
 class TestRunResult:
     ok: bool
@@ -90,9 +96,9 @@ class TestRunResult:
     stdout: str
     stderr: str
     combined: str
-    summary_line: Optional[str] = None
-    failing_tests: Optional[list[str]] = None
-    first_traceback: Optional[str] = None
+    summary_line: str | None = None
+    failing_tests: list[str] | None = None
+    first_traceback: str | None = None
     # Structured test results
     passed_count: int = 0
     failed_count: int = 0
@@ -100,8 +106,8 @@ class TestRunResult:
     skipped_count: int = 0
     xpassed_count: int = 0
     xfailed_count: int = 0
-    failed_test_details: list[dict[str, Any]] = None
-    error_test_details: list[dict[str, Any]] = None
+    failed_test_details: list[dict[str, Any]] | None = None
+    error_test_details: list[dict[str, Any]] | None = None
     # True when the run was killed at *timeout_sec* rather than finishing.
     # Without this the caller cannot tell "the suite failed" from "we never let
     # the suite finish" — both arrive as ok=False with a nonzero exit code, and
@@ -130,9 +136,9 @@ class TestRunner:
         self,
         repo_root: str,
         *,
-        python_executable: Optional[str] = None,
-        env_overrides: Optional[dict[str, str]] = None,
-        test_command: Optional[list[str]] = None,
+        python_executable: str | None = None,
+        env_overrides: dict[str, str] | None = None,
+        test_command: list[str] | None = None,
     ):
         self.repo_root = str(Path(repo_root).resolve())
         self.python_executable = python_executable or os.environ.get("PYTHON", "python3")
@@ -148,11 +154,11 @@ class TestRunner:
     def run(
         self,
         *,
-        args: Optional[list[str]] = None,
+        args: list[str] | None = None,
         timeout_sec: int = 120,
-        cancel_check: Optional[Callable[[], bool]] = None,
-        stream_callback: Optional[Callable[[str, str, dict[str, Any]], None]] = None,
-        meta: Optional[dict[str, Any]] = None,
+        cancel_check: Callable[[], bool] | None = None,
+        stream_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> TestRunResult:
         """
         Generic run — uses self.test_command if set, otherwise falls back to pytest.
@@ -163,16 +169,18 @@ class TestRunner:
         group is killed and the result comes back with cancelled=True.
         """
         cmd = self._build_cmd(args=args)
-        return self._run_cmd(cmd, timeout_sec=timeout_sec, cancel_check=cancel_check, stream_callback=stream_callback, meta=meta)
+        return self._run_cmd(
+            cmd, timeout_sec=timeout_sec, cancel_check=cancel_check, stream_callback=stream_callback, meta=meta
+        )
 
     def run_pytest(
         self,
         *,
-        args: Optional[list[str]] = None,
+        args: list[str] | None = None,
         timeout_sec: int = 300,
-        cancel_check: Optional[Callable[[], bool]] = None,
-        stream_callback: Optional[Callable[[str, str, dict[str, Any]], None]] = None,
-        meta: Optional[dict[str, Any]] = None,
+        cancel_check: Callable[[], bool] | None = None,
+        stream_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> TestRunResult:
         """Run pytest. Delegates to run() with a pytest-friendly default timeout."""
         return self.run(
@@ -190,9 +198,9 @@ class TestRunner:
         cmd: list[str],
         *,
         timeout_sec: int = 120,
-        cancel_check: Optional[Callable[[], bool]] = None,
-        stream_callback: Optional[Callable[[str, str, dict[str, Any]], None]] = None,
-        meta: Optional[dict[str, Any]] = None,
+        cancel_check: Callable[[], bool] | None = None,
+        stream_callback: Callable[[str, str, dict[str, Any]], None] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> TestRunResult:
         """Core subprocess runner — shared by run() and run_pytest()."""
         meta = dict(meta or {})
@@ -213,7 +221,8 @@ class TestRunner:
             env["COLUMNS"] = "200"
 
         from .config.thresholds import config as _thresholds
-        _CAP = _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
+
+        _cap = _thresholds.tokens.BASH_OUTPUT_MAX_CHARS
 
         start = time.monotonic()
         proc = subprocess.Popen(
@@ -240,8 +249,15 @@ class TestRunner:
         # Resolve the group NOW, while the child is certainly alive: the
         # timeout/cancel teardown may run after the leader exited and was
         # reaped, and a re-resolved getpgid() would then fail (see
-        # _kill_process_group).
-        _pgid = os.getpgid(proc.pid)
+        # _kill_process_group). Race: an instantly-exiting command (`echo`,
+        # `true`) can be reaped between the Popen return and this call under
+        # parallel-suite load — getpgid then raises ProcessLookupError and
+        # _run_cmd crashes instead of returning the output. A dead leader has
+        # no group to kill, so None is the correct degraded value.
+        try:
+            _pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            _pgid = None
 
         def _emit(line: str, stream: str) -> None:
             if stream_callback:
@@ -273,15 +289,15 @@ class TestRunner:
             # ends carry signal — collection errors at the start, the summary
             # line and FAILED list at the end, which is what every extractor
             # below reads.
-            _out_cap = _BoundedCapture(_CAP)
-            _err_cap = _BoundedCapture(_CAP)
+            _out_cap = _BoundedCapture(_cap)
+            _err_cap = _BoundedCapture(_cap)
             _out_lock = _th.Lock()
             _err_lock = _th.Lock()
 
             def _read_stream(stream, capture, lock, stream_name):
                 try:
-                    for _raw in iter(stream.readline, ''):
-                        _line = _raw.rstrip('\n')
+                    for _raw in iter(stream.readline, ""):
+                        _line = _raw.rstrip("\n")
                         with lock:
                             capture.feed(_line + "\n")
                         _emit(_line, stream_name)
@@ -289,7 +305,9 @@ class TestRunner:
                     # Pipe closed under us (kill/cancel path): the partial
                     # output already fed to the capture is still the answer.
                     logger.debug(
-                        "test_runner: %s drain ended early: %s", stream_name, exc,
+                        "test_runner: %s drain ended early: %s",
+                        stream_name,
+                        exc,
                     )
 
             _t_out = _th.Thread(
@@ -310,12 +328,12 @@ class TestRunner:
             # instead of leaving them unowned until the budget expires (same
             # discipline as bash's _capture_bounded poll). Deadline-based, so
             # the timeout contract is unchanged.
-            _CANCEL_POLL_S = 0.5
+            _cancel_poll_s = 0.5
             _deadline = time.monotonic() + timeout_sec
             cancelled = False
             while True:
                 try:
-                    proc.wait(timeout=min(_CANCEL_POLL_S, max(0.0, _deadline - time.monotonic())))
+                    proc.wait(timeout=min(_cancel_poll_s, max(0.0, _deadline - time.monotonic())))
                     break
                 except subprocess.TimeoutExpired:
                     if time.monotonic() >= _deadline:
@@ -326,7 +344,11 @@ class TestRunner:
                         break
 
             if timed_out or cancelled:
-                _kill_process_group(proc, _pgid)
+                if _pgid is not None:
+                    _kill_process_group(proc, _pgid)
+                else:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.kill()
                 if timed_out:
                     _marker = f"[test_runner] TIMEOUT — killed after {timeout_sec}s"
                 else:
@@ -350,7 +372,8 @@ class TestRunner:
                     # answer. The zombie is the OS's problem.
                     logger.warning(
                         "test_runner: child %s not reaped %ss after SIGKILL",
-                        proc.pid, _KILL_REAP_GRACE,
+                        proc.pid,
+                        _KILL_REAP_GRACE,
                     )
 
             _t_out.join(timeout=_DRAIN_JOIN_GRACE)
@@ -394,9 +417,14 @@ class TestRunner:
             failing_tests = None
             first_traceback = None
             structured_results = {
-                "passed": 0, "failed": 0, "errors": 0,
-                "skipped": 0, "xpassed": 0, "xfailed": 0,
-                "failed_tests": [], "error_tests": [],
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+                "xpassed": 0,
+                "xfailed": 0,
+                "failed_tests": [],
+                "error_tests": [],
             }
 
         return TestRunResult(
@@ -421,7 +449,7 @@ class TestRunner:
             cancelled=cancelled,
         )
 
-    def _build_cmd(self, *, args: Optional[list[str]]) -> list[str]:
+    def _build_cmd(self, *, args: list[str] | None) -> list[str]:
         if args is not None:
             return list(args)
         if self.test_command:
@@ -429,7 +457,7 @@ class TestRunner:
         # prefer python -m pytest for venv consistency
         return [self.python_executable, "-m", "pytest", "-q"]
 
-    def _extract_summary_line(self, combined: str) -> Optional[str]:
+    def _extract_summary_line(self, combined: str) -> str | None:
         """Return summary line from combined output (pytest, jest, go test, etc.)."""
         if not combined:
             return None
@@ -476,9 +504,14 @@ class TestRunner:
         import re
 
         result: dict[str, Any] = {
-            "passed": 0, "failed": 0, "errors": 0,
-            "skipped": 0, "xpassed": 0, "xfailed": 0,
-            "failed_tests": [], "error_tests": [],
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "xpassed": 0,
+            "xfailed": 0,
+            "failed_tests": [],
+            "error_tests": [],
         }
         if not combined:
             return result
@@ -487,10 +520,10 @@ class TestRunner:
         summary = self._extract_summary_line(combined)
         if summary:
             _count_keys = [
-                ("passed",  "passed"),
-                ("failed",  "failed"),
-                ("errors",  "errors"),
-                ("error",   "errors"),   # pytest sometimes uses singular
+                ("passed", "passed"),
+                ("failed", "failed"),
+                ("errors", "errors"),
+                ("error", "errors"),  # pytest sometimes uses singular
                 ("skipped", "skipped"),
                 ("xpassed", "xpassed"),
                 ("xfailed", "xfailed"),
@@ -503,7 +536,7 @@ class TestRunner:
         # Collect traceback blocks per test (between "____ name ____" markers)
         # so we can attach assertion messages to individual failing tests.
         _tb_by_test: dict[str, str] = {}
-        _current_tb_test: Optional[str] = None
+        _current_tb_test: str | None = None
         _current_tb_lines: list[str] = []
 
         def _tb_head_tail(lines: list[str], max_lines: int = 50) -> str:
@@ -553,7 +586,7 @@ class TestRunner:
                     _colon = err_msg.find(": ")
                     if _colon > 0:
                         error_type = err_msg[:_colon].strip()
-                        message = err_msg[_colon + 2:].strip()
+                        message = err_msg[_colon + 2 :].strip()
                     else:
                         error_type = ""
                         message = err_msg
@@ -561,20 +594,22 @@ class TestRunner:
                     test_id.split("::")[-1] if "::" in test_id else test_id,
                     "",
                 )
-                result["failed_tests"].append({
-                    "test_id": test_id,
-                    "name": test_id.split("::")[-1] if "::" in test_id else test_id,
-                    "error_type": error_type,
-                    "message": message,
-                    "traceback": traceback,
-                })
+                result["failed_tests"].append(
+                    {
+                        "test_id": test_id,
+                        "name": test_id.split("::")[-1] if "::" in test_id else test_id,
+                        "error_type": error_type,
+                        "message": message,
+                        "traceback": traceback,
+                    }
+                )
 
         # Error test details from "ERROR ..." lines
         seen_errors: set = set()
         for line in _lines_combined:
             s = line.strip()
             if s.startswith("ERROR "):
-                rest = s[len("ERROR "):].strip()
+                rest = s[len("ERROR ") :].strip()
                 test_id = rest.split(" - ", 1)[0].strip()
                 if test_id and test_id not in seen_errors:
                     seen_errors.add(test_id)
@@ -582,16 +617,18 @@ class TestRunner:
                     err_msg = ""
                     if " - " in rest:
                         err_msg = rest.split(" - ", 1)[1].strip()
-                    result["error_tests"].append({
-                        "test_id": test_id,
-                        "name": test_id.split("::")[-1] if "::" in test_id else test_id,
-                        "error_type": "ERROR",
-                        "message": err_msg,
-                    })
+                    result["error_tests"].append(
+                        {
+                            "test_id": test_id,
+                            "name": test_id.split("::")[-1] if "::" in test_id else test_id,
+                            "error_type": "ERROR",
+                            "message": err_msg,
+                        }
+                    )
 
         return result
 
-    def _extract_first_traceback(self, combined: str) -> Optional[str]:
+    def _extract_first_traceback(self, combined: str) -> str | None:
         if not combined:
             return None
 
@@ -615,8 +652,14 @@ class TestRunner:
         excerpt = lines[start_idx : start_idx + 120]
         return "\n".join(excerpt).rstrip("\n")
 
-_SUMMARY_KEYWORDS = (
-    'PASSED', 'FAILED', 'ERROR', 'SKIPPED', 'XFAIL', 'XPASS',  # pytest
-    'PASS', 'FAIL',  # jest/go test
-)
 
+_SUMMARY_KEYWORDS = (
+    "PASSED",
+    "FAILED",
+    "ERROR",
+    "SKIPPED",
+    "XFAIL",
+    "XPASS",  # pytest
+    "PASS",
+    "FAIL",  # jest/go test
+)

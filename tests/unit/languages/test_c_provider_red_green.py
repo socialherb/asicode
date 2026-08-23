@@ -6,7 +6,7 @@ Covers every uncovered surface of c_provider.py:
   lines, and the filter_resolution branch
 - _find_compile_commands upward walk; _extract_include_flags arguments /
   command / shlex-failure / empty / relative-path resolution;
-  _collect_I_flags separated and combined spellings
+  _collect_i_flags separated and combined spellings
 - capabilities caching; tempfile-failure and toolchain-degrade paths in
   both syntax and semantic compiles
 - validate_semantics: not-on-disk skip, compile_commands.json include
@@ -16,6 +16,7 @@ Covers every uncovered surface of c_provider.py:
   top-level definitions (function/struct/enum/macro incl. EOF macro),
   find_top_level_definitions, find_symbol_body_range, definition keywords
 """
+
 from __future__ import annotations
 
 import json
@@ -28,7 +29,7 @@ import pytest
 from external_llm.languages.c_provider import (
     CppSyntaxProvider,
     CSyntaxProvider,
-    _collect_I_flags,
+    _collect_i_flags,
     _extract_include_flags,
     _find_compile_commands,
     _match_compile_commands_entry,
@@ -46,6 +47,7 @@ C_SRC = "int main(void) { return 0; }\n"
 
 
 # ── module-level helpers ───────────────────────────────────────────────────
+
 
 class TestParseCcDiagnostics:
     def test_non_matching_lines_ignored(self):
@@ -94,7 +96,7 @@ class TestExtractIncludeFlags:
     def test_shlex_failure_falls_back_to_split(self):
         entry = {"directory": "/proj", "command": 'gcc -I"unterminated a.c'}
         flags = _extract_include_flags(entry)
-        assert flags == ["-I/proj/\"unterminated"]  # cmd.split() keeps the token
+        assert flags == ['-I/proj/"unterminated']  # cmd.split() keeps the token
 
     def test_empty_entry_returns_empty(self):
         assert _extract_include_flags({}) == []
@@ -109,13 +111,14 @@ class TestExtractIncludeFlags:
 
 class TestCollectIFlags:
     def test_separated_and_combined(self):
-        assert _collect_I_flags(["gcc", "-I", "dir", "-Idir2", "-Wall", "-c", "x.c"]) == [
-            "-Idir", "-Idir2",
+        assert _collect_i_flags(["gcc", "-I", "dir", "-Idir2", "-Wall", "-c", "x.c"]) == [
+            "-Idir",
+            "-Idir2",
         ]
 
     def test_lone_trailing_dash_I_ignored(self):
-        assert _collect_I_flags(["gcc", "-I"]) == []
-        assert _collect_I_flags(["gcc", "-I", "-c", "x.c"]) == ["-I-c"]  # pairs with next token
+        assert _collect_i_flags(["gcc", "-I"]) == []
+        assert _collect_i_flags(["gcc", "-I", "-c", "x.c"]) == ["-I-c"]  # pairs with next token
 
 
 class TestSamePath:
@@ -139,6 +142,7 @@ class TestSamePath:
 
 # ── capabilities / basic commands ──────────────────────────────────────────
 
+
 class TestCapabilitiesAndCommands:
     def test_capabilities_cached(self):
         p = CSyntaxProvider()
@@ -161,7 +165,11 @@ class TestCapabilitiesAndCommands:
 
     def test_definition_keywords(self):
         assert CSyntaxProvider().get_definition_keywords() == [
-            "struct ", "union ", "enum ", "typedef ", "#define ",
+            "struct ",
+            "union ",
+            "enum ",
+            "typedef ",
+            "#define ",
         ]
 
     def test_language_ids(self):
@@ -175,6 +183,7 @@ class TestCapabilitiesAndCommands:
 
 # ── syntax compile: degrade paths ──────────────────────────────────────────
 
+
 class TestSyntaxCompileDegrade:
     @staticmethod
     def _gcc_only():
@@ -184,42 +193,55 @@ class TestSyntaxCompileDegrade:
         )
 
     def test_tempfile_failure_tree_sitter_fallback(self):
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider._tempfile_for_content",
-            return_value=("", lambda: None),
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider._tempfile_for_content",
+                return_value=("", lambda: None),
+            ),
         ):
             r = CSyntaxProvider().validate_syntax("main.c", C_SRC)
         assert r.ok is True
 
     def test_file_not_found_tree_sitter_fallback(self):
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=FileNotFoundError("gcc vanished"),
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=FileNotFoundError("gcc vanished"),
+            ),
         ):
             r = CSyntaxProvider().validate_syntax("main.c", C_SRC)
         assert r.ok is True
 
     def test_timeout_tree_sitter_fallback(self):
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=subprocess.TimeoutExpired("gcc", 30),
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("gcc", 30),
+            ),
         ):
             r = CSyntaxProvider().validate_syntax("main.c", C_SRC)
         assert r.ok is True
 
     def test_timeout_cpp(self):
-        with patch(
-            "external_llm.languages.c_provider.shutil.which",
-            side_effect=lambda c: f"/usr/bin/{c}" if c in ("g++", "clang++") else None,
-        ), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=subprocess.TimeoutExpired("g++", 30),
+        with (
+            patch(
+                "external_llm.languages.c_provider.shutil.which",
+                side_effect=lambda c: f"/usr/bin/{c}" if c in ("g++", "clang++") else None,
+            ),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("g++", 30),
+            ),
         ):
             r = CppSyntaxProvider().validate_syntax("main.cpp", C_SRC)
         assert r.ok is True
 
 
 # ── semantic compile: degrade + ccdb + .h union ────────────────────────────
+
 
 class TestSemantics:
     @staticmethod
@@ -237,9 +259,12 @@ class TestSemantics:
     def test_file_not_found_skips(self, tmp_path):
         f = tmp_path / "main.c"
         f.write_text(C_SRC)
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=FileNotFoundError("gcc"),
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=FileNotFoundError("gcc"),
+            ),
         ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.checked is False
@@ -248,9 +273,12 @@ class TestSemantics:
     def test_timeout_skips(self, tmp_path):
         f = tmp_path / "main.c"
         f.write_text(C_SRC)
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=subprocess.TimeoutExpired("gcc", 30),
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("gcc", 30),
+            ),
         ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.checked is False
@@ -259,17 +287,24 @@ class TestSemantics:
     def test_ccdb_include_flags_injected(self, tmp_path):
         f = tmp_path / "main.c"
         f.write_text(C_SRC)
-        (tmp_path / "compile_commands.json").write_text(json.dumps([
-            {
-                "directory": str(tmp_path),
-                "file": "main.c",
-                "arguments": ["gcc", "-Iinc", "-c", "main.c"],
-            },
-        ]))
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            return_value=_fake_proc(0),
-        ) as run:
+        (tmp_path / "compile_commands.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "directory": str(tmp_path),
+                        "file": "main.c",
+                        "arguments": ["gcc", "-Iinc", "-c", "main.c"],
+                    },
+                ]
+            )
+        )
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                return_value=_fake_proc(0),
+            ) as run,
+        ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.ok is True
         cmd = run.call_args.args[0]
@@ -278,16 +313,19 @@ class TestSemantics:
     def test_header_union_retry_cpp_accepts(self, tmp_path):
         f = tmp_path / "x.h"
         f.write_text("namespace N { int v = 1; }\n")
-        with patch(
-            "external_llm.languages.c_provider.shutil.which",
-            side_effect=lambda c: f"/usr/bin/{c}" if c in ("gcc", "g++") else None,
-        ), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=[
-                _fake_proc(1, stderr="x.h:1:10: error: expected ';' before '}'"),
-                _fake_proc(0),
-            ],
-        ) as run:
+        with (
+            patch(
+                "external_llm.languages.c_provider.shutil.which",
+                side_effect=lambda c: f"/usr/bin/{c}" if c in ("gcc", "g++") else None,
+            ),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=[
+                    _fake_proc(1, stderr="x.h:1:10: error: expected ';' before '}'"),
+                    _fake_proc(0),
+                ],
+            ) as run,
+        ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.ok is True  # C compile failed, C++ accepted → valid C++ header
         assert run.call_count == 2
@@ -295,9 +333,12 @@ class TestSemantics:
     def test_semantics_error_kept_for_target_file(self, tmp_path):
         f = tmp_path / "main.c"
         f.write_text(C_SRC)
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            return_value=_fake_proc(1, stderr="main.c:1:1: error: expected ';'\nother.c:1:1: error: boom\n"),
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                return_value=_fake_proc(1, stderr="main.c:1:1: error: expected ';'\nother.c:1:1: error: boom\n"),
+            ),
         ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.ok is False
@@ -372,6 +413,7 @@ class TestRegexFallbacks:
 
 # ── remaining branch coverage: ccdb no-match, .h union failure, TS paths ───
 
+
 class TestSemanticsEdges:
     @staticmethod
     def _gcc_only():
@@ -383,12 +425,19 @@ class TestSemanticsEdges:
     def test_ccdb_without_matching_entry_still_compiles(self, tmp_path):
         f = tmp_path / "main.c"
         f.write_text(C_SRC)
-        (tmp_path / "compile_commands.json").write_text(json.dumps([
-            {"directory": str(tmp_path), "file": "other.c", "arguments": ["gcc", "-c", "other.c"]},
-        ]))
-        with self._gcc_only(), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            return_value=_fake_proc(0),
+        (tmp_path / "compile_commands.json").write_text(
+            json.dumps(
+                [
+                    {"directory": str(tmp_path), "file": "other.c", "arguments": ["gcc", "-c", "other.c"]},
+                ]
+            )
+        )
+        with (
+            self._gcc_only(),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                return_value=_fake_proc(0),
+            ),
         ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.ok is True
@@ -396,15 +445,18 @@ class TestSemanticsEdges:
     def test_header_union_both_compilers_fail(self, tmp_path):
         f = tmp_path / "x.h"
         f.write_text("namespace N { int v = 1; }\n")
-        with patch(
-            "external_llm.languages.c_provider.shutil.which",
-            side_effect=lambda c: f"/usr/bin/{c}" if c in ("gcc", "g++") else None,
-        ), patch(
-            "external_llm.languages.c_provider.subprocess.run",
-            side_effect=[
-                _fake_proc(1, stderr="x.h:1:10: error: expected ';' before '}'"),
-                _fake_proc(1, stderr="x.h:1:10: error: expected ';' before '}'"),
-            ],
+        with (
+            patch(
+                "external_llm.languages.c_provider.shutil.which",
+                side_effect=lambda c: f"/usr/bin/{c}" if c in ("gcc", "g++") else None,
+            ),
+            patch(
+                "external_llm.languages.c_provider.subprocess.run",
+                side_effect=[
+                    _fake_proc(1, stderr="x.h:1:10: error: expected ';' before '}'"),
+                    _fake_proc(1, stderr="x.h:1:10: error: expected ';' before '}'"),
+                ],
+            ),
         ):
             r = CSyntaxProvider().validate_semantics(str(f))
         assert r.ok is False  # C++ retry also failed → keep the C verdict
@@ -420,6 +472,7 @@ class TestExtractIncludeFlagsEdges:
 class TestTreeSitterPrimaryPaths:
     def _ts_or_skip(self):
         import external_llm.languages.tree_sitter_utils as tsu
+
         if not tsu.is_available():
             pytest.skip("tree-sitter core not installed")
 

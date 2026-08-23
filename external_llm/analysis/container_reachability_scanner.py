@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.common.atomic_io import atomic_write_json
@@ -65,7 +65,7 @@ class ContainerReachabilityCandidate:
     file: str
     container_symbol: str  # bare name, e.g. ``_INTENT_STRATEGIES``
     qualified_name: str  # qualified, e.g. ``AgentLoop._INTENT_STRATEGIES``
-    enclosing_class: Optional[str]
+    enclosing_class: str | None
     container_kind: str  # always "dict_literal" in this version
     lineno: int
     end_lineno: int
@@ -74,7 +74,7 @@ class ContainerReachabilityCandidate:
     keys_possibly_unreachable: list[str]
     keys_reachable: list[str]
     read_sites: list[dict[str, Any]]
-    key_domain: Optional[list[str]]  # inferred domain; None = unknown
+    key_domain: list[str] | None  # inferred domain; None = unknown
     confidence: float
     evidence: list[str]
 
@@ -99,7 +99,7 @@ class ContainerReachabilityCandidate:
         }
 
 
-def _reachability_reason(cand: "ContainerReachabilityCandidate") -> str:
+def _reachability_reason(cand: ContainerReachabilityCandidate) -> str:
     """Human-readable one-line summary consumed by the SCAN tool's ``reason``.
 
     The SCAN handler's candidate→line renderer looks up ``description`` then
@@ -132,7 +132,7 @@ def _is_private_name(name: str) -> bool:
 
 def _candidate_allowed(
     name: str,
-    cross_file_referenced_names: Optional[set],
+    cross_file_referenced_names: set | None,
 ) -> bool:
     """Cross-file / privacy filter for one candidate container name.
 
@@ -146,7 +146,7 @@ def _candidate_allowed(
     return _is_private_name(name)
 
 
-def _extract_string_keys(dict_node: ast.Dict) -> Optional[list[str]]:
+def _extract_string_keys(dict_node: ast.Dict) -> list[str] | None:
     """Extract all keys from a Dict node if every key is a string constant.
 
     Returns None when any key is not a string constant (e.g. integer keys,
@@ -176,7 +176,7 @@ def _build_lineno_to_method(tree: ast.Module) -> dict[int, str]:
             self.generic_visit(node)
             self._stack.pop()
 
-        def _visit_func(self, node: ast.FunctionDef) -> None:
+        def _visit_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             self._stack.append(node.name)
             qualified_name = ".".join(self._stack)
             end = getattr(node, "end_lineno", node.lineno)
@@ -221,9 +221,9 @@ def _classify_key_expr(node: ast.expr) -> tuple:
 
 
 def _is_container_ref(
-    node: ast.expr,
+    node: ast.AST,
     container_name: str,
-    enclosing_class: Optional[str],
+    enclosing_class: str | None,
 ) -> bool:
     """True when *node* references the container.
 
@@ -241,7 +241,7 @@ def _is_container_ref(
 
 def _collect_dict_literals(
     tree: ast.Module,
-    cross_file_referenced_names: Optional[set] = None,
+    cross_file_referenced_names: set | None = None,
     *,
     include_all: bool = False,
 ) -> list[tuple]:
@@ -261,7 +261,7 @@ def _collect_dict_literals(
     """
     results = []
 
-    def _scan_body(body: list, enclosing_class: Optional[str]) -> None:
+    def _scan_body(body: list, enclosing_class: str | None) -> None:
         for node in body:
             if isinstance(node, ast.ClassDef):
                 _scan_body(list(node.body), enclosing_class=node.name)
@@ -308,7 +308,7 @@ def _collect_read_sites(
     tree: ast.Module,
     container_name: str,
     lineno_to_method: dict[int, str],
-    enclosing_class: Optional[str] = None,
+    enclosing_class: str | None = None,
 ) -> tuple:
     """Find all read sites for *container_name* in the tree.
 
@@ -376,7 +376,7 @@ def _collect_read_sites(
     return sites, has_dynamic_use
 
 
-def _collect_constant_returns(func_node: ast.FunctionDef) -> Optional[set[str]]:
+def _collect_constant_returns(func_node: ast.FunctionDef) -> set[str] | None:
     """If every ``return`` in func_node yields a string constant, return that set.
 
     Returns None when any return is non-constant or there are no returns.
@@ -399,14 +399,14 @@ def _collect_constant_returns(func_node: ast.FunctionDef) -> Optional[set[str]]:
 def _find_method_in_class(
     class_node: ast.ClassDef,
     method_name: str,
-) -> Optional[ast.FunctionDef]:
+) -> ast.FunctionDef | None:
     for node in class_node.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == method_name:
             return node  # type: ignore[return-value]
     return None
 
 
-def _resolve_class_constant(class_node: ast.ClassDef, attr_name: str) -> Optional[str]:
+def _resolve_class_constant(class_node: ast.ClassDef, attr_name: str) -> str | None:
     """Return the string value of a class-level constant for *attr_name*, or None.
 
     Only resolves simple single-level assignments at class body scope:
@@ -435,7 +435,7 @@ def _resolve_class_constant(class_node: ast.ClassDef, attr_name: str) -> Optiona
     return None
 
 
-def _find_class_node(tree: ast.Module, class_name: str) -> Optional[ast.ClassDef]:
+def _find_class_node(tree: ast.Module, class_name: str) -> ast.ClassDef | None:
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             return node
@@ -456,8 +456,8 @@ def _binds_name(target: ast.expr, var_name: str) -> bool:
 def _domain_of_rhs(
     rhs: ast.expr,
     tree: ast.Module,
-    enclosing_class: Optional[str],
-) -> Optional[set[str]]:
+    enclosing_class: str | None,
+) -> set[str] | None:
     """Domain of one assignment RHS, or None when not statically determinable."""
     # Case 1: direct string constant
     if isinstance(rhs, ast.Constant) and isinstance(rhs.value, str):
@@ -482,11 +482,11 @@ def _domain_of_rhs(
 
 def _infer_key_domain_for_var(
     tree: ast.Module,
-    method_node: ast.FunctionDef,
+    method_node: ast.FunctionDef | ast.AsyncFunctionDef,
     var_name: str,
-    enclosing_class: Optional[str],
+    enclosing_class: str | None,
     target_lineno: int,
-) -> Optional[set[str]]:
+) -> set[str] | None:
     """Try to determine the string value domain for ``var_name`` in ``method_node``.
 
     The domain is the UNION of every reaching assignment (lineno <=
@@ -553,7 +553,7 @@ def _compute_reachability(
     read_sites: list[ContainerReadSite],
     tree: ast.Module,
     enclosing_class: str | None,
-    method_nodes: dict[str, ast.FunctionDef],
+    method_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
 ) -> tuple:
     """Return (keys_unreachable, keys_possibly_unreachable, keys_reachable, domain, evidence).
 
@@ -728,13 +728,13 @@ def _crx_save(repo_root: str, cache: dict) -> None:
         logger.debug("container-reachability cache write failed", exc_info=True)
 
 
-def _crx_stat(abs_path: str) -> Optional[tuple[int, int]]:
+def _crx_stat(abs_path: str) -> tuple[int, int] | None:
     """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
     (single stat code path; order contract documented there, B1)."""
     return parse_cache.stat_fingerprint(abs_path)
 
 
-def _extract_container_file(abs_path: str) -> Optional[dict]:
+def _extract_container_file(abs_path: str) -> dict | None:
     """Full per-file container analysis — a pure function of file content.
 
     Returns the cross-file-set-independent superset payload (see cache
@@ -749,7 +749,7 @@ def _extract_container_file(abs_path: str) -> Optional[dict]:
     lineno_to_method = _build_lineno_to_method(tree)
 
     # method_nodes: qualified_name → FunctionDef (reachability domain inference)
-    method_nodes: dict[str, ast.FunctionDef] = {}
+    method_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             qual_name = lineno_to_method.get(node.lineno, node.name)
@@ -794,7 +794,7 @@ def scan_container_reachability(
     file_paths: list[str],
     max_per_file: int = _cfg.counts.SCANNER_CONTAINER_REACH_MAX,
     min_unreachable_keys: int = 1,
-    cross_file_referenced_names: Optional[set] = None,
+    cross_file_referenced_names: set | None = None,
 ) -> list[ContainerReachabilityCandidate]:
     """Scan Python files for dict literals with structurally unreachable keys.
 
@@ -937,5 +937,5 @@ def scan_container_reachability(
     if _truncated_total:
         # Function attribute consumed by ScannerRegistry.run() (reset via
         # `del` before each invocation).
-        scan_container_reachability._truncated = _truncated_total
+        scan_container_reachability._truncated = _truncated_total  # type: ignore[attr-defined]  # dynamic attr consumed by ScannerRegistry.run()
     return candidates

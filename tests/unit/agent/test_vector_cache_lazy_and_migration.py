@@ -17,6 +17,7 @@ has a cache: the load path reads the old entries back and ``_save_index`` dumps
 happen on LOAD, with the dirty flag set, so the file shrinks once and stays
 small.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,9 +31,7 @@ from external_llm.agent.vector_cache import (
     get_configured_embedding_model_name,
 )
 
-pytestmark = pytest.mark.skipif(
-    not (HAS_FAISS and HAS_NUMPY), reason="faiss/numpy not installed"
-)
+pytestmark = pytest.mark.skipif(not (HAS_FAISS and HAS_NUMPY), reason="faiss/numpy not installed")
 
 _DIM = 384
 
@@ -68,9 +67,7 @@ def _legacy_cache(tmp_path, n=50, content_size=20_000):
         for i in range(n)
     }
     (tmp_path / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
-    (tmp_path / "embedding_model.txt").write_text(
-        get_configured_embedding_model_name(), encoding="utf-8"
-    )
+    (tmp_path / "embedding_model.txt").write_text(get_configured_embedding_model_name(), encoding="utf-8")
     return (tmp_path / "metadata.json").stat().st_size
 
 
@@ -110,8 +107,7 @@ def test_legacy_content_is_stripped_on_load_and_marks_dirty(tmp_path):
         "legacy 'content' survived the load — every session keeps paying for it"
     )
     assert mgr._dirty is True, (
-        "strip without dirty means _save_index never rewrites the file, so the "
-        "bulk is re-read on every future session"
+        "strip without dirty means _save_index never rewrites the file, so the bulk is re-read on every future session"
     )
     # The fields search actually uses must survive.
     sample = next(iter(mgr.id_to_doc.values()))
@@ -181,7 +177,5 @@ def test_cache_dir_is_derived_from_repo_root_not_cwd(tmp_path, monkeypatch):
     searcher = RAGSearcher(str(repo), vector_cache_enabled=True)
     if searcher.vector_cache_manager is None:
         pytest.skip("vector cache disabled (missing sentence-transformers)")
-    assert searcher.vector_cache_manager.cache_dir.resolve() == (
-        repo / ".asicode" / "vector_cache"
-    ).resolve()
+    assert searcher.vector_cache_manager.cache_dir.resolve() == (repo / ".asicode" / "vector_cache").resolve()
     assert not (elsewhere / ".asicode").exists(), "cache dir littered into CWD"

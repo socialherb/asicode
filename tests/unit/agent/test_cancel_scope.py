@@ -10,6 +10,7 @@ Contracts sealed here:
     the handler (the pool slot frees immediately instead of after the tool's
     full run).
 """
+
 from __future__ import annotations
 
 import threading
@@ -50,9 +51,7 @@ class TestScopeStack:
             call_cancel_scope(inner),
         ):
             raise RuntimeError("boom")
-        assert current_cancel_event() is None, (
-            "exception must not leave a stale scope for the next dispatch"
-        )
+        assert current_cancel_event() is None, "exception must not leave a stale scope for the next dispatch"
 
     def test_raise_if_call_cancelled_only_when_set(self):
         ev = threading.Event()

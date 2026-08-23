@@ -18,6 +18,7 @@ Mutation guards: if ``_INSIGHTS_THREAD_LOCKS`` is reverted to a plain ``dict``,
 the GC-after-release assertion fails (entry survives). If lockstep eviction in
 ``_archive_capped_put`` is removed, the version-dict-bounded assertion fails.
 """
+
 from __future__ import annotations
 
 import gc
@@ -126,8 +127,7 @@ class TestInsightsLockRegistry:
                 captured["inner"] = inner
 
         assert captured["outer"] is captured["inner"], (
-            "re-entrant call created a DIFFERENT lock — nesting would deadlock "
-            "or fail to serialize"
+            "re-entrant call created a DIFFERENT lock — nesting would deadlock or fail to serialize"
         )
 
     def test_concurrent_threads_for_same_repo_serialize(self, tmp_path):
@@ -203,8 +203,7 @@ class TestArchiveVersionLockstep:
 
         assert len(_ARCHIVE_PARSED_CACHE) <= cap, "content cache unbounded"
         assert len(_ARCHIVE_WRITE_VERSIONS) <= cap, (
-            "_ARCHIVE_WRITE_VERSIONS grew unbounded — lockstep eviction in "
-            "_archive_capped_put is missing"
+            "_ARCHIVE_WRITE_VERSIONS grew unbounded — lockstep eviction in _archive_capped_put is missing"
         )
 
     def test_evicted_repo_version_is_gone(self, tmp_path):
@@ -256,6 +255,7 @@ class TestArchiveVersionLockstep:
         """P1: a path evicted from ONE cache keeps its write version while it
         still lives in the sibling cache, so the sibling does not false-miss
         (full re-parse + re-tokenize) on its next request."""
+
         class _Tok:
             def tokenize(self, text):
                 return text.split()
@@ -264,8 +264,8 @@ class TestArchiveVersionLockstep:
         cap = _ARCHIVE_CACHE_MAX_ENTRIES
         keep = _make_repo(tmp_path, "keep")
         append_entries_to_archive(keep, _archive_entry("keep"))
-        _parsed_archive_cached(keep)          # PARSED: [keep]
-        _archive_analyzed_cached(keep, tok)   # ANALYZED: [keep]
+        _parsed_archive_cached(keep)  # PARSED: [keep]
+        _archive_analyzed_cached(keep, tok)  # ANALYZED: [keep]
         path = insights_archive_path(keep)
         assert path in _ARCHIVE_WRITE_VERSIONS
 
@@ -305,9 +305,7 @@ class TestActiveVersionLockstep:
             load_active_insights_cached(repo)  # populates content cache
 
         assert len(_ACTIVE_CONTENT_CACHE) <= cap, "active content cache unbounded"
-        assert len(_ACTIVE_WRITE_VERSIONS) <= cap, (
-            "_ACTIVE_WRITE_VERSIONS grew unbounded — lockstep eviction missing"
-        )
+        assert len(_ACTIVE_WRITE_VERSIONS) <= cap, "_ACTIVE_WRITE_VERSIONS grew unbounded — lockstep eviction missing"
 
 
 # ── C1: _archive_capped_put must be a true LRU (pop-before-reinsert) ──────────
@@ -336,9 +334,7 @@ class TestArchiveCappedPutLRU:
         _archive_capped_put(cache, "A", "A-refreshed")  # re-put → must move to back
         _archive_capped_put(cache, "K7", "K7")  # over cap → evict exactly one
 
-        assert cache.get("A") == "A-refreshed", (
-            "re-put key was evicted — insertion order not refreshed (C1)"
-        )
+        assert cache.get("A") == "A-refreshed", "re-put key was evicted — insertion order not refreshed (C1)"
         assert "K0" not in cache, "true LRU survived — eviction is FIFO (C1)"
         assert len(cache) == cap
 
@@ -373,8 +369,7 @@ class TestArchiveCappedPutLRU:
         _parsed_archive_cached(repo_i)
 
         assert insights_archive_path(repo_a) in _ARCHIVE_PARSED_CACHE, (
-            "active repo evicted despite fresh re-read — re-put must refresh "
-            "insertion order (C1)"
+            "active repo evicted despite fresh re-read — re-put must refresh insertion order (C1)"
         )
         assert insights_archive_path(others[0]) not in _ARCHIVE_PARSED_CACHE, (
             "true LRU survived — eviction uses stale dict positions (C1)"
@@ -407,8 +402,7 @@ class TestCanonicalArchiveCacheKeys:
             # Reading via the alias must hit the SAME slot…
             assert len(_parsed_archive_cached(alias)) == 1
             assert len(_ARCHIVE_PARSED_CACHE) == 1, (
-                "alias spelling occupied a second cache slot — "
-                "canonical_repo_key missing in insights_archive_path (C2)"
+                "alias spelling occupied a second cache slot — canonical_repo_key missing in insights_archive_path (C2)"
             )
             assert insights_archive_path(repo) == insights_archive_path(alias)
             # One shared counter: the alias read sees version 1 (bumped by the
@@ -434,8 +428,7 @@ class TestCanonicalArchiveCacheKeys:
             _archive_invalidate(alias)  # invalidate via the OTHER spelling
 
             assert _ARCHIVE_WRITE_VERSIONS[key] == before + 1, (
-                "invalidator bumped a version key the reader never checks — "
-                "spelling split (C2)"
+                "invalidator bumped a version key the reader never checks — spelling split (C2)"
             )
             assert key not in _ARCHIVE_PARSED_CACHE, "cache not dropped on invalidate"
         finally:
@@ -460,8 +453,7 @@ class TestCanonicalActiveCacheKeys:
             assert load_active_insights_cached(repo) == content
             assert load_active_insights_cached(alias) == content
             assert len(_ACTIVE_CONTENT_CACHE) == 1, (
-                "active cache split across spellings — canonical_repo_key "
-                "missing in insights_path (C2)"
+                "active cache split across spellings — canonical_repo_key missing in insights_path (C2)"
             )
             assert insights_path(repo) == insights_path(alias)
         finally:

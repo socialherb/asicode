@@ -4,13 +4,14 @@ Single source of truth for :func:`run_bounded_subprocess`. Previously this
 helper was duplicated (and at risk of drift) in ``intelligent_service.py`` and
 ``git_tools.py``; both now import it from here.
 """
+
 from __future__ import annotations
 
 import contextlib
 import os
 import signal
 import subprocess
-from typing import Optional
+from collections.abc import Callable
 
 # How often a tool blocked on a subprocess re-checks for cancellation. Small
 # enough that ESC feels immediate, large enough that the wakeups are free next
@@ -22,7 +23,7 @@ from typing import Optional
 CANCEL_POLL_INTERVAL = 0.25
 
 
-def cancel_probe(config) -> "callable":
+def cancel_probe(config) -> Callable[[], bool]:
     """A zero-arg predicate reading ``config.cancel_event`` FRESH each call.
 
     Not a captured event: the design-chat REPL swaps ``config.cancel_event``
@@ -31,6 +32,7 @@ def cancel_probe(config) -> "callable":
     indexers document. Returns a callable so the polling loop stays free of the
     config object.
     """
+
     def _probe() -> bool:
         _ev = getattr(config, "cancel_event", None)
         return _ev is not None and _ev.is_set()
@@ -43,11 +45,11 @@ def run_bounded_subprocess(
     *,
     timeout: int = 120,
     shell: bool = False,
-    executable: Optional[str] = None,
-    cwd: Optional[str] = None,
-    input: Optional[str] = None,
-    env: Optional[dict[str, str]] = None,
-) -> "subprocess.CompletedProcess":
+    executable: str | None = None,
+    cwd: str | None = None,
+    input: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """``subprocess.run`` with a mandatory timeout and full process-group cleanup.
 
     Guarantees the agent never blocks indefinitely on a subprocess — e.g.
@@ -65,11 +67,18 @@ def run_bounded_subprocess(
     degrade gracefully.
     """
     proc = subprocess.Popen(
-        cmd, shell=shell, executable=executable, cwd=cwd,
+        cmd,
+        shell=shell,
+        executable=executable,
+        cwd=cwd,
         stdin=subprocess.PIPE if input is not None else None,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-        start_new_session=True, env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+        env=env,
     )
     try:
         stdout, stderr = proc.communicate(input=input, timeout=timeout)
@@ -92,13 +101,21 @@ def run_bounded_subprocess(
             # Preserve the partial output buffered before the timeout rather
             # than blanking it: half a traceback is still evidence, and losing
             # it turns a timeout into a misleading empty result.
-            stdout, stderr = exc.stdout or "", exc.stderr or ""
+            # text=True above: exc.stdout is str | None; decode defensively
+            # when the typeshed union (bytes | str | None) is wider.
+            _out, _err = exc.stdout or "", exc.stderr or ""
+            stdout = _out.decode("utf-8", "replace") if isinstance(_out, bytes) else _out
+            stderr = _err.decode("utf-8", "replace") if isinstance(_err, bytes) else _err
         _note = f"\n[aborted: exceeded {timeout}s timeout]"
         return subprocess.CompletedProcess(
-            args=cmd, returncode=-9,
-            stdout=stdout or "", stderr=(stderr or "") + _note,
+            args=cmd,
+            returncode=-9,
+            stdout=stdout or "",
+            stderr=(stderr or "") + _note,
         )
     return subprocess.CompletedProcess(
-        args=cmd, returncode=proc.returncode,
-        stdout=stdout or "", stderr=stderr or "",
+        args=cmd,
+        returncode=proc.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
     )

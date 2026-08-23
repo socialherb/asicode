@@ -44,6 +44,7 @@ class _Harness(WriteToolsMixin):
         # Mirrors ToolRegistry._secure_path: a repo-BOUNDARY check, not an
         # existence check (and absolute paths INSIDE the repo are allowed).
         from pathlib import Path as _Path
+
         repo = _Path(self.repo_root).resolve()
         p = _Path(path)
         resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -67,9 +68,14 @@ class _SemanticHarness(_Harness):
             "language": "python",
             "errors": [],
             "semantic_diagnostics": [
-                {"file_path": str(path), "line": 3, "col": 5,
-                 "message": "Cannot access member 'bar' for type 'Foo'",
-                 "severity": "error", "code": "attr-defined"},
+                {
+                    "file_path": str(path),
+                    "line": 3,
+                    "col": 5,
+                    "message": "Cannot access member 'bar' for type 'Foo'",
+                    "severity": "error",
+                    "code": "attr-defined",
+                },
             ],
         }
 
@@ -102,19 +108,15 @@ class TestBlockIntroducerAstNestingGate:
         )
         target.write_text(original, encoding="utf-8")
 
-        snippet = (
-            "# ── Cache section ──\n"
-            "_CACHE: dict = {}\n"
-            "\n"
-            "def helper():\n"
-            "    return 1\n"
+        snippet = "# ── Cache section ──\n_CACHE: dict = {}\n\ndef helper():\n    return 1\n"
+        result = sem_harness._tool_anchor_edit(
+            {
+                "file_path": "mod.py",
+                "anchor_pattern": "x = 1",
+                "edit_mode": "insert_after",
+                "code_snippet": snippet,
+            }
         )
-        result = sem_harness._tool_anchor_edit({
-            "file_path": "mod.py",
-            "anchor_pattern": "x = 1",
-            "edit_mode": "insert_after",
-            "code_snippet": snippet,
-        })
 
         assert not result.ok
         assert result.metadata.get("failure_class") == "structural_gate_violation"
@@ -125,26 +127,19 @@ class TestBlockIntroducerAstNestingGate:
         there is no trailing code to swallow, so the insert must succeed."""
         target = tmp_path / "mod.py"
         target.write_text(
-            "class Foo:\n"
-            "    def bar(self):\n"
-            "        x = 1\n"
-            "        return x\n",
+            "class Foo:\n    def bar(self):\n        x = 1\n        return x\n",
             encoding="utf-8",
         )
 
-        snippet = (
-            "# ── Cache section ──\n"
-            "_CACHE: dict = {}\n"
-            "\n"
-            "def helper():\n"
-            "    return 1\n"
+        snippet = "# ── Cache section ──\n_CACHE: dict = {}\n\ndef helper():\n    return 1\n"
+        result = sem_harness._tool_anchor_edit(
+            {
+                "file_path": "mod.py",
+                "anchor_pattern": "return x",
+                "edit_mode": "insert_after",
+                "code_snippet": snippet,
+            }
         )
-        result = sem_harness._tool_anchor_edit({
-            "file_path": "mod.py",
-            "anchor_pattern": "return x",
-            "edit_mode": "insert_after",
-            "code_snippet": snippet,
-        })
 
         assert result.ok, f"should succeed: {result.error}"
         content = target.read_text(encoding="utf-8")
@@ -161,18 +156,15 @@ class TestBlockIntroducerAstNestingGate:
         closures."""
         target = tmp_path / "mod.py"
         target.write_text("def pre_existing():\n    pass\n", encoding="utf-8")
-        snippet = (
-            "def with_helper():\n"
-            "    def _inner(x):\n"
-            "        return x + 1\n"
-            "    return _inner\n"
+        snippet = "def with_helper():\n    def _inner(x):\n        return x + 1\n    return _inner\n"
+        result = sem_harness._tool_anchor_edit(
+            {
+                "file_path": "mod.py",
+                "anchor_pattern": "pass",
+                "edit_mode": "insert_after",
+                "code_snippet": snippet,
+            }
         )
-        result = sem_harness._tool_anchor_edit({
-            "file_path": "mod.py",
-            "anchor_pattern": "pass",
-            "edit_mode": "insert_after",
-            "code_snippet": snippet,
-        })
         assert result.ok, f"legitimate inner helper wrongly rejected: {result.error}"
         content = target.read_text(encoding="utf-8")
         assert "\ndef with_helper():" in content
@@ -188,14 +180,15 @@ class TestBlockIntroducerAstNestingGate:
         from external_llm.agent.tool_handlers.write_tools import (
             _check_block_introducer_nesting,
         )
+
         src = (
-            "import os\n"                       # pre-existing
-            "def pre():\n    pass\n"            # pre-existing
-            "def outer(self):\n"                # inserted (0-based line 3)
-            "    def _score(rel):\n"            # inserted inner helper
+            "import os\n"  # pre-existing
+            "def pre():\n    pass\n"  # pre-existing
+            "def outer(self):\n"  # inserted (0-based line 3)
+            "    def _score(rel):\n"  # inserted inner helper
             "        return rel\n"
             "    return _score\n"
-            "def after():\n    pass\n"          # pre-existing
+            "def after():\n    pass\n"  # pre-existing
         )
         assert _check_block_introducer_nesting(src, 3, 7) is None
 
@@ -205,9 +198,10 @@ class TestBlockIntroducerAstNestingGate:
         from external_llm.agent.tool_handlers.write_tools import (
             _check_block_introducer_nesting,
         )
+
         src = (
             "def pre_existing():\n    x = 1\n"  # pre-existing
-            "    def oops():\n        pass\n"   # inserted, nested in pre_existing
+            "    def oops():\n        pass\n"  # inserted, nested in pre_existing
             "    return x\n"
         )
         err = _check_block_introducer_nesting(src, 2, 4)
@@ -221,12 +215,13 @@ class TestBlockIntroducerAstNestingGate:
         from external_llm.agent.tool_handlers.write_tools import (
             _check_block_introducer_nesting,
         )
+
         src = (
-            "def pre_existing():\n    x = 1\n"          # pre-existing
-            "    def new_a():\n"                        # inserted, nested in pre_existing
-            "        def new_b():\n"                    # inserted inner closure
+            "def pre_existing():\n    x = 1\n"  # pre-existing
+            "    def new_a():\n"  # inserted, nested in pre_existing
+            "        def new_b():\n"  # inserted inner closure
             "            pass\n"
-            "    return x\n"                            # pre-existing
+            "    return x\n"  # pre-existing
         )
         # inserted 0-based lines 2..5 (new_a + new_b + new_b body)
         err = _check_block_introducer_nesting(src, 2, 5)
@@ -239,11 +234,12 @@ class TestBlockIntroducerAstNestingGate:
         from external_llm.agent.tool_handlers.write_tools import (
             _check_block_introducer_nesting,
         )
+
         src = (
-            "def pre():\n    pass\n"            # pre-existing
-            "class C:\n"                        # inserted
+            "def pre():\n    pass\n"  # pre-existing
+            "class C:\n"  # inserted
             "    def m(self):\n        return 1\n"
-            "def after():\n    pass\n"          # pre-existing
+            "def after():\n    pass\n"  # pre-existing
         )
         assert _check_block_introducer_nesting(src, 2, 5) is None
 
@@ -257,17 +253,12 @@ class TestBlockIntroducerAstNestingGate:
         from external_llm.agent.tool_handlers.write_tools import (
             _check_block_introducer_nesting,
         )
+
         # (1) async def inserted INTO a pre-existing function body → flagged.
         #     The async def is parsed as a child of ``pre`` (deep indent), so
         #     it genuinely lands in someone else's body.
-        src1 = "def pre():\n    pass\n" "    async def a():\n        return 1\n"
+        src1 = "def pre():\n    pass\n    async def a():\n        return 1\n"
         assert _check_block_introducer_nesting(src1, 2, 4) is not None
         # (2) async def WITH an inner closure, inserted at top level → OK.
-        src2 = (
-            "def pre():\n    pass\n"
-            "async def outer():\n"
-            "    def _inner():\n"
-            "        return 1\n"
-            "    return _inner()\n"
-        )
+        src2 = "def pre():\n    pass\nasync def outer():\n    def _inner():\n        return 1\n    return _inner()\n"
         assert _check_block_introducer_nesting(src2, 2, 6) is None

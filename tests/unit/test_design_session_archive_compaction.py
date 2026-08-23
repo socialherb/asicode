@@ -7,6 +7,7 @@ whole file and the BM25 cache holds the tokenised copy.  Past
 records (tail preserved verbatim), with the absolute-index invariant
 ``_archive_last_index`` relies on kept intact.
 """
+
 from __future__ import annotations
 
 import json
@@ -60,11 +61,7 @@ def test_archive_compaction_folds_oldest_keeps_tail(mgr, monkeypatch):
     assert mgr._compact_archive("s1") is True
     assert path.stat().st_size <= 3000  # folded back under the cap
 
-    lines = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     # Newest records preserved verbatim (tail is what history search needs).
     assert lines[-1]["i"] == 59
     assert lines[-1]["content"] == records[-1]["content"]
@@ -110,11 +107,7 @@ def test_archive_append_after_compaction_no_duplicates(mgr, monkeypatch):
     mgr._archive_compressed_turns(session)
 
     # The 3 new records were appended with correct absolute indices.
-    lines = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert [r["i"] for r in lines if r["i"] > last_i] == [60, 61, 62]
     assert DesignSessionManager._archive_last_index(path) == 62
     # No duplicate of the pre-compaction region (indices stay strictly
@@ -140,11 +133,7 @@ def test_startup_sweep_compacts_overgrown_archive(tmp_path, monkeypatch):
     mgr = DesignSessionManager(repo_root=str(tmp_path))
     archive = mgr._archive_path("dead")
     assert archive.stat().st_size <= 3000
-    lines = [
-        json.loads(line)
-        for line in archive.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    lines = [json.loads(line) for line in archive.read_text(encoding="utf-8").splitlines() if line.strip()]
     # Tail preserved verbatim — the archive-index invariant survives the sweep.
     assert lines[-1]["i"] == 59
     assert lines[-1]["content"] == records[-1]["content"]

@@ -1,6 +1,7 @@
 """
 Unit tests for vector cache embedding model singleton.
 """
+
 import os
 import sys
 from unittest.mock import Mock, patch
@@ -24,8 +25,10 @@ EXPECTED_MODEL = get_configured_embedding_model_name()
 def test_global_embedding_model_singleton():
     """Test that get_global_embedding_model() returns the same instance."""
     # Mock SentenceTransformer to avoid actual model loading
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+    ):
         mock_instance = Mock()
         mock_instance.get_sentence_embedding_dimension.return_value = 384
         mock_st.return_value = mock_instance
@@ -45,10 +48,12 @@ def test_global_embedding_model_singleton():
 def test_vector_cache_manager_shares_model():
     """Test that VectorCacheManager instances share the same embedding model."""
     # Mock SentenceTransformer and dependencies
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True), \
-         patch('external_llm.agent.vector_cache.HAS_NUMPY', True), \
-         patch('external_llm.agent.vector_cache.HAS_FAISS', False):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+        patch("external_llm.agent.vector_cache.HAS_NUMPY", True),
+        patch("external_llm.agent.vector_cache.HAS_FAISS", False),
+    ):
         mock_instance = Mock()
         mock_instance.get_sentence_embedding_dimension.return_value = 384
         mock_st.return_value = mock_instance
@@ -73,8 +78,10 @@ def test_vector_cache_manager_shares_model():
 
 def test_reset_global_embedding_model():
     """Test that reset_global_embedding_model() clears the singleton."""
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+    ):
         mock_instance = Mock()
         mock_instance.get_sentence_embedding_dimension.return_value = 384
         mock_st.return_value = mock_instance
@@ -97,8 +104,10 @@ def test_reset_global_embedding_model():
 
 def test_get_global_embedding_dimension():
     """Test get_global_embedding_dimension() returns correct dimension."""
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+    ):
         mock_instance = Mock()
         mock_instance.get_embedding_dimension.return_value = 512
         mock_st.return_value = mock_instance
@@ -108,6 +117,7 @@ def test_get_global_embedding_dimension():
 
         # Import the function
         from external_llm.agent.vector_cache import get_global_embedding_dimension
+
         dimension = get_global_embedding_dimension()
 
         assert dimension == 512
@@ -129,8 +139,10 @@ def test_falls_back_to_cached_model_when_preferred_unavailable():
         inst.get_sentence_embedding_dimension.return_value = 384
         return inst
 
-    with patch('external_llm.agent.vector_cache.SentenceTransformer', side_effect=fake_st), \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer", side_effect=fake_st),
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+    ):
         reset_global_embedding_model()
         model = get_global_embedding_model()
 
@@ -140,9 +152,10 @@ def test_falls_back_to_cached_model_when_preferred_unavailable():
 
 def test_all_models_failing_returns_none():
     """When every candidate fails, the loader returns None (graceful no-op)."""
-    with patch('external_llm.agent.vector_cache.SentenceTransformer',
-               side_effect=OSError("offline")), \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer", side_effect=OSError("offline")),
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+    ):
         reset_global_embedding_model()
         assert get_global_embedding_model() is None
 
@@ -176,10 +189,12 @@ def test_warmup_does_not_double_load_with_concurrent_caller():
 
     from external_llm.agent.vector_cache import warmup_embedding_model
 
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True), \
-         patch('external_llm.agent.vector_cache.HAS_NUMPY', True), \
-         patch('external_llm.agent.vector_cache.HAS_FAISS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+        patch("external_llm.agent.vector_cache.HAS_NUMPY", True),
+        patch("external_llm.agent.vector_cache.HAS_FAISS", True),
+    ):
         mock_instance = Mock()
         mock_instance.get_sentence_embedding_dimension.return_value = 384
         mock_st.return_value = mock_instance
@@ -209,8 +224,10 @@ def test_warmup_noop_when_deps_missing():
     """warmup_embedding_model must be a safe no-op when deps are absent."""
     from external_llm.agent.vector_cache import warmup_embedding_model
 
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', False):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", False),
+    ):
         reset_global_embedding_model()
         warmup_embedding_model()  # must not raise, must not load
         assert mock_st.call_count == 0
@@ -221,10 +238,12 @@ def test_warmup_noop_when_already_loaded():
     """warmup_embedding_model must not re-invoke the loader when warm."""
     from external_llm.agent.vector_cache import warmup_embedding_model
 
-    with patch('external_llm.agent.vector_cache.SentenceTransformer') as mock_st, \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True), \
-         patch('external_llm.agent.vector_cache.HAS_NUMPY', True), \
-         patch('external_llm.agent.vector_cache.HAS_FAISS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer") as mock_st,
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+        patch("external_llm.agent.vector_cache.HAS_NUMPY", True),
+        patch("external_llm.agent.vector_cache.HAS_FAISS", True),
+    ):
         mock_instance = Mock()
         mock_instance.get_sentence_embedding_dimension.return_value = 384
         mock_st.return_value = mock_instance
@@ -240,13 +259,16 @@ def test_warmup_swallows_loader_exception():
     """A loader failure must not propagate from the warmup primitive."""
     from external_llm.agent.vector_cache import warmup_embedding_model
 
-    with patch('external_llm.agent.vector_cache.SentenceTransformer',
-               side_effect=RuntimeError("boom")), \
-         patch('external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS', True), \
-         patch('external_llm.agent.vector_cache.HAS_NUMPY', True), \
-         patch('external_llm.agent.vector_cache.HAS_FAISS', True):
+    with (
+        patch("external_llm.agent.vector_cache.SentenceTransformer", side_effect=RuntimeError("boom")),
+        patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", True),
+        patch("external_llm.agent.vector_cache.HAS_NUMPY", True),
+        patch("external_llm.agent.vector_cache.HAS_FAISS", True),
+    ):
         reset_global_embedding_model()
         # Must not raise even though all candidates fail.
         warmup_embedding_model()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-xvs"])

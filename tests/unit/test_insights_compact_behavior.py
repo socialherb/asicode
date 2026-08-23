@@ -9,6 +9,7 @@ from the ``_compact_insights_interactive`` closure for testability:
 
 These are pure deterministic functions — no mocking needed.
 """
+
 import pytest
 
 from asi import (
@@ -21,6 +22,7 @@ from external_llm.agent.insights_manager import InsightEntry
 # ═══════════════════════════════════════════════════════════════
 # _insights_compact_is_noop
 # ═══════════════════════════════════════════════════════════════
+
 
 def _mk_ent(header: str) -> InsightEntry:
     return InsightEntry(
@@ -40,22 +42,30 @@ class TestIsNoop:
         """Whitespace differences alone do NOT count as a change."""
         h = "### [pattern] 2026-01-01"
         e = [_mk_ent(h)]
-        assert _insights_compact_is_noop(
-            "  hello   world\nfoo",
-            "hello world\n  foo",
-            e, e,
-        ) is True
+        assert (
+            _insights_compact_is_noop(
+                "  hello   world\nfoo",
+                "hello world\n  foo",
+                e,
+                e,
+            )
+            is True
+        )
 
     def test_content_differs(self):
         """Different body text → not no-op."""
         h = "### [pattern] 2026-01-01"
         e1 = [_mk_ent(h)]
         e2 = [_mk_ent(h)]  # same header, but body differs
-        assert _insights_compact_is_noop(
-            "### [pattern] 2026-01-01\nold body",
-            "### [pattern] 2026-01-01\nnew body",
-            e2, e1,
-        ) is False
+        assert (
+            _insights_compact_is_noop(
+                "### [pattern] 2026-01-01\nold body",
+                "### [pattern] 2026-01-01\nnew body",
+                e2,
+                e1,
+            )
+            is False
+        )
 
     def test_same_text_fewer_entries(self):
         """Same normalized text but fewer entries → not no-op (loss detected)."""
@@ -70,11 +80,15 @@ class TestIsNoop:
         """Compactor shortened body while preserving headers → not no-op."""
         h = "### [pattern] 2026-01-01"
         e = [_mk_ent(h)]
-        assert _insights_compact_is_noop(
-            "### [pattern] 2026-01-01\nlong body text here",
-            "### [pattern] 2026-01-01\nshort",
-            e, e,
-        ) is False
+        assert (
+            _insights_compact_is_noop(
+                "### [pattern] 2026-01-01\nlong body text here",
+                "### [pattern] 2026-01-01\nshort",
+                e,
+                e,
+            )
+            is False
+        )
 
     def test_empty_content(self):
         """Both empty → no-op."""
@@ -90,6 +104,7 @@ class TestIsNoop:
 # ═══════════════════════════════════════════════════════════════
 # _size_compact_budget
 # ═══════════════════════════════════════════════════════════════
+
 
 class TestSizeCompactBudget:
     def test_empty_content(self):
@@ -140,6 +155,7 @@ class TestSizeCompactBudget:
 # ═══════════════════════════════════════════════════════════════
 # _dropped_entries
 # ═══════════════════════════════════════════════════════════════
+
 
 class TestDroppedEntries:
     def test_none_dropped(self):

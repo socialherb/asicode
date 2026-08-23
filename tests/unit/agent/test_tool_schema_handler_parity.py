@@ -13,6 +13,7 @@ An "unknown tool" is indistinguishable from a bug in the harness from the
 model's side, so the failure is silent and unrecoverable rather than merely
 useless. These tests pin both directions of the contract.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -88,9 +89,7 @@ def test_python_only_and_design_chat_filters_compose(tool_registry):
     from external_llm.languages import LanguageId
 
     ts_agent = _names(tool_registry.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT))
-    ts_design = _names(
-        tool_registry.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT, design_chat=True)
-    )
+    ts_design = _names(tool_registry.get_tool_schemas(lang_filter=LanguageId.TYPESCRIPT, design_chat=True))
     python_only = {s["name"] for s in AGENT_TOOL_SCHEMAS if s.get("x_python_only")}
     assert python_only, "no schema carries x_python_only any more"
     assert not (python_only & ts_agent)
@@ -109,26 +108,27 @@ def test_python_only_and_design_chat_filters_compose(tool_registry):
 
 # Handlers that are dispatched by something other than a model tool call.
 # Adding a handler without a schema is a decision, so it must be made HERE.
-INTERNAL_ONLY_HANDLERS = frozenset({
-    # Reached through delegate_to_helper, not chosen by the model.
-    "delegate_to_helper",
-    "delegate_to_local_model",
-    "edit_file",
-    # Removed from the schemas because bash is equivalent and more flexible;
-    # kept dispatchable for internal callers and backward compatibility.
-    "run_tests",
-    "run_lint",
-    # Internal bookkeeping invoked by the loop, never advertised.
-    "update_memory",
-})
+INTERNAL_ONLY_HANDLERS = frozenset(
+    {
+        # Reached through delegate_to_helper, not chosen by the model.
+        "delegate_to_helper",
+        "delegate_to_local_model",
+        "edit_file",
+        # Removed from the schemas because bash is equivalent and more flexible;
+        # kept dispatchable for internal callers and backward compatibility.
+        "run_tests",
+        "run_lint",
+        # Internal bookkeeping invoked by the loop, never advertised.
+        "update_memory",
+    }
+)
 
 
 def test_every_handler_is_reachable_or_declared_internal():
     """A dispatchable tool the model is never told about is dead weight."""
     advertised = _names(AGENT_TOOL_SCHEMAS)
     orphaned = sorted(
-        n for n in ToolRegistry._TOOL_HANDLER_MAP
-        if n not in advertised and n not in INTERNAL_ONLY_HANDLERS
+        n for n in ToolRegistry._TOOL_HANDLER_MAP if n not in advertised and n not in INTERNAL_ONLY_HANDLERS
     )
     assert not orphaned, (
         f"handler exists but nothing advertises it: {orphaned}. "
@@ -143,6 +143,4 @@ def test_internal_only_list_has_no_stale_entries():
     assert not stale, f"listed as internal-only but no longer a handler: {stale}"
     advertised = _names(AGENT_TOOL_SCHEMAS)
     now_public = sorted(INTERNAL_ONLY_HANDLERS & advertised)
-    assert not now_public, (
-        f"advertised to models but still listed as internal-only: {now_public}"
-    )
+    assert not now_public, f"advertised to models but still listed as internal-only: {now_public}"

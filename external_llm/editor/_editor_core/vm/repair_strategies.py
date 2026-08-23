@@ -7,11 +7,11 @@ Each strategy:
 
 Strategies are dispatched by FailureType via the RepairRegistry.
 """
+
 from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from typing import Optional
 
 from external_llm.editor._editor_core.vm.classification import Classification
 from external_llm.editor._editor_core.vm.failure_classifier import FailureType
@@ -20,12 +20,15 @@ from external_llm.editor.primitives.models import PrimitiveKind, PrimitiveOp
 
 # ── Utility ───────────────────────────────────────────────────────────
 
+
 def _make_raw_replacement(code: str) -> list[PrimitiveOp]:
     """Wrap a full code replacement as a raw-replacement op."""
-    return [PrimitiveOp(
-        kind=PrimitiveKind.INSERT_STATEMENT,
-        payload={"__raw_code__": code},
-    )]
+    return [
+        PrimitiveOp(
+            kind=PrimitiveKind.INSERT_STATEMENT,
+            payload={"__raw_code__": code},
+        )
+    ]
 
 
 def _get_indent(line: str) -> str:
@@ -39,8 +42,11 @@ def _get_indent(line: str) -> str:
 
 
 def _trim_call_arguments(
-    lines: list[str], idx: int, *, keep_first: bool = False,
-) -> Optional[str]:
+    lines: list[str],
+    idx: int,
+    *,
+    keep_first: bool = False,
+) -> str | None:
     """Trim the argument list of the call on line *idx*; return new source or None.
 
     Returns None when the call cannot be trimmed (no parens on the line, empty
@@ -55,21 +61,24 @@ def _trim_call_arguments(
     paren_close = line.find(")", paren_open)
     if paren_close == -1:
         return None
-    inner = line[paren_open + 1:paren_close].strip()
+    inner = line[paren_open + 1 : paren_close].strip()
     if not inner:
         return None
     args = [a.strip() for a in inner.split(",")]
     if len(args) < 2:
         return None
     new_inner = args[0] if keep_first else ", ".join(args[:-1])
-    lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
+    lines[idx] = line[: paren_open + 1] + new_inner + line[paren_close:]
     return "\n".join(lines)
 
 
 def _repair_argument_mismatch(
-    code: str, error: VerifyError, markers: tuple[str, ...], *,
+    code: str,
+    error: VerifyError,
+    markers: tuple[str, ...],
+    *,
     keep_first: bool = False,
-) -> Optional[list[PrimitiveOp]]:
+) -> list[PrimitiveOp] | None:
     """Trim the call's argument list when the message carries a *marker*.
 
     Shared by the py/java/kotlin/go argument-mismatch strategies — the only
@@ -140,8 +149,10 @@ _PY_IMPORT_MAP: dict[str, tuple] = {
 
 
 def py_repair_missing_variable(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add import for undefined variable if it's a known stdlib/typing symbol."""
     symbol = classification.symbol
     if not symbol:
@@ -151,15 +162,19 @@ def py_repair_missing_variable(
         return None
     module, is_name = entry
     stmt = f"from {module} import {symbol}" if is_name else f"import {module}"
-    return [PrimitiveOp(
-        kind=PrimitiveKind.INSERT_IMPORT,
-        payload={"statement": stmt},
-    )]
+    return [
+        PrimitiveOp(
+            kind=PrimitiveKind.INSERT_IMPORT,
+            payload={"statement": stmt},
+        )
+    ]
 
 
 def py_repair_syntax_error(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix common Python syntax errors (missing colon, indent issues)."""
     if error.line is None:
         return None
@@ -175,9 +190,22 @@ def py_repair_syntax_error(
         if not line.endswith(":"):
             # Check if ending with a keyword that expects colon
             stripped = line.strip()
-            if any(stripped.startswith(kw) for kw in
-                   ("def ", "class ", "if ", "elif ", "else", "for ",
-                    "while ", "try", "except", "with ", "finally")):
+            if any(
+                stripped.startswith(kw)
+                for kw in (
+                    "def ",
+                    "class ",
+                    "if ",
+                    "elif ",
+                    "else",
+                    "for ",
+                    "while ",
+                    "try",
+                    "except",
+                    "with ",
+                    "finally",
+                )
+            ):
                 lines[idx] = line + ":"
                 return _make_raw_replacement("\n".join(lines))
         return None
@@ -194,10 +222,10 @@ def _repair_missing_return(
     *,
     is_header: Callable[[str], bool],
     skip_comments: bool,
-    end_marker: Optional[str],
+    end_marker: str | None,
     return_stmt_factory: Callable[[str], str],
     extra_indent: bool = False,
-) -> Optional[list[PrimitiveOp]]:
+) -> list[PrimitiveOp] | None:
     """Insert a return statement into the body containing ``error.line``.
 
     Walks backward from the error line to find the enclosing function/method
@@ -246,12 +274,17 @@ def _repair_missing_return(
         lines.insert(last_body_line + 1, stmt_indent + return_stmt_factory(stripped))
         return _make_raw_replacement("\n".join(lines))
     return None
+
+
 def py_repair_missing_return(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add return None to a function missing a return."""
     return _repair_missing_return(
-        code, error,
+        code,
+        error,
         is_header=lambda s: s.startswith("def ") and s.endswith(":"),
         skip_comments=True,
         end_marker=None,
@@ -260,8 +293,10 @@ def py_repair_missing_return(
 
 
 def py_repair_argument_mismatch(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix argument count mismatch — limited case: add/remove self."""
     msg = error.message.lower()
     if "missing 1 required positional argument" in msg:
@@ -270,7 +305,10 @@ def py_repair_argument_mismatch(
     if "takes 1 positional argument but" in msg:
         # Keep only the first argument (self plus the intended args).
         return _repair_argument_mismatch(
-            code, error, ("takes 1 positional argument but",), keep_first=True,
+            code,
+            error,
+            ("takes 1 positional argument but",),
+            keep_first=True,
         )
     return None
 
@@ -312,9 +350,12 @@ _JAVA_IMPORT_MAP: dict[str, str] = {
 # Shared by the Java/Kotlin repair families — the only language difference is
 # the import statement's trailing semicolon and the diagnostic wording.
 def _repair_unknown_symbol(
-    code: str, classification: Classification, import_map: dict[str, str], *,
+    code: str,
+    classification: Classification,
+    import_map: dict[str, str],
+    *,
     stmt_fmt: str = "import {}",
-) -> Optional[list[PrimitiveOp]]:
+) -> list[PrimitiveOp] | None:
     """Add an import for an unknown symbol if it maps to a known FQN.
 
     *stmt_fmt* formats the import statement from the FQN — Java
@@ -331,16 +372,21 @@ def _repair_unknown_symbol(
     stmt = stmt_fmt.format(fqn)
     if stmt in code:
         return None
-    return [PrimitiveOp(
-        kind=PrimitiveKind.INSERT_IMPORT,
-        payload={"statement": stmt},
-    )]
+    return [
+        PrimitiveOp(
+            kind=PrimitiveKind.INSERT_IMPORT,
+            payload={"statement": stmt},
+        )
+    ]
 
 
 def _repair_missing_semicolon(
-    code: str, error: VerifyError, markers: tuple[str, ...], *,
+    code: str,
+    error: VerifyError,
+    markers: tuple[str, ...],
+    *,
     skip_ending: tuple[str, ...] = (),
-) -> Optional[list[PrimitiveOp]]:
+) -> list[PrimitiveOp] | None:
     """Append ``;`` to the error line when the message carries a *marker*.
 
     Lines ending with any *skip_ending* suffix are left untouched (Go's
@@ -360,29 +406,36 @@ def _repair_missing_semicolon(
         lines[idx] = line + ";"
         return _make_raw_replacement("\n".join(lines))
     return None
+
+
 def java_repair_unknown_symbol(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add import for unknown symbol if it's a known Java type."""
     return _repair_unknown_symbol(code, classification, _JAVA_IMPORT_MAP, stmt_fmt="import {};")
 
 
 def java_repair_syntax_error(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix common Java syntax errors (missing semicolons, braces)."""
     return _repair_missing_semicolon(code, error, ("';' expected", "expected ';'"))
 
 
 def java_repair_missing_return(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add return null to method missing a return statement."""
     return _repair_missing_return(
-        code, error,
-        is_header=lambda s: any(
-            s.startswith(kw) for kw in ("public ", "private ", "protected ")
-        ) and "{" in s,
+        code,
+        error,
+        is_header=lambda s: any(s.startswith(kw) for kw in ("public ", "private ", "protected ")) and "{" in s,
         skip_comments=False,
         end_marker="}",
         return_stmt_factory=lambda _s: "return null;",
@@ -420,15 +473,19 @@ _KOTLIN_IMPORT_MAP: dict[str, str] = {
 
 
 def kotlin_repair_unknown_symbol(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add import for unknown symbol if known (Kotlin imports carry no semicolon)."""
     return _repair_unknown_symbol(code, classification, _KOTLIN_IMPORT_MAP, stmt_fmt="import {}")
 
 
 def kotlin_repair_syntax_error(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix common Kotlin syntax errors (missing semicolons)."""
     return _repair_missing_semicolon(code, error, ("expecting ';'", "expected ';'"))
 
@@ -469,8 +526,10 @@ _GO_IMPORT_MAP: dict[str, str] = {
 
 
 def go_repair_unknown_symbol(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix undefined symbol: try import first, then case-correction.
 
     Go undefined errors come in two flavors:
@@ -484,7 +543,10 @@ def go_repair_unknown_symbol(
 
     # ── Path 1: Known stdlib package → add import (shared helper) ──
     ops = _repair_unknown_symbol(
-        code, classification, _GO_IMPORT_MAP, stmt_fmt='import "{}"',
+        code,
+        classification,
+        _GO_IMPORT_MAP,
+        stmt_fmt='import "{}"',
     )
     if ops is not None:
         return ops
@@ -530,18 +592,20 @@ def go_repair_unknown_symbol(
     # Check each candidate against the code (word-boundary match)
     for candidate in unique_candidates:
         # Use word-boundary regex to avoid substring matches
-        _pat = re.compile(r'\b' + re.escape(candidate) + r'\b')
+        _pat = re.compile(r"\b" + re.escape(candidate) + r"\b")
         if _pat.search(code):
             # Replace the undefined symbol in the error line only
-            lines[idx] = re.sub(r'\b' + re.escape(symbol) + r'\b', candidate, lines[idx])
+            lines[idx] = re.sub(r"\b" + re.escape(symbol) + r"\b", candidate, lines[idx])
             return _make_raw_replacement("\n".join(lines))
 
     return None
 
 
 def go_repair_unused_import(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Remove unused import (Go compiler error)."""
     symbol = classification.symbol
     if not symbol:
@@ -578,11 +642,16 @@ def go_repair_unused_import(
 
 
 def go_repair_syntax_error(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix common Go syntax errors (missing semicolons, braces)."""
     semicolon_fix = _repair_missing_semicolon(
-        code, error, ("expected ';'", "expected newline"), skip_ending=("{",),
+        code,
+        error,
+        ("expected ';'", "expected newline"),
+        skip_ending=("{",),
     )
     if semicolon_fix is not None:
         return semicolon_fix
@@ -606,18 +675,24 @@ def go_repair_syntax_error(
 
 
 def java_repair_argument_mismatch(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix Java argument count mismatch by removing extra arguments."""
     return _repair_argument_mismatch(
-        code, error, ("actual and formal argument lists differ in length",),
+        code,
+        error,
+        ("actual and formal argument lists differ in length",),
     )
 
 
 def _repair_duplicate_identifier(
-    code: str, error: VerifyError,
-    markers: tuple[str, ...], patterns: tuple[tuple[str, str], ...],
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    markers: tuple[str, ...],
+    patterns: tuple[tuple[str, str], ...],
+) -> list[PrimitiveOp] | None:
     """Rename a duplicate identifier on the error line by appending a suffix.
 
     *patterns* is a sequence of ``(regex, suffix)`` pairs tried in order on
@@ -643,12 +718,17 @@ def _repair_duplicate_identifier(
             lines[idx] = _get_indent(line) + new_line
             return _make_raw_replacement("\n".join(lines))
     return None
+
+
 def java_repair_duplicate_identifier(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix duplicate class/local identifier by appending a suffix."""
     return _repair_duplicate_identifier(
-        code, error,
+        code,
+        error,
         markers=("duplicate class",),
         patterns=((r"\bclass\s+(\w+)", "Dup"),),
     )
@@ -666,11 +746,14 @@ def _kotlin_return_stmt(header: str) -> str:
 
 
 def kotlin_repair_missing_return(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add return (Unit/null) to a Kotlin function missing a return."""
     return _repair_missing_return(
-        code, error,
+        code,
+        error,
         is_header=lambda s: s.startswith("fun "),
         skip_comments=False,
         end_marker="}",
@@ -680,18 +763,23 @@ def kotlin_repair_missing_return(
 
 
 def kotlin_repair_argument_mismatch(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix Kotlin argument count mismatch — remove extra arguments."""
     return _repair_argument_mismatch(code, error, ("too many", "required"))
 
 
 def kotlin_repair_duplicate_identifier(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix duplicate Kotlin identifier by appending a suffix."""
     return _repair_duplicate_identifier(
-        code, error,
+        code,
+        error,
         markers=("duplicate",),
         patterns=((r"\bfun\s+(\w+)", "Dup"), (r"\bclass\s+(\w+)", "Dup")),
     )
@@ -703,8 +791,10 @@ def kotlin_repair_duplicate_identifier(
 
 
 def go_repair_argument_mismatch(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix Go argument count mismatch — remove extra or add zero-value args."""
     if error.line is None:
         return None
@@ -727,14 +817,14 @@ def go_repair_argument_mismatch(
         paren_close = line.find(")", paren_open)
         if paren_close == -1:
             return None
-        inner = line[paren_open + 1:paren_close].strip()
+        inner = line[paren_open + 1 : paren_close].strip()
 
         # Try to extract expected parameter types from the error message
         # Go error: "not enough arguments in call to ...\n    have (type1)\n    want (type1, type2, type3)"
         # NOTE: search in *original* error.message (preserves type casing like time.Time)
         #        while 'msg' (lowercased) is used for keyword checks only.
         _want_types: list[str] = []
-        _want_m = re.search(r'want\s+\(([^)]*)\)', error.message, re.IGNORECASE)
+        _want_m = re.search(r"want\s+\(([^)]*)\)", error.message, re.IGNORECASE)
         if _want_m:
             _want_types = [t.strip() for t in _want_m.group(1).split(",")]
 
@@ -759,7 +849,7 @@ def go_repair_argument_mismatch(
             new_inner = "nil"  # empty args → use nil as safe default
         else:
             new_inner = inner + ", nil"  # unknown type → nil (will be caught by TYPE_MISMATCH repair)
-        lines[idx] = line[:paren_open + 1] + new_inner + line[paren_close:]
+        lines[idx] = line[: paren_open + 1] + new_inner + line[paren_close:]
         return _make_raw_replacement("\n".join(lines))
     return None
 
@@ -769,7 +859,7 @@ def _go_return_stmt(header: str) -> str:
     ret_type = None
     paren_close = header.rfind(")")
     if paren_close != -1:
-        after_parens = header[paren_close + 1:].strip()
+        after_parens = header[paren_close + 1 :].strip()
         if after_parens and "{" not in after_parens:
             ret_type = after_parens.split("{")[0].strip()
     if ret_type:
@@ -778,13 +868,16 @@ def _go_return_stmt(header: str) -> str:
 
 
 def go_repair_missing_return(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Add return with zero-value to a Go function missing a return statement."""
     if "missing return" not in error.message.lower():
         return None
     return _repair_missing_return(
-        code, error,
+        code,
+        error,
         is_header=lambda s: bool(re.match(r"^func\s+\w+", s)),
         skip_comments=False,
         end_marker="}",
@@ -830,8 +923,10 @@ def _go_zero_value(type_name: str) -> str:
 
 
 def go_repair_type_mismatch(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix Go type mismatch — add explicit type conversion when possible."""
     if error.line is None:
         return None
@@ -847,10 +942,10 @@ def go_repair_type_mismatch(
     # Search the *original* message (like `go_repair_argument_mismatch`) so
     # qualified type names keep their casing ("time.Time", "sql.NullString").
     m = re.search(
-        r'cannot use\s+(?P<expr>nil|\S+?)'
-        r'(?:\s*\(\s*type\s+(?P<from_legacy>[^)]+)\s*\))?'
-        r'(?:\s*\(\s*variable of\s+(?:struct\s+)?type\s+(?P<from_modern>[^)]+)\s*\))?'
-        r'\s+as\s+(?:type\s+)?(?P<to>[^\s]+?)(?:\s+value)?\s+in\b',
+        r"cannot use\s+(?P<expr>nil|\S+?)"
+        r"(?:\s*\(\s*type\s+(?P<from_legacy>[^)]+)\s*\))?"
+        r"(?:\s*\(\s*variable of\s+(?:struct\s+)?type\s+(?P<from_modern>[^)]+)\s*\))?"
+        r"\s+as\s+(?:type\s+)?(?P<to>[^\s]+?)(?:\s+value)?\s+in\b",
         error.message,
         re.IGNORECASE,
     )
@@ -870,20 +965,30 @@ def go_repair_type_mismatch(
         # Try wrapping the offending expression in Type(expr)
         # For simple numeric conversions like int, float64 etc.
         numeric_types = {
-            "int", "int8", "int16", "int32", "int64",
-            "uint", "uint8", "uint16", "uint32", "uint64",
-            "float32", "float64",
-            "byte", "rune",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "float32",
+            "float64",
+            "byte",
+            "rune",
         }
         if from_type in numeric_types and to_type in numeric_types:
             # Wrap the expression in Type(...)
             # Find what to wrap: the assignment or comparison value
             eq_pos = line.find("=")
             if eq_pos != -1:
-                rhs = line[eq_pos + 1:].strip()
+                rhs = line[eq_pos + 1 :].strip()
                 rhs_clean = rhs.rstrip(" {") if "{" in rhs else rhs.rstrip()
                 new_rhs = f"{to_type}({rhs_clean})"
-                lines[idx] = line[:eq_pos + 1] + " " + new_rhs
+                lines[idx] = line[: eq_pos + 1] + " " + new_rhs
                 return _make_raw_replacement("\n".join(lines))
     return None
 
@@ -894,11 +999,14 @@ def go_repair_type_mismatch(
 
 
 def py_repair_duplicate_identifier(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fix duplicate function/class identifier by appending a suffix."""
     return _repair_duplicate_identifier(
-        code, error,
+        code,
+        error,
         markers=("redefined", "duplicate"),
         patterns=((r"\bdef\s+(\w+)", "_dup"), (r"\bclass\s+(\w+)", "Dup")),
     )
@@ -907,6 +1015,7 @@ def py_repair_duplicate_identifier(
 # ═══════════════════════════════════════════════════════════════════════
 # Strategy map per language
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def _build_python_strategies() -> dict[FailureType, Callable]:
     return {
@@ -968,8 +1077,10 @@ def get_strategies(language: str) -> dict[FailureType, Callable]:
 
 
 def repair_unknown_symbol(
-    code: str, error: VerifyError, classification: Classification,
-) -> Optional[list[PrimitiveOp]]:
+    code: str,
+    error: VerifyError,
+    classification: Classification,
+) -> list[PrimitiveOp] | None:
     """Fallback: delegate to language-specific unknown symbol repair."""
     get_strategies("python")  # overridden by registry
     return None

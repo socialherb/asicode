@@ -48,7 +48,7 @@ import queue
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from external_llm.agent.tool_registry import ToolRegistry
@@ -57,6 +57,7 @@ from external_llm.editor.agent.mcp._session_queue import (
     _SESSION_IDLE_TTL_SECONDS,
     _SESSION_SWEEP_INTERVAL_SECONDS,
     JsonRpcHandler,
+    QuietHttpHandler,
     _SessionQueueMixin,
 )
 
@@ -69,6 +70,14 @@ logger = logging.getLogger(__name__)
 # Socket timeout for client connections — a stalled client must not pin a
 # worker thread forever (ThreadingHTTPServer spawns one thread per connection).
 _SOCKET_TIMEOUT_SECONDS = 30
+
+# SSE keep-alive heartbeat interval.  The stream loop blocks on the session
+# queue; without periodic writes it can never detect a vanished client (a RST
+# only fails the *next* write), so a dead client's session would linger until
+# the idle sweep (30 min).  Writing an SSE comment (a no-op event) on a timer
+# turns a vanished client into a BrokenPipeError within one interval, and
+# touches the session so an *active* client is never swept.
+_SSE_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 # Global cap on concurrent id'd JSON-RPC requests (tool calls) — mirrors the
 # stdio transport's BoundedSemaphore(8).  Overflow is answered 503.
@@ -89,10 +98,11 @@ class StreamableHttpMcpServer(_SessionQueueMixin):
         host: str = "127.0.0.1",
         port: int = 8766,
         *,
-        handle: Optional[JsonRpcHandler] = None,
+        handle: JsonRpcHandler | None = None,
         max_concurrent: int = _MAX_CONCURRENT_REQUESTS,
         session_idle_ttl: float = _SESSION_IDLE_TTL_SECONDS,
         sweep_interval: float = _SESSION_SWEEP_INTERVAL_SECONDS,
+        heartbeat_interval: float = _SSE_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self.registry = registry
         # JSON-RPC handler — injected by server.py's _run_streamable_server so
@@ -100,6 +110,7 @@ class StreamableHttpMcpServer(_SessionQueueMixin):
         # tests inject fakes.  None (direct construction) degrades to an
         # explicit error.
         self._handle = handle
+        self._heartbeat_interval = heartbeat_interval
         self._concurrency_semaphore = threading.BoundedSemaphore(max_concurrent)
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self))
         self.host, self.port = self.httpd.server_address[:2]
@@ -116,7 +127,7 @@ class StreamableHttpMcpServer(_SessionQueueMixin):
         with self._lock:
             self._last_active[session_id] = time.monotonic()
 
-    def _handle_request_capped(self, request: dict) -> tuple[bool, Optional[str]]:
+    def _handle_request_capped(self, request: dict) -> tuple[bool, str | None]:
         """Handle an id'd request under the global concurrency cap.
 
         Returns ``(True, payload)`` on success (``payload`` is None for
@@ -136,7 +147,7 @@ class StreamableHttpMcpServer(_SessionQueueMixin):
 def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandler]:
     """Build the request-handler class bound to ``server`` (closure, no globals)."""
 
-    class _StreamableHandler(BaseHTTPRequestHandler):
+    class _StreamableHandler(QuietHttpHandler):
         server_version = "asicode-mcp-streamable/1.0"
         protocol_version = "HTTP/1.1"
         # Socket timeout — a stalled client must not pin a worker thread
@@ -146,8 +157,8 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
 
         # SSE streams stay open for the connection's lifetime; a log line per
         # event would spam stderr — route to the module logger (debug level).
-        def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("MCP Streamable-HTTP %s %s", self.address_string(), fmt % args)
+        def log_message(self, format: str, *args: Any) -> None:
+            logger.debug("MCP Streamable-HTTP %s %s", self.address_string(), format % args)
 
         # -- helpers ---------------------------------------------------------
 
@@ -169,11 +180,15 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            # Error responses end the exchange: never reuse this connection
+            # for a keep-alive read of a client that may already be gone.
+            self.send_header("Connection", "close")
             self._cors_headers()
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
 
-        def _read_body(self) -> Optional[dict]:
+        def _read_body(self) -> dict | None:
             """Read + parse the JSON-RPC body; None on any parse/size failure."""
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -192,11 +207,13 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
             except (json.JSONDecodeError, UnicodeDecodeError):
                 request = None
             if not isinstance(request, dict):
-                payload = json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "Parse error"},
-                })
+                payload = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    }
+                )
                 body = payload.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -207,11 +224,27 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
                 return None
             return request
 
-        def _stream_loop(self, messages: queue.Queue[Optional[str]], session_id: str) -> None:
-            """Write queued payloads as SSE ``message`` events until the sentinel."""
+        def _stream_loop(self, messages: queue.Queue[str | None], session_id: str) -> None:
+            """Write queued payloads as SSE ``message`` events until the sentinel.
+
+            Idle periods poll with a heartbeat timeout instead of blocking on
+            ``messages.get()`` forever: a vanished client is only detectable at
+            the next write, so without a periodic write a dead client's session
+            would linger until the idle sweep (30 min).
+            """
             try:
                 while True:
-                    data = messages.get()
+                    try:
+                        data = messages.get(timeout=server._heartbeat_interval)
+                    except queue.Empty:
+                        # Keep-alive: SSE comment (no-op event).  Fails fast
+                        # (BrokenPipeError) if the client has vanished, and
+                        # touches the session so an active stream is never
+                        # idle-swept.
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        server._touch(session_id)
+                        continue
                     if data is None:
                         break
                     self.wfile.write(f"event: message\ndata: {data}\n\n".encode())
@@ -232,13 +265,13 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
 
         # -- HTTP verbs --------------------------------------------------------
 
-        def do_OPTIONS(self) -> None:
+        def do_OPTIONS(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             self.send_response(204)
             self._cors_headers()
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def do_POST(self) -> None:
+        def do_POST(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             if urlparse(self.path).path != "/mcp":
                 self._json_error(404, "Not found — POST /mcp")
                 return
@@ -274,6 +307,12 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
                             self.wfile.write(f"event: message\ndata: {payload}\n\n".encode())
                             self.wfile.flush()
                         self._stream_loop(messages, session_id)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        # Normal client disconnect mid-stream: the stream loop
+                        # already dropped the session (finally).  Do NOT re-raise
+                        # — socketserver would print a traceback for a routine
+                        # disconnect, spamming the log.
+                        server._drop_session(session_id)
                     except Exception:
                         # A failure between _new_session and the stream loop
                         # must not leave the session behind.
@@ -332,7 +371,7 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self) -> None:
+        def do_GET(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             # SSE resume path: re-attach to an existing session's stream.
             if urlparse(self.path).path != "/mcp":
                 self._json_error(404, "Not found — GET /mcp?session_id=<id>")
@@ -350,7 +389,7 @@ def _make_handler(server: StreamableHttpMcpServer) -> type[BaseHTTPRequestHandle
             self.end_headers()
             self._stream_loop(session, session_id)
 
-        def do_DELETE(self) -> None:
+        def do_DELETE(self) -> None:  # noqa: N802 — stdlib/3rd-party dispatch protocol (name is fixed by caller)
             if urlparse(self.path).path != "/mcp":
                 self._json_error(404, "Not found")
                 return

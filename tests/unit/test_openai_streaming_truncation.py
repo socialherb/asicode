@@ -9,6 +9,7 @@ terminating chunk is intact). These tests pin the fix that detects unbalanced
 JSON delimiters and rewrites ``finish_reason`` to ``'truncated'``, using the
 shared ``_count_delimiters`` helper — mirroring providers.py DeepSeek exactly.
 """
+
 from __future__ import annotations
 
 from external_llm import openai_client as oc
@@ -132,9 +133,7 @@ def test_chat_with_tools_streaming_detects_truncated_args(monkeypatch):
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "truncated"
     assert resp.tool_calls == []
 
@@ -146,9 +145,7 @@ def test_chat_with_tools_streaming_balanced_args_keeps_tool_calls(monkeypatch):
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "tool_calls"
     assert len(resp.tool_calls) == 1
     assert resp.tool_calls[0].name == "read_file"
@@ -161,9 +158,7 @@ def test_chat_with_tools_streaming_truncated_content_json(monkeypatch):
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "truncated"
 
 
@@ -174,7 +169,5 @@ def test_chat_with_tools_streaming_partial_args_with_no_arguments_not_flagged(mo
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
     ]
     client = _make_streaming_client(monkeypatch, events)
-    resp = client._chat_with_tools_streaming(
-        "http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None
-    )
+    resp = client._chat_with_tools_streaming("http://x/v1/chat/completions", {}, {"model": "m"}, "m", lambda c: None)
     assert resp.finish_reason == "tool_calls"

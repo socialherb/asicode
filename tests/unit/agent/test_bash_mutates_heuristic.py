@@ -14,6 +14,7 @@ running the heuristic against real commands:
 4. Pure-read pipelines (`grep foo | head`) unconditionally invalidated the
    cache just for containing a `|`, even though every segment is read-only.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -237,6 +238,7 @@ class TestTreeSitterStructuralPath:
         # A command tree-sitter-bash flags as having an error → None (caller
         # falls back to the conservative text heuristic).
         import external_llm.languages.tree_sitter_utils as _ts
+
         if not _ts.is_available():
             return  # nothing to test without tree-sitter
         # Construct input that parses with has_error: an unterminated construct.
@@ -252,23 +254,17 @@ class TestFallbackWhenTreeSitterUnavailable:
     contract (a stale cache is worse than a miss)."""
 
     def test_fallback_preserves_conservative_substitution(self, monkeypatch):
-        monkeypatch.setattr(
-            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None)
-        )
+        monkeypatch.setattr(ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None))
         # `$(...)` → conservative invalidate (bail-out path).
         assert _mutates("ls $(git stash pop)") is True
 
     def test_fallback_preserves_readonly_pipeline(self, monkeypatch):
-        monkeypatch.setattr(
-            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None)
-        )
+        monkeypatch.setattr(ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None))
         # Unquoted pure-read pipeline still recognized read-only via regex split.
         assert _mutates("git log --oneline | head") is False
 
     def test_fallback_preserves_quoted_pipe_bailout(self, monkeypatch):
-        monkeypatch.setattr(
-            ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None)
-        )
+        monkeypatch.setattr(ToolRegistry, "_bash_command_segments_via_ts", staticmethod(lambda c, _tree=None: None))
         # With the fallback, a quoted pipeline bails out conservatively (the
         # structural path is what resolves it; without it we stay fail-closed).
         assert _mutates("grep 'a | b' f | head") is True
@@ -297,6 +293,7 @@ class TestRedirectFdDupVsFile:
     def test_fd_dup_unit(self):
         if not _ts_bash_ok():
             import pytest
+
             pytest.skip("tree-sitter-bash unavailable")
         is_dup = ToolRegistry._redirect_is_fd_dup
         assert is_dup("2>&1") is True
@@ -312,6 +309,7 @@ class TestRedirectFdDupVsFile:
     def test_fd_dup_not_treated_as_mutation(self):
         if not _ts_bash_ok():
             import pytest
+
             pytest.skip("tree-sitter-bash unavailable")
         # 2>&1 merges stderr into stdout — writes no file; must stay read-only.
         assert _mutates("git log 2>&1 | head") is False
@@ -320,6 +318,7 @@ class TestRedirectFdDupVsFile:
     def test_stderr_to_file_is_a_mutation(self):
         if not _ts_bash_ok():
             import pytest
+
             pytest.skip("tree-sitter-bash unavailable")
         # 2>err.log truncates/creates a file → mutate (fd-dup helper must NOT
         # misclassify it).
@@ -328,6 +327,7 @@ class TestRedirectFdDupVsFile:
     def test_stdout_to_file_is_a_mutation(self):
         if not _ts_bash_ok():
             import pytest
+
             pytest.skip("tree-sitter-bash unavailable")
         assert _mutates("echo hi > out.txt") is True
         assert _mutates("echo hi >> out.txt") is True
@@ -336,9 +336,7 @@ class TestRedirectFdDupVsFile:
         """When tree-sitter-bash is unavailable, the conservative scanner still
         catches ``2>&1`` (over-invalidation → cache miss, never stale data).
         This pins that the fallback never loosens safety."""
-        monkeypatch.setattr(
-            ToolRegistry, "_has_file_redirect_via_ts", classmethod(lambda cls, c, _tree=None: None)
-        )
+        monkeypatch.setattr(ToolRegistry, "_has_file_redirect_via_ts", classmethod(lambda cls, c, _tree=None: None))
         assert _mutates("git log 2>&1 | head") is True
 
 
@@ -416,15 +414,32 @@ class TestConservativeDefaultStillHolds:
     """Spot-check that the fix did not weaken or over-broaden the classifier."""
 
     def test_known_mutators(self):
-        for cmd in ("sed -i 's/a/b/' f", "find . -delete", "sort -o out in",
-                    "dd if=/dev/zero of=f", "truncate -s 0 f", "install -m 644 a b",
-                    "git stash pop", "echo hi > f", "echo hi | tee f"):
+        for cmd in (
+            "sed -i 's/a/b/' f",
+            "find . -delete",
+            "sort -o out in",
+            "dd if=/dev/zero of=f",
+            "truncate -s 0 f",
+            "install -m 644 a b",
+            "git stash pop",
+            "echo hi > f",
+            "echo hi | tee f",
+        ):
             assert _mutates(cmd) is True, cmd
 
     def test_known_readonly_still_cacheable(self):
-        for cmd in ("cat a.py", "ls -la", "git status", "grep -rn x .",
-                    "git log --oneline", "pwd", "whoami", "printenv",
-                    "head -20 f", "wc -l f"):
+        for cmd in (
+            "cat a.py",
+            "ls -la",
+            "git status",
+            "grep -rn x .",
+            "git log --oneline",
+            "pwd",
+            "whoami",
+            "printenv",
+            "head -20 f",
+            "wc -l f",
+        ):
             assert _mutates(cmd) is False, cmd
 
 
@@ -443,10 +458,12 @@ class TestDevNullAndFdSinks:
     """
 
     def test_stderr_discard_is_readonly(self):
-        for cmd in ("cat a.py 2>/dev/null",
-                    "git status 2>/dev/null",
-                    "grep -r x . 2>/dev/null | head",
-                    "find . -name '*.py' 2>/dev/null"):
+        for cmd in (
+            "cat a.py 2>/dev/null",
+            "git status 2>/dev/null",
+            "grep -r x . 2>/dev/null | head",
+            "find . -name '*.py' 2>/dev/null",
+        ):
             assert _mutates(cmd) is False, cmd
 
     def test_stdout_discard_forms_are_readonly(self):
@@ -457,8 +474,7 @@ class TestDevNullAndFdSinks:
     def test_append_sink_forms_are_readonly(self):
         """`find` returns the FIRST `>`, so `>>` left a stray `>` on the target
         and no sink matched — the append forms stayed classified as writes."""
-        for cmd in ("ls >>/dev/null", "cat a 2>>/dev/null", "ls &>>/dev/null",
-                    "ls >> /dev/null"):
+        for cmd in ("ls >>/dev/null", "cat a 2>>/dev/null", "ls &>>/dev/null", "ls >> /dev/null"):
             assert _mutates(cmd) is False, cmd
 
     def test_append_to_real_file_still_mutating(self):
@@ -472,11 +488,13 @@ class TestDevNullAndFdSinks:
     def test_real_file_redirect_still_mutating(self):
         """The sink allowance must not swallow a genuine write in the same
         command — in either order, and for look-alike paths."""
-        for cmd in ("echo x > /tmp/real",
-                    "cat a >out.txt 2>/dev/null",
-                    "cat a 2>/dev/null >out.txt",
-                    "ls > /dev/nullx",
-                    "ls > /dev/null/foo"):
+        for cmd in (
+            "echo x > /tmp/real",
+            "cat a >out.txt 2>/dev/null",
+            "cat a 2>/dev/null >out.txt",
+            "ls > /dev/nullx",
+            "ls > /dev/null/foo",
+        ):
             assert _mutates(cmd) is True, cmd
 
 
@@ -504,15 +522,14 @@ class TestParseBashTreeSharedBootstrap:
             raise RuntimeError("bootstrap failure must be swallowed by helper")
 
         monkeypatch.setattr(_ts, "is_available", lambda: True)
-        monkeypatch.setattr(
-            _ts, "get_parser", lambda _lang: types.SimpleNamespace(parse=_fake_parse)
-        )
+        monkeypatch.setattr(_ts, "get_parser", lambda _lang: types.SimpleNamespace(parse=_fake_parse))
         assert ToolRegistry._has_file_redirect_via_ts("ls") is None
         assert ToolRegistry._bash_command_segments_via_ts("ls") is None
         assert len(calls) == 2
 
 
 # ── single-parse / shared-tree / classification cache (P1) ───────────────────
+
 
 class TestSingleParseSharedTree:
     """P1: ``_bash_command_mutates_files`` used to parse the same command TWICE

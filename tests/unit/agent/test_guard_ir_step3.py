@@ -12,6 +12,7 @@ from external_llm.agent.guard_ir import parse_guard
 
 # ── Tests: compact invariant ──────────────────────────────────────────────────────
 
+
 class TestCompactInvariant:
     """ir.compact returned by parse_guard must be a single line and
     semantically equivalent to to_legacy_tuple()."""
@@ -36,13 +37,11 @@ class TestCompactInvariant:
         assert ir is not None
         ir2 = parse_guard(ir.compact)
         assert ir2 is not None
-        assert ir.to_legacy_tuple() == ir2.to_legacy_tuple(), (
-            f"compact changed semantics: {raw!r} → {ir.compact!r}"
-        )
+        assert ir.to_legacy_tuple() == ir2.to_legacy_tuple(), f"compact changed semantics: {raw!r} → {ir.compact!r}"
 
     @pytest.mark.parametrize("raw", CASES)
     def test_guard_ir_condition_from_compact_matches_raw(self, raw):
-        ir_raw    = parse_guard(raw)
+        ir_raw = parse_guard(raw)
         ir_compact = parse_guard(parse_guard(raw).compact)
         assert ir_raw is not None and ir_compact is not None
         assert ir_raw.condition is not None and ir_compact.condition is not None
@@ -51,6 +50,7 @@ class TestCompactInvariant:
 
 
 # ── Tests: compact form sync ────────────────────────────────────────────────
+
 
 class TestGuardStatementSync:
     """guard_statement must be in compact form after parse_guard."""
@@ -62,6 +62,7 @@ class TestGuardStatementSync:
 
 
 # ── Tests: ast_ops statement == guard_statement invariant ──────────────────────────
+
 
 class TestAstOpsStatementInvariant:
     """ast_ops[0]["statement"] and guard_statement must share the same compact form.
@@ -79,7 +80,7 @@ class TestAstOpsStatementInvariant:
         assert ir1.compact == ir2.compact
 
     def test_block_form_compact_matches_inline_compact(self):
-        ir_block  = parse_guard("if not x:\n    continue")
+        ir_block = parse_guard("if not x:\n    continue")
         ir_inline = parse_guard("if not x: continue")
         assert ir_block is not None and ir_inline is not None
         assert ir_block.compact == ir_inline.compact

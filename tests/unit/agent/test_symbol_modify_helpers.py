@@ -19,6 +19,7 @@ first-class regression tests.
 
 Run: pytest tests/unit/agent/test_symbol_modify_helpers.py -v
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -48,6 +49,7 @@ from external_llm.common.indent_utils import (
 )
 
 # ── _analyze_logical_lines ───────────────────────────────────────────────────
+
 
 class TestAnalyzeLogicalLines:
     def test_simple_one_line_per_logical(self):
@@ -85,6 +87,7 @@ class TestAnalyzeLogicalLines:
 
 # ── _file_indent_unit_from_logical ───────────────────────────────────────────
 
+
 class TestFileIndentUnitFromLogical:
     def test_four_space_file(self):
         src = "def f():\n    a = 1\n    b = 2\n"
@@ -119,6 +122,7 @@ class TestFileIndentUnitFromLogical:
 
 # ── _mode_logical_indent ─────────────────────────────────────────────────────
 
+
 class TestModeLogicalIndent:
     def test_most_common_width(self):
         lines = ["        a", "        b", "        c", "    outlier"]
@@ -148,6 +152,7 @@ class TestModeLogicalIndent:
 
 # ── _block_parses_after_dedent ───────────────────────────────────────────────
 
+
 class TestBlockParsesAfterDedent:
     def test_consistent_block_parses(self):
         lines = ["    a = 1", "    b = 2"]
@@ -176,6 +181,7 @@ class TestBlockParsesAfterDedent:
 
 # ── _post_edit_syntax_ok ────────────────────────────────────────────────────────
 
+
 class TestPostEditSyntaxOk:
     def test_valid_python(self):
         assert _post_edit_syntax_ok("x = 1\n", "m.py") is True
@@ -193,6 +199,7 @@ class TestPostEditSyntaxOk:
 
 
 # ── _apply_diff_to_source ────────────────────────────────────────────────────
+
 
 class TestApplyDiffToSource:
     def test_simple_replacement(self):
@@ -275,6 +282,7 @@ class TestApplyDiffToSource:
 # _reindent_relative is covered elsewhere, but the cross-char tab↔space branch
 # and continuation-preservation are subtle enough to pin down here.
 
+
 class TestReindentRelativeEdgeCases:
     def test_blank_lines_emit_empty(self):
         body_lines = ["    x = 1", "", "    y = 2"]
@@ -294,8 +302,8 @@ class TestReindentRelativeEdgeCases:
     def test_continuation_shifts_with_owner_delta(self):
         # A paren continuation must move by the same delta as its owning line.
         body_lines = [
-            "    foo(",       # logical, depth 0 relative
-            "        1,",     # continuation owned by line 1, col 8
+            "    foo(",  # logical, depth 0 relative
+            "        1,",  # continuation owned by line 1, col 8
         ]
         out = _reindent_relative(
             body_lines,
@@ -317,7 +325,7 @@ class TestReindentRelativeEdgeCases:
         body_lines = ["\tx = 1", "\t\ty = 2"]
         out = _reindent_relative(
             body_lines,
-            anchor_indent=1,   # one tab
+            anchor_indent=1,  # one tab
             base_prefix="    ",
             model_char="\t",
             model_unit=1,
@@ -338,28 +346,31 @@ class TestPostEditSyntaxFallbackTiers:
     errors that keep the braces balanced."""
 
     SRC = "function alpha() {\n  return 1;\n}\n"
-    ORPHAN = "function alpha() {\n  return 1;\n}\n}\n"     # brace-imbalanced
-    BAL_BAD = "function alpha( {\n  return 1;\n}\n"        # balanced, invalid
+    ORPHAN = "function alpha() {\n  return 1;\n}\n}\n"  # brace-imbalanced
+    BAL_BAD = "function alpha( {\n  return 1;\n}\n"  # balanced, invalid
     GOOD = "function alpha() {\n  return 2;\n}\n"
 
     @staticmethod
     def _no_node(monkeypatch):
         import shutil as _sh
+
         real = _sh.which
-        monkeypatch.setattr(
-            smt.shutil, "which", lambda n: None if n == "node" else real(n)
-        )
+        monkeypatch.setattr(smt.shutil, "which", lambda n: None if n == "node" else real(n))
 
     @staticmethod
     def _node_explodes(monkeypatch, exc):
         def boom(*a, **k):
             raise exc
+
         monkeypatch.setattr(smt.subprocess, "run", boom)
 
-    @pytest.mark.parametrize("exc", [
-        subprocess.TimeoutExpired("node", 10),
-        OSError("boom"),
-    ])
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            subprocess.TimeoutExpired("node", 10),
+            OSError("boom"),
+        ],
+    )
     def test_infra_failure_is_not_weaker_than_absence(self, monkeypatch, exc):
         """Regression: the except branch used to `return True`, waving through
         an orphan brace that node-absent correctly rejected."""
@@ -369,12 +380,10 @@ class TestPostEditSyntaxFallbackTiers:
     def test_absence_and_failure_agree(self, monkeypatch):
         with monkeypatch.context() as m:
             self._no_node(m)
-            absent = [smt._post_edit_syntax_ok(c, "a.js", self.SRC)
-                      for c in (self.ORPHAN, self.BAL_BAD, self.GOOD)]
+            absent = [smt._post_edit_syntax_ok(c, "a.js", self.SRC) for c in (self.ORPHAN, self.BAL_BAD, self.GOOD)]
         with monkeypatch.context() as m:
             self._node_explodes(m, OSError("boom"))
-            failed = [smt._post_edit_syntax_ok(c, "a.js", self.SRC)
-                      for c in (self.ORPHAN, self.BAL_BAD, self.GOOD)]
+            failed = [smt._post_edit_syntax_ok(c, "a.js", self.SRC) for c in (self.ORPHAN, self.BAL_BAD, self.GOOD)]
         assert absent == failed, "infra failure diverged from tool absence"
 
     def test_balanced_syntax_error_rejected_without_node(self, monkeypatch):
@@ -413,7 +422,9 @@ class TestPostEditSyntaxFallbackTiers:
         assert smt._post_edit_syntax_ok("def a():\n    return 1\n", "m.py", "") is True
         assert smt._post_edit_syntax_ok("def a(:\n    return 1\n", "m.py", "") is False
 
+
 # ── _strip_redundant_* shared-tree threading ─────────────────────────────────
+
 
 class TestStripRedundantSharedTree:
     """The strip helpers accept a pre-parsed _src_tree so a caller that already
@@ -424,6 +435,7 @@ class TestStripRedundantSharedTree:
         import ast
 
         from external_llm.agent.repair_helpers import _strip_redundant_inline_imports
+
         src = "import os\n\n\ndef g():\n    pass\n"
         new_body = "def f():\n    import os\n    return 1\n"
         a = _strip_redundant_inline_imports(new_body, src)
@@ -435,6 +447,7 @@ class TestStripRedundantSharedTree:
         import ast
 
         from external_llm.agent.repair_helpers import _strip_redundant_inline_imports
+
         src = "import os\n"
         tree = ast.parse(src)
         calls = []
@@ -445,9 +458,7 @@ class TestStripRedundantSharedTree:
             return orig_parse(*a, **k)
 
         monkeypatch.setattr(ast, "parse", counting)
-        _strip_redundant_inline_imports(
-            "def f():\n    import os\n    return 1\n", src, _src_tree=tree
-        )
+        _strip_redundant_inline_imports("def f():\n    import os\n    return 1\n", src, _src_tree=tree)
         # The file_source text is never re-parsed (only new_body/candidate are).
         assert all(c[0] != src for c in calls)
 
@@ -455,14 +466,8 @@ class TestStripRedundantSharedTree:
         import ast
 
         from external_llm.agent.repair_helpers import _strip_redundant_dataclass_decorator
-        src = (
-            "import dataclasses\n"
-            "from dataclasses import dataclass\n"
-            "\n"
-            "@dataclass\n"
-            "class C:\n"
-            "    x: int\n"
-        )
+
+        src = "import dataclasses\nfrom dataclasses import dataclass\n\n@dataclass\nclass C:\n    x: int\n"
         tree = ast.parse(src)
         calls = []
         orig_parse = ast.parse
@@ -472,8 +477,6 @@ class TestStripRedundantSharedTree:
             return orig_parse(*a, **k)
 
         monkeypatch.setattr(ast, "parse", counting)
-        out = _strip_redundant_dataclass_decorator(
-            "@dataclass\nclass C:\n    x: int\n", src, _src_tree=tree
-        )
+        out = _strip_redundant_dataclass_decorator("@dataclass\nclass C:\n    x: int\n", src, _src_tree=tree)
         assert "@dataclass" not in out
         assert all(c[0] != src for c in calls)

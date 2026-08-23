@@ -9,6 +9,7 @@ Two write shapes must both clear it: the write TOOLS go through
 `_invalidate_cache_after_write` (known target paths), and a mutating `bash`
 goes through `_invalidate_caches_unknown_scope` (targets unknowable).
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -41,10 +42,7 @@ def _registry(repo: Path) -> ToolRegistry:
 def _globbed(reg: ToolRegistry) -> set[str]:
     r = reg.dispatch("glob", {"pattern": "*.py"})
     assert r.ok
-    return {
-        line.strip().split("  (")[0]
-        for line in (r.content or "").splitlines()[1:] if line.strip()
-    }
+    return {line.strip().split("  (")[0] for line in (r.content or "").splitlines()[1:] if line.strip()}
 
 
 class TestGlobSeesFreshWrites:
@@ -60,17 +58,23 @@ class TestGlobSeesFreshWrites:
     def test_write_plan_created_file(self, repo: Path):
         reg = _registry(repo)
         assert NEW not in _globbed(reg)
-        assert reg.dispatch("write_plan", {"plan": {
-            "version": "ASICODE_PLAN_V1",
-            "operations": [{"op": "create_file", "path": NEW, "content": "def hello():\n    return 1\n"}],
-        }}).ok
+        assert reg.dispatch(
+            "write_plan",
+            {
+                "plan": {
+                    "version": "ASICODE_PLAN_V1",
+                    "operations": [{"op": "create_file", "path": NEW, "content": "def hello():\n    return 1\n"}],
+                }
+            },
+        ).ok
         assert NEW in _globbed(reg)
 
     def test_apply_patch_created_file(self, repo: Path):
         reg = _registry(repo)
         assert NEW not in _globbed(reg)
-        assert reg.dispatch("apply_patch", {"patch":
-            f"--- /dev/null\n+++ b/{NEW}\n@@ -0,0 +1,2 @@\n+def hello():\n+    return 1\n"}).ok
+        assert reg.dispatch(
+            "apply_patch", {"patch": f"--- /dev/null\n+++ b/{NEW}\n@@ -0,0 +1,2 @@\n+def hello():\n+    return 1\n"}
+        ).ok
         assert NEW in _globbed(reg)
 
     def test_renamed_file_moves(self, repo: Path):
@@ -128,6 +132,6 @@ def test_suggester_and_glob_share_one_index(repo: Path):
     import inspect
 
     from external_llm.agent.tool_handlers.read_tools import ReadToolsMixin
+
     assert "_repo_file_index" in inspect.getsource(ReadToolsMixin._tool_glob)
     assert "_repo_file_index" in inspect.getsource(wt.WriteToolsMixin._suggest_missing_paths)
-

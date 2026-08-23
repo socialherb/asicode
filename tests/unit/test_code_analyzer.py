@@ -8,6 +8,7 @@ the rendered signature. The lossy signature was fed to the LLM via
 about call arity / keyword-only constraints. Coverage was 0/62 branches
 before this file.
 """
+
 from __future__ import annotations
 
 import ast
@@ -31,6 +32,7 @@ def _sig(src: str, tmp_path: Path) -> str:
 
 # --- CA-B2: signature completeness across all parameter kinds ---
 
+
 def test_posonly_kwonly_kwarg_all_preserved(tmp_path):
     """`def f(a, /, b, *, c=2, **kw)` — was rendered as `def f(b):`."""
     sig = _sig(
@@ -40,11 +42,11 @@ def test_posonly_kwonly_kwarg_all_preserved(tmp_path):
         """,
         tmp_path,
     )
-    assert "a" in sig          # positional-only  (was DROPPED)
-    assert "/" in sig          # positional-only separator
+    assert "a" in sig  # positional-only  (was DROPPED)
+    assert "/" in sig  # positional-only separator
     assert "b" in sig
-    assert "c" in sig          # keyword-only     (was DROPPED)
-    assert "**kw" in sig       # kwargs           (was DROPPED)
+    assert "c" in sig  # keyword-only     (was DROPPED)
+    assert "**kw" in sig  # kwargs           (was DROPPED)
 
 
 def test_posonly_not_dropped(tmp_path):
@@ -70,9 +72,7 @@ def test_kwonly_without_vararg_has_bare_star(tmp_path):
 
 
 def test_type_hints_kept_across_kinds(tmp_path):
-    analysis = _analyze(
-        "def f(a: int, /, b: str, *, c: float, **kw: bool):\n    pass\n", tmp_path
-    )
+    analysis = _analyze("def f(a: int, /, b: str, *, c: float, **kw: bool):\n    pass\n", tmp_path)
     func = analysis.functions[0]
     assert func.type_hints.get("a") == "int"
     assert func.type_hints.get("b") == "str"
@@ -89,6 +89,7 @@ def test_vararg_annotation(tmp_path):
 
 
 # --- backward-compat / guardrails ---
+
 
 def test_plain_args_backward_compat(tmp_path):
     assert _sig("def f(x, y):\n    return x + y\n", tmp_path).startswith("def f(x, y):")
@@ -113,6 +114,7 @@ def test_async_function(tmp_path):
 # ``ast.AnnAssign`` (``X: int = 5``) was silently dropped, so typed constants
 # and type aliases never reached the LLM-facing "Type aliases/Constants" block
 # in ``super_context_builder._extract_type_info``.
+
 
 def test_annassign_typed_constant_captured(tmp_path):
     """``MAX_RETRIES: int = 5`` was dropped; only plain ``X = 5`` was handled."""
@@ -171,6 +173,7 @@ def test_annassign_in_class_body_not_global(tmp_path):
 # set with O(1) lookup. Correctness is identical (AST nodes compare by
 # identity), so the regression guards below assert nesting exclusion holds.
 
+
 def test_toplevel_filter_excludes_nested_defs(tmp_path):
     a = _analyze(
         """
@@ -217,6 +220,7 @@ def test_toplevel_detection_many_nodes_stable(tmp_path):
 
 # --- analyze_file error handling (L91-93): parse failure / missing file ---
 
+
 def test_analyze_file_syntax_error_returns_none(tmp_path):
     """Unparseable source → analyze_file swallows and returns None."""
     p = tmp_path / "bad.py"
@@ -231,6 +235,7 @@ def test_analyze_file_missing_file_returns_none(tmp_path):
 
 # --- ast.Import (L126-127) ---
 
+
 def test_plain_import_captured(tmp_path):
     """``import os`` / ``import sys as system`` → ImportInfo with module+alias."""
     a = _analyze("import os\nimport sys as system\n", tmp_path)
@@ -240,6 +245,7 @@ def test_plain_import_captured(tmp_path):
 
 
 # --- ast.ImportFrom (L133-149): absolute + relative level encoding ---
+
 
 def test_from_import_absolute(tmp_path):
     """``from a.b import c, d`` → module='a.b', names=['c','d']."""
@@ -265,6 +271,7 @@ def test_from_import_no_module_relative(tmp_path):
 
 # --- module-level Call nodes (L153-155) ---
 
+
 def test_module_level_calls_collected(tmp_path):
     """Top-level Call nodes populate ``analysis.calls`` (Name + Attribute)."""
     a = _analyze("print(value)\nobj.method()\n", tmp_path)
@@ -280,6 +287,7 @@ def test_call_with_non_name_func_skipped(tmp_path):
 
 # --- return types (L238 extraction, L342 signature) ---
 
+
 def test_return_type_captured(tmp_path):
     a = _analyze("def f() -> int:\n    return 1\n", tmp_path)
     assert a.functions[0].return_type == "int"
@@ -293,6 +301,7 @@ def test_return_type_absent(tmp_path):
 
 
 # --- _collect_calls: per-function calls + nested-scope exclusion (L268-271, DG-B1) ---
+
 
 def test_function_calls_collected_per_scope(tmp_path):
     a = _analyze(
@@ -326,6 +335,7 @@ def test_function_calls_exclude_nested_scope(tmp_path):
 
 # --- docstring in function signature (L349-350) ---
 
+
 def test_docstring_in_function_signature(tmp_path):
     a = _analyze(
         '''
@@ -350,6 +360,7 @@ def test_function_signature_no_docstring(tmp_path):
 
 
 # --- format_class_signature (L358-381) ---
+
 
 def test_format_class_with_bases_docstring_methods(tmp_path):
     a = _analyze(
@@ -395,6 +406,7 @@ def test_format_class_with_decorator(tmp_path):
 
 # --- _node_to_string fallback (L312-320): ast.unparse failure on older Python ---
 
+
 def test_node_to_string_fallback_name():
     """When ast.unparse raises, a Name node falls back to node.id."""
     analyzer = CodeAnalyzer()
@@ -426,6 +438,7 @@ def test_node_to_string_fallback_other_node():
 
 
 # --- remaining branch coverage: non-Name assign targets + unnamed inner calls ---
+
 
 def test_assign_with_non_name_target_skipped(tmp_path):
     """Tuple-unpacking target ``a, b = 1, 2`` is a Tuple, not a Name → skipped."""

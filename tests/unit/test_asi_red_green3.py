@@ -2,6 +2,7 @@
 remaining edge branches (resize, clipboard-win, dotenv debug, exact-name lookup,
 insights budget warning, dep-status rich, main() env fallbacks). Source-free.
 """
+
 from __future__ import annotations
 
 import json
@@ -12,6 +13,7 @@ import sys
 import asi
 
 # ─── _ShimmerSpinner ───────────────────────────────────────────────────────────
+
 
 class TestShimmerSpinner:
     def test_render_basic(self):
@@ -42,6 +44,7 @@ class TestShimmerSpinner:
 
     def test_update_rich_text(self):
         from rich.text import Text
+
         sp = asi._ShimmerSpinner("a", "blue")
         sp.update(text=Text("rich"))
         assert sp._spinner.text is not None
@@ -66,6 +69,7 @@ class TestShimmerSpinner:
 
 
 # ─── console ensures ───────────────────────────────────────────────────────────
+
 
 class TestConsoleEnsures:
     def test_ensure_console_imported_rich(self, monkeypatch):
@@ -93,6 +97,7 @@ class TestConsoleEnsures:
 
 # ─── _ToolRunningFilter / _RowSafeEmitMixin / _FsyncedFileHandler edges ────────
 
+
 class TestToolRunningFilterEdges:
     def test_active_property(self):
         f = asi._ToolRunningFilter()
@@ -111,9 +116,11 @@ class TestToolRunningFilterEdges:
 class TestFsyncedFileHandlerCloseError:
     def test_fsync_failure_prints(self, tmp_path, monkeypatch, capsys):
         h = asi._FsyncedFileHandler(str(tmp_path / "log.txt"))
+
         class BadStream:
             def fileno(self):
                 return 999999
+
         h.stream = BadStream()
         h.close()
         assert "fsync failed" in capsys.readouterr().err
@@ -124,6 +131,7 @@ class TestRowSafeEmitMixin:
         class H(asi._RowSafeEmitMixin, logging.StreamHandler):
             def __init__(self):
                 super().__init__(sys.stderr)
+
         h = H()
         monkeypatch.setattr(asi, "_active_spinner_printer", None)
         monkeypatch.setattr(asi, "_prompt_session", None)
@@ -135,6 +143,7 @@ class TestRowSafeEmitMixin:
         class H(asi._RowSafeEmitMixin, logging.StreamHandler):
             def __init__(self):
                 super().__init__(sys.stderr)
+
         h = H()
         monkeypatch.setattr(asi, "_active_spinner_printer", None)
         monkeypatch.setattr(asi, "_prompt_session", None)
@@ -148,16 +157,22 @@ class TestRowSafeEmitMixin:
 
     def test_emit_with_running_app_invalidate(self, monkeypatch):
         invalidated = []
+
         class App:
             is_running = True
+
             def invalidate(self):
                 invalidated.append(True)
+
         class Sess:
             app = App()
+
         monkeypatch.setattr(asi, "_prompt_session", Sess())
+
         class H(asi._RowSafeEmitMixin, logging.StreamHandler):
             def __init__(self):
                 super().__init__(sys.stderr)
+
         h = H()
         monkeypatch.setattr(asi, "_active_spinner_printer", None)
         rec = logging.LogRecord("n", logging.INFO, __file__, 1, "plain-message", None, None)
@@ -166,6 +181,7 @@ class TestRowSafeEmitMixin:
 
 
 # ─── _SafeRichFormatter str-args / misc edges ──────────────────────────────────
+
 
 class TestSafeRichFormatterEdges:
     def test_non_str_msg(self):
@@ -182,6 +198,7 @@ class TestRichMarkdownCls:
 
 # ─── _render_run_diff remaining edges ──────────────────────────────────────────
 
+
 class TestRenderRunDiffEdges:
     def test_rendered_empty_returns_false(self, monkeypatch):
         monkeypatch.setattr(asi, "_RICH", False)
@@ -194,19 +211,21 @@ class TestRenderRunDiffEdges:
         monkeypatch.setattr(asi, "_RICH", False)
         monkeypatch.setattr(asi, "_out_console", None)
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py"])
-        monkeypatch.setattr(asi, "_file_diff_text",
-                             lambda r, b, p: ("@@ -1 +1 @@\n-old\n+new\n context\n", False))
+        monkeypatch.setattr(asi, "_file_diff_text", lambda r, b, p: ("@@ -1 +1 @@\n-old\n+new\n context\n", False))
         asi._render_run_diff("/x", {"ref": "r"})
         out = capsys.readouterr().out
         assert "-old" in out and "+new" in out
 
     def test_rich_branch_summary_print(self, monkeypatch):
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
             def rule(self, *a, **k):
                 pass
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         monkeypatch.setattr(asi, "_changed_files_since", lambda r, b: ["a.py"])
@@ -229,6 +248,7 @@ class TestRunChangedStatsEdges:
             if args[0] == "ls-files":
                 return 0, ""
             return 0, ""
+
         monkeypatch.setattr(asi, "_git", fake_git)
         stats = asi._run_changed_stats("/x", {"ref": "r", "untracked": frozenset()})
         assert stats[0][0] == "a.py"  # fallback path used
@@ -237,9 +257,11 @@ class TestRunChangedStatsEdges:
 class TestPrintRunChangeSummaryRich:
     def test_rich_branch(self, monkeypatch):
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         monkeypatch.setattr(asi, "_run_changed_stats", lambda r, b: [("a.py", 2, 1, False), ("b.py", 0, 0, True)])
@@ -248,6 +270,7 @@ class TestPrintRunChangeSummaryRich:
 
 
 # ─── _resolve_model_interactive exact-name / ollama-exact ─────────────────────
+
 
 class TestResolveModelInteractiveExact:
     def test_exact_known_model(self, monkeypatch):
@@ -273,6 +296,7 @@ class TestResolveModelInteractiveExact:
 
 # ─── insights archive budget warning / drop index ──────────────────────────────
 
+
 class TestInsightsArchiveEdges:
     def _write(self, tmp_path, active_body, archive_body):
         d = tmp_path / ".asicode"
@@ -285,7 +309,8 @@ class TestInsightsArchiveEdges:
         repo = self._write(
             tmp_path,
             "# H\n\n### [pattern] 2026-01-01 10:00 +0900\na\n",
-            "# A\n\n### [pattern] 2026-01-02 10:00 +0900\n" + "x" * 8000 + "\n")
+            "# A\n\n### [pattern] 2026-01-02 10:00 +0900\n" + "x" * 8000 + "\n",
+        )
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
         asi._handle_insights_archive(str(repo), "archive restore 1")
@@ -308,6 +333,7 @@ class TestInsightsArchiveEdges:
 
 # ─── clipboard win branch / extract edges ──────────────────────────────────────
 
+
 class TestClipboardWin:
     def test_win_clip(self, monkeypatch):
         monkeypatch.setattr(asi.sys, "platform", "win32")
@@ -326,6 +352,7 @@ class TestExtractToolCmdEdges:
 
 
 # ─── _load_dotenv debug-log branches ───────────────────────────────────────────
+
 
 class TestLoadDotenvEdges:
     def test_quoted_inline_comment_logged(self, tmp_path, monkeypatch):
@@ -348,13 +375,19 @@ class TestLoadDotenvEdges:
 
 # ─── _check_dep_status edges ───────────────────────────────────────────────────
 
+
 class TestCheckDepStatusEdges:
     def test_skip_and_duplicate(self, monkeypatch):
         class T:
             def __init__(self, cmd, found, skipped):
                 self.cmd, self.found, self.skipped = cmd, found, skipped
-        tools = [T("tree-sitter", True, False), T("dup", True, False), T("dup", True, False),
-                 T("skipped-tool", False, True)]
+
+        tools = [
+            T("tree-sitter", True, False),
+            T("dup", True, False),
+            T("dup", True, False),
+            T("skipped-tool", False, True),
+        ]
         monkeypatch.setattr(asi, "_is_embedding_model_cached", lambda m: True)
         status = asi._check_dep_status(tools)
         assert status["dup"] == "ON"  # first wins
@@ -364,10 +397,12 @@ class TestCheckDepStatusEdges:
 
 # ─── _print_dep_status rich branch ─────────────────────────────────────────────
 
+
 class TestPrintDepStatusRich:
     def _patch(self, monkeypatch, tools=(), files=(), langs=()):
         import external_llm.languages.dependency_checker as dc
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(dc, "detect_repo_languages", lambda r: [])
         monkeypatch.setattr(dc, "_check_tools_with_state", lambda d, no_prompt=False: list(tools))
         monkeypatch.setattr(asi, "_git_ls_files", lambda r: list(files))
@@ -380,9 +415,11 @@ class TestPrintDepStatusRich:
 
     def test_rich_branch_no_missing(self, monkeypatch):
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         self._patch(monkeypatch)
@@ -391,10 +428,13 @@ class TestPrintDepStatusRich:
 
     def test_rich_branch_missing_grammar(self, monkeypatch):
         printed = []
+
         class FakeOut:
             file = None
+
             def print(self, *a, **k):
                 printed.append(a)
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         self._patch(monkeypatch, files=["a.py"], langs={"python"})
@@ -405,6 +445,7 @@ class TestPrintDepStatusRich:
     def test_missing_grammar_eof(self, monkeypatch):
         def _eof(p=""):
             raise EOFError
+
         monkeypatch.setattr(asi, "_RICH", False)
         monkeypatch.setattr(asi, "_out_console", None)
         self._patch(monkeypatch, files=["a.py"], langs={"python"})
@@ -424,12 +465,15 @@ class TestPrintDepStatusRich:
 
 # ─── _render_status rich helper row ────────────────────────────────────────────
 
+
 class TestRenderStatusRichHelper:
     def test_helper_row_rich(self, monkeypatch):
         printed = []
+
         class FakeOut:
             def print(self, *a, **k):
                 printed.append(a)
+
         monkeypatch.setattr(asi, "_RICH", True)
         monkeypatch.setattr(asi, "_out_console", FakeOut())
         asi._render_status("/r", "p", "m", "code", {"prompt": 10}, helper="h-helper")
@@ -437,6 +481,7 @@ class TestRenderStatusRichHelper:
 
 
 # ─── main() env/config fallbacks ───────────────────────────────────────────────
+
 
 class TestMainEnvFallbacks:
     def test_env_provider_model_fallback(self, monkeypatch, tmp_path):

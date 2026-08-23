@@ -25,13 +25,14 @@ Helper is NOT a lane. Helper is a tool capability (delegate_to_helper) that the
 Developer can call from any lane when it needs a subordinate model for code generation.
 Helper ON/OFF is controlled by AgentConfig.helper_enabled, not by routing.
 """
+
 from __future__ import annotations
 
 import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from ..languages import LanguageRegistry
 from .enums import Complexity, Scope
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 # ── Enums ────────────────────────────────────────────────────────────────────
+
 
 class TaskKind(str, Enum):
     MICRO_EDIT = "MICRO_EDIT"
@@ -61,10 +63,11 @@ class TaskKind(str, Enum):
 class Lane(str, Enum):
     # PLANNER (structured spec → plan → execute pipeline) was removed with the
     # lane it named; MAIN_AGENT is the only lane the router can return.
-    MAIN_AGENT = "main_agent"        # Tool-use loop: _run_llm_loop directly
+    MAIN_AGENT = "main_agent"  # Tool-use loop: _run_llm_loop directly
 
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
+
 
 @dataclass
 class RouteDecision:
@@ -80,11 +83,11 @@ class RouteDecision:
     requires_planner: bool = False
 
     # Config overrides — None means keep existing value
-    self_review_enabled: Optional[bool] = None
-    auto_test_on_patch: Optional[bool] = None
-    rag_enabled: Optional[bool] = None
-    multi_agent: Optional[bool] = None
-    max_turns_override: Optional[int] = None
+    self_review_enabled: bool | None = None
+    auto_test_on_patch: bool | None = None
+    rag_enabled: bool | None = None
+    multi_agent: bool | None = None
+    max_turns_override: int | None = None
 
     # (pre_resolved_spec and explore_report removed — ExploreAgent pipeline removed)
 
@@ -92,13 +95,14 @@ class RouteDecision:
     target_specificity_score: float = 0.5
 
     # READ_ONLY: question type for readonly pipeline
-    readonly_kind: Optional[str] = None
+    readonly_kind: str | None = None
 
     # Intent understanding result from IntentResolver (language-neutral, LLM-powered)
-    intent_result: Optional[IntentResult] = None
+    intent_result: IntentResult | None = None
 
 
 # ── Route Features ──────────────────────────────────────────────────────────
+
 
 @dataclass
 class RouteFeatures:
@@ -114,7 +118,7 @@ class RouteFeatures:
     """
 
     # raw / lexical
-    request: str = ""              # intermediate
+    request: str = ""  # intermediate
     request_lower: str = ""
     word_count: int = 0
 
@@ -123,7 +127,7 @@ class RouteFeatures:
 
     # intent
     has_edit_intent: bool = False
-    has_read_intent: bool = False   # intermediate
+    has_read_intent: bool = False  # intermediate
     has_explain_intent: bool = False  # intermediate
     has_locate_intent: bool = False  # intermediate
     has_question_form: bool = False  # intermediate
@@ -144,8 +148,8 @@ class RouteFeatures:
     target_specificity_score: float = 0.0
 
     # scope
-    file_count: int = 0            # intermediate
-    symbol_count: int = 0          # intermediate
+    file_count: int = 0  # intermediate
+    symbol_count: int = 0  # intermediate
     is_multi_file: bool = False
     is_project_wide: bool = False
     has_cross_file_signal: bool = False  # intermediate
@@ -158,10 +162,10 @@ class RouteFeatures:
     looks_trivial_edit: bool = False  # intermediate
 
     # language / capability
-    all_targets_non_structured: Optional[bool] = None
+    all_targets_non_structured: bool | None = None
 
     # readonly analysis subtype
-    readonly_kind: Optional[str] = None  # intermediate
+    readonly_kind: str | None = None  # intermediate
 
     # task classification (derived by _classify_task_meta, passed to RouteDecision)
     task_kind: TaskKind = TaskKind.SINGLE_FILE_EDIT
@@ -170,6 +174,7 @@ class RouteFeatures:
 
 
 # ── Deterministic Classifier ──────────────────────────────────────────────────
+
 
 class DeterministicClassifier:
     """
@@ -186,10 +191,10 @@ class DeterministicClassifier:
 
     # File extension pattern is dynamically generated from LanguageRegistry
     # to stay in sync with registered language providers.
-    _file_ext_pattern: Optional["re.Pattern"] = None
+    _file_ext_pattern: re.Pattern | None = None
 
     @classmethod
-    def _get_file_ext_pattern(cls) -> "re.Pattern":
+    def _get_file_ext_pattern(cls) -> re.Pattern:
         if cls._file_ext_pattern is None:
             cls._file_ext_pattern = re.compile(
                 LanguageRegistry.instance().get_file_pattern(),
@@ -198,15 +203,15 @@ class DeterministicClassifier:
         return cls._file_ext_pattern
 
     _SYMBOL_PATTERN = re.compile(
-        r'(?:'
-        r'[A-Z][a-z]+[A-Z]'              # PascalCase: "UserService", "TodoApp"
-        r'|[a-z]+_[a-z]+'                 # snake_case: "create_user", "login_handler"
-        r'|[a-z]+[A-Z][a-z]+'            # camelCase: "myFunction", "getUser"
-        r'|`[^`]+`'                        # backtick quoted: `my_func`
-        r'|class\s+\w+'                   # explicit: "class Foo"
-        r'|def\s+\w+'                     # explicit: "def bar"
-        r'|function\s+\w+'               # explicit: "function baz"
-        r')',
+        r"(?:"
+        r"[A-Z][a-z]+[A-Z]"  # PascalCase: "UserService", "TodoApp"
+        r"|[a-z]+_[a-z]+"  # snake_case: "create_user", "login_handler"
+        r"|[a-z]+[A-Z][a-z]+"  # camelCase: "myFunction", "getUser"
+        r"|`[^`]+`"  # backtick quoted: `my_func`
+        r"|class\s+\w+"  # explicit: "class Foo"
+        r"|def\s+\w+"  # explicit: "def bar"
+        r"|function\s+\w+"  # explicit: "function baz"
+        r")",
     )
 
     # ── edit intent detection (structural fallback) ──
@@ -224,7 +229,7 @@ class DeterministicClassifier:
 
     @staticmethod
     def _features_from_intent(
-        intent_result: "IntentResult",
+        intent_result: IntentResult,
         f: RouteFeatures,
     ) -> None:
         """Populate RouteFeatures from LLM IntentResult (primary source).
@@ -245,9 +250,9 @@ class DeterministicClassifier:
 
         if it in _read_intents or lane == "read_only":
             f.has_read_intent = True
-            f.has_explain_intent = (it == "question")
-            f.has_locate_intent = (it == "question")  # questions often ask "where is X"
-            f.has_question_form = (it == "question")
+            f.has_explain_intent = it == "question"
+            f.has_locate_intent = it == "question"  # questions often ask "where is X"
+            f.has_question_form = it == "question"
             f.has_edit_intent = False
         else:
             # Any non-read intent (known edit types + unknown future types) → edit
@@ -304,7 +309,7 @@ class DeterministicClassifier:
     def extract_features(
         self,
         request: str,
-        intent_result: Optional["IntentResult"] = None,
+        intent_result: IntentResult | None = None,
     ) -> RouteFeatures:
         """Extract structural features from request. Keywords → features, NOT lanes."""
         f = RouteFeatures()
@@ -312,11 +317,8 @@ class DeterministicClassifier:
         f.word_count = len(request.split())
 
         # CJK normalisation: ~1.5 CJK chars ≈ 1 English word (empirically better than //2
- # for Korean-heavy requests like "3-5줄짜리 파이썬 function를 리팩터링해주세요").
-        _cjk_count = sum(
-            1 for c in request
-            if is_cjk(c)
-        )
+        # for Korean-heavy requests like "3-5줄짜리 파이썬 function를 리팩터링해주세요").
+        _cjk_count = sum(1 for c in request if is_cjk(c))
         if _cjk_count > 5:
             f.word_count = max(f.word_count, _cjk_count * 2 // 3)
 
@@ -330,15 +332,13 @@ class DeterministicClassifier:
 
         _sym_matches = self._SYMBOL_PATTERN.findall(request)
         # Strip backticks from backtick-quoted symbol names
-        _sym_matches = [m.strip('`') for m in _sym_matches]
+        _sym_matches = [m.strip("`") for m in _sym_matches]
         f.symbol_count = len(_sym_matches)
 
         # ── intent extraction ──
         # PRIMARY: IntentResult from LLM (if available and confident)
         _intent_is_primary = (
-            intent_result is not None
-            and intent_result.confidence >= 0.5
-            and intent_result.intent_type != "unknown"
+            intent_result is not None and intent_result.confidence >= 0.5 and intent_result.intent_type != "unknown"
         )
         if _intent_is_primary:
             self._features_from_intent(intent_result, f)  # type: ignore[arg-type]
@@ -356,23 +356,29 @@ class DeterministicClassifier:
         f.has_explicit_file = f.file_count > 0
         f.has_explicit_symbol = f.symbol_count > 0
 
-        _has_line_or_block_anchor = bool(re.search(
-            r'(?:line\s*\d+|this\s+block|import\s+section)',
-            rl,
-        ))
-        _has_css_selector_anchor = bool(re.search(
-            r'(?:\.[a-z][\w-]+|#[a-z][\w-]+|data-[\w-]+)',
-            rl,
-        ))
+        _has_line_or_block_anchor = bool(
+            re.search(
+                r"(?:line\s*\d+|this\s+block|import\s+section)",
+                rl,
+            )
+        )
+        _has_css_selector_anchor = bool(
+            re.search(
+                r"(?:\.[a-z][\w-]+|#[a-z][\w-]+|data-[\w-]+)",
+                rl,
+            )
+        )
         _has_exact_string_anchor = bool(re.search(r'"[^"]{2,}"', request))
 
-        f.has_anchor_or_exact_target = any([
-            f.has_explicit_file,
-            f.has_explicit_symbol,
-            _has_line_or_block_anchor,
-            _has_css_selector_anchor,
-            _has_exact_string_anchor,
-        ])
+        f.has_anchor_or_exact_target = any(
+            [
+                f.has_explicit_file,
+                f.has_explicit_symbol,
+                _has_line_or_block_anchor,
+                _has_css_selector_anchor,
+                _has_exact_string_anchor,
+            ]
+        )
 
         # has_specific_change_object: TRUE if the request mentions a concrete
         # change target (not just a vague "fix this"). Uses IntentResult's
@@ -404,13 +410,15 @@ class DeterministicClassifier:
         # P5: extend/feature intent with single file → downgrade to single_file
         # when there is no cross-file evidence. The extend intent type is a weak
         # signal that inflates scope — file_count + cross-file signal are stronger.
-        if (f.is_multi_file
+        if (
+            f.is_multi_file
             and _intent_is_primary
             and intent_result is not None
             and intent_result.intent_type in ("extend", "feature")
             and f.file_count <= 1
             and not f.has_cross_file_signal
-            and not f.has_propagation_signal):
+            and not f.has_propagation_signal
+        ):
             f.is_multi_file = False
 
         # ── language / capability ──
@@ -420,9 +428,8 @@ class DeterministicClassifier:
             f.all_targets_non_structured = not any(_structured)
 
         # ── ambiguity extraction ──
-        f.has_conflicting_intent = (
-            f.has_edit_intent
-            and (f.has_read_intent or f.has_explain_intent or f.has_locate_intent)
+        f.has_conflicting_intent = f.has_edit_intent and (
+            f.has_read_intent or f.has_explain_intent or f.has_locate_intent
         )
 
         # ── readonly subtype ──
@@ -442,7 +449,8 @@ class DeterministicClassifier:
         return f
 
     def _classify_task_meta(
-        self, f: RouteFeatures,
+        self,
+        f: RouteFeatures,
     ) -> tuple:
         """Derive task_kind, complexity, scope from features (for RouteDecision fields)."""
         # Task kind
@@ -486,7 +494,7 @@ class DeterministicClassifier:
 
         return task_kind, complexity, scope
 
-    def decide_flow(self, f: RouteFeatures, intent_result: Optional["IntentResult"] = None) -> RouteDecision:
+    def decide_flow(self, f: RouteFeatures, intent_result: IntentResult | None = None) -> RouteDecision:
         """Build a MAIN_AGENT routing decision for the request.
 
         PLANNER lane is permanently disabled (Tier 3 consolidation). All
@@ -526,8 +534,8 @@ class DeterministicClassifier:
             confidence=_conf,
             reasoning=_reason,
             self_review_enabled=f.complexity != Complexity.LOW,  # Self-review is useful for complex changes
-            auto_test_on_patch=f.requests_test_work,          # Only when the user explicitly requests it
-            rag_enabled=False,                                 #RAG (topic) PLANNER tier dedicated (tier check)
+            auto_test_on_patch=f.requests_test_work,  # Only when the user explicitly requests it
+            rag_enabled=False,  # RAG (topic) PLANNER tier dedicated (tier check)
             multi_agent=False,
             target_specificity_score=f.target_specificity_score,
         )
@@ -573,16 +581,18 @@ class DeterministicClassifier:
     def classify(
         self,
         request: str,
-        intent_result: Optional["IntentResult"] = None,
+        intent_result: IntentResult | None = None,
     ) -> RouteDecision:
         """Feature-based routing: extract_features() → decide_flow()."""
         features = self.extract_features(
-            request, intent_result=intent_result,
+            request,
+            intent_result=intent_result,
         )
         return self.decide_flow(features, intent_result=intent_result)
 
 
 # ── Task Router ────────────────────────────────────────────────────────────────
+
 
 class TaskRouter:
     """
@@ -642,7 +652,8 @@ class TaskRouter:
 
         # Stage 1: Deterministic (with IntentResult as primary signal source)
         decision = self._deterministic.classify(
-            request, intent_result=intent_result,
+            request,
+            intent_result=intent_result,
         )
         logger.info(
             "Router stage-1: kind=%s lane=%s confidence=%.2f reason=%r",
@@ -662,7 +673,6 @@ class TaskRouter:
 
         # Apply lane-specific config defaults (only fills None fields)
         return self._apply_lane_defaults(decision)
-
 
     def _apply_lane_defaults(self, decision: RouteDecision) -> RouteDecision:
         """Apply default config overrides for the selected lane (only fills None fields)."""

@@ -8,6 +8,7 @@ is caught as a regression, and that the lazy ``__getattr__`` (PEP 562) keeps
 ``from external_llm import ExternalLLMService`` and
 ``unittest.mock.patch("external_llm.ExternalLLMService")`` working.
 """
+
 from __future__ import annotations
 
 import importlib

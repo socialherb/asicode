@@ -1,6 +1,7 @@
 """
 Integration tests for Plan Compiler.
 """
+
 from pathlib import Path
 
 import pytest
@@ -64,12 +65,8 @@ class TestPlanCompiler:
         plan = {
             "version": "ASICODE_PLAN_V1",
             "operations": [
-                {
-                    "type": "edit_blocks",
-                    "path": "nonexistent.py",
-                    "blocks": [{"before": "foo", "after": "bar"}]
-                }
-            ]
+                {"type": "edit_blocks", "path": "nonexistent.py", "blocks": [{"before": "foo", "after": "bar"}]}
+            ],
         }
 
         with pytest.raises(PlanCompileError) as exc_info:
@@ -86,9 +83,9 @@ class TestPlanCompiler:
                 {
                     "type": "edit_blocks",
                     "path": "sample.py",
-                    "blocks": [{"before": "nonexistent content xyz123", "after": "new content"}]
+                    "blocks": [{"before": "nonexistent content xyz123", "after": "new content"}],
                 }
-            ]
+            ],
         }
 
         with pytest.raises(PlanCompileError) as exc_info:
@@ -100,19 +97,15 @@ class TestPlanCompiler:
         """Test compilation prevents path traversal attacks."""
         plan = {
             "version": "ASICODE_PLAN_V1",
-            "operations": [
-                {
-                    "type": "create_file",
-                    "path": "../../../etc/passwd",
-                    "content": "malicious"
-                }
-            ]
+            "operations": [{"type": "create_file", "path": "../../../etc/passwd", "content": "malicious"}],
         }
 
         with pytest.raises(PlanCompileError) as exc_info:
             _compile(plan, temp_repo_root)
 
-        assert "Path traversal" in str(exc_info.value) or "outside" in str(exc_info.value) or ".." in str(exc_info.value)
+        assert (
+            "Path traversal" in str(exc_info.value) or "outside" in str(exc_info.value) or ".." in str(exc_info.value)
+        )
 
     def test_compile_plan_with_insert_before(self, temp_repo_root: str):
         """Test compilation of insert_before operation."""
@@ -124,13 +117,8 @@ class TestPlanCompiler:
         plan = {
             "version": "ASICODE_PLAN_V1",
             "operations": [
-                {
-                    "type": "insert_before",
-                    "path": "test_insert.py",
-                    "anchor": "line2",
-                    "lines": ["inserted_line\n"]
-                }
-            ]
+                {"type": "insert_before", "path": "test_insert.py", "anchor": "line2", "lines": ["inserted_line\n"]}
+            ],
         }
 
         diff = _compile(plan, temp_repo_root)
@@ -149,13 +137,8 @@ class TestPlanCompiler:
         plan = {
             "version": "ASICODE_PLAN_V1",
             "operations": [
-                {
-                    "type": "insert_after",
-                    "path": "test_insert.py",
-                    "anchor": "line2",
-                    "lines": ["inserted_line\n"]
-                }
-            ]
+                {"type": "insert_after", "path": "test_insert.py", "anchor": "line2", "lines": ["inserted_line\n"]}
+            ],
         }
 
         diff = _compile(plan, temp_repo_root)
@@ -173,12 +156,8 @@ class TestPlanCompiler:
         plan = {
             "version": "ASICODE_PLAN_V1",
             "operations": [
-                {
-                    "type": "edit_blocks",
-                    "path": "test_delete.py",
-                    "blocks": [{"before": "line2\nline3\n", "after": ""}]
-                }
-            ]
+                {"type": "edit_blocks", "path": "test_delete.py", "blocks": [{"before": "line2\nline3\n", "after": ""}]}
+            ],
         }
 
         diff = _compile(plan, temp_repo_root)
@@ -199,12 +178,8 @@ class TestPlanCompiler:
         plan = {
             "version": "ASICODE_PLAN_V1",
             "operations": [
-                {
-                    "type": "edit_blocks",
-                    "path": "test_replace.py",
-                    "blocks": [{"before": "old2\n", "after": "new2\n"}]
-                }
-            ]
+                {"type": "edit_blocks", "path": "test_replace.py", "blocks": [{"before": "old2\n", "after": "new2\n"}]}
+            ],
         }
 
         diff = _compile(plan, temp_repo_root)
@@ -214,21 +189,20 @@ class TestPlanCompiler:
 
     def test_compile_plan_validation_invalid_version(self, temp_repo_root: str):
         """Test compilation fails with invalid version."""
-        plan = {
-            "version": "INVALID_VERSION",
-            "operations": []
-        }
+        plan = {"version": "INVALID_VERSION", "operations": []}
 
         with pytest.raises(PlanCompileError) as exc_info:
             _compile(plan, temp_repo_root)
 
-        assert "version" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower() or "kind" in str(exc_info.value).lower()
+        assert (
+            "version" in str(exc_info.value).lower()
+            or "invalid" in str(exc_info.value).lower()
+            or "kind" in str(exc_info.value).lower()
+        )
 
     def test_compile_plan_validation_missing_version(self, temp_repo_root: str):
         """Test compilation fails with missing version."""
-        plan = {
-            "operations": []
-        }
+        plan = {"operations": []}
 
         with pytest.raises(PlanCompileError) as exc_info:
             _compile(plan, temp_repo_root)
@@ -237,9 +211,7 @@ class TestPlanCompiler:
 
     def test_compile_plan_validation_missing_operations(self, temp_repo_root: str):
         """Test compilation fails with missing operations."""
-        plan = {
-            "version": "ASICODE_PLAN_V1"
-        }
+        plan = {"version": "ASICODE_PLAN_V1"}
 
         with pytest.raises(PlanCompileError) as exc_info:
             _compile(plan, temp_repo_root)
@@ -248,10 +220,7 @@ class TestPlanCompiler:
 
     def test_compile_empty_operations(self, temp_repo_root: str):
         """Test compilation with empty operations list raises an error."""
-        plan = {
-            "version": "ASICODE_PLAN_V1",
-            "operations": []
-        }
+        plan = {"version": "ASICODE_PLAN_V1", "operations": []}
 
         with pytest.raises(PlanCompileError):
             _compile(plan, temp_repo_root)
@@ -264,11 +233,7 @@ class TestPlanCompiler:
         diff = _compile(sample_simple_edit_plan_dict, temp_repo_root)
 
         # Apply the diff
-        success = apply_patch_and_verify(
-            temp_repo_root,
-            diff,
-            ["Fixed indentation"]
-        )
+        success = apply_patch_and_verify(temp_repo_root, diff, ["Fixed indentation"])
 
         assert success, "Failed to apply compiled diff"
 
@@ -299,13 +264,10 @@ def func3():
                     "type": "edit_blocks",
                     "path": "complex.py",
                     "blocks": [
-                        {
-                            "before": "def func2():\n    return 2",
-                            "after": "def func2():\n    return 2\n    # Modified"
-                        }
-                    ]
+                        {"before": "def func2():\n    return 2", "after": "def func2():\n    return 2\n    # Modified"}
+                    ],
                 }
-            ]
+            ],
         }
 
         diff = _compile(plan, temp_repo_root)
@@ -315,7 +277,6 @@ def func3():
         # Should only modify func2, not func1 or func3
         assert "func1" not in diff or "+++ b/complex.py" in diff  # Might appear in context lines
         assert "func3" not in diff or "+++ b/complex.py" in diff
-
 
     def test_fuzzy_match_reindents_after_block(self, temp_repo_root: str):
         """When edit_blocks 'before' doesn't match exactly (whitespace diff),
@@ -334,12 +295,12 @@ def func3():
                     "path": "indent_test.ts",
                     "blocks": [
                         {
-                            "before": '    function foo() {\n        return 1;\n    }',
-                            "after": '    function foo() {\n        return 2;\n    }'
+                            "before": "    function foo() {\n        return 1;\n    }",
+                            "after": "    function foo() {\n        return 2;\n    }",
                         }
-                    ]
+                    ],
                 }
-            ]
+            ],
         }
 
         diff = _compile(plan, temp_repo_root)
@@ -359,11 +320,7 @@ def func3():
         separator is preserved (not rewritten to the LLM's mangled version)."""
         filepath = Path(temp_repo_root) / "deco.py"
         sep = "# ── _find_last_definition " + "─" * 30  # box-drawing run
-        filepath.write_text(
-            sep + "\n"
-            "def _find_last_definition(node):\n"
-            "    return node\n"
-        )
+        filepath.write_text(sep + "\ndef _find_last_definition(node):\n    return node\n")
         git_add_and_commit(temp_repo_root, "Add decorative separator file")
 
         # LLM emits ASCII dashes with a different run length than the file.
@@ -376,11 +333,11 @@ def func3():
                     "blocks": [
                         {
                             "before": "# -- _find_last_definition --\n"
-                                      "def _find_last_definition(node):\n"
-                                      "    return node",
+                            "def _find_last_definition(node):\n"
+                            "    return node",
                             "after": "# -- _find_last_definition --\n"
-                                     "def _find_last_definition(node):\n"
-                                     "    return node.last",
+                            "def _find_last_definition(node):\n"
+                            "    return node.last",
                         }
                     ],
                 }
@@ -437,6 +394,7 @@ class TestCreateFileContentNormalization:
         not retain the outer quotes.
         """
         import json as _json
+
         path = "new_dbl.py"
         inner = 'monkeypatch.setenv("EXTERNAL_LLM_MODEL", "deepseek/deepseek-v4-flash")'
         plan = {
@@ -522,14 +480,13 @@ class TestContentNormalizationExtensionGate:
                 "ops": [{"op": "create_file", "path": path, "content": raw}],
             }
             staged = self._stage(plan, temp_repo_root)
-            assert staged[path] == raw, (
-                f"{path}: legitimate literal backslash-n was corrupted by unescape"
-            )
+            assert staged[path] == raw, f"{path}: legitimate literal backslash-n was corrupted by unescape"
 
     def test_code_file_double_encoded_quotes_still_decoded(self, temp_repo_root: str):
         """The gate must NOT break the original fix: for code files the
         double-encoding artifact must still be decoded."""
         import json as _json
+
         inner = 'monkeypatch.setenv("EXTERNAL_LLM_MODEL", "deepseek/deepseek-v4-flash")'
         for path in ["fix.py", "lib.go", "main.rs", "index.ts", "build.sh", "App.vue"]:
             plan = {
@@ -560,15 +517,33 @@ class TestPathIsCodeLike:
     def test_code_extensions(self):
         from plan_compiler import _path_is_code_like
 
-        for path in ["a.py", "src/app.py", "lib.go", "main.rs", "index.ts",
-                     "App.tsx", "App.vue", "build.sh", "Main.kt", "page.dart"]:
+        for path in [
+            "a.py",
+            "src/app.py",
+            "lib.go",
+            "main.rs",
+            "index.ts",
+            "App.tsx",
+            "App.vue",
+            "build.sh",
+            "Main.kt",
+            "page.dart",
+        ]:
             assert _path_is_code_like(path), f"{path} should be code-like"
 
     def test_data_text_extensions(self):
         from plan_compiler import _path_is_code_like
 
-        for path in ["data.json", "notes.txt", "README.md", "conf.yaml",
-                     "data.csv", "page.html", "style.css", "feed.xml"]:
+        for path in [
+            "data.json",
+            "notes.txt",
+            "README.md",
+            "conf.yaml",
+            "data.csv",
+            "page.html",
+            "style.css",
+            "feed.xml",
+        ]:
             assert not _path_is_code_like(path), f"{path} should NOT be code-like"
 
     def test_no_extension_is_not_code_like(self):
@@ -587,6 +562,7 @@ class TestPathIsCodeLike:
         assert _path_is_code_like("Module.GO")
         assert not _path_is_code_like("DATA.JSON")
         assert not _path_is_code_like("README.MD")
+
         @pytest.mark.integration
         class TestDoubleDecodeQuoteFreeCode:
             """The double-JSON-decode gate must catch code whose only encoded character
@@ -608,6 +584,7 @@ class TestPathIsCodeLike:
                 """Double-encoded code with a newline but no inner quotes must still
                 have its outer quotes stripped (the exact regression case)."""
                 import json as _json
+
                 inner = "x = 1\nprint(x)\ny = 2"
                 for path in ["qfree.py", "qfree.go", "qfree.ts"]:
                     plan = {
@@ -616,8 +593,7 @@ class TestPathIsCodeLike:
                     }
                     staged = self._stage(plan, temp_repo_root)
                     assert staged[path] == inner, (
-                        f"{path}: quote-free double-encoded code not decoded; "
-                        f"got {staged[path]!r} expected {inner!r}"
+                        f"{path}: quote-free double-encoded code not decoded; got {staged[path]!r} expected {inner!r}"
                     )
                     assert not staged[path].startswith('"'), f"{path}: outer quotes survived"
 
@@ -632,13 +608,12 @@ class TestPathIsCodeLike:
                     "ops": [{"op": "create_file", "path": "literal.py", "content": body}],
                 }
                 staged = self._stage(plan, temp_repo_root)
-                assert staged["literal.py"] == body, (
-                    "plain quoted string without escapes should be preserved"
-                )
+                assert staged["literal.py"] == body, "plain quoted string without escapes should be preserved"
 
             def test_quote_free_code_with_tab_decoded(self, temp_repo_root: str):
                 """Double-encoded code whose only escape is a tab (``\\t``) must decode."""
                 import json as _json
+
                 inner = "a\tb\tc"
                 plan = {
                     "kind": "ASICODE_PLAN_V1",
@@ -647,6 +622,8 @@ class TestPathIsCodeLike:
                 staged = self._stage(plan, temp_repo_root)
                 assert staged["tabs.py"] == inner
                 assert not staged["tabs.py"].startswith('"')
+
+
 class TestInsertOpsContentNormalization:
     """Regression tests: insert_after / insert_before / insert_after_line line
     payloads PRESERVE language escape sequences (e.g. Python "\n") rather than
@@ -681,15 +658,19 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after", "path": self._ANCHOR_FILE,
-                "anchor": "line2", "lines": ['x = "foo\\nbar"'],
-            }],
+            "ops": [
+                {
+                    "op": "insert_after",
+                    "path": self._ANCHOR_FILE,
+                    "anchor": "line2",
+                    "lines": ['x = "foo\\nbar"'],
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         # Literal backslash-n preserved (not turned into a real newline):
         assert 'x = "foo\\nbar"' in staged
-        assert 'x = "foo\nbar"' not in staged.replace('\\n', '')  # no real newline introduced
+        assert 'x = "foo\nbar"' not in staged.replace("\\n", "")  # no real newline introduced
 
     def test_insert_after_real_newline_flattened(self, temp_repo_root: str):
         """When the LLM wants multiple lines it sends a REAL newline (which the
@@ -698,10 +679,14 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after", "path": self._ANCHOR_FILE,
-                "anchor": "line2", "lines": "import os\nx = 1",  # real newline
-            }],
+            "ops": [
+                {
+                    "op": "insert_after",
+                    "path": self._ANCHOR_FILE,
+                    "anchor": "line2",
+                    "lines": "import os\nx = 1",  # real newline
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         assert "import os\nx = 1" in staged
@@ -711,10 +696,14 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after", "path": self._ANCHOR_FILE,
-                "anchor": "line2", "lines": ["import os", "x = 1"],
-            }],
+            "ops": [
+                {
+                    "op": "insert_after",
+                    "path": self._ANCHOR_FILE,
+                    "anchor": "line2",
+                    "lines": ["import os", "x = 1"],
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         assert "import os\nx = 1" in staged
@@ -725,10 +714,14 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_before", "path": self._ANCHOR_FILE,
-                "anchor": "line2", "content": "import os\nx = 1",
-            }],
+            "ops": [
+                {
+                    "op": "insert_before",
+                    "path": self._ANCHOR_FILE,
+                    "anchor": "line2",
+                    "content": "import os\nx = 1",
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         assert "import os\nx = 1" in staged
@@ -740,14 +733,18 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after_line", "path": self._ANCHOR_FILE,
-                "line": 2, "lines": ['x = "foo\\nbar"'],
-            }],
+            "ops": [
+                {
+                    "op": "insert_after_line",
+                    "path": self._ANCHOR_FILE,
+                    "line": 2,
+                    "lines": ['x = "foo\\nbar"'],
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         assert 'x = "foo\\nbar"' in staged
-        assert 'x = "foo\nbar"' not in staged.replace('\\n', '')
+        assert 'x = "foo\nbar"' not in staged.replace("\\n", "")
 
     def test_insert_after_line_real_newline_flattened(self, temp_repo_root: str):
         """insert_after_line: a real newline (JSON-decoded) is flattened into
@@ -755,10 +752,14 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after_line", "path": self._ANCHOR_FILE,
-                "line": 2, "lines": "import os\nx = 1",  # real newline
-            }],
+            "ops": [
+                {
+                    "op": "insert_after_line",
+                    "path": self._ANCHOR_FILE,
+                    "line": 2,
+                    "lines": "import os\nx = 1",  # real newline
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         assert "import os\nx = 1" in staged
@@ -771,14 +772,17 @@ class TestInsertOpsContentNormalization:
         ``unterminated string literal``. This is the exact failure a parallel
         session hit via write_plan/insert_after_line."""
         # seed a valid python body so the whole staged file compiles
-        create_test_file(temp_repo_root, self._ANCHOR_FILE,
-                         "line1 = 1\nline2 = 2\nline3 = 3\n")
+        create_test_file(temp_repo_root, self._ANCHOR_FILE, "line1 = 1\nline2 = 2\nline3 = 3\n")
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after", "path": self._ANCHOR_FILE,
-                "anchor": "line2 = 2", "lines": ['_out = "\\n".join(_parts)'],
-            }],
+            "ops": [
+                {
+                    "op": "insert_after",
+                    "path": self._ANCHOR_FILE,
+                    "anchor": "line2 = 2",
+                    "lines": ['_out = "\\n".join(_parts)'],
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         # Must compile cleanly — the literal backslash-n inside the string must survive.
@@ -786,14 +790,17 @@ class TestInsertOpsContentNormalization:
 
     def test_insert_after_line_py_compiles_with_newline_join_escape(self, temp_repo_root: str):
         """Same regression as above, via insert_after_line (line-number based)."""
-        create_test_file(temp_repo_root, self._ANCHOR_FILE,
-                         "line1 = 1\nline2 = 2\nline3 = 3\n")
+        create_test_file(temp_repo_root, self._ANCHOR_FILE, "line1 = 1\nline2 = 2\nline3 = 3\n")
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after_line", "path": self._ANCHOR_FILE,
-                "line": 2, "lines": ['_out = "\\n".join(_parts)'],
-            }],
+            "ops": [
+                {
+                    "op": "insert_after_line",
+                    "path": self._ANCHOR_FILE,
+                    "line": 2,
+                    "lines": ['_out = "\\n".join(_parts)'],
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         compile(staged, self._ANCHOR_FILE, "exec")
@@ -804,10 +811,14 @@ class TestInsertOpsContentNormalization:
         self._seed(temp_repo_root)
         plan = {
             "kind": "ASICODE_PLAN_V1",
-            "ops": [{
-                "op": "insert_after_line", "path": self._ANCHOR_FILE,
-                "line": 2, "lines": ["import os", "x = 1"],
-            }],
+            "ops": [
+                {
+                    "op": "insert_after_line",
+                    "path": self._ANCHOR_FILE,
+                    "line": 2,
+                    "lines": ["import os", "x = 1"],
+                }
+            ],
         }
         staged = self._stage(plan, temp_repo_root)
         assert "import os\nx = 1" in staged
@@ -843,7 +854,7 @@ class TestReplaceFileGuardHonorsStagedState:
         because the file did not exist on disk yet.
         """
         big = "x = 1\n" * 1000  # ~6000 chars
-        small = "y = 2\n"        # 6 chars -> ~0.1% of big
+        small = "y = 2\n"  # 6 chars -> ~0.1% of big
         plan = {
             "kind": "ASICODE_PLAN_V1",
             "ops": [
@@ -903,8 +914,8 @@ class TestLnoPrefixStrip:
         assert _has_lno_prefix("28:code") is True
 
     def test_has_lno_prefix_rejects_non_prefix(self):
-        assert _has_lno_prefix("code: here") is False   # colon not preceded by digits
-        assert _has_lno_prefix(":code") is False        # colon at index 0
+        assert _has_lno_prefix("code: here") is False  # colon not preceded by digits
+        assert _has_lno_prefix(":code") is False  # colon at index 0
         assert _has_lno_prefix("plain line") is False
         assert _has_lno_prefix("") is False
 
@@ -912,11 +923,11 @@ class TestLnoPrefixStrip:
         assert _strip_lno_prefix("  28: code") == "code"
         assert _strip_lno_prefix("28: code") == "code"
         assert _strip_lno_prefix("28:\tcode") == "code"
-        assert _strip_lno_prefix("28:  code") == " code"   # only ONE space consumed
+        assert _strip_lno_prefix("28:  code") == " code"  # only ONE space consumed
 
     def test_strip_lno_prefix_no_prefix_unchanged(self):
         assert _strip_lno_prefix("plain line") == "plain line"
-        assert _strip_lno_prefix("28 : code") == "28 : code"   # space before colon
+        assert _strip_lno_prefix("28 : code") == "28 : code"  # space before colon
 
     def test_strip_lno_prefix_no_space_keeps_space(self):
         """insert_after_line payload indentation must survive verbatim."""

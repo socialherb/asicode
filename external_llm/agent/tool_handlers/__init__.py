@@ -4,6 +4,7 @@ Tool handler mixins for ToolRegistry.
 Each module contains a Mixin class with a group of _tool_* methods.
 ToolRegistry inherits from all mixins via multiple inheritance.
 """
+
 from .agent_tools import AgentToolsMixin
 from .analysis_tools import AnalysisToolsMixin
 from .browser_tools import BrowserActionToolsMixin

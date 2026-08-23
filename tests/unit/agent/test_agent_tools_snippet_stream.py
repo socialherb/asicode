@@ -47,9 +47,7 @@ def test_snippet_out_of_range_returns_empty(tmp_path):
 def test_stream_split_window_stops_reading_after_last():
     raw = b"".join(b"line %d\n" % i for i in range(1, 100_001))
     fh = _CountingReader(raw)
-    total, window = _stream_split_window(
-        fh, b"", 1, 80, 1 << 20, stop_after_last=True
-    )
+    total, window = _stream_split_window(fh, b"", 1, 80, 1 << 20, stop_after_last=True)
     assert len(window) == 80
     # Chunk-granularity stop: the whole first 64 KiB chunk is counted before
     # the break fires, so total overshoots — the caller discards it.

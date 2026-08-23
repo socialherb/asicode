@@ -1,11 +1,11 @@
 """
 Language registry — singleton that maps file paths to providers.
 """
+
 from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
 
 from .base import SyntaxProvider
 from .models import LanguageId
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class LanguageRegistry:
     """Singleton registry of language providers, keyed by ``LanguageId``."""
 
-    _instance: Optional["LanguageRegistry"] = None
+    _instance: LanguageRegistry | None = None
 
     def __init__(self) -> None:
         self._providers: dict[LanguageId, SyntaxProvider] = {}
@@ -44,6 +44,7 @@ class LanguageRegistry:
         from .scala_provider import ScalaSyntaxProvider
         from .swift_provider import SwiftSyntaxProvider
         from .typescript_provider import TypeScriptSyntaxProvider
+
         self.register(PythonSyntaxProvider())
         self.register(TypeScriptSyntaxProvider())
         self.register(JavaScriptSyntaxProvider())
@@ -67,7 +68,7 @@ class LanguageRegistry:
         self.register(CppSyntaxProvider())
 
     @classmethod
-    def instance(cls) -> "LanguageRegistry":
+    def instance(cls) -> LanguageRegistry:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -86,12 +87,12 @@ class LanguageRegistry:
 
     # ── Lookup ────────────────────────────────────────────────────────────
 
-    def get(self, file_path: str) -> Optional[SyntaxProvider]:
+    def get(self, file_path: str) -> SyntaxProvider | None:
         """Return the provider for *file_path*, or ``None`` if unsupported."""
         lang = LanguageId.from_path(file_path)
         return self._providers.get(lang)
 
-    def get_by_lang(self, lang: LanguageId) -> Optional[SyntaxProvider]:
+    def get_by_lang(self, lang: LanguageId) -> SyntaxProvider | None:
         """Return the provider for *lang*, or ``None`` if unsupported."""
         return self._providers.get(lang)
 

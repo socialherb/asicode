@@ -41,14 +41,9 @@ def _only_symbol(g: RepositoryGraph):
 
 # --- positive: the exotic-args shapes that used to carry per-call suppress ----
 def test_signature_extraction_full_shapes():
-    src = (
-        "async def f(a: int = 1, *args: str, b: float = 2.0, **kw: bool) -> None:\n"
-        "    return\n"
-    )
+    src = "async def f(a: int = 1, *args: str, b: float = 2.0, **kw: bool) -> None:\n    return\n"
     sym = _only_symbol(_build_graph(src))
-    assert sym.signature == (
-        "async def f(a: int = 1, *args: str, b: float = 2.0, **kw: bool) -> None"
-    ), sym.signature
+    assert sym.signature == ("async def f(a: int = 1, *args: str, b: float = 2.0, **kw: bool) -> None"), sym.signature
     # Hash = sha1 of name + arg names (vararg/kwarg prefixed), first 8 hex chars.
     expected = hashlib.sha1(b"f,a,*args,b,**kw", usedforsecurity=False).hexdigest()[:8]
     assert sym.signature_hash == expected

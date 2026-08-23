@@ -66,9 +66,7 @@ class TestEstimateCacheAdjustedCost:
     def test_anthropic_cache_creation_premium(self):
         # Cache writes cost a 25% premium over the base input rate.
         in_rate, _ = _RATES["anthropic"]
-        cost = estimate_cache_adjusted_cost(
-            "anthropic", 1000, 0, cache_read_tok=0, cache_creation_tok=10000
-        )
+        cost = estimate_cache_adjusted_cost("anthropic", 1000, 0, cache_read_tok=0, cache_creation_tok=10000)
         expected = (1000 * in_rate + 10000 * in_rate * 1.25) / 1_000_000
         assert cost == pytest.approx(expected, rel=1e-9)
 
@@ -94,9 +92,7 @@ class TestCacheHitPct:
 
     def test_deepseek_uses_prompt_denominator(self):
         # DeepSeek prompt already includes the cached reads as a subset.
-        assert cache_hit_pct("deepseek", 12327, 3968) == pytest.approx(
-            3968 * 100.0 / 12327, rel=1e-9
-        )
+        assert cache_hit_pct("deepseek", 12327, 3968) == pytest.approx(3968 * 100.0 / 12327, rel=1e-9)
 
     def test_zai_uses_total_input_denominator(self):
         # Regression: ZAIAnthropicClient serves GLM over the Anthropic Messages
@@ -137,9 +133,7 @@ class TestCacheHitPct:
         without_creation = cache_hit_pct("anthropic", 1500, 40000, 0)
         with_creation = cache_hit_pct("anthropic", 1500, 40000, 5000)
         assert with_creation < without_creation
-        assert with_creation == pytest.approx(
-            40000 * 100.0 / (1500 + 40000 + 5000), rel=1e-9
-        )
+        assert with_creation == pytest.approx(40000 * 100.0 / (1500 + 40000 + 5000), rel=1e-9)
         assert 0.0 <= with_creation <= 100.0
 
 
@@ -148,16 +142,14 @@ class TestCacheCostSummary:
 
     def test_anthropic_actual_below_full_for_reads(self):
         full, actual, hit = cache_cost_summary("anthropic", 15308, 749, 23574, 0)
-        assert actual < full          # arrow reads as a real saving
-        assert actual > 0             # not negative
-        assert 0.0 <= hit <= 100.0    # not 154%
+        assert actual < full  # arrow reads as a real saving
+        assert actual > 0  # not negative
+        assert 0.0 <= hit <= 100.0  # not 154%
 
     def test_deepseek_matches_legacy_helpers(self):
         full, actual, _hit = cache_cost_summary("deepseek", 12327, 3312, 3968, 0)
         assert full == pytest.approx(estimate_cost("deepseek", 12327, 3312), rel=1e-9)
-        assert actual == pytest.approx(
-            estimate_cache_adjusted_cost("deepseek", 12327, 3312, 3968), rel=1e-9
-        )
+        assert actual == pytest.approx(estimate_cache_adjusted_cost("deepseek", 12327, 3312, 3968), rel=1e-9)
 
 
 class TestDeepSeekModelCacheRate:
@@ -168,30 +160,41 @@ class TestDeepSeekModelCacheRate:
     must take precedence over the provider-level ``_CACHE_DISCOUNT`` fallback.
     """
 
-    @pytest.mark.parametrize("model,cache_rate", [
-        ("deepseek-v4-flash",  0.0028),
-        ("deepseek-v4-pro",    0.003625),
-        ("deepseek-chat",      0.07),
-        ("deepseek-reasoner",  0.14),
-        ("deepseek-r1",        0.14),
-    ])
+    @pytest.mark.parametrize(
+        "model,cache_rate",
+        [
+            ("deepseek-v4-flash", 0.0028),
+            ("deepseek-v4-pro", 0.003625),
+            ("deepseek-chat", 0.07),
+            ("deepseek-reasoner", 0.14),
+            ("deepseek-r1", 0.14),
+        ],
+    )
     def test_model_specific_cache_rate_used(self, model, cache_rate):
         """Model-specific cached rate must be used instead of provider discount."""
         # DeepSeek uses subset accounting: prompt INCLUDES cache_read.
         prompt, cached, completion = 10000, 5000, 2000
         # Get the input rate for this model.
         in_rate = {
-            "deepseek-v4-flash": 0.14, "deepseek-v4-pro": 0.435,
-            "deepseek-chat": 0.27, "deepseek-reasoner": 0.55,
+            "deepseek-v4-flash": 0.14,
+            "deepseek-v4-pro": 0.435,
+            "deepseek-chat": 0.27,
+            "deepseek-reasoner": 0.55,
             "deepseek-r1": 0.55,
         }[model]
         out_rate = {
-            "deepseek-v4-flash": 0.28, "deepseek-v4-pro": 0.87,
-            "deepseek-chat": 1.10, "deepseek-reasoner": 2.19,
+            "deepseek-v4-flash": 0.28,
+            "deepseek-v4-pro": 0.87,
+            "deepseek-chat": 1.10,
+            "deepseek-reasoner": 2.19,
             "deepseek-r1": 2.19,
         }[model]
         actual = estimate_cache_adjusted_cost(
-            "deepseek", prompt, completion, cached, model=model,
+            "deepseek",
+            prompt,
+            completion,
+            cached,
+            model=model,
         )
         # Subset formula: raw - cached * (in_rate - cache_rate)
         raw = (prompt * in_rate + completion * out_rate) / 1_000_000
@@ -203,7 +206,11 @@ class TestDeepSeekModelCacheRate:
     def test_v4_flash_cache_is_very_cheap(self):
         """v4-flash cache hit at $0.0028/1M is dramatically cheaper than full input."""
         actual = estimate_cache_adjusted_cost(
-            "deepseek", 100_000, 5000, cache_read_tok=80_000, model="deepseek-v4-flash",
+            "deepseek",
+            100_000,
+            5000,
+            cache_read_tok=80_000,
+            model="deepseek-v4-flash",
         )
         full = estimate_cost("deepseek", 100_000, 5000, model="deepseek-v4-flash")
         # With 80% cache hit at v4-flash's $0.0028/1M, savings should be substantial.
@@ -212,6 +219,7 @@ class TestDeepSeekModelCacheRate:
     def test_unknown_deepseek_uses_fallback(self):
         """Unknown DeepSeek model falls back to _CACHE_DISCOUNT['deepseek'] = 0.26."""
         from external_llm.agent._shared_utils import _get_cached_input_rate
+
         cached = _get_cached_input_rate("deepseek", 0.5, "deepseek-v5-flash")
         assert cached == pytest.approx(0.5 * 0.26, rel=1e-9)
 
@@ -228,6 +236,7 @@ class TestOpenRouterDeepSeekCache:
     def test_flat_10_percent_discount(self):
         """OpenRouter DeepSeek cache uses 10% of OpenRouter's input rate."""
         from external_llm.agent._shared_utils import _get_cached_input_rate
+
         # v4-flash: OpenRouter input = $0.09/1M
         cached = _get_cached_input_rate("openrouter", 0.09, "deepseek/deepseek-v4-flash")
         assert cached == pytest.approx(0.09 * 0.1, rel=1e-9)  # $0.009
@@ -235,22 +244,32 @@ class TestOpenRouterDeepSeekCache:
     def test_v4_pro_flat_discount(self):
         """OpenRouter v4-pro also uses flat 10% (not native's 0.8%)."""
         from external_llm.agent._shared_utils import _get_cached_input_rate
+
         cached = _get_cached_input_rate("openrouter", 0.435, "deepseek/deepseek-v4-pro")
         assert cached == pytest.approx(0.435 * 0.1, rel=1e-9)  # $0.0435
 
     def test_unknown_openrouter_deepseek_uses_fallback(self):
         """Unknown OpenRouter model falls back to openrouter flat 10%."""
         from external_llm.agent._shared_utils import _get_cached_input_rate
+
         cached = _get_cached_input_rate("openrouter", 0.5, "deepseek/deepseek-v5-flash")
         assert cached == pytest.approx(0.5 * 0.1, rel=1e-9)
 
     def test_cost_differs_from_native(self):
         """OpenRouter cache cost differs from native — this is expected (different input rates)."""
         or_cost = estimate_cache_adjusted_cost(
-            "openrouter", 100_000, 5000, 50_000, model="deepseek/deepseek-v4-flash",
+            "openrouter",
+            100_000,
+            5000,
+            50_000,
+            model="deepseek/deepseek-v4-flash",
         )
         native_cost = estimate_cache_adjusted_cost(
-            "deepseek", 100_000, 5000, 50_000, model="deepseek-v4-flash",
+            "deepseek",
+            100_000,
+            5000,
+            50_000,
+            model="deepseek-v4-flash",
         )
         # Both should be cheaper than no-cache cost.
         assert or_cost < estimate_cost("openrouter", 100_000, 5000, model="deepseek/deepseek-v4-flash")
@@ -271,12 +290,15 @@ class TestZaiModelCacheRate:
     Z.AI's cache storage is free so no creation premium applies.
     """
 
-    @pytest.mark.parametrize("model,in_rate,cached_rate", [
-        ("glm-5.2", 1.40, 0.26),
-        ("glm-5",   1.00, 0.20),
-        ("glm-4.6", 0.60, 0.11),
-        ("glm-4.5", 0.60, 0.11),
-    ])
+    @pytest.mark.parametrize(
+        "model,in_rate,cached_rate",
+        [
+            ("glm-5.2", 1.40, 0.26),
+            ("glm-5", 1.00, 0.20),
+            ("glm-4.6", 0.60, 0.11),
+            ("glm-4.5", 0.60, 0.11),
+        ],
+    )
     def test_separate_reprice_bit_exact(self, model, in_rate, cached_rate):
         # 12327 uncached input + 3968 cached (reported separately), 3312 output.
         # prompt_tok EXCLUDES cached (Anthropic usage shape); cached is billed at
@@ -285,11 +307,14 @@ class TestZaiModelCacheRate:
         prompt, cached, completion = 12327, 3968, 3312
         out_rate = {"glm-5.2": 4.40, "glm-5": 3.20, "glm-4.6": 2.20, "glm-4.5": 2.20}[model]
         actual = estimate_cache_adjusted_cost(
-            "zai", prompt, completion, cached, model=model,
+            "zai",
+            prompt,
+            completion,
+            cached,
+            model=model,
             base_url="https://api.z.ai/paas/v4/chat",
         )
-        expected = (prompt * in_rate + cached * cached_rate
-                    + completion * out_rate) / 1_000_000
+        expected = (prompt * in_rate + cached * cached_rate + completion * out_rate) / 1_000_000
         assert actual == pytest.approx(expected, rel=1e-9)
         # Cheaper than billing ALL input (prompt + cached) at the full rate.
         assert actual < estimate_cost("zai", prompt + cached, completion, model=model)
@@ -300,17 +325,23 @@ class TestZaiModelCacheRate:
         # ALL input (prompt + cached) at full price (no savings).
         prompt, cached, completion = 12327, 3968, 3312
         adjusted = estimate_cache_adjusted_cost(
-            "zai", prompt, completion, cached  # no model=
+            "zai",
+            prompt,
+            completion,
+            cached,  # no model=
         )
-        assert adjusted == pytest.approx(
-            estimate_cost("zai", prompt + cached, completion), rel=1e-9
-        )
+        assert adjusted == pytest.approx(estimate_cost("zai", prompt + cached, completion), rel=1e-9)
 
     def test_summary_shows_savings_for_glm52(self):
         # Regression: before model-specific rates, actual == full (no savings).
         # Pass PAYG base_url so the model-specific cached rate applies.
         full, actual, hit = cache_cost_summary(
-            "zai", 12327, 3312, 3968, 0, model="glm-5.2",
+            "zai",
+            12327,
+            3312,
+            3968,
+            0,
+            model="glm-5.2",
             base_url="https://api.z.ai/paas/v4/chat",
         )
         assert actual < full
@@ -332,6 +363,7 @@ class TestZaiModelCacheRate:
         assert _longest_prefix_match("glm-5.2", reversed_table) == 0.26
         # And the production table resolves both tiers correctly.
         from external_llm.agent._shared_utils import _MODEL_CACHE_RATE
+
         assert _longest_prefix_match("glm-5.2", _MODEL_CACHE_RATE) == 0.26
         assert _longest_prefix_match("glm-5", _MODEL_CACHE_RATE) == 0.20
 
@@ -341,7 +373,11 @@ class TestZaiModelCacheRate:
         """z.ai Coding Plan (no base_url): cached tokens billed at full in_rate."""
         prompt, cached, completion = 12327, 3968, 3312
         actual = estimate_cache_adjusted_cost(
-            "zai", prompt, completion, cached, model="glm-5.2",
+            "zai",
+            prompt,
+            completion,
+            cached,
+            model="glm-5.2",
         )
         # No discount: cost = (prompt + cached) * in_rate + completion * out_rate
         expected = estimate_cost("zai", prompt + cached, completion, model="glm-5.2")
@@ -350,7 +386,12 @@ class TestZaiModelCacheRate:
     def test_coding_plan_summary_shows_no_savings(self):
         """cache_cost_summary for Coding Plan: actual == full (no savings)."""
         full, actual, hit = cache_cost_summary(
-            "zai", 12327, 3312, 3968, 0, model="glm-5.2",
+            "zai",
+            12327,
+            3312,
+            3968,
+            0,
+            model="glm-5.2",
         )
         assert actual == pytest.approx(full, rel=1e-9)
         assert 0.0 <= hit <= 100.0
@@ -363,7 +404,11 @@ class TestZaiModelCacheRate:
         """z.ai PAYG endpoint: cached tokens at model-specific discount rate."""
         prompt, cached, completion = 12327, 3968, 3312
         actual = estimate_cache_adjusted_cost(
-            "zai", prompt, completion, cached, model="glm-5.2",
+            "zai",
+            prompt,
+            completion,
+            cached,
+            model="glm-5.2",
             base_url=self._PAYG_URL,
         )
         # Should be cheaper than full price (discount applied).
@@ -373,7 +418,12 @@ class TestZaiModelCacheRate:
     def test_payg_summary_shows_savings(self):
         """cache_cost_summary for PAYG: actual < full (savings)."""
         full, actual, hit = cache_cost_summary(
-            "zai", 12327, 3312, 3968, 0, model="glm-5.2",
+            "zai",
+            12327,
+            3312,
+            3968,
+            0,
+            model="glm-5.2",
             base_url=self._PAYG_URL,
         )
         assert actual < full
@@ -383,6 +433,7 @@ class TestZaiModelCacheRate:
 
     def test_is_zai_payg_url_variants(self):
         from external_llm.agent._shared_utils import _is_zai_payg_url
+
         # Coding Plan endpoints
         assert not _is_zai_payg_url("")
         assert not _is_zai_payg_url("https://api.z.ai/anthropic/v1/messages")
@@ -408,10 +459,7 @@ class TestExtractFilesFromPatch:
 
     def test_both_formats_deduplication(self):
         patch = (
-            "diff --git a/file_a.py b/file_a.py\n"
-            "+++ b/file_a.py\n"
-            "diff --git a/file_b.py b/file_b.py\n"
-            "+++ b/file_b.py\n"
+            "diff --git a/file_a.py b/file_a.py\n+++ b/file_a.py\ndiff --git a/file_b.py b/file_b.py\n+++ b/file_b.py\n"
         )
         result = extract_files_from_patch(patch)
         assert result == ["file_a.py", "file_b.py"]
@@ -431,11 +479,7 @@ class TestExtractFilesFromPatch:
         assert result == ["README.md"]
 
     def test_multiple_files_plus(self):
-        patch = (
-            "+++ b/first.py\n"
-            "+++ b/second.py\n"
-            "--- a/third.py\n"
-        )
+        patch = "+++ b/first.py\n+++ b/second.py\n--- a/third.py\n"
         result = extract_files_from_patch(patch)
         assert result == ["first.py", "second.py"]
 
@@ -543,6 +587,7 @@ def test_archive_capped_put_bounds_archive_cache():
 # package pollute the index. Both walkers now share _walk_should_skip_dir, so
 # these cases must be skipped regardless of which walker runs.
 
+
 def test_walk_should_skip_dir_excludes_hidden_vendor_venv_and_site_packages():
     """_walk_should_skip_dir must skip hidden, vendor, venv*, site-packages, egg-info."""
     from external_llm.agent._shared_utils import _walk_should_skip_dir
@@ -552,11 +597,22 @@ def test_walk_should_skip_dir_excludes_hidden_vendor_venv_and_site_packages():
     # the *original* _walk_py_files semantics, preserved verbatim — broadening
     # to `"venv" in d` would also catch benign dirs like "invention"/"prevention".
     skip = [
-        ".git", ".hidden", ".venv", ".mypy_cache",              # hidden / dot-dirs
-        "__pycache__", "node_modules", "env", "build", "dist",  # _WALK_SKIP_DIRS exact
-        "venv", "venv310", "venv-proj",                         # venv* prefix (TS/JS regressed here)
-        "site-packages", "lib.site-packages",                   # site-packages substring (TS/JS regressed here)
-        "foo.egg-info", "pkg.egg-info",                         # *.egg-info
+        ".git",
+        ".hidden",
+        ".venv",
+        ".mypy_cache",  # hidden / dot-dirs
+        "__pycache__",
+        "node_modules",
+        "env",
+        "build",
+        "dist",  # _WALK_SKIP_DIRS exact
+        "venv",
+        "venv310",
+        "venv-proj",  # venv* prefix (TS/JS regressed here)
+        "site-packages",
+        "lib.site-packages",  # site-packages substring (TS/JS regressed here)
+        "foo.egg-info",
+        "pkg.egg-info",  # *.egg-info
     ]
     for d in skip:
         assert _walk_should_skip_dir(d), f"expected {d!r} to be skipped"
@@ -577,6 +633,7 @@ def test_walk_should_skip_dir_keeps_normal_source_dirs():
 # a .py walk must never satisfy a later .ts lookup (and vice versa). These lock
 # in the design decision that justifies keeping two wrappers + two caches
 # instead of collapsing into a single walker.
+
 
 def test_walk_caches_are_isolated_per_extension_set(tmp_path):
     """A py walk populates _PY_WALK_CACHE only; a ts/js walk the ts cache only."""
@@ -600,6 +657,7 @@ def test_walk_caches_are_isolated_per_extension_set(tmp_path):
     assert str(tmp_path) in su._TS_WALK_CACHE
     assert {p.name for p in su._PY_WALK_CACHE[str(tmp_path)][1]} == {"a.py"}
     assert {p.name for p in su._TS_WALK_CACHE[str(tmp_path)][1]} == {"b.ts"}
+
 
 def test_walk_ts_js_consumes_TS_JS_EXTENSIONS_constant(tmp_path, monkeypatch):
     """_walk_ts_js_files must honor the _TS_JS_EXTENSIONS constant (single source
@@ -729,8 +787,7 @@ def test_walk_repo_files_complete_cache_serves_smaller_cap_without_overshoot(tmp
     # Second walk with a smaller cap → cache hit, but result sliced to the cap.
     small = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"), [0])
     assert len(small) == 3, (
-        "Complete cache must be sliced to the caller's cap — got "
-        f"{len(small)} files for a max_files=3 request"
+        f"Complete cache must be sliced to the caller's cap — got {len(small)} files for a max_files=3 request"
     )
     assert small is not big  # still a distinct object (shallow copy after slice)
 
@@ -753,9 +810,7 @@ def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
     first = _walk_repo_files(tmp_path, 3, cache, lambda n: n.endswith(".py"), [0])
     assert len(first) == 3
     cached_obj = cache[str(tmp_path)][1]
-    assert first is not cached_obj, (
-        "Truncated miss path must return a COPY, not the cached list object"
-    )
+    assert first is not cached_obj, "Truncated miss path must return a COPY, not the cached list object"
     # Mutate the returned copy; the cache entry must be unaffected.
     first.append(Path("/polluted.py"))
     assert Path("/polluted.py") not in cache[str(tmp_path)][1], (
@@ -770,9 +825,7 @@ def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
     complete = _walk_repo_files(sub, 100, cache2, lambda n: n.endswith(".py"), [0])
     assert len(complete) == 1
     cached_obj2 = cache2[str(sub)][1]
-    assert complete is not cached_obj2, (
-        "Complete-walk miss path must return a COPY, not the cached list object"
-    )
+    assert complete is not cached_obj2, "Complete-walk miss path must return a COPY, not the cached list object"
     complete.append(Path("/polluted2.py"))
     assert Path("/polluted2.py") not in cache2[str(sub)][1]
 
@@ -785,6 +838,7 @@ def test_walk_repo_files_miss_path_returns_copy_not_cached_object(tmp_path):
 # empty find_symbol results. The walker now (1) sorts dirnames+filenames for a
 # deterministic, source-prioritized descent and (2) flags truncation so callers
 # can tell "absent" from "not indexed".
+
 
 def test_walk_dir_sort_key_source_before_tests_fixtures_generated():
     """_walk_dir_sort_key must tier source dirs (0) before tests/fixtures (1),
@@ -916,15 +970,14 @@ def test_walk_truncated_for_reports_slice_from_a_complete_cache_entry(tmp_path):
     )
 
     root = _seed_walk(tmp_path, 50)
-    complete = _walk_py_files(root, 100)          # high-cap caller finishes
+    complete = _walk_py_files(root, 100)  # high-cap caller finishes
     assert len(complete) == 50
     assert _PY_WALK_CACHE[str(root)][2] is False, "cache entry should be complete"
 
-    shortened = _walk_py_files(root, 20)          # low-cap caller reuses it
+    shortened = _walk_py_files(root, 20)  # low-cap caller reuses it
     assert len(shortened) == 20, "expected the cache-hit slice path"
     assert _walk_truncated_for(root, _PY_WALK_CACHE, 20) is True, (
-        "a 20-of-50 result is truncated for this caller even though the cached "
-        "walk itself was complete"
+        "a 20-of-50 result is truncated for this caller even though the cached walk itself was complete"
     )
 
 
@@ -938,9 +991,7 @@ def test_walk_truncated_for_is_false_when_the_cap_covers_the_corpus(tmp_path):
     root = _seed_walk(tmp_path, 50)
     _walk_py_files(root, 100)
     assert _walk_truncated_for(root, _PY_WALK_CACHE, 100) is False
-    assert _walk_truncated_for(root, _PY_WALK_CACHE, 50) is False, (
-        "cap exactly equal to the corpus size loses nothing"
-    )
+    assert _walk_truncated_for(root, _PY_WALK_CACHE, 50) is False, "cap exactly equal to the corpus size loses nothing"
 
 
 def test_walk_truncated_for_still_honours_the_stored_flag(tmp_path):
@@ -971,11 +1022,11 @@ def test_symbol_searcher_passes_its_own_cap(tmp_path):
     from external_llm.agent._shared_utils import _walk_py_files
 
     root = _seed_walk(tmp_path, 50)
-    _walk_py_files(root, 100)                      # complete entry, cap 100
+    _walk_py_files(root, 100)  # complete entry, cap 100
     searcher = ss.SymbolSearcher(str(root))
     original = ss._MAX_PY_FILES
     try:
-        ss._MAX_PY_FILES = 20                      # our cap is lower
+        ss._MAX_PY_FILES = 20  # our cap is lower
         assert searcher.index_was_truncated() is True
         ss._MAX_PY_FILES = 100
         assert searcher.index_was_truncated() is False

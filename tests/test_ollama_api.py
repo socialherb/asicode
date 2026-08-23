@@ -8,6 +8,7 @@ Covers:
   * Connection / timeout / HTTP failures never poison the cache.
   * Ollama-format model-name guard.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -59,6 +60,7 @@ def _age_negative_past_ttl() -> None:
 
 
 # ── TTL-bounded cache (the fix) ────────────────────────────────────────────
+
 
 class TestTTLCache:
     @patch("external_llm.ollama_api.requests.post")
@@ -122,6 +124,7 @@ class TestTTLCache:
 
 
 # ── Failure paths: short negative cache (storm-collapse + expiry) ───────────
+
 
 class TestNegativeCache:
     """Failures populate a short-TTL negative cache that collapses per-request
@@ -230,6 +233,7 @@ class TestNegativeCache:
 
 # ── FIFO entry cap (parity with _shared_utils._capped_put) ──────────────────
 
+
 class TestCacheCap:
     """Both num_ctx caches are FIFO-bounded so a pathological spread of distinct
     (model, base_url) keys cannot grow either dict without bound."""
@@ -255,6 +259,7 @@ class TestCacheCap:
 
 
 # ── Ollama-format model-name guard ─────────────────────────────────────────
+
 
 class TestModelNameGuard:
     @patch("external_llm.ollama_api.requests.post")
@@ -319,6 +324,7 @@ class TestNumCtxForModelFallback:
     def test_estimation_with_llmmessage_raises_above_floor(self, _reg, _api):
         """Real LLMMessage with large content triggers estimation > 8192."""
         from external_llm.client import LLMMessage
+
         msgs = [LLMMessage(role="user", content="x" * 50000)]
         est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
         assert est > 8192
@@ -329,6 +335,7 @@ class TestNumCtxForModelFallback:
     def test_estimation_caps_at_32768(self, _reg, _api):
         """Extremely large messages cap at 32768, never above."""
         from external_llm.client import LLMMessage
+
         msgs = [LLMMessage(role="user", content="x" * 1_000_000)]
         est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
         assert est <= 32768
@@ -346,6 +353,7 @@ class TestNumCtxForModelFallback:
     def test_explicit_modelfile_not_raised_by_estimation(self, _api):
         """Priority 0 Modelfile value honoured exactly, even if estimate > it."""
         from external_llm.client import LLMMessage
+
         msgs = [LLMMessage(role="user", content="x" * 50000)]
         est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
         assert est == 4096  # Modelfile wins, estimation not applied
@@ -355,12 +363,14 @@ class TestNumCtxForModelFallback:
     def test_explicit_registry_not_raised_by_estimation(self, _reg, _api):
         """Priority 1 registry value honoured exactly, even if estimate > it."""
         from external_llm.client import LLMMessage
+
         msgs = [LLMMessage(role="user", content="x" * 50000)]
         est = self._client()._num_ctx_for_model("test:latest", messages=msgs)
         assert est == 6144  # Registry wins, estimation not applied
 
 
 # ── Consolidation: ONE /api/show POST serves both queries ──────────────────
+
 
 class TestShowPayloadConsolidation:
     """num_ctx and capabilities are BOTH fields of a single /api/show response.
@@ -375,18 +385,14 @@ class TestShowPayloadConsolidation:
 
     @patch("external_llm.ollama_api.requests.post")
     def test_num_ctx_then_capabilities_one_post(self, mock_post):
-        mock_post.return_value = _ok_resp(
-            {"parameters": {"num_ctx": 8192}, "capabilities": ["tools", "vision"]}
-        )
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 8192}, "capabilities": ["tools", "vision"]})
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 8192
         assert query_ollama_capabilities(_MODEL, base_url_hint=_TEST_URL) == ("tools", "vision")
         assert mock_post.call_count == 1  # ONE POST serves BOTH queries
 
     @patch("external_llm.ollama_api.requests.post")
     def test_capabilities_then_num_ctx_one_post(self, mock_post):
-        mock_post.return_value = _ok_resp(
-            {"parameters": {"num_ctx": 4096}, "capabilities": ["completion"]}
-        )
+        mock_post.return_value = _ok_resp({"parameters": {"num_ctx": 4096}, "capabilities": ["completion"]})
         assert query_ollama_capabilities(_MODEL, base_url_hint=_TEST_URL) == ("completion",)
         assert query_ollama_num_ctx(_MODEL, base_url_hint=_TEST_URL) == 4096
         assert mock_post.call_count == 1
@@ -413,6 +419,7 @@ class TestShowPayloadConsolidation:
 
 
 # ── Cache-key model-name normalisation (버그-2b) ────────────────────────────
+
 
 class TestCacheKeyNormalization:
     """providers.py passes the raw model string while context_budget.py passes
@@ -450,6 +457,7 @@ class TestCacheKeyNormalization:
 
 
 # ── base_url threading through _resolve_context_limit (버그-2a) ──────────────
+
 
 class TestResolveContextLimitBaseUrl:
     """_resolve_context_limit forwards base_url to the Ollama /api/show query so

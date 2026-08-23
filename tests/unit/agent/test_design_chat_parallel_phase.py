@@ -11,6 +11,7 @@ These drive the real ``_respond_impl`` multi-tool branch and assert that a
 mutating bash never overlaps a concurrent read (max concurrency == 1), while a
 read-only bash batch still parallelizes (guards against over-serialization).
 """
+
 from __future__ import annotations
 
 import threading
@@ -32,7 +33,10 @@ def _make_tc(name: str, args: dict) -> ToolCallRequest:
 
 def _make_response(tool_calls=None, content="ok") -> ToolCallResponse:
     return ToolCallResponse(
-        content=content, model="x", provider="openai", tool_calls=tool_calls or [],
+        content=content,
+        model="x",
+        provider="openai",
+        tool_calls=tool_calls or [],
     )
 
 
@@ -44,9 +48,15 @@ class _RegStub:
     """Minimal registry stub exposing the partition-relevant surface, while
     re-using the REAL ``_tool_call_mutates`` classifier (single source of
     truth) so the test exercises the same predicate the fix wires in."""
+
     _WRITE_TOOLS: ClassVar[set] = {
-        "apply_patch", "write_plan", "edit_ast", "edit_file",
-        "edit_text", "modify_symbol", "anchor_edit",
+        "apply_patch",
+        "write_plan",
+        "edit_ast",
+        "edit_file",
+        "edit_text",
+        "modify_symbol",
+        "anchor_edit",
     }
     _SERIAL_TOOLS = frozenset({"ask_user"})
     repo_language = None
@@ -58,6 +68,7 @@ class _RegStub:
         # Re-use the REAL classifier (single source of truth) so the test
         # exercises the same predicate logic the fix wires in.
         from external_llm.agent.tool_registry import ToolRegistry
+
         if name in self._WRITE_TOOLS:
             return True
         if name == "bash":
@@ -122,10 +133,10 @@ def _drive(loop, tool_calls):
     loop._call_llm_with_retry = lambda fn, **kwargs: responses.pop(0)
 
     result = DesignChatResult()
-    with patch("external_llm.agent.design_chat_loop._apply_context_hard_cap",
-               lambda msgs, *a, **k: msgs), \
-         patch("external_llm.agent.design_chat_loop._strip_tool_messages",
-               lambda m: m):
+    with (
+        patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", lambda msgs, *a, **k: msgs),
+        patch("external_llm.agent.design_chat_loop._strip_tool_messages", lambda m: m),
+    ):
         loop._respond_impl([], None, None, 1, None, result, mode="code")
     return state, order
 
@@ -139,8 +150,7 @@ def test_dcl_serializes_mutating_bash_against_reads():
     ]
     loop = DesignChatLoop.__new__(DesignChatLoop)
     state, _order = _drive(loop, tool_calls)
-    assert state["max"] == 1, (
-        f"mutating bash overlapped a concurrent read (max={state['max']})")
+    assert state["max"] == 1, f"mutating bash overlapped a concurrent read (max={state['max']})"
 
 
 def test_dcl_keeps_readonly_bash_parallel():
@@ -153,8 +163,7 @@ def test_dcl_keeps_readonly_bash_parallel():
     ]
     loop = DesignChatLoop.__new__(DesignChatLoop)
     state, _order = _drive(loop, tool_calls)
-    assert state["max"] >= 2, (
-        f"read-only bash batch did not parallelize (max={state['max']})")
+    assert state["max"] >= 2, f"read-only bash batch did not parallelize (max={state['max']})"
 
 
 def test_dcl_two_mutating_bash_never_overlap():
@@ -166,8 +175,7 @@ def test_dcl_two_mutating_bash_never_overlap():
     ]
     loop = DesignChatLoop.__new__(DesignChatLoop)
     state, _order = _drive(loop, tool_calls)
-    assert state["max"] == 1, (
-        f"two mutating bash overlapped (max={state['max']})")
+    assert state["max"] == 1, f"two mutating bash overlapped (max={state['max']})"
 
 
 def _drive_cancel(loop, tool_calls, spy, ev):
@@ -190,10 +198,10 @@ def _drive_cancel(loop, tool_calls, spy, ev):
     loop._call_llm_with_retry = lambda fn, **kwargs: responses.pop(0)
 
     result = DesignChatResult()
-    with patch("external_llm.agent.design_chat_loop._apply_context_hard_cap",
-               lambda msgs, *a, **k: msgs), \
-         patch("external_llm.agent.design_chat_loop._strip_tool_messages",
-               lambda m: m):
+    with (
+        patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", lambda msgs, *a, **k: msgs),
+        patch("external_llm.agent.design_chat_loop._strip_tool_messages", lambda m: m),
+    ):
         return loop._respond_impl([], None, None, 1, None, result, mode="code")
 
 
@@ -217,10 +225,15 @@ def test_dcl_cancel_event_preempts_parallel_tool_phase():
 
     def _run():
         try:
-            _drive_cancel(loop, [
-                _make_tc("find_symbol", {"name": "x"}),
-                _make_tc("bash", {"command": "ls -la"}),
-            ], _slow_spy, ev)
+            _drive_cancel(
+                loop,
+                [
+                    _make_tc("find_symbol", {"name": "x"}),
+                    _make_tc("bash", {"command": "ls -la"}),
+                ],
+                _slow_spy,
+                ev,
+            )
             out["exc"] = None
         except AgentCancelled as ac:
             out["exc"] = ac
@@ -228,10 +241,9 @@ def test_dcl_cancel_event_preempts_parallel_tool_phase():
     t = threading.Thread(target=_run)
     t.start()
     time.sleep(0.2)  # let the tools start in the pool
-    ev.set()         # user presses ESC
+    ev.set()  # user presses ESC
     t.join(timeout=5)
-    assert isinstance(out.get("exc"), AgentCancelled), (
-        f"cancel did not preempt the tool phase (exc={out.get('exc')!r})")
+    assert isinstance(out.get("exc"), AgentCancelled), f"cancel did not preempt the tool phase (exc={out.get('exc')!r})"
     assert not finished["v"], "cancel must abort while the tool is still running"
 
 
@@ -250,10 +262,15 @@ def test_dcl_agent_cancelled_from_tool_future_propagates():
 
     def _run():
         try:
-            _drive_cancel(loop, [
-                _make_tc("find_symbol", {"name": "x"}),
-                _make_tc("bash", {"command": "ls -la"}),
-            ], _cancelling_spy, ev)
+            _drive_cancel(
+                loop,
+                [
+                    _make_tc("find_symbol", {"name": "x"}),
+                    _make_tc("bash", {"command": "ls -la"}),
+                ],
+                _cancelling_spy,
+                ev,
+            )
             out["exc"] = None
         except AgentCancelled as ac:
             out["exc"] = ac
@@ -264,7 +281,8 @@ def test_dcl_agent_cancelled_from_tool_future_propagates():
     release.set()
     t.join(timeout=5)
     assert isinstance(out.get("exc"), AgentCancelled), (
-        f"AgentCancelled was swallowed into a tool error (exc={out.get('exc')!r})")
+        f"AgentCancelled was swallowed into a tool error (exc={out.get('exc')!r})"
+    )
 
 
 def test_dcl_serial_phase_agent_cancelled_propagates():
@@ -279,10 +297,15 @@ def test_dcl_serial_phase_agent_cancelled_propagates():
 
     loop = DesignChatLoop.__new__(DesignChatLoop)
     with pytest.raises(AgentCancelled):
-        _drive_cancel(loop, [
-            _make_tc("find_symbol", {"name": "x"}),
-            _make_tc("ask_user", {"question": "?"}),
-        ], _spy, ev)
+        _drive_cancel(
+            loop,
+            [
+                _make_tc("find_symbol", {"name": "x"}),
+                _make_tc("ask_user", {"question": "?"}),
+            ],
+            _spy,
+            ev,
+        )
 
 
 def test_dcl_single_tool_phase_agent_cancelled_propagates():
@@ -316,10 +339,10 @@ def _drive_with_cancel(loop, tool_calls, cancel_event, spy):
     ]
     loop._call_llm_with_retry = lambda fn, **kwargs: responses.pop(0)
     result = DesignChatResult()
-    with patch("external_llm.agent.design_chat_loop._apply_context_hard_cap",
-               lambda msgs, *a, **k: msgs), \
-         patch("external_llm.agent.design_chat_loop._strip_tool_messages",
-               lambda m: m):
+    with (
+        patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", lambda msgs, *a, **k: msgs),
+        patch("external_llm.agent.design_chat_loop._strip_tool_messages", lambda m: m),
+    ):
         loop._respond_impl([], None, None, 1, None, result, mode="code")
 
 
@@ -390,8 +413,10 @@ def test_dcl_cancel_event_preempts_single_tool_phase():
     def _run():
         try:
             _drive_with_cancel(
-                loop, [_make_tc("find_symbol", {"name": "x"})],
-                cancel_event, _slow_spy,
+                loop,
+                [_make_tc("find_symbol", {"name": "x"})],
+                cancel_event,
+                _slow_spy,
             )
             out["exc"] = None
         except AgentCancelled as ac:
@@ -403,7 +428,8 @@ def test_dcl_cancel_event_preempts_single_tool_phase():
     cancel_event.set()  # user presses ESC
     t.join(timeout=5)
     assert isinstance(out.get("exc"), AgentCancelled), (
-        f"cancel did not preempt the single-tool phase (exc={out.get('exc')!r})")
+        f"cancel did not preempt the single-tool phase (exc={out.get('exc')!r})"
+    )
 
 
 def test_dcl_single_serial_tool_runs_inline_on_calling_thread():
@@ -425,7 +451,8 @@ def test_dcl_single_serial_tool_runs_inline_on_calling_thread():
     loop = DesignChatLoop.__new__(DesignChatLoop)
     _drive_with_cancel(loop, [_make_tc("ask_user", {"question": "q"})], cancel_event, _spy)
     assert seen["thread"] == threading.main_thread().name, (
-        f"ask_user ran on {seen['thread']!r} instead of the calling thread")
+        f"ask_user ran on {seen['thread']!r} instead of the calling thread"
+    )
 
 
 def test_dcl_single_serial_tool_skipped_after_cancel():
@@ -477,10 +504,12 @@ def test_dcl_abandoned_worker_events_suppressed_after_cancel():
 
     loop._process_tool_call = _spy
     responses = [
-        _make_response(tool_calls=[
-            _make_tc("find_symbol", {"name": "fast"}),
-            _make_tc("find_symbol", {"name": "slow"}),
-        ]),
+        _make_response(
+            tool_calls=[
+                _make_tc("find_symbol", {"name": "fast"}),
+                _make_tc("find_symbol", {"name": "slow"}),
+            ]
+        ),
         _make_response(tool_calls=[], content="done"),
     ]
     loop._call_llm_with_retry = lambda fn, **kwargs: responses.pop(0)
@@ -489,12 +518,11 @@ def test_dcl_abandoned_worker_events_suppressed_after_cancel():
 
     def _run():
         try:
-            with patch("external_llm.agent.design_chat_loop._apply_context_hard_cap",
-                       lambda msgs, *a, **k: msgs), \
-                 patch("external_llm.agent.design_chat_loop._strip_tool_messages",
-                       lambda m: m):
-                loop._respond_impl([], lambda *a, **k: events.append(a),
-                                   None, 1, None, result, mode="code")
+            with (
+                patch("external_llm.agent.design_chat_loop._apply_context_hard_cap", lambda msgs, *a, **k: msgs),
+                patch("external_llm.agent.design_chat_loop._strip_tool_messages", lambda m: m),
+            ):
+                loop._respond_impl([], lambda *a, **k: events.append(a), None, 1, None, result, mode="code")
             out["exc"] = None
         except AgentCancelled as ac:
             out["exc"] = ac
@@ -504,11 +532,9 @@ def test_dcl_abandoned_worker_events_suppressed_after_cancel():
     time.sleep(0.2)  # let the tools start; the slow worker waits on the event
     cancel_event.set()  # user presses ESC
     t.join(timeout=5)
-    assert isinstance(out.get("exc"), AgentCancelled), (
-        f"cancel did not abort the phase (exc={out.get('exc')!r})")
+    assert isinstance(out.get("exc"), AgentCancelled), f"cancel did not abort the phase (exc={out.get('exc')!r})"
     # Wait for the abandoned worker's late emit attempt — otherwise the
     # assertion below races the worker and passes vacuously.
     assert worker_emitted.wait(5), "slow worker never reached its emit"
-    leaked = [e for e in events
-              if isinstance(e, tuple) and e and e[0] == "design_tool_call"]
+    leaked = [e for e in events if isinstance(e, tuple) and e and e[0] == "design_tool_call"]
     assert leaked == [], f"late events from abandoned worker leaked: {leaked}"

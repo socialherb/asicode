@@ -8,6 +8,7 @@ The prefilter's correctness contract is a three-way distinction:
 Mixing up "empty set" and "None" would either silently drop symbol
 definitions or needlessly parse the whole repo. These tests pin the contract.
 """
+
 import os
 import time
 from pathlib import Path
@@ -99,10 +100,7 @@ class TestDefPatternPrefilter:
             encoding="utf-8",
         )
         (tmp_path / "importer.py").write_text(
-            "from defs import Widget, make_widget, FACTORY\n\n"
-            "w = Widget()\n"
-            "make_widget()\n"
-            "print(FACTORY)\n",
+            "from defs import Widget, make_widget, FACTORY\n\nw = Widget()\nmake_widget()\nprint(FACTORY)\n",
             encoding="utf-8",
         )
         return tmp_path
@@ -116,9 +114,14 @@ class TestDefPatternPrefilter:
 
     def test_importer_excluded_definer_kept(self, tmp_path):
         root = self._repo(tmp_path)
-        for token, kind in [("Widget", "any"), ("Widget", "class"),
-                            ("make_widget", "function"), ("spin", "any"),
-                            ("FACTORY", "variable"), ("limit", "variable")]:
+        for token, kind in [
+            ("Widget", "any"),
+            ("Widget", "class"),
+            ("make_widget", "function"),
+            ("spin", "any"),
+            ("FACTORY", "variable"),
+            ("limit", "variable"),
+        ]:
             out = self._defining(root, token, kind)
             assert out is not None, (token, kind)
             assert str((root / "defs.py").resolve()) in out, (token, kind)
@@ -190,9 +193,7 @@ class TestDefPatternPrefilter:
         """A definition split across physical lines (`X \\` + `= 1`) is
         invisible to the line-based regex. The def-set comes back empty and
         the word-match fallback must still find the symbol."""
-        (tmp_path / "weird.py").write_text(
-            "HIDDEN_CONT \\\n    = 5\n", encoding="utf-8"
-        )
+        (tmp_path / "weird.py").write_text("HIDDEN_CONT \\\n    = 5\n", encoding="utf-8")
         orig = _use_real_rg()
         try:
             s = ss.SymbolSearcher(str(tmp_path))
@@ -272,7 +273,8 @@ class TestNonPyIndexProbe:
 
         ts_langs = tsu.get_available_languages() if ss._HAS_TS else set()
         dead = [
-            p for p in set(LanguageRegistry.instance()._providers.values())
+            p
+            for p in set(LanguageRegistry.instance()._providers.values())
             if p.language_id().value not in ("python", "typescript", "javascript")
             and p.language_id().value not in ts_langs
             and not p.get_symbol_patterns(kind="any")
@@ -316,6 +318,7 @@ class TestNonPyIndexProbe:
         """A warm index is a dict hit — cheaper than probing. Probing there
         would make the fast path slower, so the gate must short-circuit."""
         import external_llm.agent.symbol_search as _ss
+
         s = ss.SymbolSearcher(str(tmp_path))
         s._nonpy_index_cache[str(tmp_path)] = (_ss._time.monotonic(), {})
         called = []
@@ -345,14 +348,9 @@ class TestNonPyProbeInProcessFastPath:
         `(?<!\\w)...(?!\\w)` rather than `\\b...\\b`: for a token starting with a
         non-word char (CSS `--primary-color`) `\\b` anchors the wrong way.
         """
-        (tmp_path / "s.css").write_text(
-            ".btn-primary { --primary-color: red; }\n", encoding="utf-8"
-        )
-        (tmp_path / "a.go").write_text(
-            "package main\nfunc GoThing() {}\n", encoding="utf-8"
-        )
-        tokens = ["GoThing", "btn-primary", "--primary-color", "primary",
-                  "GoThin", "oThing", "Nope", "main"]
+        (tmp_path / "s.css").write_text(".btn-primary { --primary-color: red; }\n", encoding="utf-8")
+        (tmp_path / "a.go").write_text("package main\nfunc GoThing() {}\n", encoding="utf-8")
+        tokens = ["GoThing", "btn-primary", "--primary-color", "primary", "GoThin", "oThing", "Nope", "main"]
         orig = _use_real_rg()
         try:
             for tok in tokens:
@@ -544,8 +542,7 @@ class TestNonpyFilesCacheCap:
             # The newest 8 entries must still be present.
             for i in range(7, 15):
                 assert f"/fake-root-{i:03d}" in ss._NONPY_FILES_CACHE, (
-                    f"[{mode}] /fake-root-{i:03d} was evicted — "
-                    f"cap or eviction order broken"
+                    f"[{mode}] /fake-root-{i:03d} was evicted — cap or eviction order broken"
                 )
         finally:
             ss._NONPY_FILES_CACHE.clear()
@@ -608,16 +605,12 @@ def test_nonpy_probe_starts_before_the_python_scan(tmp_path, monkeypatch):
         return False
 
     monkeypatch.setattr(ss, "_rg_py_files_defining", _slow_defining)
-    monkeypatch.setattr(
-        ss.SymbolSearcher, "_nonpy_index_worth_building", _probe, raising=True
-    )
+    monkeypatch.setattr(ss.SymbolSearcher, "_nonpy_index_worth_building", _probe, raising=True)
 
     ss.SymbolSearcher(tmp_path).find_symbol("Widget")
 
     assert order, "neither the probe nor the prefilter ran"
-    assert order[0] == "nonpy-probe-start", (
-        f"probe did not start before the Python prefilter finished: {order}"
-    )
+    assert order[0] == "nonpy-probe-start", f"probe did not start before the Python prefilter finished: {order}"
 
 
 def test_nonpy_probe_failure_falls_back_inline(tmp_path, monkeypatch):
@@ -635,9 +628,7 @@ def test_nonpy_probe_failure_falls_back_inline(tmp_path, monkeypatch):
             raise RuntimeError("probe exploded")
         return False
 
-    monkeypatch.setattr(
-        ss.SymbolSearcher, "_nonpy_index_worth_building", _boom, raising=True
-    )
+    monkeypatch.setattr(ss.SymbolSearcher, "_nonpy_index_worth_building", _boom, raising=True)
     # Must not propagate, and must have retried inline.
     ss.SymbolSearcher(tmp_path).find_symbol("Widget")
     assert len(calls) == 2, f"no inline retry after probe failure: {calls}"
@@ -662,9 +653,7 @@ def test_nonpy_probe_timeout_falls_back_inline(tmp_path, monkeypatch):
             time.sleep(2)  # longer than the monkeypatched 50 ms cap below
         return False
 
-    monkeypatch.setattr(
-        ss.SymbolSearcher, "_nonpy_index_worth_building", _slow_probe, raising=True
-    )
+    monkeypatch.setattr(ss.SymbolSearcher, "_nonpy_index_worth_building", _slow_probe, raising=True)
     monkeypatch.setattr(ss, "_NONPY_PROBE_TIMEOUT_SEC", 0.05)
     # The pooled probe is still sleeping; find_symbol must time out, retry
     # inline (2nd call), and return without ever seeing the probe's answer.
@@ -726,9 +715,7 @@ class TestNonPyBlobMemo:
         orig = _use_real_rg()
         try:
             assert ss._rg_token_in_nonpy_files(tmp_path, "Gamma") is False
-            (tmp_path / "c.go").write_text(
-                "package main\nfunc ZedNewFile() {}\n", encoding="utf-8"
-            )
+            (tmp_path / "c.go").write_text("package main\nfunc ZedNewFile() {}\n", encoding="utf-8")
             # Exactly what invalidate_nonpy_caches does to the walk cache.
             ss._NONPY_FILES_CACHE.pop(str(tmp_path), None)
             assert ss._rg_token_in_nonpy_files(tmp_path, "ZedNewFile") is True
@@ -758,9 +745,7 @@ class TestNonPyBlobMemo:
         try:
             called = []
             real = ss._word_in_files
-            monkeypatch.setattr(
-                ss, "_word_in_files", lambda *a: called.append(a) or real(*a)
-            )
+            monkeypatch.setattr(ss, "_word_in_files", lambda *a: called.append(a) or real(*a))
             assert ss._rg_token_in_nonpy_files(tmp_path, "a\nb") is False
             assert called, "newline token must take the streaming path"
         finally:
@@ -780,9 +765,7 @@ class TestNonPyBlobMemo:
                 os.chmod(p, 0o644)
             called = []
             real = ss._word_in_files
-            monkeypatch.setattr(
-                ss, "_word_in_files", lambda *a: called.append(a) or real(*a)
-            )
+            monkeypatch.setattr(ss, "_word_in_files", lambda *a: called.append(a) or real(*a))
             assert ss._rg_token_in_nonpy_files(tmp_path, "Delta") is False
             assert not called, "unreadable file forced a rebuild on every probe"
         finally:
@@ -794,15 +777,15 @@ class TestNonPyBlobMemo:
         including bad-boundary skips, blob edges, and empty tokens."""
         blob = "xxGoThingyy\nGoThing\nzz"
         cases = [
-            ("GoThing", True),      # 1st flanked by x/y (bad), 2nd clean
+            ("GoThing", True),  # 1st flanked by x/y (bad), 2nd clean
             ("xxGoThingyy", True),  # blob start
-            ("zz", True),           # blob end
-            ("GoThin", False),      # partial inside GoThing (followed by g)
-            ("GoThingy", False),    # literal hit but bad boundary on both sides
-            ("Thing", False),       # both occurrences preceded by G
-            ("xx", False),          # blob start but followed by G
+            ("zz", True),  # blob end
+            ("GoThin", False),  # partial inside GoThing (followed by g)
+            ("GoThingy", False),  # literal hit but bad boundary on both sides
+            ("Thing", False),  # both occurrences preceded by G
+            ("xx", False),  # blob start but followed by G
             ("Nope", False),
-            ("", False),            # must terminate, not loop
+            ("", False),  # must terminate, not loop
         ]
         for tok, exp in cases:
             assert ss._blob_contains_word(blob, tok) is exp, tok
@@ -814,10 +797,7 @@ class TestNonPyBlobMemo:
         (tmp_path / "a.go").write_text("yyy GoThing zzz", encoding="utf-8")
         (tmp_path / "b.go").write_text("GoOther\n", encoding="utf-8")
         files = [str(tmp_path / "a.go"), str(tmp_path / "b.go")]
-        blob = "\n".join(
-            p.read_text(encoding="utf-8")
-            for p in (tmp_path / "a.go", tmp_path / "b.go")
-        )
+        blob = "\n".join(p.read_text(encoding="utf-8") for p in (tmp_path / "a.go", tmp_path / "b.go"))
         for tok in ["GoThing", "GoOther", "Thing", "GoTh", "Other", "yyy", "zzz", "Nope"]:
             got = ss._blob_contains_word(blob, tok)
             exp = ss._word_in_files(files, tok)
@@ -838,10 +818,7 @@ class TestNonPyBlobMemo:
                         value = ast.get_source_segment(src, target.value)
                         if value and "_NONPY_BLOB_CACHE" in value:
                             plain.append(target.lineno)
-        assert not plain, (
-            f"_word_in_files_cached stores the memo with plain `=` at {plain} — "
-            "use _capped_put"
-        )
+        assert not plain, f"_word_in_files_cached stores the memo with plain `=` at {plain} — use _capped_put"
 
     def test_blob_cache_stays_fifo_capped(self, tmp_path):
         """cap+2 roots through the real probe leave _NONPY_BLOB_MAX_ENTRIES."""

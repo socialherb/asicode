@@ -7,6 +7,7 @@ returned ``None`` for every request, breaking intelligent_service, orchestrator,
 and local_assistant callers. This went undetected because no test exercised
 run() end-to-end. These tests prevent that class of regression.
 """
+
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,14 +43,17 @@ def test_run_main_agent_invokes_llm_loop(tmp_path):
     """run() must route MAIN_AGENT to _run_llm_loop and return a real AgentResult."""
     loop = _make_loop(tmp_path)
     loop.config.route_decision = SimpleNamespace(
-        lane=Lane.MAIN_AGENT, confidence=0.9, task_kind="general",
-        reasoning="", complexity=None, target_specificity_score=0.5,
+        lane=Lane.MAIN_AGENT,
+        confidence=0.9,
+        task_kind="general",
+        reasoning="",
+        complexity=None,
+        target_specificity_score=0.5,
     )
     called = []
     loop._run_llm_loop = lambda ctx: (
         called.append(ctx),
-        AgentResult(status="success", final_message="ok", turns=[],
-                    applied_patches=[], metadata={}),
+        AgentResult(status="success", final_message="ok", turns=[], applied_patches=[], metadata={}),
     )[-1]
 
     result = loop.run("change alpha to 2")
@@ -70,4 +74,3 @@ def test_run_route_none_returns_fallback_result(tmp_path):
     result = loop.run("test request")
     assert isinstance(result, AgentResult)
     assert result.metadata.get("unhandled_lane") is True
-

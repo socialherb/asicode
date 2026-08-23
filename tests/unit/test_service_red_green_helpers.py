@@ -5,6 +5,7 @@ Baseline: service.py 34% (832 stmts / 547 miss). This file covers the
 non-generate_patch surface; test_service_red_green_generate_patch.py covers
 generate_patch itself.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -17,6 +18,7 @@ from external_llm.service import ExternalLLMService, _asrp_text, _bounded_read_t
 # ---------------------------------------------------------------------------
 # module-level helpers
 # ---------------------------------------------------------------------------
+
 
 def test_asrp_text_clips_long_text():
     assert _asrp_text("a" * 100, 10) == "a" * 10 + " …[CLIPPED]"
@@ -95,14 +97,16 @@ def test_is_section_boundary_variants():
 
 
 def test_extract_failure_summary_block():
-    txt = "\n".join([
-        "some preamble",
-        "failure_summary:",
-        "line one",
-        "line two",
-        "====",
-        "after",
-    ])
+    txt = "\n".join(
+        [
+            "some preamble",
+            "failure_summary:",
+            "line one",
+            "line two",
+            "====",
+            "after",
+        ]
+    )
     assert svc_mod._extract_failure_summary_block(txt) == "line one\nline two"
 
 
@@ -126,22 +130,26 @@ def test_extract_failure_summary_block_handles_non_string():
 
 
 def test_extract_failed_reason():
-    txt = "\n".join([
-        "status: FAILED",
-        "reason: the block was not found",
-        "====",
-    ])
+    txt = "\n".join(
+        [
+            "status: FAILED",
+            "reason: the block was not found",
+            "====",
+        ]
+    )
     assert svc_mod._extract_failed_reason(txt) == "reason: the block was not found"
 
 
 def test_extract_failed_reason_three_max():
-    txt = "\n".join([
-        "status: FAILED",
-        "reason: one",
-        "reason: two",
-        "reason: three",
-        "reason: four",
-    ])
+    txt = "\n".join(
+        [
+            "status: FAILED",
+            "reason: one",
+            "reason: two",
+            "reason: three",
+            "reason: four",
+        ]
+    )
     assert svc_mod._extract_failed_reason(txt) == "reason: one"
 
 
@@ -166,10 +174,12 @@ def test_extract_identifiers():
 # class-level helpers
 # ---------------------------------------------------------------------------
 
+
 def test_suppress_console_noise(capsys):
     with ExternalLLMService._suppress_console_noise():
         print("hidden out")
         import sys
+
         print("hidden err", file=sys.stderr)
     out = capsys.readouterr()
     assert "hidden" not in out.out and "hidden" not in out.err
@@ -185,7 +195,7 @@ def test_is_trivial_edit_request_true_false():
 
 def test_extract_literal_needles_from_request():
     needles = ExternalLLMService._extract_literal_needles_from_request(
-        'Add "SOME_STRING_LITERAL" and \'other literal\' plus a bullet'
+        "Add \"SOME_STRING_LITERAL\" and 'other literal' plus a bullet"
     )
     assert "SOME_STRING_LITERAL" in needles
     assert "other literal" in needles
@@ -202,15 +212,13 @@ def test_extract_literal_needles_bullet_lines():
 def test_extract_literal_needles_empty_and_dedup():
     assert ExternalLLMService._extract_literal_needles_from_request("") == []
     assert ExternalLLMService._extract_literal_needles_from_request(None) == []
-    n = ExternalLLMService._extract_literal_needles_from_request(
-        '"ABCDEF" "ABCDEF" - A very long bullet line here\n'
-    )
+    n = ExternalLLMService._extract_literal_needles_from_request('"ABCDEF" "ABCDEF" - A very long bullet line here\n')
     assert n == sorted(n, key=len, reverse=True)
 
 
 def test_extract_literal_needles_unterminated_quote():
     # opening quote without a closing quote -> the pair search breaks cleanly
-    assert ExternalLLMService._extract_literal_needles_from_request("add '" ) == []
+    assert ExternalLLMService._extract_literal_needles_from_request("add '") == []
 
 
 def test_extract_literal_needles_blank_needle_skipped():
@@ -222,9 +230,7 @@ def test_extract_literal_needles_blank_needle_skipped():
 
 def test_noop_precheck_literal_present(tmp_path):
     (tmp_path / "hello.txt").write_text("marker_xyz here\n", encoding="utf-8")
-    assert ExternalLLMService._noop_precheck_for_literal_add(
-        str(tmp_path), "hello.txt", 'add "marker_xyz" to the file'
-    )
+    assert ExternalLLMService._noop_precheck_for_literal_add(str(tmp_path), "hello.txt", 'add "marker_xyz" to the file')
 
 
 def test_noop_precheck_literal_absent(tmp_path):
@@ -240,9 +246,7 @@ def test_noop_precheck_empty_args(tmp_path):
 
 
 def test_noop_precheck_missing_file(tmp_path):
-    assert not ExternalLLMService._noop_precheck_for_literal_add(
-        str(tmp_path), "nope.txt", 'add "SOME_STRING" please'
-    )
+    assert not ExternalLLMService._noop_precheck_for_literal_add(str(tmp_path), "nope.txt", 'add "SOME_STRING" please')
 
 
 def test_noop_precheck_no_needles(tmp_path):
@@ -257,9 +261,7 @@ def test_noop_precheck_resolve_error(tmp_path, monkeypatch):
         raise ValueError("traversal")
 
     monkeypatch.setattr(svc_mod, "resolve_inside_repo", _boom)
-    assert not ExternalLLMService._noop_precheck_for_literal_add(
-        str(tmp_path), "x.txt", 'add "SOME_STRING"'
-    )
+    assert not ExternalLLMService._noop_precheck_for_literal_add(str(tmp_path), "x.txt", 'add "SOME_STRING"')
 
 
 def test_noop_precheck_streaming_sliding_window(tmp_path):
@@ -268,9 +270,7 @@ def test_noop_precheck_streaming_sliding_window(tmp_path):
     # losing the trailing needle (here: none present -> False)
     p = tmp_path / "big.txt"
     p.write_text("x" * 70_000 + "\n", encoding="utf-8")
-    assert not ExternalLLMService._noop_precheck_for_literal_add(
-        str(tmp_path), "big.txt", 'add "NEEDLE_NOT_PRESENT"'
-    )
+    assert not ExternalLLMService._noop_precheck_for_literal_add(str(tmp_path), "big.txt", 'add "NEEDLE_NOT_PRESENT"')
 
 
 def test_noop_precheck_resolve_oserror(tmp_path, monkeypatch):
@@ -278,13 +278,12 @@ def test_noop_precheck_resolve_oserror(tmp_path, monkeypatch):
         raise OSError("denied")
 
     monkeypatch.setattr(svc_mod, "resolve_inside_repo", _boom)
-    assert not ExternalLLMService._noop_precheck_for_literal_add(
-        str(tmp_path), "x.txt", 'add "SOME_STRING"'
-    )
+    assert not ExternalLLMService._noop_precheck_for_literal_add(str(tmp_path), "x.txt", 'add "SOME_STRING"')
 
 
 def test_noop_precheck_read_oserror(tmp_path, monkeypatch):
     """File exists but reading it fails -> the streaming-read guard returns False."""
+
     class _ReadBoom:
         def exists(self):
             return True
@@ -296,9 +295,7 @@ def test_noop_precheck_read_oserror(tmp_path, monkeypatch):
             raise OSError("read denied")
 
     monkeypatch.setattr(svc_mod, "resolve_inside_repo", lambda rr, tf: _ReadBoom())
-    assert not ExternalLLMService._noop_precheck_for_literal_add(
-        str(tmp_path), "x.txt", 'add "SOME_STRING"'
-    )
+    assert not ExternalLLMService._noop_precheck_for_literal_add(str(tmp_path), "x.txt", 'add "SOME_STRING"')
 
 
 def test_read_target_file_snippet(tmp_path):
@@ -343,9 +340,7 @@ def test_read_target_file_snippet_resolve_error(tmp_path, monkeypatch):
 
 
 def test_extract_identifier_needles():
-    ids = ExternalLLMService._extract_identifier_needles(
-        "In the _looks_like_unified_diff function fix the bug"
-    )
+    ids = ExternalLLMService._extract_identifier_needles("In the _looks_like_unified_diff function fix the bug")
     assert "_looks_like_unified_diff" in ids
     assert len(ids) <= 6
 
@@ -359,9 +354,7 @@ def test_read_focused_snippet_hit(tmp_path):
     p = tmp_path / "t.py"
     p.write_text("\n".join(f"line {i}" for i in range(50)), encoding="utf-8")
     svc = ExternalLLMService.__new__(ExternalLLMService)
-    out = svc._read_target_file_focused_snippet_best_effort(
-        str(tmp_path), "t.py", needles=["line 25"], radius_lines=3
-    )
+    out = svc._read_target_file_focused_snippet_best_effort(str(tmp_path), "t.py", needles=["line 25"], radius_lines=3)
     assert "line 25" in out
     assert "line 22" in out and "line 28" in out
 
@@ -380,9 +373,7 @@ def test_read_focused_snippet_miss_and_guards(tmp_path):
 def test_read_focused_snippet_empty_file(tmp_path):
     (tmp_path / "t.py").write_text("", encoding="utf-8")
     svc = ExternalLLMService.__new__(ExternalLLMService)
-    assert svc._read_target_file_focused_snippet_best_effort(
-        str(tmp_path), "t.py", needles=["x"]
-    ) == ""
+    assert svc._read_target_file_focused_snippet_best_effort(str(tmp_path), "t.py", needles=["x"]) == ""
 
 
 def test_read_focused_snippet_resolve_oserror(tmp_path, monkeypatch):
@@ -391,14 +382,13 @@ def test_read_focused_snippet_resolve_oserror(tmp_path, monkeypatch):
 
     monkeypatch.setattr(svc_mod, "resolve_inside_repo", _boom)
     svc = ExternalLLMService.__new__(ExternalLLMService)
-    assert svc._read_target_file_focused_snippet_best_effort(
-        str(tmp_path), "t.py", needles=["x"]
-    ) == ""
+    assert svc._read_target_file_focused_snippet_best_effort(str(tmp_path), "t.py", needles=["x"]) == ""
 
 
 def test_git_cmd_best_effort_success(monkeypatch):
     monkeypatch.setattr(
-        svc_mod.subprocess, "run",
+        svc_mod.subprocess,
+        "run",
         lambda *a, **kw: SimpleNamespace(returncode=0, stdout=" main\n"),
     )
     assert ExternalLLMService._git_cmd_best_effort("/tmp", ["rev-parse", "--abbrev-ref", "HEAD"]) == "main"
@@ -406,7 +396,8 @@ def test_git_cmd_best_effort_success(monkeypatch):
 
 def test_git_cmd_best_effort_nonzero_and_exc(monkeypatch):
     monkeypatch.setattr(
-        svc_mod.subprocess, "run",
+        svc_mod.subprocess,
+        "run",
         lambda *a, **kw: SimpleNamespace(returncode=1, stdout=""),
     )
     assert ExternalLLMService._git_cmd_best_effort("/tmp", ["x"]) == ""
@@ -451,9 +442,11 @@ def test_extract_previous_failure_hint():
 # _build_llm_context_v7 / super
 # ---------------------------------------------------------------------------
 
+
 def _patch_git(monkeypatch, branch="main", head="abc123"):
     monkeypatch.setattr(
-        svc_mod, "get_git_snapshot",
+        svc_mod,
+        "get_git_snapshot",
         lambda rr: {"branch": branch, "head_hash": head} if branch else {},
     )
 
@@ -463,7 +456,10 @@ def test_build_llm_context_v7_basic(tmp_path, monkeypatch):
     _patch_git(monkeypatch)
     svc = ExternalLLMService.__new__(ExternalLLMService)
     text, meta = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix", is_trivial=False,
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=False,
     )
     assert meta["kind"] == "LLM_CONTEXT_V7"
     assert meta["branch"] == "main"
@@ -476,7 +472,10 @@ def test_build_llm_context_v7_no_git(tmp_path, monkeypatch):
     _patch_git(monkeypatch, branch="", head="")
     svc = ExternalLLMService.__new__(ExternalLLMService)
     text, meta = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix", is_trivial=False,
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=False,
     )
     assert "branch" not in meta and "head_commit" not in meta
     assert "BRANCH:" not in text
@@ -486,18 +485,27 @@ def test_build_llm_context_v7_full_file_mode(tmp_path, monkeypatch):
     _patch_git(monkeypatch)
     svc = ExternalLLMService.__new__(ExternalLLMService)
     text, _ = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix",
-        is_trivial=False, output_mode="full_file",
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=False,
+        output_mode="full_file",
     )
     assert "Output ONLY a single FILE block" in text
     text2, _ = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix",
-        is_trivial=False, output_mode="diff",
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=False,
+        output_mode="diff",
     )
     assert "Output ONLY a valid unified diff" in text2
     text3, _ = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix",
-        is_trivial=False, output_mode="auto",
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=False,
+        output_mode="auto",
     )
     assert "exactly ONE full-file rewrite block" in text3
 
@@ -506,7 +514,10 @@ def test_build_llm_context_v7_empty_root_and_no_snippet(monkeypatch):
     _patch_git(monkeypatch)
     svc = ExternalLLMService.__new__(ExternalLLMService)
     text, meta = svc._build_llm_context_v7_best_effort(
-        repo_root="", target_file="t.py", user_request="fix", is_trivial=True,
+        repo_root="",
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=True,
     )
     assert "TARGET_FILE: t.py" in text
     assert meta["snippet_chars"] == 0
@@ -516,8 +527,11 @@ def test_build_llm_context_v7_previous_failure_hint(tmp_path, monkeypatch):
     _patch_git(monkeypatch)
     svc = ExternalLLMService.__new__(ExternalLLMService)
     text, meta = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix",
-        is_trivial=False, previous_failure_hint="some stale hint",
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix",
+        is_trivial=False,
+        previous_failure_hint="some stale hint",
     )
     assert meta["previous_failure_hint_chars"] == len("some stale hint")
     assert "PREVIOUS_FAILURE_HINT" in text
@@ -528,13 +542,18 @@ def test_build_llm_context_v7_trivial_focused_and_fail_radius(tmp_path, monkeypa
     _patch_git(monkeypatch)
     svc = ExternalLLMService.__new__(ExternalLLMService)
     _text, meta = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py",
-        user_request="in _my_target add a line", is_trivial=True,
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="in _my_target add a line",
+        is_trivial=True,
     )
     assert meta["snippet_kind"] == "focused"
     _text2, meta2 = svc._build_llm_context_v7_best_effort(
-        repo_root=str(tmp_path), target_file="t.py", user_request="fix the typo",
-        is_trivial=True, previous_failure_hint="block not found",
+        repo_root=str(tmp_path),
+        target_file="t.py",
+        user_request="fix the typo",
+        is_trivial=True,
+        previous_failure_hint="block not found",
     )
     assert meta2["snippet_failure_hint"] == "block_not_found"
     assert meta2["snippet_kind"] in ("focused", "head_tail")
@@ -551,9 +570,7 @@ def test_build_llm_context_super_ok(monkeypatch):
     # service.py binds SuperContextBuilder at module level -> patch svc_mod
     monkeypatch.setattr(svc_mod, "SuperContextBuilder", _FakeSuper)
     svc = ExternalLLMService.__new__(ExternalLLMService)
-    text, meta = svc._build_llm_context_super_best_effort(
-        repo_root="/tmp", target_file="t.py", user_request="fix"
-    )
+    text, meta = svc._build_llm_context_super_best_effort(repo_root="/tmp", target_file="t.py", user_request="fix")
     assert text == "SUPER TEXT\n"
     assert meta["kind"] == "LLM_CONTEXT_SUPER"
 
@@ -565,9 +582,7 @@ def test_build_llm_context_super_fallback(monkeypatch):
 
     monkeypatch.setattr(svc_mod, "SuperContextBuilder", _BoomSuper)
     svc = ExternalLLMService.__new__(ExternalLLMService)
-    _text, meta = svc._build_llm_context_super_best_effort(
-        repo_root="/tmp", target_file="t.py", user_request="fix"
-    )
+    _text, meta = svc._build_llm_context_super_best_effort(repo_root="/tmp", target_file="t.py", user_request="fix")
     assert meta["kind"] == "LLM_CONTEXT_V7"
     assert meta["variant_fallback_from"] == "super"
     assert "super" in meta["super_error"]
@@ -575,9 +590,7 @@ def test_build_llm_context_super_fallback(monkeypatch):
 
 def test_build_llm_context_super_empty_root(monkeypatch):
     svc = ExternalLLMService.__new__(ExternalLLMService)
-    text, meta = svc._build_llm_context_super_best_effort(
-        repo_root="", target_file=None, user_request="fix"
-    )
+    text, meta = svc._build_llm_context_super_best_effort(repo_root="", target_file=None, user_request="fix")
     assert text == ""
     assert meta["reason"] == "repo_root_empty"
 
@@ -585,6 +598,7 @@ def test_build_llm_context_super_empty_root(monkeypatch):
 # ---------------------------------------------------------------------------
 # __init__ / _get_default_model
 # ---------------------------------------------------------------------------
+
 
 def test_init_ollama_timeout(monkeypatch):
     captured = {}
@@ -652,8 +666,7 @@ def test_default_models_sync_with_client_classes():
     mapping = ExternalLLMService._PROVIDER_DEFAULT_MODELS
     for provider, client_default in expected.items():
         assert mapping[provider] == client_default, (
-            f"{provider}: service default {mapping[provider]!r} "
-            f"drifted from client DEFAULT_MODEL {client_default!r}"
+            f"{provider}: service default {mapping[provider]!r} drifted from client DEFAULT_MODEL {client_default!r}"
         )
     # Sanity: zai is served by two protocol clients (OpenAI-compatible ZAIClient
     # and Anthropic-compatible ZAIAnthropicClient). Both must carry the same
@@ -666,6 +679,7 @@ def test_default_models_sync_with_client_classes():
 # ---------------------------------------------------------------------------
 # context building / parsing / normalization / prompts / retry gate
 # ---------------------------------------------------------------------------
+
 
 def test_build_context_best_effort_tuple(monkeypatch):
     class _FakeBuilder:
@@ -795,6 +809,7 @@ def test_is_target_file_small_enough_stat_oserror(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # create_service_from_env
 # ---------------------------------------------------------------------------
+
 
 def test_create_service_from_env_no_provider(monkeypatch):
     monkeypatch.delenv("EXTERNAL_LLM_PROVIDER", raising=False)

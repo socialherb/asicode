@@ -27,6 +27,7 @@ class TestSharedPool:
     def test_pool_is_singleton(self):
         """Repeated import returns the same instance."""
         from external_llm.agent._thread_pool import shared_pool as sp2
+
         assert sp2 is shared_pool
 
 

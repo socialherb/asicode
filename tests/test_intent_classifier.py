@@ -1,6 +1,7 @@
 """
 Tests for intent_classifier.py — request intent analysis.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from external_llm.agent.execution_mode_classifier import (
 )
 
 # ── ExecuteMode ───────────────────────────────────────────────────────────
+
 
 class TestExecuteMode:
     """Tests for ExecuteMode enum with fuzzy matching.
@@ -54,20 +56,24 @@ class TestExecuteMode:
         with pytest.raises(ValueError, match="not a valid ExecuteMode"):
             ExecuteMode(42)
 
-    @pytest.mark.parametrize("value,expected", [
-        ("intelligent", ExecuteMode.INTELLIGENT),
-        ("INTELLIGENT", ExecuteMode.INTELLIGENT),
-        ("Intelligent", ExecuteMode.INTELLIGENT),
-        ("LEGACY", ExecuteMode.LEGACY),
-        ("plan_json", ExecuteMode.PLAN_JSON),
-        ("plan json", ExecuteMode.PLAN_JSON),
-        ("intelligent", ExecuteMode.INTELLIGENT),
-    ])
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("intelligent", ExecuteMode.INTELLIGENT),
+            ("INTELLIGENT", ExecuteMode.INTELLIGENT),
+            ("Intelligent", ExecuteMode.INTELLIGENT),
+            ("LEGACY", ExecuteMode.LEGACY),
+            ("plan_json", ExecuteMode.PLAN_JSON),
+            ("plan json", ExecuteMode.PLAN_JSON),
+            ("intelligent", ExecuteMode.INTELLIGENT),
+        ],
+    )
     def test_various_modes(self, value, expected):
         assert ExecuteMode(value) == expected
 
 
 # ── _LLM_MODE_ALIASES ────────────────────────────────────────────────────
+
 
 class TestLLMModeAliases:
     """Test that all aliases map to correct ExecuteMode."""
@@ -98,29 +104,33 @@ class TestLLMModeAliases:
 
 # ── _has_number_after_keyword ─────────────────────────────────────────────
 
+
 class TestHasNumberAfterKeyword:
     """Tests for _has_number_after_keyword."""
 
-    @pytest.mark.parametrize("text,keywords,expected", [
-        # Standard cases
-        ("fix line 42", ("line",), True),
-        ("go to line42", ("line",), True),
-        ("modify line  42 now", ("line",), True),
-        ("no line reference", ("line",), False),
-        # Keyword embedded in word but followed by a number → matches
-        ("online 42", ("line",), True),
-        ("multi line", ("line",), False),
-        # Korean keywords
-        ("라인 42에서 수정", ("라인",), True),
-        ("줄 5로 이동", ("줄",), True),
-        # Edge cases
-        ("no keyword at all", ("line", "라인", "줄"), False),
-        ("", ("line",), False),
-        ("line", ("line",), False),
-        ("line   ", ("line",), False),
-        ("line42extra", ("line",), True),
-        ("prefix_line 42", ("line",), True),
-    ])
+    @pytest.mark.parametrize(
+        "text,keywords,expected",
+        [
+            # Standard cases
+            ("fix line 42", ("line",), True),
+            ("go to line42", ("line",), True),
+            ("modify line  42 now", ("line",), True),
+            ("no line reference", ("line",), False),
+            # Keyword embedded in word but followed by a number → matches
+            ("online 42", ("line",), True),
+            ("multi line", ("line",), False),
+            # Korean keywords
+            ("라인 42에서 수정", ("라인",), True),
+            ("줄 5로 이동", ("줄",), True),
+            # Edge cases
+            ("no keyword at all", ("line", "라인", "줄"), False),
+            ("", ("line",), False),
+            ("line", ("line",), False),
+            ("line   ", ("line",), False),
+            ("line42extra", ("line",), True),
+            ("prefix_line 42", ("line",), True),
+        ],
+    )
     def test_various_inputs(self, text, keywords, expected):
         assert _has_number_after_keyword(text, keywords) == expected
 
@@ -141,6 +151,7 @@ class TestHasNumberAfterKeyword:
 
 
 # ── _analyze_intent_with_keywords ─────────────────────────────────────────
+
 
 class TestAnalyzeIntentWithKeywords:
     """Tests for keyword-based intent analysis fallback."""
@@ -234,6 +245,7 @@ class TestLineReferenceKeywordCoverage:
 
 # ── validate_instruction_target_file ──────────────────────────────────────
 
+
 class TestValidateInstructionTargetFile:
     """Tests for validate_instruction_target_file."""
 
@@ -261,6 +273,7 @@ class TestValidateInstructionTargetFile:
 
 
 # ── _analyze_intent_with_llm_if_available ─────────────────────────────────
+
 
 class TestAnalyzeIntentWithLLM:
     """Tests for LLM-based intent analysis with mocked external service.
@@ -358,10 +371,14 @@ class TestAnalyzeIntentWithLLM:
 
 # ── analyze_request_for_optimal_mode ──────────────────────────────────────
 
+
 class TestAnalyzeRequestForOptimalMode:
     """Tests for top-level analyze_request_for_optimal_mode."""
 
-    @patch("external_llm.agent.execution_mode_classifier._analyze_intent_with_llm_if_available", return_value=ExecuteMode.STRICT_JSON)
+    @patch(
+        "external_llm.agent.execution_mode_classifier._analyze_intent_with_llm_if_available",
+        return_value=ExecuteMode.STRICT_JSON,
+    )
     def test_llm_takes_priority(self, mock_llm):
         result = analyze_request_for_optimal_mode("test", "foo.py")
         assert result == "strict_json"
@@ -376,6 +393,7 @@ class TestAnalyzeRequestForOptimalMode:
 
 
 # ── _get_mode_matcher / semantic backstop ─────────────────────────────────
+
 
 class TestModeMatcherAndSemanticBackstop:
     """Tests for the lazy _get_mode_matcher singleton and the semantic

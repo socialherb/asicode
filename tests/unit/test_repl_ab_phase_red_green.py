@@ -63,10 +63,16 @@ class _FakeSessionMgr:
         self.turns = []
 
     def add_turn(self, session_id, role, note, model=None, digest=None, tool_results=None):
-        self.turns.append({
-            "session_id": session_id, "role": role, "note": note,
-            "model": model, "digest": digest, "tool_results": tool_results,
-        })
+        self.turns.append(
+            {
+                "session_id": session_id,
+                "role": role,
+                "note": note,
+                "model": model,
+                "digest": digest,
+                "tool_results": tool_results,
+            }
+        )
 
 
 def _write_config(repo_root, data):
@@ -127,12 +133,10 @@ class TestKickNextPromptSuggestion:
     def test_valid_delivery(self, monkeypatch):
         monkeypatch.setattr(threading, "Thread", _SyncThread)
         delivered = []
-        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion",
-                            lambda text, gen: delivered.append((text, gen)))
+        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion", lambda text, gen: delivered.append((text, gen)))
         llm = _FakeLLM(content="improve the tests", emit_warning=True)
         gen = repl_impl._next_suggestion_gen
-        repl_impl._kick_next_prompt_suggestion(
-            llm, "model-x", "refactor the parser", "final answer", "work digest")
+        repl_impl._kick_next_prompt_suggestion(llm, "model-x", "refactor the parser", "final answer", "work digest")
         assert delivered == [("improve the tests", gen)]
         msgs, kw = llm.calls[0]
         assert kw["model"] == "model-x" and kw["temperature"] == 0.3
@@ -144,8 +148,7 @@ class TestKickNextPromptSuggestion:
     def test_empty_final_message_and_digest(self, monkeypatch):
         monkeypatch.setattr(threading, "Thread", _SyncThread)
         delivered = []
-        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion",
-                            lambda text, gen: delivered.append((text, gen)))
+        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion", lambda text, gen: delivered.append((text, gen)))
         llm = _FakeLLM(content="run the linter")
         repl_impl._kick_next_prompt_suggestion(llm, "m", "fix the bug", "", "")
         assert len(delivered) == 1
@@ -156,11 +159,9 @@ class TestKickNextPromptSuggestion:
         monkeypatch.setattr(threading, "Thread", _SyncThread)
         repl_impl._auto_continue_state.update({"on": True, "depth": 2, "cap": 5})
         noted = []
-        monkeypatch.setattr(repl_impl, "_notify_above_prompt",
-                            lambda text, color: noted.append((text, color)))
+        monkeypatch.setattr(repl_impl, "_notify_above_prompt", lambda text, color: noted.append((text, color)))
         llm = _FakeLLM(content="NONE")
-        repl_impl._kick_next_prompt_suggestion(
-            llm, "model-x", "refactor the parser", "", "", auto_mode=True)
+        repl_impl._kick_next_prompt_suggestion(llm, "model-x", "refactor the parser", "", "", auto_mode=True)
         assert len(noted) == 1
         assert "stopped" in noted[0][0] and "after 2 auto step(s)" in noted[0][0]
         assert llm.calls[0][0][0].content == repl_impl._AUTO_NEXT_SUGGEST_SYSTEM
@@ -169,10 +170,8 @@ class TestKickNextPromptSuggestion:
         monkeypatch.setattr(threading, "Thread", _SyncThread)
         repl_impl._auto_continue_state.update({"on": False, "depth": 0, "cap": 5})
         noted = []
-        monkeypatch.setattr(repl_impl, "_notify_above_prompt",
-                            lambda text, color: noted.append((text, color)))
-        repl_impl._kick_next_prompt_suggestion(
-            _FakeLLM(content="NONE"), "m", "req", "", "", auto_mode=True)
+        monkeypatch.setattr(repl_impl, "_notify_above_prompt", lambda text, color: noted.append((text, color)))
+        repl_impl._kick_next_prompt_suggestion(_FakeLLM(content="NONE"), "m", "req", "", "", auto_mode=True)
         assert noted == []
 
     def test_gen_mismatch_inside_chat_discards(self, monkeypatch):
@@ -190,12 +189,10 @@ class TestKickNextPromptSuggestion:
                 repl_impl._next_suggestion_gen += 1
                 return getattr(real_client, name)
 
-        monkeypatch.setitem(sys.modules, "external_llm.client",
-                            _BumpingProxy("external_llm.client"))
+        monkeypatch.setitem(sys.modules, "external_llm.client", _BumpingProxy("external_llm.client"))
         monkeypatch.setattr(threading, "Thread", _SyncThread)
         delivered = []
-        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion",
-                            lambda t, g: delivered.append((t, g)))
+        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion", lambda t, g: delivered.append((t, g)))
         llm = _FakeLLM(content="improve the tests")
         repl_impl._kick_next_prompt_suggestion(llm, "m", "refactor the parser", "f", "d")
         assert llm.calls == [] and delivered == []
@@ -213,8 +210,7 @@ class TestKickNextPromptSuggestion:
 
         monkeypatch.setattr(threading, "Thread", _SyncThread)
         delivered = []
-        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion",
-                            lambda t, g: delivered.append(1))
+        monkeypatch.setattr(repl_impl, "_deliver_next_suggestion", lambda t, g: delivered.append(1))
         repl_impl._kick_next_prompt_suggestion(_Boom(), "m", "req", "f", "d")  # must not raise
         assert delivered == []
 
@@ -226,7 +222,8 @@ class TestPromptInput:
     def _collector(self, monkeypatch):
         collected = []
         monkeypatch.setattr(
-            repl_impl, "_collect_input",
+            repl_impl,
+            "_collect_input",
             lambda prompt, bottom_toolbar=False: collected.append((prompt, bottom_toolbar)) or "in",
         )
         return collected
@@ -294,8 +291,7 @@ class TestInitSessionState:
     def _svc(with_llm=True):
         if not with_llm:
             return SimpleNamespace()
-        return SimpleNamespace(
-            llm_service=SimpleNamespace(thinking_mode="keep", reasoning_effort="keep"))
+        return SimpleNamespace(llm_service=SimpleNamespace(thinking_mode="keep", reasoning_effort="keep"))
 
     def test_no_config_defaults(self, tmp_path):
         dc = SimpleNamespace(thinking_mode="x", reasoning_effort="y")
@@ -312,17 +308,22 @@ class TestInitSessionState:
         assert svc.llm_service.thinking_mode is None
 
     def test_config_values_loaded(self, tmp_path):
-        _write_config(tmp_path, {
-            "thinking_state": True,
-            "reasoning_effort": "high",
-            "helper_provider": "openai",
-            "helper_model": "gpt-x",
-            "chat_mode": "orchestrator",
-            "dev_models": {
-                "1": ["p1", "m1"], "2": ("p2", "m2", "extra"),
-                "bad": "x", "3": ["only-one"],
+        _write_config(
+            tmp_path,
+            {
+                "thinking_state": True,
+                "reasoning_effort": "high",
+                "helper_provider": "openai",
+                "helper_model": "gpt-x",
+                "chat_mode": "orchestrator",
+                "dev_models": {
+                    "1": ["p1", "m1"],
+                    "2": ("p2", "m2", "extra"),
+                    "bad": "x",
+                    "3": ["only-one"],
+                },
             },
-        })
+        )
         dc = SimpleNamespace(thinking_mode=None, reasoning_effort=None)
         svc = self._svc()
         state = repl_impl._init_session_state(str(tmp_path), svc, dc)
@@ -351,8 +352,7 @@ class TestInitSessionState:
     def test_terminal_branch_uses_term_cfg(self, tmp_path, monkeypatch):
         shared = Path(tmp_path) / ".asicode" / "config.json"
         shared.parent.mkdir(parents=True)
-        shared.write_text(json.dumps({"thinking_state": False, "reasoning_effort": "max"}),
-                          encoding="utf-8")
+        shared.write_text(json.dumps({"thinking_state": False, "reasoning_effort": "max"}), encoding="utf-8")
         term = Path(tmp_path) / ".asicode" / "terminals" / "ttys007.json"
         monkeypatch.setattr(repl_impl, "_terminal_config_path", lambda root: str(term))
         state = repl_impl._init_session_state(str(tmp_path), self._svc(), SimpleNamespace())
@@ -374,11 +374,8 @@ class TestInitReplEngine:
 
     def _patches(self, monkeypatch, *, svc=_DEFAULT_SVC, nudge=(False, "")):
         if svc is self._DEFAULT_SVC:
-            svc = SimpleNamespace(model="test-m", provider="test-p",
-                                  llm_service=SimpleNamespace())
-        monkeypatch.setattr(
-            intelligent_service_mod, "create_intelligent_service_from_env",
-            lambda *a, **k: svc)
+            svc = SimpleNamespace(model="test-m", provider="test-p", llm_service=SimpleNamespace())
+        monkeypatch.setattr(intelligent_service_mod, "create_intelligent_service_from_env", lambda *a, **k: svc)
         monkeypatch.setattr(insights_manager, "compute_stats", lambda root: {"count": 1})
         monkeypatch.setattr(insights_manager, "should_nudge", lambda stats: nudge)
         seen = []
@@ -496,14 +493,10 @@ class _FakeOrchConfig:
 class TestRunOrchestrateSingleShot:
     def _setup(self, monkeypatch, *, raises=False):
         if raises:
-            monkeypatch.setattr(
-                intelligent_service_mod, "create_intelligent_service_from_env",
-                lambda *a, **k: None)
+            monkeypatch.setattr(intelligent_service_mod, "create_intelligent_service_from_env", lambda *a, **k: None)
         else:
             svc = SimpleNamespace(model="orch-m", llm_service=SimpleNamespace(client="CLIENT"))
-            monkeypatch.setattr(
-                intelligent_service_mod, "create_intelligent_service_from_env",
-                lambda *a, **k: svc)
+            monkeypatch.setattr(intelligent_service_mod, "create_intelligent_service_from_env", lambda *a, **k: svc)
         monkeypatch.setattr(orchestrator_mod, "OrchestratorAgent", _FakeOrchAgent)
         monkeypatch.setattr(orchestrator_mod, "OrchestratorConfig", _FakeOrchConfig)
         monkeypatch.setattr(tool_registry_mod, "ToolRegistry", _FakeToolRegistry)
@@ -511,10 +504,8 @@ class TestRunOrchestrateSingleShot:
 
     def test_builds_and_runs(self, monkeypatch):
         self._setup(monkeypatch)
-        args = SimpleNamespace(provider="p", model="m", api_key=None,
-                               thinking_mode=True, reasoning_effort="high")
-        out = repl_impl._run_orchestrate_single_shot(
-            args, "/repo", "do it", lambda e, p=None: None, threading.Event())
+        args = SimpleNamespace(provider="p", model="m", api_key=None, thinking_mode=True, reasoning_effort="high")
+        out = repl_impl._run_orchestrate_single_shot(args, "/repo", "do it", lambda e, p=None: None, threading.Event())
         assert out == "RESULT:do it"
         agent = _FakeOrchAgent.instances[-1]
         assert agent.kw["llm_client"] == "CLIENT" and agent.kw["model"] == "orch-m"
@@ -545,59 +536,75 @@ class TestRunOnce:
     _NO_RESULT = object()
 
     @staticmethod
-    def _mk_result(status="success", final_message="ok", error="",
-                   applied_patches=None, turns=0, metadata=None):
+    def _mk_result(status="success", final_message="ok", error="", applied_patches=None, turns=0, metadata=None):
         return SimpleNamespace(
-            status=status, final_message=final_message, error=error,
-            applied_patches=applied_patches or [], turns=turns, metadata=metadata or {})
+            status=status,
+            final_message=final_message,
+            error=error,
+            applied_patches=applied_patches or [],
+            turns=turns,
+            metadata=metadata or {},
+        )
 
     @staticmethod
     def _args(**over):
         base = {
-            "repo": "", "verbose": False, "json_stream": False, "json": False, "orchestrate": False,
-            "provider": "p", "model": "m", "api_key": None, "max_turns": 5,
-            "thinking_mode": None, "reasoning_effort": None, "scoped_verification": True,
+            "repo": "",
+            "verbose": False,
+            "json_stream": False,
+            "json": False,
+            "orchestrate": False,
+            "provider": "p",
+            "model": "m",
+            "api_key": None,
+            "max_turns": 5,
+            "thinking_mode": None,
+            "reasoning_effort": None,
+            "scoped_verification": True,
         }
         base.update(over)
         return SimpleNamespace(**base)
 
-    def _setup(self, monkeypatch, *, result=_NO_RESULT, engine_raises=None,
-               orch=None, orch_raises=None):
+    def _setup(self, monkeypatch, *, result=_NO_RESULT, engine_raises=None, orch=None, orch_raises=None):
         box = {"shown": [], "stream": [], "json": [], "err": [], "printed": [], "orch": []}
         monkeypatch.setattr(repl_impl, "_resolve_repo_root", lambda repo: "/tmp/fake-repo")
         monkeypatch.setattr(repl_impl, "_git_baseline", lambda root: "BASE")
         monkeypatch.setattr(
-            repl_impl, "_show_result",
-            lambda result, elapsed, repo_root=None, baseline=None:
-            box["shown"].append((result, repo_root, baseline)))
+            repl_impl,
+            "_show_result",
+            lambda result, elapsed, repo_root=None, baseline=None: box["shown"].append((result, repo_root, baseline)),
+        )
         monkeypatch.setattr(
-            repl_impl, "_json_stream_emit",
-            lambda event, payload=None, **kw: box["stream"].append((event, payload)))
+            repl_impl, "_json_stream_emit", lambda event, payload=None, **kw: box["stream"].append((event, payload))
+        )
         monkeypatch.setattr(
-            repl_impl, "_build_json_output",
-            lambda result, elapsed: box["json"].append((result, elapsed)))
+            repl_impl, "_build_json_output", lambda result, elapsed: box["json"].append((result, elapsed))
+        )
         monkeypatch.setattr(
-            repl_impl, "_json_error_output",
-            lambda status, error, duration_ms=0: box["err"].append((status, error, duration_ms)))
-        monkeypatch.setattr(repl_impl, "_print",
-                            lambda text, color: box["printed"].append(text))
+            repl_impl,
+            "_json_error_output",
+            lambda status, error, duration_ms=0: box["err"].append((status, error, duration_ms)),
+        )
+        monkeypatch.setattr(repl_impl, "_print", lambda text, color: box["printed"].append(text))
         if orch is not None:
             monkeypatch.setattr(repl_impl, "_run_orchestrate_single_shot", orch)
             monkeypatch.setattr(repl_impl, "_orchestrator_result_to_agent_like", lambda r: r)
         if orch_raises is not None:
+
             def _boom(*a, **k):
                 raise orch_raises
 
             monkeypatch.setattr(repl_impl, "_run_orchestrate_single_shot", _boom)
         if engine_raises is not None:
+
             def _raises(*a, **k):
                 raise engine_raises
 
             monkeypatch.setattr(repl_impl, "_run_with_cancel", _raises)
         else:
             monkeypatch.setattr(
-                repl_impl, "_run_with_cancel",
-                lambda *a, **k: (None if result is self._NO_RESULT else result))
+                repl_impl, "_run_with_cancel", lambda *a, **k: None if result is self._NO_RESULT else result
+            )
         monkeypatch.setattr(repl_impl, "_build_engine", lambda config: SimpleNamespace())
         return box
 
@@ -621,8 +628,9 @@ class TestRunOnce:
         assert self._run(self._args()) == 0
 
     def test_clarification_returns_2(self, monkeypatch):
-        box = self._setup(monkeypatch, result=self._mk_result(
-            status="clarification_needed", final_message="which file?"))
+        box = self._setup(
+            monkeypatch, result=self._mk_result(status="clarification_needed", final_message="which file?")
+        )
         rc = self._run(self._args())
         assert rc == 2
         assert any("which file?" in t for t in box["printed"])
@@ -755,10 +763,8 @@ class TestFinalizePendingDesignChat:
         return t
 
     def test_fast_path_completed_content(self):
-        box = {"result": SimpleNamespace(content="final answer text",
-                                         tool_results=[SimpleNamespace()])}
-        pending = {"thread": threading.Thread(), "box": box,
-                   "design_config": SimpleNamespace(cancel_event=object())}
+        box = {"result": SimpleNamespace(content="final answer text", tool_results=[SimpleNamespace()])}
+        pending = {"thread": threading.Thread(), "box": box, "design_config": SimpleNamespace(cancel_event=object())}
         mgr = _FakeSessionMgr()
         repl_impl._finalize_pending_design_chat(pending, mgr, "sess-1", "model-x")
         assert mgr.turns[0]["session_id"] == "sess-1" and mgr.turns[0]["model"] == "model-x"
@@ -783,8 +789,7 @@ class TestFinalizePendingDesignChat:
         assert mgr.turns[0]["digest"] == ""
 
     def test_esc_interrupt_preserves_tool_results(self):
-        partial = SimpleNamespace(content="partial answer",
-                                  tool_results=[SimpleNamespace(), SimpleNamespace()])
+        partial = SimpleNamespace(content="partial answer", tool_results=[SimpleNamespace(), SimpleNamespace()])
         pending = {"thread": threading.Thread(), "box": {"error": SimpleNamespace(partial_result=partial)}}
         mgr = _FakeSessionMgr()
         repl_impl._finalize_pending_design_chat(pending, mgr, "s", "m")

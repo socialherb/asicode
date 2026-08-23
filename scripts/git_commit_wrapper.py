@@ -57,6 +57,7 @@ goes through it automatically (repo-local, no per-user setup)::
 NOTE: ``pre-commit install`` overwrites ``.git/hooks/pre-commit`` — re-run
 ``--install-hook`` after re-installing pre-commit's own hook.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -67,7 +68,6 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from typing import Optional
 
 RACE_MARKER = "files were modified by this hook"
 SETTLE_TIMEOUT = 15.0
@@ -113,9 +113,7 @@ _HOOK_TEMPLATE = (
 Runner = Callable[[list[str], str], subprocess.CompletedProcess]
 
 
-def _run_cmd(
-    argv: list[str], cwd: str, timeout: float | None = _CMD_TIMEOUT
-) -> subprocess.CompletedProcess:
+def _run_cmd(argv: list[str], cwd: str, timeout: float | None = _CMD_TIMEOUT) -> subprocess.CompletedProcess:
     """Run a command, capturing output. OSError guard: required by the repo's
     unguarded-subprocess gate (a missing binary must not crash silently).
 
@@ -162,7 +160,7 @@ def _warn(msg: str) -> None:
     sys.stderr.flush()
 
 
-def _toplevel(cwd: str, runner: Runner) -> Optional[str]:
+def _toplevel(cwd: str, runner: Runner) -> str | None:
     cp = runner(["git", "rev-parse", "--show-toplevel"], cwd)
     if cp.returncode != 0:
         return None
@@ -202,9 +200,7 @@ def _scope_pathspec(exclude: Sequence[str]) -> list[str]:
     return ["--", ":(top)"] + [":(exclude,top,literal)" + p for p in exclude]
 
 
-def _snapshot(
-    cwd: str, runner: Runner, exclude: Sequence[str] = ()
-) -> tuple[int, bytes]:
+def _snapshot(cwd: str, runner: Runner, exclude: Sequence[str] = ()) -> tuple[int, bytes]:
     """Working-tree diff (pre-commit's own signal, see _DIFF_ARGS), restricted
     to files outside ``exclude``.
 
@@ -238,7 +234,7 @@ def _wait_for_settle(
     waiting for the PARALLEL writer to stop, not for our own hooks' edits.
     """
     deadline = time.monotonic() + timeout
-    prev: Optional[tuple[int, bytes]] = None
+    prev: tuple[int, bytes] | None = None
     stable = 0
     while time.monotonic() < deadline:
         cur = _snapshot(cwd, runner, exclude)
@@ -290,8 +286,8 @@ def _precommit_argv() -> list[str]:
 
 def run_hooks(
     args: list[str],
-    cwd: Optional[str] = None,
-    runner: Optional[Runner] = None,
+    cwd: str | None = None,
+    runner: Runner | None = None,
     settle_timeout: float = SETTLE_TIMEOUT,
     settle_interval: float = SETTLE_INTERVAL,
     settle_stable_samples: int = SETTLE_STABLE_SAMPLES,
@@ -363,9 +359,7 @@ def run_hooks(
             scope,
         )
         if not settled:
-            _warn(
-                f"tree did not settle within {settle_timeout:.0f}s; retrying once anyway."
-            )
+            _warn(f"tree did not settle within {settle_timeout:.0f}s; retrying once anyway.")
         try:
             cp = runner(cmd, cwd)
         except subprocess.TimeoutExpired:
@@ -390,14 +384,14 @@ def run_hooks(
     return cp.returncode
 
 
-def _top_for_cli(runner: Runner) -> Optional[str]:
+def _top_for_cli(runner: Runner) -> str | None:
     top = _toplevel(os.getcwd(), runner)
     if top is None:
         print("commit-wrapper: not inside a git repository", file=sys.stderr)
     return top
 
 
-def _hook_path(top: str, runner: Runner) -> Optional[str]:
+def _hook_path(top: str, runner: Runner) -> str | None:
     # --git-path honours core.hooksPath (verified on git 2.39): installing into
     # a hardcoded .git/hooks would be silently inert when it is set.
     cp = runner(["git", "rev-parse", "--git-path", "hooks/pre-commit"], top)
@@ -411,7 +405,7 @@ def _hook_path(top: str, runner: Runner) -> Optional[str]:
     return os.path.abspath(p)
 
 
-def _install_hook(runner: Optional[Runner] = None, force: bool = False) -> int:
+def _install_hook(runner: Runner | None = None, force: bool = False) -> int:
     runner = runner or _default_runner
     top = _top_for_cli(runner)
     if top is None:
@@ -447,8 +441,7 @@ def _install_hook(runner: Optional[Runner] = None, force: bool = False) -> int:
                 )
                 return 1
             print(
-                f"commit-wrapper: warning: overwriting foreign hook at "
-                f"{hook_path} (--force)",
+                f"commit-wrapper: warning: overwriting foreign hook at {hook_path} (--force)",
                 file=sys.stderr,
             )
     content = _HOOK_TEMPLATE.format(
@@ -467,7 +460,7 @@ def _install_hook(runner: Optional[Runner] = None, force: bool = False) -> int:
     return 0
 
 
-def _uninstall_hook(runner: Optional[Runner] = None) -> int:
+def _uninstall_hook(runner: Runner | None = None) -> int:
     runner = runner or _default_runner
     top = _top_for_cli(runner)
     if top is None:
@@ -483,20 +476,16 @@ def _uninstall_hook(runner: Optional[Runner] = None) -> int:
         existing = f.read()
     if _HOOK_MARKER not in existing:
         print(
-            f"commit-wrapper: error: {hook_path} is not this wrapper's hook — "
-            "not touching it",
+            f"commit-wrapper: error: {hook_path} is not this wrapper's hook — not touching it",
             file=sys.stderr,
         )
         return 1
     os.remove(hook_path)
-    print(
-        f"commit-wrapper: removed {hook_path} — run `pre-commit install` to "
-        "restore the standard pre-commit gate"
-    )
+    print(f"commit-wrapper: removed {hook_path} — run `pre-commit install` to restore the standard pre-commit gate")
     return 0
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     doc = (__doc__ or "").strip()
     if not argv:

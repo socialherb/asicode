@@ -1,6 +1,7 @@
 """
 Integration tests for context builder and RAG integration.
 """
+
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -75,7 +76,7 @@ class TestContextBuilder:
 
         rag_searcher = agent.registry._rag_searcher
         assert rag_searcher is not None
-        assert hasattr(rag_searcher, 'find_relevant_files')
+        assert hasattr(rag_searcher, "find_relevant_files")
 
     def test_rag_find_relevant_files_called(self, temp_repo_root_with_memory: str):
         """Test RAG find_relevant_files integration."""
@@ -86,11 +87,9 @@ class TestContextBuilder:
             {"file": "sample.py", "content": "def hello() -> str:", "score": 0.9},
         ]
 
-        with patch.object(rag_searcher, 'find_relevant_files', return_value=mock_results) as mock_find:
+        with patch.object(rag_searcher, "find_relevant_files", return_value=mock_results) as mock_find:
             # _build_session_context doesn't call RAG directly — RAG is injected during run()
             # Just verify the mock path is valid
             result = rag_searcher.find_relevant_files("test query", top_k=3)
             assert result == mock_results
             assert mock_find.call_count == 1
-
-

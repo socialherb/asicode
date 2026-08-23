@@ -20,13 +20,13 @@ returns a composite exposing ``is_set()`` — the only method the cooperative
 channel consumes (vulture's ``_is_cancelled``, the dispatch entry check, the
 scanner-to-scanner checkpoint).
 """
+
 from __future__ import annotations
 
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Optional
 
 
 class CallCancelledError(Exception):
@@ -52,7 +52,7 @@ class _CompositeCancel:
     def is_set(self) -> bool:
         return any(e.is_set() for e in self._events)
 
-    def wait(self, timeout: Optional[float] = None) -> bool:
+    def wait(self, timeout: float | None = None) -> bool:
         """Block until any source is set (True) or *timeout* elapses (False).
 
         Mirrors ``threading.Event.wait`` semantics: ``timeout=None`` waits
@@ -99,15 +99,15 @@ def call_cancel_scope(event: threading.Event) -> Iterator[threading.Event]:
         stack.pop()
 
 
-def current_cancel_event() -> Optional[threading.Event]:
+def current_cancel_event() -> threading.Event | None:
     """Innermost per-call cancel event for THIS thread, ``None`` if no scope."""
     stack = getattr(_local, "stack", None)
     return stack[-1] if stack else None
 
 
 def effective_cancel(
-    *fallbacks: Optional[threading.Event],
-) -> Optional["threading.Event | _CompositeCancel"]:
+    *fallbacks: threading.Event | None,
+) -> threading.Event | _CompositeCancel | None:
     """Merge the active scope with *fallbacks* (e.g. ``config.cancel_event``).
 
     Returns ``None`` when no source exists (serial dispatch: zero behavior

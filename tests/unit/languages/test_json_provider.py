@@ -1,4 +1,5 @@
 """Unit tests for JsonSyntaxProvider."""
+
 from __future__ import annotations
 
 import pytest
@@ -13,6 +14,7 @@ def provider():
 
 
 # ── language_id / capabilities ────────────────────────────────────────────────
+
 
 def test_language_id(provider):
     assert provider.language_id() == LanguageId.JSON
@@ -29,6 +31,7 @@ def test_capabilities_no_symbol_ops(provider):
 
 
 # ── Valid JSON ───────────────────────────────────────────────────────────────
+
 
 def test_valid_simple_object(provider):
     result = provider.validate_syntax("test.json", '{"a": 1, "b": true}')
@@ -53,6 +56,7 @@ def test_valid_array(provider):
 
 
 # ── Invalid JSON ────────────────────────────────────────────────────────
+
 
 def test_invalid_trailing_comma(provider):
     result = provider.validate_syntax("bad.json", '{"a": 1,}')
@@ -80,6 +84,7 @@ def test_language_in_result(provider):
 
 
 # ── JSONC (JSON with comments) ────────────────────────────────────────────────────
+
 
 def test_jsonc_line_comment_stripped(provider):
     content = '{\n  // description\n  "strict": true\n}'
@@ -115,13 +120,7 @@ def test_jsonc_block_comment_multi_line(provider):
 
 
 def test_jsonc_mixed_line_and_block_comments(provider):
-    content = (
-        '{\n'
-        '  // header\n'
-        '  /* block */ "a": 1,\n'
-        '  "b": "http://x" // url\n'
-        '}'
-    )
+    content = '{\n  // header\n  /* block */ "a": 1,\n  "b": "http://x" // url\n}'
     result = provider.validate_syntax("settings.jsonc", content)
     assert result.ok is True
 
@@ -138,6 +137,8 @@ def test_jsonc_unclosed_block_comment_is_invalid(provider):
     content = '{"a": 1 /* never closed'
     result = provider.validate_syntax("bad.jsonc", content)
     assert result.ok is False
+
+
 def test_plain_json_comment_is_invalid(provider):
     # .json files don't strip comments, so this is a parse error
     content = '{"a": 1 // comment\n}'
@@ -147,6 +148,7 @@ def test_plain_json_comment_is_invalid(provider):
 
 # ── File globs ───────────────────────────────────────────────────────────────
 
+
 def test_file_globs(provider):
     globs = provider.get_file_globs()
     assert "*.json" in globs
@@ -154,6 +156,7 @@ def test_file_globs(provider):
 
 
 # ── Unimplemented methods return safe defaults ───────────────────────────────────────────────────
+
 
 def test_get_symbol_patterns_returns_empty(provider):
     assert provider.get_symbol_patterns() == []

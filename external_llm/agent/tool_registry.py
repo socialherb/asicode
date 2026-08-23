@@ -5,6 +5,7 @@ Tool Registry for asicode Agent
 Provides safe tool dispatch for the LLM agent loop.
 Security: all file operations are bounded by repo_root.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -18,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from .agent_profile import AgentProfile
@@ -33,13 +34,14 @@ from external_llm.common.walk_policy import _walk_should_skip_dir
 from ..graph.graph_facade import RepositoryGraphFacade
 
 # ── Extracted modules ────────────────────────────────────────────────────
-from ..languages import LanguageId
+from ..languages import LanguageId, SyntaxValidationResult
 from ._thread_pool import CANCEL_POLL_INTERVAL, shared_pool
 from .agent_loop_types import WRITE_TOOL_NAMES, AgentCancelled
 from .argument_repairer import ArgumentRepairer
 from .call_graph import CallGraphIndexer
 from .cancel_scope import call_cancel_scope, current_cancel_event
 from .config.thresholds import config as _cfg
+from .intent_models import IntentResult
 from .lint_runner import LintRunner
 from .performance_metrics import get_global_collector
 from .rag_searcher import RAGSearcher
@@ -78,16 +80,16 @@ class AgentConfig:
     # (safe-by-construction). Default True enables verify-by-default.
     scoped_verification: bool = True
     context_variant: str = "v7"
-    stream_callback: Optional[Callable[[str, dict[str, Any]], None]] = None
+    stream_callback: Callable[[str, dict[str, Any]], None] | None = None
     # Whether the stream_callback handles "content" events (incremental token rendering).
     # False in CLI mode (_ProgressPrinter has no "content" handler — all SSE overhead
     # would be discarded). Skips token_callback lambda creation + SSE streaming overhead.
     consume_content_events: bool = True
     # Lint maximum issue count
-    max_lint_issues: int = 50          # Maximum number of issues to return from lint results
+    max_lint_issues: int = 50  # Maximum number of issues to return from lint results
     # TDD auto-feedback loop
-    auto_test_on_patch: bool = False   # Automatically run pytest after patch apply
-    max_tdd_cycles: int = 3            # Maximum retry count after consecutive failures
+    auto_test_on_patch: bool = False  # Automatically run pytest after patch apply
+    max_tdd_cycles: int = 3  # Maximum retry count after consecutive failures
     test_paths: list[str] = field(default_factory=list)  # pytest paths/arguments
     # Timeout budget (seconds) for the run_tests tool. Default 300, not 120:
     # with an empty test_paths the TDD gate runs the FULL suite, and 120 s was
@@ -95,28 +97,30 @@ class AgentConfig:
     test_timeout_sec: int = 300
     # Self-Review
     self_review_enabled: bool = False  # Enable post-execution self-review phase
-    max_review_turns: int = 3          # Maximum review turns for self-review corrections
-    #RAG: related file automatic provide
-    rag_enabled: bool = True           # Auto-inject related file Top-K at session start
-    rag_top_k: int = 5                 # Number of files to auto-provide
+    max_review_turns: int = 3  # Maximum review turns for self-review corrections
+    # RAG: related file automatic provide
+    rag_enabled: bool = True  # Auto-inject related file Top-K at session start
+    rag_top_k: int = 5  # Number of files to auto-provide
     # Human-in-the-Loop approval gate
     # Callable: (tool_name, args, preview_text) -> bool (True=proceed)
-    approval_callback: Optional[Callable[["str", "dict[str,Any]", "str"], bool]] = None
+    approval_callback: Callable[[str, dict[str, Any], str], bool] | None = None
 
     # User Checkpoint: LLM asks user for questions/confirmations
     # Callable: (question_data: dict) -> dict  ({"status": "answered"|"timeout", "answer": ...})
     user_checkpoint_enabled: bool = True
-    user_checkpoint_max_questions: int = 3       # Max questions per session
-    user_checkpoint_timeout: int = ASK_USER_DEFAULT_TIMEOUT            # Timeout (seconds); on expiry, proceeds autonomously with default
-    user_checkpoint_callback: Optional[Callable[["dict[str,Any]"], "dict[str,Any]"]] = None
-    _user_checkpoint_count: int = 0              # Runtime: current session question counter
+    user_checkpoint_max_questions: int = 3  # Max questions per session
+    user_checkpoint_timeout: int = (
+        ASK_USER_DEFAULT_TIMEOUT  # Timeout (seconds); on expiry, proceeds autonomously with default
+    )
+    user_checkpoint_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    _user_checkpoint_count: int = 0  # Runtime: current session question counter
 
     # Server-side cancellation support (set by /agent/cancel)
-    cancel_event: Optional["threading.Event"] = None
+    cancel_event: threading.Event | None = None
 
     # Mid-task user message injection (set by /agent/message/{session_id})
     # Queue items: str (user message text)
-    message_queue: Optional[Any] = None
+    message_queue: Any | None = None
 
     # Context sliding window: keep only this many recent non-system messages
     # (0 = disabled, keep all). Prevents token overflow on long runs.
@@ -124,7 +128,7 @@ class AgentConfig:
 
     # Multi-agent fields
     agent_id: str = "main"
-    file_lock_manager: Optional[Any] = None  # FileLockManager instance
+    file_lock_manager: Any | None = None  # FileLockManager instance
 
     # Auto-observation: after a successful patch, optionally inject the diff as a user observation.
     # Default False to keep tool dispatch predictable in tests and avoid extra tool calls.
@@ -139,11 +143,15 @@ class AgentConfig:
     # ── Helper configuration (canonical) ─────────────────────────────────────
     # Helper is NOT a lane. Helper is the delegate_to_helper tool capability.
     helper_enabled: bool = False
-    helper_model: str = ""           # Any model identifier (API or Ollama)
-    helper_max_calls: int = 5        # Max delegation calls per session
+    helper_model: str = ""  # Any model identifier (API or Ollama)
+    helper_max_calls: int = 5  # Max delegation calls per session
     helper_ollama_url: str = "http://127.0.0.1:11434"  # Used when helper_model is Ollama
 
-    route_decision: Optional[Any] = None
+    route_decision: Any | None = None
+    # Intent understanding result from IntentResolver (language-neutral).
+    # Assigned post-construction by the REPL engine (`_build_engine`);
+    # consumed by SpecResolver to avoid duplicate LLM calls.
+    intent_result: IntentResult | None = None
 
     # ── Bench / Experiment ────────────────────────────────────────────────────
     # Force a specific patch strategy for all modify_symbol ops in this session.
@@ -157,10 +165,10 @@ class AgentConfig:
     # Vector cache for semantic search
     vector_cache_enabled: bool = True
 
-    # Ollama reasoning / thinking toggle
-    thinking_mode: bool = False
+    # Ollama reasoning / thinking toggle (None = not explicitly set; provider decides)
+    thinking_mode: bool | None = False
     # Reasoning depth for providers that support it ("high" | "max"); None = provider default
-    reasoning_effort: Optional[str] = None
+    reasoning_effort: str | None = None
 
     # Turn reduction optimizations
     dynamic_turn_budget_enabled: bool = True  # Dynamically adjust turn budget based on progress
@@ -199,9 +207,8 @@ class AgentConfig:
 
     # Developer model: the client/model the AgentLoop itself runs on when the
     # caller overrides it (webapp resolves this into AgentLoop's llm_client).
-    developer_llm_client: Optional[Any] = None
+    developer_llm_client: Any | None = None
     developer_model: str = ""
-
 
     # Design chat mode: write tools disabled, no early-finish, LLM synthesizes full response
     design_chat_mode: bool = False
@@ -225,7 +232,7 @@ class AgentConfig:
     # ── Agent profile (custom tool/model/turn constraints) ────────────────
     # Load via: AgentProfile.load(name, repo_root) or load_profile(name, repo_root)
     # None = no profile, all defaults apply.
-    agent_profile: Optional[Any] = None  # AgentProfile instance
+    agent_profile: Any | None = None  # AgentProfile instance
 
     # ── Cross-repo read boundary (trust-scoped) ───────────────────────────
     # When False (default), read tools (read_file / get_file_outline /
@@ -255,7 +262,7 @@ class AgentConfig:
         self.helper_max_calls = max(1, self.helper_max_calls)
         self.context_window_size = max(10, self.context_window_size)
 
-    def make_token_callback(self) -> Optional[Callable[[Optional[str]], None]]:
+    def make_token_callback(self) -> Callable[[str | None], None] | None:
         """Return a gated, None-safe token callback for content streaming.
 
         Returns ``None`` when streaming is disabled or ``consume_content_events``
@@ -271,10 +278,12 @@ class AgentConfig:
         cb = self.stream_callback
         if cb is None or not self.consume_content_events:
             return None
+
         # Capture cb in closure; guard None text (reset sentinel)
-        def _token_cb(text: Optional[str]) -> None:
+        def _token_cb(text: str | None) -> None:
             if text is not None:
                 cb("content", {"text": text})
+
         return _token_cb
 
 
@@ -299,6 +308,7 @@ class SemanticOutcome:
     model verbatim so it can act on the difference (re-check another way, or
     say the check was unavailable) instead of trusting a check that never ran.
     """
+
     diagnostics: list[dict] = field(default_factory=list)
     skip_reason: str = ""
 
@@ -311,7 +321,7 @@ class SemanticOutcome:
 class ToolResult:
     ok: bool
     content: str = ""
-    error: Optional[str] = None
+    error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     execution_time: float = 0.0
     partial_failure: bool = False  # True if operation partially succeeded
@@ -349,7 +359,7 @@ def _bias_matched_candidate(match) -> str:
     """The path token of a bias-correction match — group(0) minus the leading
     whitespace/tilde prefix, an optional ``cd `` verb, and the trailing subpath.
     """
-    _candidate = match.group(0)[len(match.group(1)):]
+    _candidate = match.group(0)[len(match.group(1)) :]
     _candidate = re.sub(r"^cd\s+", "", _candidate)
     _sub = match.group(3) or ""
     if _sub:
@@ -405,10 +415,7 @@ def _under_scratch_root(candidate: str) -> bool:
     if not candidate:
         return False
     c = os.path.realpath(os.path.expanduser(candidate))
-    return any(
-        c == r or c.startswith(r.rstrip("/") + "/")
-        for r in (os.path.realpath(x) for x in _SCRATCH_ROOTS)
-    )
+    return any(c == r or c.startswith(r.rstrip("/") + "/") for r in (os.path.realpath(x) for x in _SCRATCH_ROOTS))
 
 
 class ToolRegistry(
@@ -443,20 +450,38 @@ class ToolRegistry(
     # Directories pruned when counting source files for language detection.
     # These never indicate the repo's primary language (deps, caches, build
     # output, VCS metadata) and walking them only distorts counts + wastes time.
-    _COUNT_SKIP_DIRS = frozenset({
-        ".git", ".hg", ".svn",
-        "node_modules", "bower_components",
-        "vendor", ".venv", "venv", "env", ".env",
-        "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-        "dist", "build", "target", "out", ".next", ".gradle",
-        ".idea", ".vscode",
-    })
+    _COUNT_SKIP_DIRS = frozenset(
+        {
+            ".git",
+            ".hg",
+            ".svn",
+            "node_modules",
+            "bower_components",
+            "vendor",
+            ".venv",
+            "venv",
+            "env",
+            ".env",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            "dist",
+            "build",
+            "target",
+            "out",
+            ".next",
+            ".gradle",
+            ".idea",
+            ".vscode",
+        }
+    )
 
     # Module-level cache for _detect_repo_language. The repo's language
     # composition is immutable during a run, so caching by repo_root avoids
     # the full os.walk (~259-452ms/call, measured on this repo) on every
     # ToolRegistry construction (IPC worker creates one per task).
-    _LANGUAGE_DETECTION_CACHE: ClassVar["dict[str, Optional[LanguageId]]"] = {}
+    _LANGUAGE_DETECTION_CACHE: ClassVar[dict[str, LanguageId | None]] = {}
 
     # Single source of truth: tool name → handler method name mapping.
     # Used by dispatch() to resolve handlers and by has_tool_handler() for
@@ -473,7 +498,7 @@ class ToolRegistry(
         "run_tests": "_tool_run_tests",
         "run_lint": "_tool_run_lint",
         "get_project_info": "_tool_get_project_info",
-        "bash": "_tool_shell_exec",           # handler method != tool name
+        "bash": "_tool_shell_exec",  # handler method != tool name
         "job": "_tool_job",
         "find_symbol": "_tool_find_symbol",
         "grep": "_tool_grep",
@@ -503,7 +528,7 @@ class ToolRegistry(
     }
 
     @staticmethod
-    def _detect_repo_language(repo_root: str) -> Optional[LanguageId]:
+    def _detect_repo_language(repo_root: str) -> LanguageId | None:
         """Detect the dominant code language of a repo by counting source files.
 
         Returns ``None`` (all tools visible) when:
@@ -536,7 +561,9 @@ class ToolRegistry(
             try:
                 _result = subprocess.run(
                     ["git", "rev-parse", "--show-toplevel"],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                     cwd=repo_root,
                     check=False,
                 )
@@ -561,10 +588,7 @@ class ToolRegistry(
             # site-packages dirs (vendored deps that distort the count).  Union
             # the shared walk_policy predicate on top so vendored trees are
             # excluded here just as they are from every other walker (F7).
-            dirs[:] = sorted(
-                d for d in dirs
-                if d not in ToolRegistry._COUNT_SKIP_DIRS and not _walk_should_skip_dir(d)
-            )
+            dirs[:] = sorted(d for d in dirs if d not in ToolRegistry._COUNT_SKIP_DIRS and not _walk_should_skip_dir(d))
             for _f in sorted(files):
                 ext = os.path.splitext(_f)[1].lower()
                 if ext not in family_exts:
@@ -585,17 +609,23 @@ class ToolRegistry(
         if not counts:
             ToolRegistry._LANGUAGE_DETECTION_CACHE[_norm] = None
             return None  # no recognized code files → safe default
-        _result = LanguageId[max(counts, key=counts.get)]
+        _result = LanguageId[max(counts, key=lambda k: counts[k])]
         ToolRegistry._LANGUAGE_DETECTION_CACHE[_norm] = _result
         return _result
 
-    def _make_result(self, **kwargs) -> "ToolResult":
+    def _make_result(self, **kwargs) -> ToolResult:
         """Create a ToolResult without importing at module level."""
         return ToolResult(**kwargs)
 
-    def __init__(self, repo_root: str, config: AgentConfig, local_assistant: Optional[Any] = None, agent_profile: Optional['AgentProfile'] = None):
+    def __init__(
+        self,
+        repo_root: str,
+        config: AgentConfig,
+        local_assistant: Any | None = None,
+        agent_profile: AgentProfile | None = None,
+    ):
         self.repo_root = str(Path(repo_root).resolve())
-        self._repo_root_override: Optional[str] = None
+        self._repo_root_override: str | None = None
         # Resolved-root memo for _secure_path. The effective root is a session
         # constant (repo_root frozen above; override set at most once), so
         # re-resolving it on every read/write tool call was pure filesystem I/O
@@ -606,7 +636,7 @@ class ToolRegistry(
         # Detect dominant code language by counting source files
         # (_LANGUAGE_EXTENSION_GROUPS — single source of truth). Used by
         # get_tool_schemas() to mask Python-only tools in pure non-Python repos.
-        self._repo_language: Optional[LanguageId] = self._detect_repo_language(self.repo_root)
+        self._repo_language: LanguageId | None = self._detect_repo_language(self.repo_root)
         self.config = config
         self._lint_runner = LintRunner(repo_root)
         self._symbol_searcher = get_symbol_searcher(repo_root)
@@ -663,6 +693,7 @@ class ToolRegistry(
         # ``RunCheckpointGate._get_store`` still defers CheckpointStore (and so
         # the .asicode/checkpoints/ mkdir) to the first captured write.
         from external_llm.agent.run_checkpoint import RunCheckpointGate
+
         self._run_checkpoint_gate = RunCheckpointGate(self.repo_root)
         # Semantic-lint coalescing (see begin_semantic_turn). Files written
         # during the current turn, awaiting ONE validate_semantics run at turn
@@ -678,15 +709,16 @@ class ToolRegistry(
         self._tool_result_cache = self._make_tool_result_cache(config)
         if self._tool_result_cache is not None:
             logger.info(
-                "Tool result cache initialized (max=%s, "
-                "TTL=%ss)", config.tool_result_cache_max_entries, config.tool_result_cache_ttl
+                "Tool result cache initialized (max=%s, TTL=%ss)",
+                config.tool_result_cache_max_entries,
+                config.tool_result_cache_ttl,
             )
         self._search_cache: dict[str, ToolResult] = {}
 
         # Local Assistant instance for delegating tasks to local LLMs
         self.local_assistant = local_assistant
         # Agent profile: explicit param takes precedence over config field
-        self._agent_profile = agent_profile if agent_profile is not None else getattr(config, 'agent_profile', None)
+        self._agent_profile = agent_profile if agent_profile is not None else getattr(config, "agent_profile", None)
         if self._agent_profile is not None:
             logger.debug("Active agent profile: %s", self._agent_profile.name)
 
@@ -701,6 +733,7 @@ class ToolRegistry(
             # exact failure the eager construction removed. Recovered from, but
             # loudly: silently building one here is what hid it last time.
             from external_llm.agent.run_checkpoint import RunCheckpointGate
+
             logger.warning(
                 "checkpoint gate missing on %s — building a detached one; this "
                 "run's Undo point may be split across agents",
@@ -803,7 +836,7 @@ class ToolRegistry(
         self._semantic_pending[abs_path] = rel_path or abs_path
         return True
 
-    def drain_pending_semantic_checks(self) -> dict[str, "SemanticOutcome"]:
+    def drain_pending_semantic_checks(self) -> dict[str, SemanticOutcome]:
         """Run one semantic check per file written this turn; end the turn.
 
         Returns ``{abs_path: SemanticOutcome}``. The diagnostics inside use the
@@ -833,8 +866,7 @@ class ToolRegistry(
         # splitting a batch across project roots needs provider-specific
         # markers, so each override does its own.
         out: dict[str, SemanticOutcome] = {
-            abs_path: SemanticOutcome(skip_reason="no semantic checker for this file type")
-            for abs_path in pending
+            abs_path: SemanticOutcome(skip_reason="no semantic checker for this file type") for abs_path in pending
         }
         by_provider: dict[int, tuple[Any, list[str]]] = {}
         for abs_path in pending:
@@ -867,9 +899,14 @@ class ToolRegistry(
         for _provider, _paths in _groups[1:]:
             try:
                 _pending_futures.append(
-                    (_provider, _paths, shared_pool.submit(
-                        _provider.validate_semantics_batch, _paths,
-                    )),
+                    (
+                        _provider,
+                        _paths,
+                        shared_pool.submit(
+                            _provider.validate_semantics_batch,
+                            _paths,
+                        ),
+                    ),
                 )
             except RuntimeError as exc:
                 # Pool already shut down (interpreter teardown). Fall back to
@@ -887,6 +924,7 @@ class ToolRegistry(
         # diagnostic into a turn-end failure.
         _ce = getattr(self.config, "cancel_event", None)
         _cancelled = False
+        results: dict[str, SyntaxValidationResult] = {}
         for provider, paths, future in [*_first, *_pending_futures]:
             if _cancelled:
                 for abs_path in paths:
@@ -931,26 +969,26 @@ class ToolRegistry(
                     # rendered as "checked, clean" — the miscue this whole
                     # design exists to avoid — so the skip travels as a skip.
                     out[abs_path] = SemanticOutcome(
-                        skip_reason=(
-                            getattr(sem, "skip_reason", "")
-                            or "the checker did not run"
-                        ),
+                        skip_reason=(getattr(sem, "skip_reason", "") or "the checker did not run"),
                     )
                     continue
-                out[abs_path] = SemanticOutcome(diagnostics=[
-                    {
-                        "file_path": abs_path,
-                        "line": e.line, "col": e.col,
-                        "message": e.message,
-                        "severity": getattr(e, "severity", "error"),
-                        "code": getattr(e, "code", ""),
-                    }
-                    for e in (sem.errors or [])
-                ])
+                out[abs_path] = SemanticOutcome(
+                    diagnostics=[
+                        {
+                            "file_path": abs_path,
+                            "line": e.line,
+                            "col": e.col,
+                            "message": e.message,
+                            "severity": getattr(e, "severity", "error"),
+                            "code": getattr(e, "code", ""),
+                        }
+                        for e in (sem.errors or [])
+                    ]
+                )
         return out
 
     @property
-    def repo_language(self) -> Optional[LanguageId]:
+    def repo_language(self) -> LanguageId | None:
         """Dominant repo language by source-file count, or None if Python/mixed/unknown.
 
         ``None`` means all tools are visible (Python-only tools not masked). A
@@ -960,7 +998,7 @@ class ToolRegistry(
         return self._repo_language
 
     @staticmethod
-    def _make_tool_result_cache(config: "AgentConfig") -> Optional[Any]:
+    def _make_tool_result_cache(config: AgentConfig) -> Any | None:
         """Build a fresh, ISOLATED ToolResultCache from ``config`` (or None).
 
         Shared by ``__init__`` and ``clone_for_subagent`` so every registry
@@ -985,6 +1023,7 @@ class ToolRegistry(
             return None
         try:
             from .tool_result_cache import ToolResultCache
+
             cache = ToolResultCache(
                 max_entries=getattr(config, "tool_result_cache_max_entries", 256),
                 default_ttl=getattr(config, "tool_result_cache_ttl", 120),
@@ -996,7 +1035,7 @@ class ToolRegistry(
         else:
             return cache
 
-    def clone_for_subagent(self, sub_config: "AgentConfig") -> "ToolRegistry":
+    def clone_for_subagent(self, sub_config: AgentConfig) -> ToolRegistry:
         """Create a lightweight clone sharing expensive resources.
 
         Shared (immutable/thread-safe): SymbolSearcher, RAGSearcher,
@@ -1018,8 +1057,8 @@ class ToolRegistry(
         clone._safety_manager = self._safety_manager
 
         # Fresh mutable state per subagent
-        clone._applied_patches: list[str] = []
-        clone._search_cache: dict[str, Any] = {}
+        clone._applied_patches = []
+        clone._search_cache = {}
 
         # Fresh, ISOLATED cache (NOT shared with the parent, NOT None). A null
         # cache threw away the most common subagent win — repeated read_file of
@@ -1054,9 +1093,7 @@ class ToolRegistry(
         # config was previously SILENTLY IGNORED and the parent's enforced.
         # `is not None` (not truthiness): matches the `__init__` `agent_profile` fallback.
         sub_profile = getattr(sub_config, "agent_profile", None)
-        clone._agent_profile = (
-            sub_profile if sub_profile is not None else getattr(self, "_agent_profile", None)
-        )
+        clone._agent_profile = sub_profile if sub_profile is not None else getattr(self, "_agent_profile", None)
         # Semantic-lint coalescing — FRESH per clone (never shared — concurrent
         # subagent writes must NOT co-accumulate into the parent's batch).
         clone._semantic_pending = {}
@@ -1110,20 +1147,21 @@ class ToolRegistry(
         # target paths is the classifier trap, so a full clear is the only
         # safe choice there.
         from ..languages import LanguageId as _LId
-        if any(_LId.from_path(p) != _LId.UNKNOWN for p in touched_paths) and hasattr(self, '_call_graph'):
-            cgi = getattr(self._call_graph, 'call_graph_indexer', None)
+
+        if any(_LId.from_path(p) != _LId.UNKNOWN for p in touched_paths) and hasattr(self, "_call_graph"):
+            cgi = getattr(self._call_graph, "call_graph_indexer", None)
             if cgi is not None:
                 cgi.invalidate_files(touched_paths)
 
         # Incrementally update RAG index for touched files (much faster than full rebuild)
-        if hasattr(self, '_rag_searcher') and self._rag_searcher:
+        if hasattr(self, "_rag_searcher") and self._rag_searcher:
             try:
                 self._rag_searcher.invalidate_files(touched_paths)
             except Exception as e:
                 logger.debug("Failed to incrementally update RAG index: %s", e)
 
         # Incrementally update GSG graph for touched Python files
-        if hasattr(self, '_call_graph') and self._call_graph:
+        if hasattr(self, "_call_graph") and self._call_graph:
             try:
                 self._call_graph.invalidate_files(touched_paths)
             except (AttributeError, TypeError) as e:
@@ -1133,6 +1171,7 @@ class ToolRegistry(
         # immediately visible to find_symbol / call-graph rebuilds.
         try:
             from external_llm.agent._shared_utils import invalidate_walk_caches
+
             invalidate_walk_caches()
         except Exception as e:
             # Non-critical — never block execution. Logged because a failure
@@ -1153,6 +1192,7 @@ class ToolRegistry(
         # which bypasses the funnel entirely.
         try:
             from external_llm.common.repo_files import invalidate_for_written_path
+
             for _p in touched_paths:
                 _abs = _p if os.path.isabs(_p) else os.path.join(self._effective_repo_root, _p)
                 invalidate_for_written_path(_abs)
@@ -1182,6 +1222,7 @@ class ToolRegistry(
                 from external_llm.agent.symbol_search import (
                     invalidate_py_prefilter_cache,
                 )
+
                 invalidate_py_prefilter_cache()
         except Exception as e:
             logger.debug("post-write invalidation: Python prefilter memo failed: %s", e)
@@ -1242,6 +1283,7 @@ class ToolRegistry(
             logger.debug("unknown-scope invalidation: call-graph invalidate failed: %s", e)
         try:
             from external_llm.agent._shared_utils import invalidate_walk_caches
+
             invalidate_walk_caches()
         except Exception as e:
             logger.debug("unknown-scope invalidation: walk cache pop failed: %s", e)
@@ -1254,6 +1296,7 @@ class ToolRegistry(
             # and `bash` creating a .py file is the exact case this method was
             # added for.
             from external_llm.agent.symbol_search import invalidate_py_prefilter_cache
+
             invalidate_py_prefilter_cache()
         except Exception as e:
             logger.debug("unknown-scope invalidation: Python prefilter memo failed: %s", e)
@@ -1268,6 +1311,7 @@ class ToolRegistry(
             from external_llm.agent.tool_handlers.write_tools import (
                 invalidate_repo_file_index,
             )
+
             invalidate_repo_file_index(self._effective_repo_root)
         except Exception as e:
             logger.debug("unknown-scope invalidation: repo file index failed: %s", e)
@@ -1290,14 +1334,13 @@ class ToolRegistry(
 
     _PATCH_FILE_THRESHOLD = 3
 
-    def _gate_check(self, tool_name: str, args: dict) -> "Optional[ToolResult]":
-        rejection = self._safety_manager.gate_check(
-            tool_name, args, self.config.approval_callback
-        )
+    def _gate_check(self, tool_name: str, args: dict) -> ToolResult | None:
+        rejection = self._safety_manager.gate_check(tool_name, args, self.config.approval_callback)
         if rejection is None:
             return None
         return ToolResult(
-            ok=False, content="",
+            ok=False,
+            content="",
             error=rejection["error"],
             metadata=rejection["metadata"],
         )
@@ -1323,7 +1366,8 @@ class ToolRegistry(
     # Read-only tools safe for result caching (no side effects, deterministic output)
     _READ_ONLY_TOOLS: ClassVar[set[str]] = {
         "get_project_info",
-        "find_symbol", "find_references",
+        "find_symbol",
+        "find_references",
         "find_tests_for_symbol",
         "find_relevant_files",
         "get_file_outline",
@@ -1340,7 +1384,8 @@ class ToolRegistry(
         # as the others. Scope is frozenset() (no repo-file dependency), so a
         # write-tool success does NOT drop them — only TTL/LRU/clear do. Repeated
         # identical queries within a turn still hit.
-        "search_web", "web_fetch",
+        "search_web",
+        "web_fetch",
     }
 
     def is_result_cacheable(self, tool_name: str) -> bool:
@@ -1374,14 +1419,46 @@ class ToolRegistry(
     #
     # Static prefixes that are unconditionally read-only (whitelist, fastest path).
     _BASH_READONLY_PREFIXES = (
-        "ls ", "cat ", "head ", "tail ", "less ", "more ",
-        "grep ", "rg ", "find ", "fd ", "locate ",
-        "wc ", "du ", "df ", "file ", "stat ", "md5sum ", "sha256sum ",
-        "diff ", "git log", "git status", "git diff", "git show",
-        "git rev-parse", "git remote -v", "git config --get",
-        "git blame", "git ls-files", "git ls-tree", "git count-objects",
-        "pwd", "whoami", "hostname", "uname", "echo ", "printf ",
-        "which ", "command -v", "type ", "printenv",
+        "ls ",
+        "cat ",
+        "head ",
+        "tail ",
+        "less ",
+        "more ",
+        "grep ",
+        "rg ",
+        "find ",
+        "fd ",
+        "locate ",
+        "wc ",
+        "du ",
+        "df ",
+        "file ",
+        "stat ",
+        "md5sum ",
+        "sha256sum ",
+        "diff ",
+        "git log",
+        "git status",
+        "git diff",
+        "git show",
+        "git rev-parse",
+        "git remote -v",
+        "git config --get",
+        "git blame",
+        "git ls-files",
+        "git ls-tree",
+        "git count-objects",
+        "pwd",
+        "whoami",
+        "hostname",
+        "uname",
+        "echo ",
+        "printf ",
+        "which ",
+        "command -v",
+        "type ",
+        "printenv",
         # NOT here, deliberately: "python -c", "python3 -c", "node -e". They were
         # whitelisted as "introspection only when via -c (no pip/install)", but -c
         # and -e run ARBITRARY code — `python3 -c "open('f','w').write(...)"`
@@ -1389,9 +1466,12 @@ class ToolRegistry(
         # ambiguous command shape there is, and this classifier's stated policy is
         # that ambiguous defaults to mutating. `node --check` stays: it only parses.
         "node --check ",
-        "pytest --collect-only", "pytest -q --co",
-        "ruff check", "ruff --version",
-        "test ", "[ ",
+        "pytest --collect-only",
+        "pytest -q --co",
+        "ruff check",
+        "ruff --version",
+        "test ",
+        "[ ",
     )
     # Tokens whose presence ANYWHERE in the command implies a filesystem mutation
     # or source-state change → cache must be invalidated. Conservative: a false
@@ -1403,21 +1483,50 @@ class ToolRegistry(
     # ``_has_redirect_outside_quotes``, a quote-aware character scan that also
     # ignores redirect chars inside string literals (``echo ">x"``).
     _BASH_WRITE_TOKENS = (
-        "tee ",      # writes stdin to a file
-        "rm ", "rmdir", "mv ", "cp ",  # remove/move/copy files
-        "mkdir", "touch ",            # create files/dirs
-        "chmod", "chown",             # metadata changes
-        "sed -i", "perl -i",          # in-place file edits
-        " -delete", " -exec",         # find ... -delete / -exec: mutate despite "find " read-only prefix
-        "git add", "git rm", "git mv", "git commit", "git checkout", "git reset",
-        "git pull", "git push", "git merge", "git rebase",
-        "git restore", "git clean",
-        "pip install", "pip uninstall", "pip3 install", "pip3 uninstall",
-        "npm install", "npm uninstall", "npm ci",
-        "yarn add", "yarn remove", "pnpm add", "pnpm remove",
-        "apply_patch", "patch -p",
-        "curl -o", "wget -o", "wget -O",  # download to file
-        "tar -x", "unzip ", "gunzip ",    # extract (creates files)
+        "tee ",  # writes stdin to a file
+        "rm ",
+        "rmdir",
+        "mv ",
+        "cp ",  # remove/move/copy files
+        "mkdir",
+        "touch ",  # create files/dirs
+        "chmod",
+        "chown",  # metadata changes
+        "sed -i",
+        "perl -i",  # in-place file edits
+        " -delete",
+        " -exec",  # find ... -delete / -exec: mutate despite "find " read-only prefix
+        "git add",
+        "git rm",
+        "git mv",
+        "git commit",
+        "git checkout",
+        "git reset",
+        "git pull",
+        "git push",
+        "git merge",
+        "git rebase",
+        "git restore",
+        "git clean",
+        "pip install",
+        "pip uninstall",
+        "pip3 install",
+        "pip3 uninstall",
+        "npm install",
+        "npm uninstall",
+        "npm ci",
+        "yarn add",
+        "yarn remove",
+        "pnpm add",
+        "pnpm remove",
+        "apply_patch",
+        "patch -p",
+        "curl -o",
+        "wget -o",
+        "wget -O",  # download to file
+        "tar -x",
+        "unzip ",
+        "gunzip ",  # extract (creates files)
     )
 
     # `git branch` argument forms that only *query* branch state (no create/
@@ -1425,8 +1534,16 @@ class ToolRegistry(
     # …) mutates. Checked as a dedicated case because a blanket "git branch"
     # prefix would also whitelist `git branch -D x` (deletes a branch).
     _GIT_BRANCH_READONLY_ARGS = (
-        "--list", "-l", "-a", "-r", "-v", "-vv",
-        "--contains", "--no-color", "--color", "--sort",
+        "--list",
+        "-l",
+        "-a",
+        "-r",
+        "-v",
+        "-vv",
+        "--contains",
+        "--no-color",
+        "--color",
+        "--sort",
     )
 
     @staticmethod
@@ -1501,7 +1618,7 @@ class ToolRegistry(
         gt = redirect_text.find(">")
         if gt < 0:
             return False
-        after = redirect_text[gt + 1:].lstrip()
+        after = redirect_text[gt + 1 :].lstrip()
         # ``find`` returns the FIRST ``>``, so on an APPEND redirect the second
         # one is still sitting in *after* (``>>/dev/null`` -> ``>/dev/null``) and
         # no sink below would match. Drop it, so the append forms (``>>``,
@@ -1552,7 +1669,7 @@ class ToolRegistry(
         return _tree
 
     @classmethod
-    def _walk_bash_nodes(cls, command: str, node_type: str, _tree=None) -> Optional[list]:
+    def _walk_bash_nodes(cls, command: str, node_type: str, _tree=None) -> list | None:
         """Return the text of every tree-sitter-bash node of *node_type* in *command*.
 
         Shares the bootstrap/parse contract of :meth:`_parse_bash_tree` and the
@@ -1581,7 +1698,7 @@ class ToolRegistry(
         while _stack:
             _node = _stack.pop()
             if _node.type == node_type:
-                _texts.append(command[_node.start_byte:_node.end_byte])
+                _texts.append(command[_node.start_byte : _node.end_byte])
             if _node.children:
                 _stack.extend(reversed(_node.children))
         return _texts
@@ -1626,10 +1743,10 @@ class ToolRegistry(
         following argument to exist).
         """
         if segment == "git stash" or segment.startswith("git stash "):
-            rest = segment[len("git stash"):].strip()
+            rest = segment[len("git stash") :].strip()
             return rest.startswith(("list", "show"))
         if segment == "git branch" or segment.startswith("git branch "):
-            rest = segment[len("git branch"):].strip()
+            rest = segment[len("git branch") :].strip()
             return rest == "" or any(rest.startswith(a) for a in cls._GIT_BRANCH_READONLY_ARGS)
         if segment == "env" or segment.startswith("env "):
             # Bare `env` (optionally with VAR=VAL assignments) prints the
@@ -1637,7 +1754,7 @@ class ToolRegistry(
             # prefix match would whitelist an arbitrary command — the same hole
             # `python -c` had. Options (-i, -u FOO) fall to mutating: conservative,
             # and only costs a cache miss.
-            rest = segment[len("env"):].strip()
+            rest = segment[len("env") :].strip()
             return all("=" in tok for tok in rest.split()) if rest else True
         return any(segment.startswith(prefix) or segment == prefix.rstrip() for prefix in cls._BASH_READONLY_PREFIXES)
 
@@ -1808,7 +1925,7 @@ class ToolRegistry(
     # overlapping entries instead of a full clear() (see _extract_write_target_paths).
     _PATH_SCOPED_READ_TOOLS = frozenset({"read_file", "get_file_outline", "read_image"})
 
-    def _resolve_repo_scope(self, path_arg: Any) -> Optional[frozenset]:
+    def _resolve_repo_scope(self, path_arg: Any) -> frozenset | None:
         """Resolve a path arg to an absolute in-repo scope, or None.
 
         Returns None for a blank arg, a bare repo root (repo-wide), or a path
@@ -1823,15 +1940,13 @@ class ToolRegistry(
         p = path_arg.strip() if isinstance(path_arg, str) else ""
         if not p or p in (".", self.repo_root):
             return None
-        full = os.path.normpath(
-            p if os.path.isabs(p) else os.path.join(self.repo_root, p)
-        )
+        full = os.path.normpath(p if os.path.isabs(p) else os.path.join(self.repo_root, p))
         root = os.path.normpath(self.repo_root)
         if full != root and not full.startswith(root + os.sep):
             return None  # escaped the repo — not a usable scope
         return frozenset({full})
 
-    def _extract_read_scope_paths(self, tool_name: str, args: dict) -> Optional[frozenset]:
+    def _extract_read_scope_paths(self, tool_name: str, args: dict) -> frozenset | None:
         """Absolute path(s) a cached read-only result depends on, or None if
         unknown/repo-wide (e.g. a search with no path filter, or any tool not
         listed below) — such entries are always dropped by a later invalidation."""
@@ -1880,7 +1995,7 @@ class ToolRegistry(
             return frozenset()
         return None
 
-    def _extract_write_target_paths(self, tool_name: str, args: dict) -> Optional[frozenset]:
+    def _extract_write_target_paths(self, tool_name: str, args: dict) -> frozenset | None:
         """Best-effort absolute target path(s) for a write-tool call, so cache
         invalidation can drop only overlapping entries. Returns None when the
         target can't be determined (caller should fall back to a full clear()).
@@ -1895,10 +2010,7 @@ class ToolRegistry(
         if not targets:
             return None  # unknown scope → caller falls back to full clear()
 
-        return frozenset(
-            os.path.normpath(t if os.path.isabs(t) else os.path.join(self.repo_root, t))
-            for t in targets
-        )
+        return frozenset(os.path.normpath(t if os.path.isabs(t) else os.path.join(self.repo_root, t)) for t in targets)
 
     # ── Write safety: snapshot + verify + rollback (delegated) ──────────
 
@@ -1977,6 +2089,7 @@ class ToolRegistry(
 
             # Convert SyntaxError_ → VerifyError
             from external_llm.editor._editor_core.vm.models import VerifyError
+
             verify_errors = [
                 VerifyError(
                     message=e.message,
@@ -1997,7 +2110,12 @@ class ToolRegistry(
                 if strategy is None:
                     continue
 
-                ops = strategy(current_code, verr, classifier)
+                # Strategies consume a Classification (typed symbol extraction),
+                # NOT the classifier object itself — passing `classifier` here
+                # would make every `.symbol` / `.fix_hint` access in the
+                # strategy body fail with AttributeError.
+                classification = classifier.classify_typed([verr])
+                ops = strategy(current_code, verr, classification)
                 if ops is None:
                     continue
 
@@ -2019,8 +2137,9 @@ class ToolRegistry(
                     current_code = repaired_code
                     _repaired_any = True
                     logger.info(
-                        "Write safety: repaired argument mismatch in %s "
-                        "(error: %s)", path, verr.message[:80],
+                        "Write safety: repaired argument mismatch in %s (error: %s)",
+                        path,
+                        verr.message[:80],
                     )
                     # Code is now clean — stop processing this file
                     break
@@ -2068,7 +2187,7 @@ class ToolRegistry(
         # ── Parse the file path from verify_detail ──
         # verify_detail format (from verify_after_write):
         #   "file_path:line:col: message"
-        _detail_path_match = re.match(r'^([^:]+):(\d+):(\d+): ', verify_detail)
+        _detail_path_match = re.match(r"^([^:]+):(\d+):(\d+): ", verify_detail)
         _detail_path = _detail_path_match.group(1) if _detail_path_match else None
 
         # Find a language provider + its pre-edit origin content for the error's file.
@@ -2101,6 +2220,9 @@ class ToolRegistry(
 
         # ── Origin-skip guard (mirrors edit_text's _et_orig_ok gate) ──
         if _origin is not None:
+            # _origin is only ever set together with a syntax-capable
+            # _provider; assert to narrow for the call below.
+            assert _provider is not None
             _o_path, _o_content = _origin
             try:
                 _orig_ok = _provider.validate_syntax(_o_path, _o_content).ok
@@ -2111,7 +2233,8 @@ class ToolRegistry(
                     "Write safety: pre-edit content of %s also failed isolated "
                     "compile — verify errors are environmental cascade noise, "
                     "keeping edit (origin-skip guard): %s",
-                    _o_path, verify_detail,
+                    _o_path,
+                    verify_detail,
                 )
                 return True
 
@@ -2120,9 +2243,11 @@ class ToolRegistry(
         except ValueError:
             return False
 
-        ftype = classifier.classify([
-            VerifyError(message=verify_detail, line=0, column=0),
-        ])
+        ftype = classifier.classify(
+            [
+                VerifyError(message=verify_detail, line=0, column=0),
+            ]
+        )
 
         # SYNTAX_ERROR and UNKNOWN are hard failures — always rollback;
         # all other recognizable errors (ARGUMENT_MISMATCH, TYPE_MISMATCH,
@@ -2132,7 +2257,7 @@ class ToolRegistry(
     # _reindent_text → imported from external_llm.common.indent_utils.reindent_text
 
     @staticmethod
-    def _auto_repair_indent(original_content: str, operations: list) -> Optional[str]:
+    def _auto_repair_indent(original_content: str, operations: list) -> str | None:
         """Try to fix indentation in edit_file operations and re-apply them.
 
         Handles replace (re-indent content to anchor's column) and insert_after
@@ -2156,7 +2281,7 @@ class ToolRegistry(
 
             if op_type == "replace":
                 # Anchor's line position and leading whitespace on that line.
-                line_start = fixed.rfind('\n', 0, idx) + 1
+                line_start = fixed.rfind("\n", 0, idx) + 1
                 leading_ws = fixed[line_start:idx]
 
                 # Skip mid-line anchors — line-level indent fix doesn't apply when
@@ -2172,12 +2297,12 @@ class ToolRegistry(
                 # Consume the line's leading whitespace along with the anchor so the
                 # indent baked into adjusted's first line replaces the existing
                 # prefix instead of stacking on top of it.
-                fixed = fixed[:line_start] + adjusted + fixed[idx + len(anchor):]
+                fixed = fixed[:line_start] + adjusted + fixed[idx + len(anchor) :]
 
             else:  # insert_after
                 # Get anchor line's indentation to use as target.
-                line_start = fixed.rfind('\n', 0, idx) + 1
-                nl_pos = fixed.find('\n', idx)
+                line_start = fixed.rfind("\n", 0, idx) + 1
+                nl_pos = fixed.find("\n", idx)
                 no_trailing_nl = nl_pos == -1
                 eol = len(fixed) if no_trailing_nl else nl_pos
                 full_line = fixed[line_start:eol]
@@ -2190,15 +2315,13 @@ class ToolRegistry(
                 # When the anchor's line has no trailing newline, insert one
                 # before the new content so it doesn't get appended to the line.
                 if no_trailing_nl:
-                    fixed = fixed + '\n' + adjusted.rstrip('\n') + '\n'
+                    fixed = fixed + "\n" + adjusted.rstrip("\n") + "\n"
                 else:
-                    fixed = fixed[:eol+1] + adjusted.rstrip('\n') + '\n' + fixed[eol+1:]
+                    fixed = fixed[: eol + 1] + adjusted.rstrip("\n") + "\n" + fixed[eol + 1 :]
 
         return fixed if fixed != original_content else None
 
-    def _after_write_success(
-        self, tool_name: str, args: dict, result: "ToolResult", snapshots: dict
-    ) -> None:
+    def _after_write_success(self, tool_name: str, args: dict, result: ToolResult, snapshots: dict) -> None:
         """Central post-success processing for a call whose changes are on disk.
 
         Runs semantic auto-repair, post-write cache invalidation
@@ -2252,9 +2375,7 @@ class ToolRegistry(
                     _sem_snapshots = {}
             if _sem_snapshots:
                 try:
-                    _sem_repaired = self._safety_manager.auto_repair_semantic(
-                        _sem_snapshots
-                    )
+                    _sem_repaired = self._safety_manager.auto_repair_semantic(_sem_snapshots)
                     if _sem_repaired > 0:
                         logger.info(
                             "[AUTO-REPAIR] Write safety: auto-repaired %d semantic finding(s)",
@@ -2262,9 +2383,7 @@ class ToolRegistry(
                         )
                         result.metadata["semantic_repaired"] = _sem_repaired
                 except Exception as _sem_exc:
-                    logger.debug(
-                        "Semantic auto-repair error: %s", _sem_exc, exc_info=True
-                    )
+                    logger.debug("Semantic auto-repair error: %s", _sem_exc, exc_info=True)
 
                 # ── Post-write cache invalidation (PARITY across write tools) ──
                 # _invalidate_cache_after_write was reachable from exactly TWO
@@ -2289,7 +2408,9 @@ class ToolRegistry(
                 except Exception as _inv_exc:
                     logger.debug(
                         "Post-write cache invalidation failed for %s: %s",
-                        tool_name, _inv_exc, exc_info=True,
+                        tool_name,
+                        _inv_exc,
+                        exc_info=True,
                     )
 
         # ── Tool-result cache + Undo + git-snapshot invalidation ──
@@ -2304,14 +2425,15 @@ class ToolRegistry(
                 # cache entries. bash (and anything else with an unknown target)
                 # falls back to a full clear — safer than guessing scope.
                 _write_paths = (
-                    self._extract_write_target_paths(tool_name, args)
-                    if tool_name in self._WRITE_TOOLS else None
+                    self._extract_write_target_paths(tool_name, args) if tool_name in self._WRITE_TOOLS else None
                 )
                 if _write_paths:
                     _n = self._tool_result_cache.invalidate_paths(_write_paths)
                     logger.debug(
                         "Tool result cache scoped-invalidated %d entr(y/ies) for %s -> %s",
-                        _n, tool_name, _write_paths,
+                        _n,
+                        tool_name,
+                        _write_paths,
                     )
                 else:
                     self._tool_result_cache.clear()
@@ -2339,13 +2461,13 @@ class ToolRegistry(
             # which changes git state without going through a write tool.
             try:
                 from .agent_context_manager import _clear_git_cache
+
                 # Pass the registry's own root so only that repo's entry is
                 # stamped dirty (coalesced invalidation); the no-arg fallback
                 # still covers any caller that cannot name a root.
                 _clear_git_cache(self.repo_root)
             except Exception:
                 logger.debug("git snapshot invalidation failed", exc_info=True)
-
 
     def dispatch(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
         """Public entry: dispatch a tool call and record metrics.
@@ -2372,14 +2494,12 @@ class ToolRegistry(
         # absence of that key on a cacheable tool means "miss"; absence on a
         # non-cacheable tool means "N/A".
         if result.metadata and result.metadata.get("cache_hit"):
-            _cache_outcome: Optional[bool] = True
+            _cache_outcome: bool | None = True
         elif self.is_result_cacheable(tool_name):
             _cache_outcome = False
         else:
             _cache_outcome = None
-        get_global_collector().record_tool_call(
-            tool_name, result.execution_time, _cache_outcome, failed=not result.ok
-        )
+        get_global_collector().record_tool_call(tool_name, result.execution_time, _cache_outcome, failed=not result.ok)
         return result
 
     def _dispatch_impl(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
@@ -2401,9 +2521,9 @@ class ToolRegistry(
         # call while this worker was still QUEUED the event is already set and
         # the pool slot must free here without running the handler at all.
         _scope_ce = current_cancel_event()
-        if (
-            self.config.cancel_event is not None and self.config.cancel_event.is_set()
-        ) or (_scope_ce is not None and _scope_ce.is_set()):
+        if (self.config.cancel_event is not None and self.config.cancel_event.is_set()) or (
+            _scope_ce is not None and _scope_ce.is_set()
+        ):
             return ToolResult(
                 ok=False,
                 content="",
@@ -2413,25 +2533,25 @@ class ToolRegistry(
             )
 
         # Agent profile tool access validation
-        if hasattr(self, '_agent_profile') and self._agent_profile is not None:
+        if hasattr(self, "_agent_profile") and self._agent_profile is not None:
             profile = self._agent_profile
             # blocked_tools takes precedence over allowed_tools
-            if hasattr(profile, 'blocked_tools') and tool_name in profile.blocked_tools:
+            if hasattr(profile, "blocked_tools") and tool_name in profile.blocked_tools:
                 return ToolResult(
                     ok=False,
                     content="",
                     error=f"Tool '{tool_name}' is blocked by agent profile '{profile.name}'",
                     execution_time=0.0,
-                    metadata={"blocked": "agent_profile", "profile": profile.name}
+                    metadata={"blocked": "agent_profile", "profile": profile.name},
                 )
             # allowed_tools: empty list means no restriction (all tools allowed)
-            if hasattr(profile, 'allowed_tools') and profile.allowed_tools and tool_name not in profile.allowed_tools:
+            if hasattr(profile, "allowed_tools") and profile.allowed_tools and tool_name not in profile.allowed_tools:
                 return ToolResult(
                     ok=False,
                     content="",
                     error=f"Tool '{tool_name}' not in allowed_tools for profile '{profile.name}'",
                     execution_time=0.0,
-                    metadata={"blocked": "agent_profile", "profile": profile.name}
+                    metadata={"blocked": "agent_profile", "profile": profile.name},
                 )
 
         # Argument repair (names, then types)
@@ -2462,12 +2582,10 @@ class ToolRegistry(
         if gate_result is not None:
             return gate_result
 
-
         # Tool result cache lookup (read-only tools only). A hit returns
         # immediately below, so no `cache_hit` flag is needed downstream — the
         # cache-store condition at the tail just checks `result.ok`.
-        if (self._tool_result_cache is not None and
-            tool_name in self._READ_ONLY_TOOLS):
+        if self._tool_result_cache is not None and tool_name in self._READ_ONLY_TOOLS:
             cached = self._tool_result_cache.get(tool_name, args)
             if cached is not None:
                 # Reconstruct ToolResult from cached dict
@@ -2496,10 +2614,9 @@ class ToolRegistry(
         # content it raced with (TOCTOU — see ToolResultCache.set(file_sigs=)).
         # Pre-capture adds one os.stat per scoped path per read-only dispatch;
         # the tail's set() then reuses these instead of re-stating.
-        _cache_paths: Optional[frozenset[str]] = None
-        _cache_sigs: Optional[dict[str, Optional[tuple[int, int]]]] = None
-        if (self._tool_result_cache is not None and
-                tool_name in self._READ_ONLY_TOOLS):
+        _cache_paths: frozenset[str] | None = None
+        _cache_sigs: dict[str, tuple[int, int, int] | None] | None = None
+        if self._tool_result_cache is not None and tool_name in self._READ_ONLY_TOOLS:
             _cache_paths = self._extract_read_scope_paths(tool_name, args)
             if _cache_paths is not None:
                 _cache_sigs = {p: _path_sig(p) for p in _cache_paths}
@@ -2529,6 +2646,8 @@ class ToolRegistry(
         # redundant I/O for this self-validating tool — skip it too.
         # anchor_edit also validates syntax before writing (deterministic, self-validating).
         _write_snapshots: dict = {}
+        _repair_path = ""
+        start_time = 0.0
         try:
             # start_time FIRST so the except handler's execution_time reference is
             # always bound even if acquire/snapshot raise below.
@@ -2592,7 +2711,8 @@ class ToolRegistry(
                                     _repair_ok = True
                                     logger.info(
                                         "Write safety: auto-repaired indentation for %s (%s ops)",
-                                        _repair_path, len(_edit_ops),
+                                        _repair_path,
+                                        len(_edit_ops),
                                     )
 
                     if _repair_ok:
@@ -2604,9 +2724,7 @@ class ToolRegistry(
                         # Same central post-success contract as the normal tail:
                         # the repaired file is on disk, so the caches must drop
                         # pre-write state and the checkpoint must confirm it.
-                        self._after_write_success(
-                            tool_name, args, _repaired_result, _write_snapshots
-                        )
+                        self._after_write_success(tool_name, args, _repaired_result, _write_snapshots)
                         return _repaired_result
 
                     # --- Try argument mismatch repair before rollback ---
@@ -2620,16 +2738,13 @@ class ToolRegistry(
                         _arg_repaired = self._repair_verify_failure(_write_snapshots)
                     except Exception as _repair_exc:
                         logger.exception(
-                            "Write safety: repair path crashed — falling through "
-                            "to rollback: %s", _repair_exc,
+                            "Write safety: repair path crashed — falling through to rollback: %s",
+                            _repair_exc,
                         )
                         _arg_repaired = False
                     if _arg_repaired:
                         # Repair succeeded — file is already written, re-verify
-                        logger.info(
-                            "Write safety: argument mismatch repaired, "
-                            "edit applied successfully"
-                        )
+                        logger.info("Write safety: argument mismatch repaired, edit applied successfully")
                         result.metadata["repaired_args"] = True
                         self._after_write_success(tool_name, args, result, _write_snapshots)
                         return result
@@ -2642,8 +2757,7 @@ class ToolRegistry(
                         _soft_fail = self._should_soft_fail_verify(_verify_detail, _write_snapshots)
                     except Exception as _soft_exc:
                         logger.exception(
-                            "Write safety: soft-fail classification crashed — "
-                            "treating as hard fail (rollback): %s",
+                            "Write safety: soft-fail classification crashed — treating as hard fail (rollback): %s",
                             _soft_exc,
                         )
                         _soft_fail = False
@@ -2655,8 +2769,7 @@ class ToolRegistry(
                         self._text_edited_files = _pre_text_edits
                     else:
                         logger.warning(
-                            "Write safety: non-syntax error — keeping changes "
-                            "(may be resolved by downstream ops): %s",
+                            "Write safety: non-syntax error — keeping changes (may be resolved by downstream ops): %s",
                             _verify_detail,
                         )
                         result.metadata["verify_warning"] = _verify_detail
@@ -2674,18 +2787,12 @@ class ToolRegistry(
                                 _t = _op.get("type", "?")
                                 _a = _op.get("anchor", "")[:120]
                                 _c = _op.get("content", "")[:300]
-                                _parts.append(
-                                    f"  [{_oi}] type={_t}\n"
-                                    f"       anchor: {_a!r}\n"
-                                    f"       content: {_c!r}"
-                                )
-                            _detail_parts.append(
-                                "--- Attempted edit operations ---\n" + "\n".join(_parts)
-                            )
+                                _parts.append(f"  [{_oi}] type={_t}\n       anchor: {_a!r}\n       content: {_c!r}")
+                            _detail_parts.append("--- Attempted edit operations ---\n" + "\n".join(_parts))
 
                     # 2. Restored (original) file content with line numbers
                     _err_path, _err_line = None, None
-                    _parts = _verify_detail.split(':', 3)
+                    _parts = _verify_detail.split(":", 3)
                     if len(_parts) >= 3 and _parts[1].isdigit() and _parts[2].isdigit():
                         _err_path, _err_line = _parts[0], int(_parts[1])
                     for _path, _orig in _write_snapshots.items():
@@ -2695,25 +2802,20 @@ class ToolRegistry(
                         # original content) — rollback deleted the file, so there
                         # is no "AFTER ROLLBACK" context to show for it.
                         if not isinstance(_orig, str):
-                            _detail_parts.append(
-                                f"--- {_path}: newly created file removed by rollback ---"
-                            )
+                            _detail_parts.append(f"--- {_path}: newly created file removed by rollback ---")
                             continue
                         _lines = _orig.splitlines()
                         if _err_line and 1 <= _err_line <= len(_lines):
                             _start = max(0, _err_line - 3)
                             _end = min(len(_lines), _err_line + 2)
-                            _ctx = "\n".join(
-                                f"{i+1:4d}|{_lines[i]}"
-                                for i in range(_start, _end)
-                            )
-                            _detail_parts.append(
-                                f"--- {_path} (lines {_start+1}-{_end}) AFTER ROLLBACK ---\n{_ctx}"
-                            )
+                            _ctx = "\n".join(f"{i + 1:4d}|{_lines[i]}" for i in range(_start, _end))
+                            _detail_parts.append(f"--- {_path} (lines {_start + 1}-{_end}) AFTER ROLLBACK ---\n{_ctx}")
 
                     _full_detail = "\n\n".join(_detail_parts)
                     logger.warning(
-                        "Write safety: %s %s", tool_name, _full_detail,
+                        "Write safety: %s %s",
+                        tool_name,
+                        _full_detail,
                     )
                     return ToolResult(
                         ok=False,
@@ -2736,9 +2838,7 @@ class ToolRegistry(
 
             # Cache result for read-only tools (a cache hit already returned
             # above, so `result.ok` alone is sufficient here)
-            if (self._tool_result_cache is not None and
-                tool_name in self._READ_ONLY_TOOLS and
-                result.ok):
+            if self._tool_result_cache is not None and tool_name in self._READ_ONLY_TOOLS and result.ok:
                 # Convert ToolResult to serializable dict.
                 # ``metadata`` defaults to {} via default_factory, but a handler
                 # that passes metadata=None explicitly overrides that default —
@@ -2757,14 +2857,19 @@ class ToolRegistry(
                 # the next get() drop this entry instead of serving stale
                 # content as fresh for the whole TTL.
                 self._tool_result_cache.set(
-                    tool_name, args, cached,
-                    paths=_cache_paths, file_sigs=_cache_sigs,
+                    tool_name,
+                    args,
+                    cached,
+                    paths=_cache_paths,
+                    file_sigs=_cache_sigs,
                 )
                 logger.debug("Tool result cache SET: %s (args: %s, paths: %s)", tool_name, args, _cache_paths)
 
         except Exception as e:
             logger.exception("Tool %s raised exception", tool_name)
-            return ToolResult(ok=False, content="", error=f"{type(e).__name__}: {e}", execution_time=time.monotonic() - start_time)
+            return ToolResult(
+                ok=False, content="", error=f"{type(e).__name__}: {e}", execution_time=time.monotonic() - start_time
+            )
         else:
             return result
         finally:
@@ -2789,21 +2894,19 @@ class ToolRegistry(
         # "> file", …) races with concurrent reads/other bash, so the whole batch
         # falls back to sequential exactly as it does for an explicit write tool.
         # Read-only bash (ls, git status, grep) still parallelizes.
-        has_write_tool = any(
-            self._tool_call_mutates(call.get("tool", ""), call.get("args", {}))
-            for call in tool_calls
-        )
+        has_write_tool = any(self._tool_call_mutates(call.get("tool", ""), call.get("args", {})) for call in tool_calls)
         has_serial_tool = any(
-            self._tool_call_is_serial(call.get("tool", ""), call.get("args", {}))
-            for call in tool_calls
+            self._tool_call_is_serial(call.get("tool", ""), call.get("args", {})) for call in tool_calls
         )
-        if (not self.config.parallel_tool_execution_enabled
-                or len(tool_calls) <= 1
-                or has_write_tool
-                or has_serial_tool):
+        if not self.config.parallel_tool_execution_enabled or len(tool_calls) <= 1 or has_write_tool or has_serial_tool:
             # Fall back to sequential execution
-            logger.debug("Parallel execution disabled or unsafe: enabled=%s, count=%d, has_write=%s, has_serial=%s",
-                         self.config.parallel_tool_execution_enabled, len(tool_calls), has_write_tool, has_serial_tool)
+            logger.debug(
+                "Parallel execution disabled or unsafe: enabled=%s, count=%d, has_write=%s, has_serial=%s",
+                self.config.parallel_tool_execution_enabled,
+                len(tool_calls),
+                has_write_tool,
+                has_serial_tool,
+            )
             return [self.dispatch(call.get("tool", ""), call.get("args", {})) for call in tool_calls]
 
         logger.debug("Parallel tool execution activated for %d tools", len(tool_calls))
@@ -2849,8 +2952,7 @@ class ToolRegistry(
                 except Exception as e:
                     logger.exception("Parallel tool execution failed")
                     result = ToolResult(
-                        ok=False, content="",
-                        error=f"Parallel execution error: {type(e).__name__}: {e}"
+                        ok=False, content="", error=f"Parallel execution error: {type(e).__name__}: {e}"
                     )
                 results.append(result)
         finally:
@@ -2864,9 +2966,7 @@ class ToolRegistry(
                     ev.set()
         return results
 
-    def _dispatch_in_scope(
-        self, tool_name: str, args: dict[str, Any], cancel_event: threading.Event
-    ) -> ToolResult:
+    def _dispatch_in_scope(self, tool_name: str, args: dict[str, Any], cancel_event: threading.Event) -> ToolResult:
         """``dispatch`` + per-call cancel scope (see ``cancel_scope`` docs).
 
         Executor submit sites that can abandon a call mid-flight route through
@@ -2876,16 +2976,14 @@ class ToolRegistry(
             return self.dispatch(tool_name, args)
 
     @staticmethod
-    def _schema_variant_key(
-        lang_filter: Optional[LanguageId], design_chat: bool
-    ) -> tuple[bool, bool]:
+    def _schema_variant_key(lang_filter: LanguageId | None, design_chat: bool) -> tuple[bool, bool]:
         """``(include_python_only, include_design_chat)`` for the variant tables."""
         include_python_only = lang_filter is None or lang_filter is LanguageId.PYTHON
         return include_python_only, design_chat
 
     def get_tool_schemas(
         self,
-        lang_filter: Optional[LanguageId] = None,
+        lang_filter: LanguageId | None = None,
         design_chat: bool = False,
     ) -> list[dict[str, Any]]:
         """Return tool schemas for the LLM API.
@@ -2910,9 +3008,7 @@ class ToolRegistry(
         """
         return TOOL_SCHEMA_VARIANTS[self._schema_variant_key(lang_filter, design_chat)]
 
-    def get_tool_names(
-        self, lang_filter: Optional[LanguageId] = None, design_chat: bool = False
-    ) -> frozenset:
+    def get_tool_names(self, lang_filter: LanguageId | None = None, design_chat: bool = False) -> frozenset:
         """Return the frozen set of known tool names for O(1) membership checks.
 
         Cheaper than calling :meth:`get_tool_schemas` and building a set each
@@ -2980,11 +3076,11 @@ class ToolRegistry(
                 cd = m.group(2) or ""
                 subpath = m.group(3) or ""
                 if subpath.startswith(f"/{_b}"):
-                    subpath = subpath[len(_b) + 1:]
+                    subpath = subpath[len(_b) + 1 :]
                 return prefix + cd + self.repo_root + subpath
 
             new_text = re.sub(
-                rf'(^|[\s~])(cd\s+)?{re.escape(_bp)}(/\S*)?(?=\s|[&;]|$)',
+                rf"(^|[\s~])(cd\s+)?{re.escape(_bp)}(/\S*)?(?=\s|[&;]|$)",
                 _strict_repl,
                 text,
             )
@@ -3024,7 +3120,7 @@ class ToolRegistry(
                 return prefix + cd + self.repo_root + subpath
 
             _re_basename = re.compile(
-                rf'(^|[\s~])(cd\s+)?(?:[~/][\w./~+@-]*?)?{re.escape(_bp_basename)}(/\S*)?(?=\s|[&;]|$)',
+                rf"(^|[\s~])(cd\s+)?(?:[~/][\w./~+@-]*?)?{re.escape(_bp_basename)}(/\S*)?(?=\s|[&;]|$)",
                 re.ASCII,
             )
             new_text = _re_basename.sub(_basename_repl, text)
@@ -3046,17 +3142,14 @@ class ToolRegistry(
         Used before emitting event payloads so the CLI display shows real paths
         instead of LLM training-data bias paths (e.g. /workspace, /home/ubuntu/…).
         """
-        return {
-            k: self._correct_bias_path(v) if isinstance(v, str) else v
-            for k, v in args.items()
-        }
+        return {k: self._correct_bias_path(v) if isinstance(v, str) else v for k, v in args.items()}
 
     @property
     def _effective_repo_root(self) -> str:
         """Return the effective repo root, preferring staging override."""
         return self._repo_root_override or self.repo_root
 
-    def _secure_path(self, path: str, *, confine: bool = False) -> Optional[Path]:
+    def _secure_path(self, path: str, *, confine: bool = False) -> Path | None:
         """
         Resolve a path against repo_root.
 

@@ -20,10 +20,9 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from common import normalize_rel_path_fast
-from path_security import resolve_inside_repo
+from path_security import normalize_rel_path, resolve_inside_repo
 
 from .code_structure_utils import extract_symbol_name, is_python_definition
 from .common.atomic_io import atomic_write_text
@@ -38,32 +37,35 @@ logger = logging.getLogger(__name__)
 # guarantee — heavy dynamic-pattern load elsewhere can evict them).
 _RE_DIFF_GIT = re.compile(r"^diff --git a/(.+?) b/(.+?)\s*$")
 _RE_HUNK_HEADER_RECOUNT = re.compile(
-    r'^(@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@)(.*)',
+    r"^(@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@)(.*)",
     re.DOTALL,
 )
-_RE_HUNK_HEADER_FIX = re.compile(
-    r'^(@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@)(.*)', re.DOTALL
-)
+_RE_HUNK_HEADER_FIX = re.compile(r"^(@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@)(.*)", re.DOTALL)
 
 # ─── Patch Context ────────────────────────────────────────────────────────────
+
 
 @dataclass
 class PatchContext:
     """Optional context for patch application."""
-    original_request: Optional[str] = None
-    file_content: Optional[str] = None
-    llm_output: Optional[str] = None
-    output_mode: Optional[str] = None
+
+    original_request: str | None = None
+    file_content: str | None = None
+    llm_output: str | None = None
+    output_mode: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+
 # ─── Patch Result ─────────────────────────────────────────────────────────────
+
 
 @dataclass
 class PatchResult:
     """Standardized result from patch application."""
+
     success: bool
-    patch_applied: Optional[str] = None  # final unified diff applied
-    error: Optional[str] = None
+    patch_applied: str | None = None  # final unified diff applied
+    error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     # Standardized metadata fields
@@ -76,7 +78,9 @@ class PatchResult:
     # execution_steps: List[Dict] - detailed step-by-step log
     # normalized_patch: str - patch after normalization
 
+
 # ─── Patch Engine ─────────────────────────────────────────────────────────────
+
 
 class PatchEngine:
     """
@@ -117,29 +121,35 @@ class PatchEngine:
         code; the ``is None`` defensive checks in callers are retained)."""
         # Diff applier (shared with agent path)
         from diff_apply import apply_patch as diff_apply_patch
+
         self._diff_apply = diff_apply_patch
 
         # AST rewriter
         from .ast_rewrite import ASTRewriter
+
         self.ast_rewriter = ASTRewriter(self.repo_root)
 
         # Semantic patcher
         from .semantic_patch import SemanticPatchEngine
+
         self.semantic_patcher = SemanticPatchEngine(self.repo_root)
 
         # Symbol searcher (already used by agent tools)
         from .agent.symbol_search import get_symbol_searcher
+
         self.symbol_searcher = get_symbol_searcher(self.repo_root)
 
         # Patch synthesizer
         from .patch_synthesizer import PatchSynthesizer
+
         self.patch_synthesizer = PatchSynthesizer(self.repo_root)
 
         # Hybrid parser
         from .hybrid_parser import HybridOutputParser
+
         self.hybrid_parser = HybridOutputParser()
 
-    def _output_mode_to_enum(self, output_mode: str) -> Optional[OutputMode]:
+    def _output_mode_to_enum(self, output_mode: str) -> OutputMode | None:
         """Convert output mode string to OutputMode enum."""
         if OutputMode is None:
             return None
@@ -153,8 +163,9 @@ class PatchEngine:
         }
         return mode_map.get(output_mode, OutputMode.UNIFIED_DIFF)
 
-    def apply_patch(self, patch_text: str, target_file: Optional[str] = None,
-                    context: Optional[PatchContext] = None) -> PatchResult:
+    def apply_patch(
+        self, patch_text: str, target_file: str | None = None, context: PatchContext | None = None
+    ) -> PatchResult:
         """
         Apply a patch with full intelligence.
 
@@ -206,10 +217,7 @@ class PatchEngine:
         # Step 1b: Early exit — target file doesn't exist and patch is not a new-file creation.
         # No amount of reanchoring / fallback can fix a missing file; bail fast so the LLM
         # can immediately switch to create_file instead of exhausting all repair attempts.
-        _patch_is_new_file = (
-            "--- /dev/null" in work_patch
-            or "@@ -0,0 " in work_patch
-        )
+        _patch_is_new_file = "--- /dev/null" in work_patch or "@@ -0,0 " in work_patch
         # Resolve check path: explicit target_file or parsed from patch header
         _check_target = target_file
         if not _check_target and not _patch_is_new_file:
@@ -316,11 +324,7 @@ class PatchEngine:
                 )
             metadata["reason"] = "noop_success"
             metadata["mode"] = "noop"
-            return PatchResult(
-                success=True,
-                patch_applied=work_patch,
-                metadata=metadata
-            )
+            return PatchResult(success=True, patch_applied=work_patch, metadata=metadata)
 
         # Step 2: Try git apply (primary path)
         self._add_step(metadata, "git_apply", "Attempting git apply")
@@ -328,18 +332,15 @@ class PatchEngine:
         if not norm_error and self._diff_apply:
             try:
                 _ga_ok, _ga_msg, _ga_reason, _ga_details = self._diff_apply(
-                    self.repo_root, work_patch,
+                    self.repo_root,
+                    work_patch,
                     file_path_hint=target_file,
                     skip_3way=_skip_3way,
                 )
                 if _ga_ok:
                     metadata["reason"] = "git_apply_success"
                     metadata["mode"] = "git_apply"
-                    return PatchResult(
-                        success=True,
-                        patch_applied=work_patch,
-                        metadata=metadata
-                    )
+                    return PatchResult(success=True, patch_applied=work_patch, metadata=metadata)
                 metadata["first_fail_reason"] = _ga_msg or _ga_reason or "git apply failed"
             except Exception as e:
                 metadata["first_fail_reason"] = f"git apply exception: {e}"
@@ -372,7 +373,9 @@ class PatchEngine:
                 self._add_step(metadata, "reanchor", "Attempting fuzzy context re-anchor")
                 reanchored = self._reanchor_patch(work_patch, target_file)
             if reanchored:
-                tol_ok2, _tol_err2, tol_mode2 = self._tolerant_git_apply(reanchored, target_file, allow_3way=not _skip_3way)
+                tol_ok2, _tol_err2, tol_mode2 = self._tolerant_git_apply(
+                    reanchored, target_file, allow_3way=not _skip_3way
+                )
                 if tol_ok2:
                     metadata["reason"] = f"reanchor_success:{tol_mode2}"
                     metadata["mode"] = f"reanchor_{tol_mode2}"
@@ -382,7 +385,8 @@ class PatchEngine:
                 if self._diff_apply:
                     try:
                         _ra_ok, _ra_msg, _ra_reason, _ra_details = self._diff_apply(
-                            self.repo_root, reanchored,
+                            self.repo_root,
+                            reanchored,
                             skip_3way=_skip_3way,
                         )
                         if _ra_ok:
@@ -402,9 +406,9 @@ class PatchEngine:
         # Try repair ladder
         repair_result = self.repair_patch(
             patch_text=normalized,
-            target_file=target_file,
+            target_file=target_file or "",
             failure_reason=metadata["first_fail_reason"],
-            llm_output=llm_output
+            llm_output=llm_output,
         )
 
         # Merge metadata
@@ -422,32 +426,22 @@ class PatchEngine:
                     # callers observe an applied tree) — skip the re-apply,
                     # which would fail on the already-consumed pre-image lines.
                     return PatchResult(
-                        success=True,
-                        patch_applied=repair_result.patch_applied,
-                        metadata=merged_metadata
+                        success=True, patch_applied=repair_result.patch_applied, metadata=merged_metadata
                     )
                 apply_ok, apply_err = self._apply_diff_once(repair_result.patch_applied, target_file)
                 if apply_ok:
                     return PatchResult(
-                        success=True,
-                        patch_applied=repair_result.patch_applied,
-                        metadata=merged_metadata
+                        success=True, patch_applied=repair_result.patch_applied, metadata=merged_metadata
                     )
                 # Repaired patch failed to apply
                 merged_metadata["reason"] = "repaired_patch_apply_failed"
                 merged_metadata["second_fail_reason"] = apply_err
                 return PatchResult(
-                    success=False,
-                    error=f"Repaired patch failed to apply: {apply_err}",
-                    metadata=merged_metadata
+                    success=False, error=f"Repaired patch failed to apply: {apply_err}", metadata=merged_metadata
                 )
             # No patch produced (should not happen)
             merged_metadata["reason"] = "repaired_patch_missing"
-            return PatchResult(
-                success=False,
-                error="Repair succeeded but no patch produced",
-                metadata=merged_metadata
-            )
+            return PatchResult(success=False, error="Repair succeeded but no patch produced", metadata=merged_metadata)
         metadata["reason"] = "repair_failed"
         metadata["fallback_used"] = repair_result.metadata.get("fallback_used", [])
         metadata["second_fail_reason"] = repair_result.metadata.get("error", "repair failed")
@@ -470,14 +464,9 @@ class PatchEngine:
                 f"blob for it, so 3-way merge cannot work. Use 'modify_symbol' or "
                 f"'edit_text' instead, or stage the file with 'git add' first.)"
             )
-        return PatchResult(
-            success=False,
-            error=_final_err,
-            metadata=metadata
-        )
+        return PatchResult(success=False, error=_final_err, metadata=metadata)
 
-    def synthesize_and_apply(self, llm_output: str, target_file: str,
-                             output_mode: str = "auto") -> PatchResult:
+    def synthesize_and_apply(self, llm_output: str, target_file: str, output_mode: str = "auto") -> PatchResult:
         """
         Parse LLM output, synthesize diff, then apply.
 
@@ -508,31 +497,21 @@ class PatchEngine:
                 expected_mode = self._output_mode_to_enum(output_mode)
                 if expected_mode is None:
                     metadata["first_fail_reason"] = "output_mode enum not available"
-                    return PatchResult(
-                        success=False,
-                        error="Output mode enumeration not available",
-                        metadata=metadata
-                    )
+                    return PatchResult(success=False, error="Output mode enumeration not available", metadata=metadata)
 
                 # Parse LLM output using hybrid parser
                 parsed = self.hybrid_parser.parse(llm_output, expected_mode)
                 if not parsed.success:
                     metadata["first_fail_reason"] = f"parse failed: {parsed.error}"
                     return PatchResult(
-                        success=False,
-                        error=f"Failed to parse LLM output: {parsed.error}",
-                        metadata=metadata
+                        success=False, error=f"Failed to parse LLM output: {parsed.error}", metadata=metadata
                     )
 
                 # Check for NEEDS_DISAMBIGUATION
                 if parsed.mode is None:
                     # This indicates NEEDS_DISAMBIGUATION
                     metadata["synth_reason"] = "needs_disambiguation"
-                    return PatchResult(
-                        success=False,
-                        error="LLM output requires disambiguation",
-                        metadata=metadata
-                    )
+                    return PatchResult(success=False, error="LLM output requires disambiguation", metadata=metadata)
 
                 # Synthesize unified diff
                 synthesized = self.patch_synthesizer.synthesize(parsed, target_file)
@@ -545,16 +524,12 @@ class PatchEngine:
                     file_content=None,
                     llm_output=llm_output,
                     output_mode=output_mode,
-                    metadata={"parsed_mode": parsed.mode.value}
+                    metadata={"parsed_mode": parsed.mode.value},
                 )
                 return self.apply_patch(synthesized, target_file, context)
             except Exception as e:
                 metadata["first_fail_reason"] = f"synthesis failed: {e}"
-                return PatchResult(
-                    success=False,
-                    error=f"LLM output synthesis failed: {e}",
-                    metadata=metadata
-                )
+                return PatchResult(success=False, error=f"LLM output synthesis failed: {e}", metadata=metadata)
         else:
             missing = []
             if not self.hybrid_parser:
@@ -569,19 +544,15 @@ class PatchEngine:
                 # to "cannot enumerate output modes" rather than a generic
                 # component failure.
                 metadata["first_fail_reason"] = "output_mode enum not available"
-                return PatchResult(
-                    success=False,
-                    error="Output mode enumeration not available",
-                    metadata=metadata
-                )
+                return PatchResult(success=False, error="Output mode enumeration not available", metadata=metadata)
             metadata["first_fail_reason"] = f"components not available: {', '.join(missing)}"
             return PatchResult(
                 success=False,
                 error=f"LLM output synthesis components not available: {', '.join(missing)}",
-                metadata=metadata
+                metadata=metadata,
             )
 
-    def _auto_repair_patch(self, patch: str, target_file: str) -> Optional[str]:
+    def _auto_repair_patch(self, patch: str, target_file: str) -> str | None:
         """
         Attempt AST-based repair of a failing patch.
         """
@@ -620,17 +591,9 @@ class PatchEngine:
             symbol_name, symbol_kind = extract_symbol_name(header)
             if symbol_name:
                 if symbol_kind == "function":
-                    result = rewriter.replace_function(
-                        file_path,
-                        symbol_name,
-                        new_code
-                    )
+                    result = rewriter.replace_function(file_path, symbol_name, new_code)
                 elif symbol_kind == "class":
-                    result = rewriter.replace_class(
-                        file_path,
-                        symbol_name,
-                        new_code
-                    )
+                    result = rewriter.replace_class(file_path, symbol_name, new_code)
                 else:
                     result = None
 
@@ -642,7 +605,6 @@ class PatchEngine:
             return None
 
         return None
-
 
     def _try_synthesize_diff_from_file_blocks(
         self,
@@ -659,7 +621,7 @@ class PatchEngine:
           - cap file/patched size
           - output is still validated later via validate_diff(..., target_file=target_file)
         """
-        tgt_rel = normalize_rel_path_fast(str(target_file))
+        tgt_rel = normalize_rel_path(str(target_file))
         # P22-2: containment guard — prompt-derived paths must not escape the repo.
         try:
             tgt_path = resolve_inside_repo(repo_root, tgt_rel)
@@ -701,7 +663,7 @@ class PatchEngine:
             p = str(b.get("path") or "").strip().strip('"').strip("'")
             if not p:
                 continue
-            rel = normalize_rel_path_fast(p)
+            rel = normalize_rel_path(p)
             code = b.get("text") or b.get("content") or ""
             code = self._strip_trailing_fences(str(code))
             blocks.append((rel, code))
@@ -720,7 +682,7 @@ class PatchEngine:
                 if tail and not _fence_tail_is_lang_tag(tail):
                     code = tail + "\n" + str(code)
                 code = self._strip_trailing_fences(str(code))
-                rel = normalize_rel_path_fast(p)
+                rel = normalize_rel_path(p)
                 if rel:
                     blocks.append((rel, code))
 
@@ -728,8 +690,8 @@ class PatchEngine:
             return ("", "no_file_block")
 
         # Pick best match: exact target path, else basename match
-        chosen_rel: Optional[str] = None
-        new_text: Optional[str] = None
+        chosen_rel: str | None = None
+        new_text: str | None = None
 
         for rel, code in blocks:
             if rel == tgt_rel:
@@ -763,14 +725,11 @@ class PatchEngine:
         must not be treated as a snippet."""
         if not text:
             return False
-        heads = [
-            ln for ln in text.splitlines()
-            if PatchEngine._SYMBOL_HEAD_RE.match(ln)
-        ]
+        heads = [ln for ln in text.splitlines() if PatchEngine._SYMBOL_HEAD_RE.match(ln)]
         return len(heads) == 1
 
     @classmethod
-    def _replace_symbol_block(cls, old_text: str, new_text: str) -> Optional[str]:
+    def _replace_symbol_block(cls, old_text: str, new_text: str) -> str | None:
         """Replace the single top-level def/class block named by the first line
         of *new_text* inside *old_text*. Returns the merged text, or None when
         the symbol's block cannot be located."""
@@ -785,9 +744,7 @@ class PatchEngine:
             if ln.rstrip() != first:
                 continue
             j = i + 1
-            while j < len(old_lines) and (
-                not old_lines[j].strip() or old_lines[j][:1] in (" ", "\t")
-            ):
+            while j < len(old_lines) and (not old_lines[j].strip() or old_lines[j][:1] in (" ", "\t")):
                 j += 1
             merged = old_lines[:i] + new_lines + old_lines[j:]
             out = "\n".join(merged)
@@ -796,8 +753,9 @@ class PatchEngine:
             return out
         return None
 
-    def _synthesize_full_file_diff(self, repo_root: str, target_file: str, new_text: str,
-                                   old_text: Optional[str] = None) -> tuple[str, str]:
+    def _synthesize_full_file_diff(
+        self, repo_root: str, target_file: str, new_text: str, old_text: str | None = None
+    ) -> tuple[str, str]:
         """Synthesize a unified diff for a full-file rewrite candidate.
 
         Shared by ``_try_synthesize_diff_from_file_blocks`` and the repair
@@ -806,7 +764,7 @@ class PatchEngine:
         read_failed / file_too_large / no_changes / file_rewrite_too_large /
         patch_too_large.
         """
-        tgt_rel = normalize_rel_path_fast(str(target_file))
+        tgt_rel = normalize_rel_path(str(target_file))
         try:
             tgt_path = resolve_inside_repo(repo_root, tgt_rel)
         except ValueError:
@@ -858,6 +816,8 @@ class PatchEngine:
             sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
             change_ratio = 1.0 - float(sm.ratio())
         except Exception:
+            old_lines = []
+            new_lines = []
             change_ratio = 1.0
 
         try:
@@ -867,7 +827,9 @@ class PatchEngine:
         except Exception:
             changed_lines_est = 10**9
 
-        if (change_ratio > float(self._MAX_FILE_REWRITE_CHANGE_RATIO)) or (changed_lines_est > int(self._MAX_FILE_REWRITE_CHANGED_LINES)):
+        if (change_ratio > float(self._MAX_FILE_REWRITE_CHANGE_RATIO)) or (
+            changed_lines_est > int(self._MAX_FILE_REWRITE_CHANGED_LINES)
+        ):
             return ("", "file_rewrite_too_large")
 
         diff_lines = list(
@@ -898,7 +860,7 @@ class PatchEngine:
         # If the model accidentally included an ending fence inside unfenced capture, trim it.
         return re.sub(r"\n```[\s\S]*\Z", "\n", t)
 
-    def _salvage_small_model_output(self, patch_text: str, target_file: str) -> Optional[str]:
+    def _salvage_small_model_output(self, patch_text: str, target_file: str) -> str | None:
         """
         Enhanced patch synthesis for small/local LLMs with malformed outputs.
         Moved from tool_registry.py _synthesize_simple_diff.
@@ -941,8 +903,9 @@ class PatchEngine:
                 return None
             if st_size > int(self._SALVAGE_SKIP_MAX_BYTES):
                 logger.debug(
-                    "salvage_small_model_output: skipping large file by size "
-                    "(st_size=%d, target=%s)", st_size, rel,
+                    "salvage_small_model_output: skipping large file by size (st_size=%d, target=%s)",
+                    st_size,
+                    rel,
                 )
                 return None
 
@@ -958,8 +921,9 @@ class PatchEngine:
             # degrades gracefully past 2000 lines.
             if len(old_lines) > 2000:
                 logger.debug(
-                    "salvage_small_model_output: skipping fuzzy salvage for "
-                    "large file (%d lines, target=%s)", len(old_lines), rel,
+                    "salvage_small_model_output: skipping fuzzy salvage for large file (%d lines, target=%s)",
+                    len(old_lines),
+                    rel,
                 )
                 return None
 
@@ -991,16 +955,20 @@ class PatchEngine:
                     removed_lines.append(line[1:])
 
                 # Before/after block detection (case-insensitive)
-                elif re.match(r'^before\s*:', line, re.IGNORECASE):
+                elif re.match(r"^before\s*:", line, re.IGNORECASE):
                     before_content = []
                     i += 1
-                    while i < len(lines) and not re.match(r'^after\s*:', lines[i], re.IGNORECASE):
+                    while i < len(lines) and not re.match(r"^after\s*:", lines[i], re.IGNORECASE):
                         before_content.append(lines[i])
                         i += 1
-                    if i < len(lines) and re.match(r'^after\s*:', lines[i], re.IGNORECASE):
+                    if i < len(lines) and re.match(r"^after\s*:", lines[i], re.IGNORECASE):
                         i += 1
                         after_content = []
-                        while i < len(lines) and lines[i].strip() and not re.match(r'^before\s*:|^after\s*:', lines[i], re.IGNORECASE):
+                        while (
+                            i < len(lines)
+                            and lines[i].strip()
+                            and not re.match(r"^before\s*:|^after\s*:", lines[i], re.IGNORECASE)
+                        ):
                             after_content.append(lines[i])
                             i += 1
                         before_blocks.append("\n".join(before_content))
@@ -1008,7 +976,7 @@ class PatchEngine:
                         continue
 
                 # Ed-style commands (e.g., "1c1", "2a", "3d")
-                elif re.match(r'^\d+[acd]\d*$', line):
+                elif re.match(r"^\d+[acd]\d*$", line):
                     ed_commands.append(line)
 
                 # Markdown code fences
@@ -1034,7 +1002,7 @@ class PatchEngine:
                     best_idx = None
                     best_ratio = 0.0
                     for start_idx in range(len(old_lines) - n_removed + 1):
-                        window = old_lines[start_idx:start_idx + n_removed]
+                        window = old_lines[start_idx : start_idx + n_removed]
                         # P24-B: autojunk=False — repeated lines (blank,
                         # common tokens) in >=200-line windows would be
                         # purged, skewing the 0.6 threshold below.
@@ -1051,26 +1019,27 @@ class PatchEngine:
                         # corrupt output silently deleting code). The exception
                         # is a match covering the ENTIRE file, which is a full
                         # rewrite rather than a partial edit.
-                        whole_file_match = (
-                            best_idx == 0 and n_removed == len(old_lines)
-                        )
+                        whole_file_match = best_idx == 0 and n_removed == len(old_lines)
                         if len(added_lines) < n_removed and not whole_file_match:
                             logger.debug(
                                 "salvage_small_model_output: strategy 1 rejected — "
                                 "replacement collapses %d removed lines into %d added",
-                                n_removed, len(added_lines),
+                                n_removed,
+                                len(added_lines),
                             )
                         else:
                             new_lines = list(old_lines)
-                            new_lines[best_idx:best_idx + n_removed] = added_lines
+                            new_lines[best_idx : best_idx + n_removed] = added_lines
 
-                            diff_lines = list(difflib.unified_diff(
-                                old_lines,
-                                new_lines,
-                                fromfile=f"a/{rel}",
-                                tofile=f"b/{rel}",
-                                lineterm="",
-                            ))
+                            diff_lines = list(
+                                difflib.unified_diff(
+                                    old_lines,
+                                    new_lines,
+                                    fromfile=f"a/{rel}",
+                                    tofile=f"b/{rel}",
+                                    lineterm="",
+                                )
+                            )
 
                             if diff_lines:
                                 diff_text = "\n".join(diff_lines)
@@ -1096,8 +1065,8 @@ class PatchEngine:
                     # Exact match first (line-level)
                     found = False
                     for start_idx in range(len(new_lines) - n_before + 1):
-                        if new_lines[start_idx:start_idx + n_before] == before_lines:
-                            new_lines[start_idx:start_idx + n_before] = after_lines
+                        if new_lines[start_idx : start_idx + n_before] == before_lines:
+                            new_lines[start_idx : start_idx + n_before] = after_lines
                             found = True
                             break
 
@@ -1106,7 +1075,7 @@ class PatchEngine:
                         best_idx = None
                         best_ratio = 0.0
                         for start_idx in range(len(new_lines) - n_before + 1):
-                            window = new_lines[start_idx:start_idx + n_before]
+                            window = new_lines[start_idx : start_idx + n_before]
                             # P24-B: autojunk=False (see above).
                             sm = difflib.SequenceMatcher(None, window, before_lines, autojunk=False)
                             ratio = sm.ratio()
@@ -1115,19 +1084,21 @@ class PatchEngine:
                                 best_idx = start_idx
 
                         if best_idx is not None and best_ratio >= 0.7:
-                            new_lines[best_idx:best_idx + n_before] = after_lines
+                            new_lines[best_idx : best_idx + n_before] = after_lines
                         else:
                             all_succeeded = False
                             break
 
                 if all_succeeded:
-                    diff_lines = list(difflib.unified_diff(
-                        old_lines,
-                        new_lines,
-                        fromfile=f"a/{rel}",
-                        tofile=f"b/{rel}",
-                        lineterm="",
-                    ))
+                    diff_lines = list(
+                        difflib.unified_diff(
+                            old_lines,
+                            new_lines,
+                            fromfile=f"a/{rel}",
+                            tofile=f"b/{rel}",
+                            lineterm="",
+                        )
+                    )
 
                     if diff_lines:
                         diff_text = "\n".join(diff_lines)
@@ -1153,6 +1124,7 @@ class PatchEngine:
                 anchor_index = None
                 with contextlib.suppress(ImportError):
                     from .agent.symbol_search import get_symbol_searcher
+
                     searcher = get_symbol_searcher(self.repo_root)
 
                     # Look for function/class definitions in added lines
@@ -1209,13 +1181,15 @@ class PatchEngine:
                 if old_text.endswith("\n"):
                     new_text += "\n"
 
-                diff_lines = list(difflib.unified_diff(
-                    old_lines,
-                    new_text.splitlines(),
-                    fromfile=f"a/{rel}",
-                    tofile=f"b/{rel}",
-                    lineterm="",
-                ))
+                diff_lines = list(
+                    difflib.unified_diff(
+                        old_lines,
+                        new_text.splitlines(),
+                        fromfile=f"a/{rel}",
+                        tofile=f"b/{rel}",
+                        lineterm="",
+                    )
+                )
 
                 if not diff_lines:
                     return None
@@ -1257,14 +1231,14 @@ class PatchEngine:
                 changes_made = False
 
                 for cmd in ed_commands:
-                    match = re.match(r'^(\d+)([acd])(\d*)$', cmd)
+                    match = re.match(r"^(\d+)([acd])(\d*)$", cmd)
                     if match:
                         line_num = int(match.group(1))
                         command = match.group(2)
                         # Convert 1-indexed to 0-indexed
                         idx = line_num - 1 if line_num > 0 else 0
 
-                        if command == 'd' and 0 <= idx < len(new_lines):
+                        if command == "d" and 0 <= idx < len(new_lines):
                             del new_lines[idx]
                             changes_made = True
                         # Note: 'c' and 'a' would need content from following lines
@@ -1275,13 +1249,15 @@ class PatchEngine:
                     if old_text.endswith("\n"):
                         new_text += "\n"
 
-                    diff_lines = list(difflib.unified_diff(
-                        old_lines,
-                        new_text.splitlines(),
-                        fromfile=f"a/{rel}",
-                        tofile=f"b/{rel}",
-                        lineterm="",
-                    ))
+                    diff_lines = list(
+                        difflib.unified_diff(
+                            old_lines,
+                            new_text.splitlines(),
+                            fromfile=f"a/{rel}",
+                            tofile=f"b/{rel}",
+                            lineterm="",
+                        )
+                    )
 
                     if diff_lines:
                         diff_text = "\n".join(diff_lines)
@@ -1298,7 +1274,7 @@ class PatchEngine:
         else:
             return None
 
-    def convert_patch_to_edit_blocks(self, patch: str, target_file: Optional[str] = None) -> Optional[dict]:
+    def convert_patch_to_edit_blocks(self, patch: str, target_file: str | None = None) -> dict | None:
         """
         Convert a unified diff patch to edit_blocks structure.
         Moved from agent_loop.py _convert_patch_to_edit_blocks.
@@ -1314,11 +1290,11 @@ class PatchEngine:
         file_path = target_file
         if not file_path:
             for line in patch.splitlines():
-                m = re.match(r'^\+\+\+ b/(.+)$', line)
+                m = re.match(r"^\+\+\+ b/(.+)$", line)
                 if m:
                     file_path = m.group(1).strip()
                     break
-                m2 = re.match(r'^diff --git a/\S+ b/(.+)$', line)
+                m2 = re.match(r"^diff --git a/\S+ b/(.+)$", line)
                 if m2:
                     file_path = m2.group(1).strip()
                     break
@@ -1380,8 +1356,9 @@ class PatchEngine:
 
         return {"file_path": file_path, "blocks": blocks}
 
-    def repair_patch(self, patch_text: str, target_file: str,
-                     failure_reason: str, llm_output: Optional[str] = None) -> PatchResult:
+    def repair_patch(
+        self, patch_text: str, target_file: str, failure_reason: str, llm_output: str | None = None
+    ) -> PatchResult:
         """
         Attempt repair using fallback ladder.
 
@@ -1410,25 +1387,19 @@ class PatchEngine:
         # If no LLM output (agent path), extract new_code from the patch text
         # and try _auto_repair_patch as fallback (P8 fix)
         if not llm_output:
-            self._add_step(metadata, "no_llm_fallback",
-                           "No LLM output — trying auto-repair from patch text")
+            self._add_step(metadata, "no_llm_fallback", "No LLM output — trying auto-repair from patch text")
             auto_fix = self._auto_repair_patch(patch_text, target_file)
             if auto_fix:
                 metadata["reason"] = "repair_success:auto_repair"
                 metadata["mode"] = "auto_repair"
                 metadata["fallback_used"] = ["auto_repair"]
                 metadata["applied"] = self._apply_repair_patch(auto_fix, target_file)
-                return PatchResult(
-                    success=True,
-                    patch_applied=auto_fix,
-                    metadata=metadata
-                )
+                return PatchResult(success=True, patch_applied=auto_fix, metadata=metadata)
             metadata["reason"] = "no_llm_fallback_all_failed"
             return PatchResult(
                 success=False,
-                error="Cannot repair patch without original LLM output "
-                      "and auto-repair from patch text failed",
-                metadata=metadata
+                error="Cannot repair patch without original LLM output and auto-repair from patch text failed",
+                metadata=metadata,
             )
 
         # Parse file blocks from LLM output (llm_output guaranteed non-None here)
@@ -1447,14 +1418,11 @@ class PatchEngine:
             # Prefer the block that matches target_file; fall back to first block
             block = parsed_blocks[0]
             try:
-                normalized_target = normalize_rel_path_fast(str(target_file))
+                normalized_target = normalize_rel_path(str(target_file))
                 for candidate in parsed_blocks:
-                    candidate_path = normalize_rel_path_fast(str(
-                        candidate.get("path")
-                        or candidate.get("file")
-                        or candidate.get("filename")
-                        or ""
-                    ))
+                    candidate_path = normalize_rel_path(
+                        str(candidate.get("path") or candidate.get("file") or candidate.get("filename") or "")
+                    )
                     if candidate_path and normalized_target and candidate_path == normalized_target:
                         block = candidate
                         break
@@ -1472,17 +1440,9 @@ class PatchEngine:
         if not new_code.strip():
             if self._llm_output_has_code_shape(llm_output or ""):
                 metadata["reason"] = "empty_new_code"
-                return PatchResult(
-                    success=False,
-                    error="Empty code block in LLM output",
-                    metadata=metadata
-                )
+                return PatchResult(success=False, error="Empty code block in LLM output", metadata=metadata)
             metadata["reason"] = "no_parsed_blocks"
-            return PatchResult(
-                success=False,
-                error="No parseable file blocks found in LLM output",
-                metadata=metadata
-            )
+            return PatchResult(success=False, error="No parseable file blocks found in LLM output", metadata=metadata)
 
         # Track which fallbacks we attempt
         fallback_attempted = []
@@ -1498,21 +1458,13 @@ class PatchEngine:
                 llm_header = (llm_output or "").strip().splitlines()[0].strip()
                 if llm_header.startswith("FUNCTION:"):
                     func_name = llm_header.split("FUNCTION:")[1].strip()
-                    result = self.ast_rewriter.replace_function(
-                        target_file,
-                        func_name,
-                        new_code
-                    )
+                    result = self.ast_rewriter.replace_function(target_file, func_name, new_code)
                     result_patch = self.ast_rewriter.generate_patch(target_file, result)
                     result_mode = "ast_function"
                     fallback_succeeded = True
                 elif llm_header.startswith("CLASS:"):
                     class_name = llm_header.split("CLASS:")[1].strip()
-                    result = self.ast_rewriter.replace_class(
-                        target_file,
-                        class_name,
-                        new_code
-                    )
+                    result = self.ast_rewriter.replace_class(target_file, class_name, new_code)
                     result_patch = self.ast_rewriter.generate_patch(target_file, result)
                     result_mode = "ast_class"
                     fallback_succeeded = True
@@ -1525,25 +1477,17 @@ class PatchEngine:
                     # chain (e.g. "A.B.method" -> class_name="A.B", method_name="method"),
                     # matching replace_method's documented nested-class support.
                     class_name, method_name = path.rsplit(".", 1)
-                    result = self.ast_rewriter.replace_method(
-                        target_file,
-                        class_name,
-                        method_name,
-                        new_code
-                    )
+                    result = self.ast_rewriter.replace_method(target_file, class_name, method_name, new_code)
                     result_patch = self.ast_rewriter.generate_patch(target_file, result)
                     result_mode = "ast_method"
                     fallback_succeeded = True
                 elif is_python_definition(new_code):
                     func_name, _ = extract_symbol_name(new_code)
-                    result = self.ast_rewriter.replace_function(
-                        target_file,
-                        func_name,
-                        new_code
-                    )
-                    result_patch = self.ast_rewriter.generate_patch(target_file, result)
-                    result_mode = "ast_autodetect"
-                    fallback_succeeded = True
+                    if func_name is not None:
+                        result = self.ast_rewriter.replace_function(target_file, func_name, new_code)
+                        result_patch = self.ast_rewriter.generate_patch(target_file, result)
+                        result_mode = "ast_autodetect"
+                        fallback_succeeded = True
             except Exception as e:
                 logger.debug("AST rewrite attempt failed: %s", e)
                 metadata["second_fail_reason"] = f"ast_rewrite_failed: {e}"
@@ -1553,9 +1497,7 @@ class PatchEngine:
                 metadata["reason"] = "all_repair_failed"
                 metadata["fallback_used"] = fallback_attempted
                 return PatchResult(
-                    success=False,
-                    error=f"All repair attempts failed: {failure_reason}",
-                    metadata=metadata
+                    success=False, error=f"All repair attempts failed: {failure_reason}", metadata=metadata
                 )
 
         # 2. Symbol search fallback
@@ -1567,7 +1509,9 @@ class PatchEngine:
                 symbol_name, symbol_kind = extract_symbol_name(header)
 
                 if symbol_name:
-                    results = self.symbol_searcher.find_symbol(symbol_name, kind=symbol_kind if symbol_kind != "function" else "any")
+                    results = self.symbol_searcher.find_symbol(
+                        symbol_name, kind=symbol_kind if symbol_kind != "function" else "any"
+                    )
                 else:
                     results = self.symbol_searcher.find_symbol(header)
 
@@ -1582,17 +1526,13 @@ class PatchEngine:
                         result = self.ast_rewriter.replace_function(
                             sym.file,  # was sym.file_path
                             sym.name,
-                            new_code
+                            new_code,
                         )
                         result_patch = self.ast_rewriter.generate_patch(sym.file, result)
                         result_mode = "ast_symbol_function"
                         fallback_succeeded = True
                     elif sym.kind == "class":
-                        result = self.ast_rewriter.replace_class(
-                            sym.file,
-                            sym.name,
-                            new_code
-                        )
+                        result = self.ast_rewriter.replace_class(sym.file, sym.name, new_code)
                         result_patch = self.ast_rewriter.generate_patch(sym.file, result)
                         result_mode = "ast_symbol_class"
                         fallback_succeeded = True
@@ -1633,9 +1573,7 @@ class PatchEngine:
                 if not fallback_succeeded:
                     # Bare-fence full-file output (no FILE: block): synthesize
                     # the diff directly from the extracted code.
-                    synth_patch, synth_reason = self._synthesize_full_file_diff(
-                        self.repo_root, target_file, new_code
-                    )
+                    synth_patch, synth_reason = self._synthesize_full_file_diff(self.repo_root, target_file, new_code)
                     if synth_reason == "file_block_synth":
                         result_patch = synth_patch
                         result_mode = "file_block_synth"
@@ -1653,22 +1591,12 @@ class PatchEngine:
             # Apply the repaired patch immediately so direct callers observe an
             # applied tree; apply_patch honors the "applied" flag and skips its
             # own re-apply (the pre-image lines are already gone by then).
-            metadata["applied"] = bool(result_patch) and self._apply_repair_patch(
-                result_patch, target_file
-            )
-            return PatchResult(
-                success=True,
-                patch_applied=result_patch,
-                metadata=metadata
-            )
+            metadata["applied"] = bool(result_patch) and self._apply_repair_patch(result_patch, target_file)
+            return PatchResult(success=True, patch_applied=result_patch, metadata=metadata)
         metadata["reason"] = "all_repair_failed"
         metadata["fallback_used"] = fallback_attempted
         metadata["second_fail_reason"] = metadata.get("second_fail_reason", "all fallbacks failed")
-        return PatchResult(
-            success=False,
-            error=f"All repair attempts failed: {failure_reason}",
-            metadata=metadata
-        )
+        return PatchResult(success=False, error=f"All repair attempts failed: {failure_reason}", metadata=metadata)
 
     def _apply_repair_patch(self, patch_text: str, target_file: str) -> bool:
         """Apply a successfully repaired patch immediately so direct callers
@@ -1684,7 +1612,7 @@ class PatchEngine:
     _FENCE_BLOCK_RE = re.compile(r"```(?P<tail>[^\n\r]*)\r?\n(?P<code>[\s\S]*?)\r?\n```")
 
     @classmethod
-    def _extract_code_from_llm_output(cls, llm_output: str) -> Optional[str]:
+    def _extract_code_from_llm_output(cls, llm_output: str) -> str | None:
         """First fenced body in header-style LLM output (no FILE: block).
 
         Handles `````code`` fence-line tails like FILE-block parsing: a plain
@@ -1711,9 +1639,7 @@ class PatchEngine:
         nothing parseable was extracted (distinguishes "empty_new_code" from
         "no_parsed_blocks")."""
         text = (llm_output or "").strip()
-        return "```" in text or bool(
-            re.match(r"^(?:FUNCTION|CLASS|METHOD)\s*:", text)
-        )
+        return "```" in text or bool(re.match(r"^(?:FUNCTION|CLASS|METHOD)\s*:", text))
 
     @staticmethod
     def _trim_patch_to_first_header(patch: str) -> str:
@@ -1731,7 +1657,7 @@ class PatchEngine:
             return ""
 
         lines = str(patch).replace("\r\n", "\n").split("\n")
-        start_idx: Optional[int] = None
+        start_idx: int | None = None
         for i, line in enumerate(lines):
             if line.startswith(("diff --git ", "--- ", "+++ ")):
                 start_idx = i
@@ -1806,20 +1732,18 @@ class PatchEngine:
             if stripped.startswith("```"):
                 continue
 
-            if (
-                stripped.startswith(
-                    (
-                        "diff --git ",
-                        "--- ",
-                        "+++ ",
-                        "@@ ",
-                        "index ",
-                        "new file mode ",
-                        "deleted file mode ",
-                        "similarity index ",
-                        "rename from ",
-                        "rename to ",
-                    )
+            if stripped.startswith(
+                (
+                    "diff --git ",
+                    "--- ",
+                    "+++ ",
+                    "@@ ",
+                    "index ",
+                    "new file mode ",
+                    "deleted file mode ",
+                    "similarity index ",
+                    "rename from ",
+                    "rename to ",
                 )
             ):
                 # An '@@' hunk header transitions us into the body region.
@@ -1835,7 +1759,7 @@ class PatchEngine:
         return normalized
 
     @staticmethod
-    def _keep_only_target_file_section(patch: str, target_file: Optional[str]) -> str:
+    def _keep_only_target_file_section(patch: str, target_file: str | None) -> str:
         """
         Best-effort: keep ONLY the diff section for the target file.
 
@@ -1855,7 +1779,7 @@ class PatchEngine:
 
         # This function assumes input has already been sanitized (no BOM/indent on markers).
         # Call _sanitize_patch_lines() first.
-        tf = normalize_rel_path_fast(target_file or "")
+        tf = normalize_rel_path(target_file or "")
         txt = str(patch).replace("\r\n", "\n")
         lines = txt.split("\n")
 
@@ -1898,7 +1822,7 @@ class PatchEngine:
             return kept
 
         # No diff --git sections. Keep a single ---/+++ file section.
-        start_idx: Optional[int] = None
+        start_idx: int | None = None
         for i, _item_ in enumerate(lines):
             if _item_.startswith("--- "):
                 start_idx = i
@@ -1907,7 +1831,7 @@ class PatchEngine:
             return txt.strip() + ("\n" if txt.strip() else "")
 
         # determine the file path from the first header, if possible
-        first_file: Optional[str] = None
+        first_file: str | None = None
         m0 = re.match(r"^---\s+a/(.+?)\s*$", lines[start_idx] or "")
         if m0:
             first_file = m0.group(1)
@@ -1931,7 +1855,7 @@ class PatchEngine:
         return kept
 
     @staticmethod
-    def _force_target_file_paths(patch: str, target_file: Optional[str]) -> str:
+    def _force_target_file_paths(patch: str, target_file: str | None) -> str:
         """
         If the model emits headers for a basename (e.g., service.py) instead of the full rel path
         (external_llm/service.py), `git apply` fails with "No such file or directory".
@@ -1944,7 +1868,7 @@ class PatchEngine:
         """
         if not patch:
             return ""
-        tf = normalize_rel_path_fast(target_file or "")
+        tf = normalize_rel_path(target_file or "")
         if not tf:
             return patch
 
@@ -1964,10 +1888,7 @@ class PatchEngine:
                     b_raw = (parts[3] or "").strip()
                     a_path = a_raw[2:] if a_raw.startswith("a/") else a_raw
                     b_path = b_raw[2:] if b_raw.startswith("b/") else b_raw
-                    if (
-                        (a_path == base and b_path == base)
-                        or (Path(a_path).name == base and Path(b_path).name == base)
-                    ):
+                    if (a_path == base and b_path == base) or (Path(a_path).name == base and Path(b_path).name == base):
                         out.append(f"diff --git a/{tf} b/{tf}")
                         continue
 
@@ -1997,7 +1918,7 @@ class PatchEngine:
         return fixed
 
     @staticmethod
-    def _ensure_headers_before_any_hunk(patch: str, target_file: Optional[str]) -> str:
+    def _ensure_headers_before_any_hunk(patch: str, target_file: str | None) -> str:
         """
         Strong best-effort guardrail for the most common git-apply failure:
           "patch fragment without header at line N: @@ ..."
@@ -2009,18 +1930,18 @@ class PatchEngine:
 
         This is intentionally simple and global (whole-patch) to catch cases where
         the model outputs an orphan hunk fragment or omits headers entirely.
-       """
+        """
         if not patch:
             return ""
 
-        tf = normalize_rel_path_fast(target_file or "")
+        tf = normalize_rel_path(target_file or "")
         if not tf:
             return patch
 
         txt = str(patch).replace("\r\n", "\n")
         lines = txt.split("\n")
 
-        first_hunk_idx: Optional[int] = None
+        first_hunk_idx: int | None = None
         for i, _item_ in enumerate(lines):
             if _item_.startswith("@@ "):
                 first_hunk_idx = i
@@ -2047,7 +1968,7 @@ class PatchEngine:
         return out
 
     @staticmethod
-    def _normalize_patch_headers(patch: str, target_file: Optional[str]) -> str:
+    def _normalize_patch_headers(patch: str, target_file: str | None) -> str:
         """
         Best-effort repair for external-LLM patch corruption that causes:
           "patch fragment without header at line N: @@ ..."
@@ -2069,15 +1990,15 @@ class PatchEngine:
         if not patch:
             return ""
 
-        tf = normalize_rel_path_fast(target_file or "")
+        tf = normalize_rel_path(target_file or "")
         txt = str(patch).replace("\r\n", "\n")
         lines = txt.split("\n")
 
         out: list[str] = []
         have_minus = False
         have_plus = False
-        cur_a: Optional[str] = None
-        cur_b: Optional[str] = None
+        cur_a: str | None = None
+        cur_b: str | None = None
 
         for line in lines:
             m = _RE_DIFF_GIT.match(line or "")
@@ -2127,8 +2048,7 @@ class PatchEngine:
     # Auto-mode: file block parsing + diff synthesis
     # ---------------------------------------------------------------------
 
-
-    def normalize_and_validate(self, patch_text: str, target_file: Optional[str]) -> tuple[str, Optional[str]]:
+    def normalize_and_validate(self, patch_text: str, target_file: str | None) -> tuple[str, str | None]:
         """
         Normalize patch candidate and validate with git apply --check.
         Applies the same sanitation/repair steps across diff/auto/fast paths.
@@ -2153,11 +2073,11 @@ class PatchEngine:
             if not ok:
                 logger.debug(
                     "normalize_and_validate: git apply precheck failed "
-                    "(non-fatal, tolerant path may still succeed): %s", err,
+                    "(non-fatal, tolerant path may still succeed): %s",
+                    err,
                 )
             return p, None
         return p, "Patch does not look like a unified diff"
-
 
     def _looks_like_unified_diff(self, text: str) -> bool:
         """Heuristic check for unified diff format."""
@@ -2166,17 +2086,18 @@ class PatchEngine:
             return False
         # Heuristic: any real diff header + at least one hunk marker
         has_header = any(s in t for s in ("diff --git ", "--- a/", "+++ b/")) or t.lstrip().startswith("--- ")
-        has_hunk = ("@@ " in t)
+        has_hunk = "@@ " in t
         # Allow hunk-only patches (starting with @@, no header) — git apply handles them
         return bool(has_hunk and (has_header or t.lstrip().startswith("@@")))
 
-    def _git_apply_check_best_effort(self, patch_text: str) -> tuple[bool, Optional[str]]:
+    def _git_apply_check_best_effort(self, patch_text: str) -> tuple[bool, str | None]:
         """
         Run git apply --check --recount --whitespace=nowarn - in repo_root.
         Returns (success, error_message).
         """
         try:
             import subprocess
+
             result = subprocess.run(
                 ["git", "apply", "--check", "--recount", "--whitespace=nowarn", "-"],
                 cwd=self.repo_root,
@@ -2198,7 +2119,7 @@ class PatchEngine:
         else:
             return False, error
 
-    def _classify_target_git_state(self, target_file: Optional[str]) -> str:
+    def _classify_target_git_state(self, target_file: str | None) -> str:
         """Classify the git tracking state of a target file (pre-apply gate).
 
         Returns one of:
@@ -2286,8 +2207,9 @@ class PatchEngine:
                         failed (conservative: keep prior 3-way behavior).
         """
         for m in re.finditer(
-            r'^index ([0-9a-f]{7,40})\.\.([0-9a-f]{7,40})',
-            patch_text, re.MULTILINE,
+            r"^index ([0-9a-f]{7,40})\.\.([0-9a-f]{7,40})",
+            patch_text,
+            re.MULTILINE,
         ):
             for sha in (m.group(1), m.group(2)):
                 # All-zero SHA = legitimate placeholder for file creation
@@ -2297,7 +2219,9 @@ class PatchEngine:
                 try:
                     chk = subprocess.run(
                         ["git", "cat-file", "-e", sha],
-                        cwd=self.repo_root, capture_output=True, timeout=5,
+                        cwd=self.repo_root,
+                        capture_output=True,
+                        timeout=5,
                         check=False,
                     )
                     if chk.returncode != 0:
@@ -2307,7 +2231,7 @@ class PatchEngine:
                     return False
         return False
 
-    def _apply_diff_once(self, patch_text: str, target_file: Optional[str] = None) -> tuple[bool, Optional[str]]:
+    def _apply_diff_once(self, patch_text: str, target_file: str | None = None) -> tuple[bool, str | None]:
         """
         Apply a unified diff using the underlying diff_apply module.
         Returns (success, error_message).
@@ -2334,18 +2258,18 @@ class PatchEngine:
                 s = line.strip()
 
                 if s.startswith("+++ b/"):
-                    inferred_path = s[len("+++ b/"):].strip()
+                    inferred_path = s[len("+++ b/") :].strip()
                     break
                 if s.startswith("--- a/"):
-                    inferred_path = s[len("--- a/"):].strip()
+                    inferred_path = s[len("--- a/") :].strip()
                     break
                 if s.startswith("+++ "):
-                    candidate = s[len("+++ "):].strip()
+                    candidate = s[len("+++ ") :].strip()
                     if candidate and candidate != "/dev/null":
                         inferred_path = candidate.removeprefix("b/")
                         break
                 if s.startswith("--- "):
-                    candidate = s[len("--- "):].strip()
+                    candidate = s[len("--- ") :].strip()
                     if candidate and candidate != "/dev/null":
                         inferred_path = candidate.removeprefix("a/")
                         break
@@ -2373,15 +2297,12 @@ class PatchEngine:
                         continue
                     cleaned.append(ln)
                 rejoined = "\n".join(cleaned)
-                normalized = (
-                    f"--- a/{inferred_path}\n"
-                    f"+++ b/{inferred_path}\n"
-                    f"{rejoined}"
-                )
+                normalized = f"--- a/{inferred_path}\n+++ b/{inferred_path}\n{rejoined}"
 
         try:
             _ado_ok, _ado_msg, _ado_reason, _ado_details = self._diff_apply(
-                self.repo_root, normalized,
+                self.repo_root,
+                normalized,
                 file_path_hint=target_file,
             )
             if _ado_ok:
@@ -2444,7 +2365,7 @@ class PatchEngine:
                 if s == "":
                     old_count += 1
                     new_count += 1
-                    normalized_body.append(" " + hl[len(s):])
+                    normalized_body.append(" " + hl[len(s) :])
                     continue
                 if s.startswith(" "):
                     old_count += 1
@@ -2465,7 +2386,7 @@ class PatchEngine:
         return "".join(output)
 
     @staticmethod
-    def _add_diff_headers(patch_text: str, target_file: Optional[str]) -> str:
+    def _add_diff_headers(patch_text: str, target_file: str | None) -> str:
         """Add missing diff headers (diff --git, ---, +++) to a patch.
 
         Handles:
@@ -2479,11 +2400,7 @@ class PatchEngine:
         # Hunk-only: starts with @@ but no headers at all
         if text.lstrip().startswith("@@") and "--- " not in text and "+++ " not in text:
             fp = target_file.lstrip("/")
-            header = (
-                f"diff --git a/{fp} b/{fp}\n"
-                f"--- a/{fp}\n"
-                f"+++ b/{fp}\n"
-            )
+            header = f"diff --git a/{fp} b/{fp}\n--- a/{fp}\n+++ b/{fp}\n"
             return header + text + "\n"
 
         # Has --- a/ but missing diff --git
@@ -2512,8 +2429,9 @@ class PatchEngine:
 
     # ── Tolerant apply: try multiple git apply flag combinations ─────────────
 
-    def _tolerant_git_apply(self, patch_text: str, target_file: Optional[str] = None,
-                            allow_3way: bool = True) -> tuple[bool, Optional[str], str]:
+    def _tolerant_git_apply(
+        self, patch_text: str, target_file: str | None = None, allow_3way: bool = True
+    ) -> tuple[bool, str | None, str]:
         """Try multiple git apply flag combinations for tolerant (small model) mode.
 
         Returns (success, error_message, mode_used).
@@ -2564,7 +2482,7 @@ class PatchEngine:
             # whitespace NEAR-MISS of the file content (e.g. a context line
             # missing its indentation) under --ignore-whitespace /
             # --ignore-space-change. -C0 alone fails cleanly instead.
-            (fixed, ["--recount", "-C0"], "fixed_C0"),                                    # pure line-number matching
+            (fixed, ["--recount", "-C0"], "fixed_C0"),  # pure line-number matching
             (fixed, ["--recount", "--ignore-space-change"], "fixed_ignore_sc"),
             (fixed, ["--recount"], "fixed_plain"),
         ]
@@ -2572,7 +2490,7 @@ class PatchEngine:
             patches_to_try.append(
                 (patch_text, ["--3way"], "3way_merge"),  # fallback to raw + 3way
             )
-        _c0_verify_fail: Optional[str] = None
+        _c0_verify_fail: str | None = None
         for try_patch, flags, mode_name in patches_to_try:
             _is_c0 = "-C0" in flags or "--unidiff-zero" in flags
             # A -C0 sibling already applied at these line numbers and failed
@@ -2625,7 +2543,8 @@ class PatchEngine:
                                 logger.warning(
                                     "tolerant_git_apply: mode=%s applied but placement "
                                     "verification failed — rolled back: %s",
-                                    mode_name, _place_detail,
+                                    mode_name,
+                                    _place_detail,
                                 )
                                 continue
                         logger.info("tolerant_git_apply succeeded mode=%s flags=%s", mode_name, flags)
@@ -2664,11 +2583,15 @@ class PatchEngine:
         # the repair ladder's job (AST / symbol / semantic / file-block), not the
         # git index's. Mutating the index here only risked leaving the file staged.
         if _c0_verify_fail is not None:
-            return False, (
-                "All tolerant git apply variants failed (line-number-only apply "
-                f"was rolled back — hunk context does not match the file at the "
-                f"patch's line numbers, likely stale: {_c0_verify_fail})"
-            ), "none"
+            return (
+                False,
+                (
+                    "All tolerant git apply variants failed (line-number-only apply "
+                    f"was rolled back — hunk context does not match the file at the "
+                    f"patch's line numbers, likely stale: {_c0_verify_fail})"
+                ),
+                "none",
+            )
         return False, "All tolerant git apply variants failed", "none"
 
     @staticmethod
@@ -2676,11 +2599,11 @@ class PatchEngine:
         """Whitespace-insensitive normal form of a source line (≥ git's --ignore-whitespace)."""
         return "".join(line.split())
 
-    def _snapshot_patch_targets(self, patch_text: str) -> dict[str, Optional[str]]:
+    def _snapshot_patch_targets(self, patch_text: str) -> dict[str, str | None]:
         """Snapshot content of every file a patch touches. None = did not exist."""
         from .agent._shared_utils import extract_files_from_patch
 
-        snap: dict[str, Optional[str]] = {}
+        snap: dict[str, str | None] = {}
         for rel in extract_files_from_patch(patch_text):
             abs_p = os.path.join(self.repo_root, rel) if self.repo_root else rel
             try:
@@ -2768,12 +2691,13 @@ class PatchEngine:
                 if r.returncode != 0:
                     logger.error(
                         "tolerant_git_apply: index rollback of %s failed: %s",
-                        path, r.stderr.decode("utf-8", errors="ignore").strip(),
+                        path,
+                        r.stderr.decode("utf-8", errors="ignore").strip(),
                     )
             except (OSError, subprocess.SubprocessError) as exc:
                 logger.exception("tolerant_git_apply: index rollback of %s failed: %s", path, exc)
 
-    def _restore_patch_targets(self, snapshot: dict[str, Optional[str]]) -> None:
+    def _restore_patch_targets(self, snapshot: dict[str, str | None]) -> None:
         """Undo an applied patch from a _snapshot_patch_targets snapshot."""
         for path, content in snapshot.items():
             try:
@@ -2814,10 +2738,10 @@ class PatchEngine:
         New files are excluded: there is no prior content to misplace against.
         """
         out: list[str] = []
-        cur: Optional[str] = None
+        cur: str | None = None
         cur_is_new = False
         hdr: str = ""
-        body: Optional[list[str]] = None
+        body: list[str] | None = None
 
         def _flush() -> None:
             if body is not None and cur and not cur_is_new and not any(ln[:1] == " " for ln in body):
@@ -2878,9 +2802,9 @@ class PatchEngine:
         """
         files: dict[str, list[list]] = {}  # rel -> [[hunk_lines, old_start], ...]
         new_files: set[str] = set()
-        cur: Optional[str] = None
+        cur: str | None = None
         cur_is_new = False
-        cur_hunk: Optional[list] = None
+        cur_hunk: list | None = None
 
         for line in patch_text.splitlines():
             if line.startswith(("diff --git ", "--- ")):
@@ -2942,17 +2866,16 @@ class PatchEngine:
                 has_removals = any(ln[:1] == "-" for ln in hunk)
                 if pre and has_removals and old_start is not None:
                     start = old_start - 1
-                    if start >= 0 and file_norm[start:start + len(pre)] == pre:
+                    if start >= 0 and file_norm[start : start + len(pre)] == pre:
                         continue
                 post = [self._ws_norm_line(ln[1:]) for ln in hunk if ln[:1] in (" ", "+")]
                 m = len(post)
                 if m == 0:
                     continue
                 n = len(file_norm)
-                if m > n or not any(file_norm[i:i + m] == post for i in range(n - m + 1)):
+                if m > n or not any(file_norm[i : i + m] == post for i in range(n - m + 1)):
                     return False, (
-                        f"{rel}: hunk context+content not found as a consecutive "
-                        "block after context-free apply"
+                        f"{rel}: hunk context+content not found as a consecutive block after context-free apply"
                     )
         return True, ""
 
@@ -3025,7 +2948,11 @@ class PatchEngine:
             new_header = f"@@ -{new_start},{old_count} +{new_new_start},{new_count} @@{suffix}"
             logger.info(
                 "%s: hunk @@ -%d → -%d %s file=%s",
-                log_prefix, old_start, new_start, log_fragment, target_file,
+                log_prefix,
+                old_start,
+                new_start,
+                log_fragment,
+                target_file,
             )
             output.append(new_header)
             output.extend(hunk_body)
@@ -3035,7 +2962,7 @@ class PatchEngine:
             return None
         return "".join(output)
 
-    def _exact_reanchor_patch(self, patch_text: str, target_file: Optional[str]) -> Optional[str]:
+    def _exact_reanchor_patch(self, patch_text: str, target_file: str | None) -> str | None:
         """Re-anchor a unified diff by finding exact removed-line content in the file.
 
         Faster and more reliable than SequenceMatcher for small line offsets.
@@ -3092,7 +3019,7 @@ class PatchEngine:
 
         return self._reanchor_patch_core(patch_text, target_file, _find_exact, "exact_reanchor")
 
-    def _reanchor_patch(self, patch_text: str, target_file: Optional[str]) -> Optional[str]:
+    def _reanchor_patch(self, patch_text: str, target_file: str | None) -> str | None:
         """Re-anchor a unified diff patch to the correct line numbers.
 
         Small models often generate patches with wrong @@ line numbers.
@@ -3137,8 +3064,9 @@ class PatchEngine:
             file_len = len(file_lines)
             if file_len > 2000:
                 logger.debug(
-                    "reanchor_patch: skipping fuzzy match for large file "
-                    "(%d lines, target=%s)", file_len, target_file,
+                    "reanchor_patch: skipping fuzzy match for large file (%d lines, target=%s)",
+                    file_len,
+                    target_file,
                 )
                 return None
 
@@ -3158,7 +3086,7 @@ class PatchEngine:
             # ratio() and silently failing the re-anchor below.
             matcher = difflib.SequenceMatcher(None, autojunk=False)
             for start_idx in range(search_start, search_end):
-                chunk = file_lines[start_idx:start_idx + window]
+                chunk = file_lines[start_idx : start_idx + window]
                 chunk_str = "".join(chunk).strip()
                 matcher.set_seqs(search_str, chunk_str)
                 ratio = matcher.ratio()
@@ -3183,13 +3111,12 @@ class PatchEngine:
 
     def _add_step(self, metadata: dict[str, Any], step: str, description: str):
         """Add execution step to metadata."""
-        metadata["execution_steps"].append({
-            "step": step,
-            "description": description,
-            "timestamp": self._current_timestamp()
-        })
+        metadata["execution_steps"].append(
+            {"step": step, "description": description, "timestamp": self._current_timestamp()}
+        )
 
     def _current_timestamp(self) -> str:
         """Get current timestamp for logging."""
         from datetime import datetime
+
         return datetime.now().isoformat()

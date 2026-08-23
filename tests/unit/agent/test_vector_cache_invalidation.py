@@ -7,6 +7,7 @@ marker drives reuse-vs-rebuild correctly. The embedding model itself is stubbed
 out (None) so the tests exercise only the index/marker logic without loading a
 real SentenceTransformer.
 """
+
 import os
 import sys
 
@@ -46,6 +47,7 @@ def _seed_cache(cache_dir, model_name, dim=384, n_docs=3):
     index.add(vecs)
     faiss.write_index(index, str(cache_dir / "faiss_index.bin"))
     import json
+
     # Metadata is persisted as JSON; keys are stringified on disk and restored
     # to int by VectorCacheManager on load.
     with open(cache_dir / "metadata.json", "w", encoding="utf-8") as f:

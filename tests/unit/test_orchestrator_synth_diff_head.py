@@ -4,6 +4,7 @@ The synthetic-diff reviewer read 64 KiB and decoded with errors=replace, so a
 multi-byte char straddling the window ended the review diff in U+FFFD (same
 class as P20-5, last sibling). The trim drops the incomplete tail.
 """
+
 from __future__ import annotations
 
 import pytest

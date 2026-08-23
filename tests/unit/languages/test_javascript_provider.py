@@ -4,6 +4,7 @@ Covers the graceful-degrade contract: when ``node`` is not on ``$PATH``
 the provider must fall back to tree-sitter syntax checking rather than
 silently returning ``ok=True``.
 """
+
 from unittest.mock import patch
 
 import pytest
@@ -24,17 +25,13 @@ class TestNodeAbsentDegrade:
 
     def test_valid_passes_tree_sitter_fallback(self):
         with self._tool_absent():
-            r = JavaScriptSyntaxProvider().validate_syntax(
-                "app.js", "const x = 1;"
-            )
+            r = JavaScriptSyntaxProvider().validate_syntax("app.js", "const x = 1;")
         assert r.ok is True
         assert r.language is LanguageId.JAVASCRIPT
 
     def test_syntax_error_caught_by_tree_sitter(self):
         with self._tool_absent():
-            r = JavaScriptSyntaxProvider().validate_syntax(
-                "app.js", "const x = ;"
-            )
+            r = JavaScriptSyntaxProvider().validate_syntax("app.js", "const x = ;")
         assert r.ok is False
         assert r.language is LanguageId.JAVASCRIPT
         assert len(r.errors) >= 1
@@ -44,6 +41,7 @@ class TestNodeAbsentDegrade:
 class TestJsRegistryWiring:
     def test_js_provider_registered(self):
         from external_llm.languages.registry import LanguageRegistry
+
         r = LanguageRegistry.instance()
         prov = r.get("app.js")
         assert prov.__class__.__name__ == "JavaScriptSyntaxProvider"
@@ -68,8 +66,12 @@ class TestJsGeneratorSymbolPatterns:
 
     def test_generator_function_symbol_pattern(self, provider):
         import re as _re
-        pats = [p for p in provider.get_symbol_patterns("function")
-                if "const" not in p.regex and "let" not in p.regex and "var" not in p.regex]
+
+        pats = [
+            p
+            for p in provider.get_symbol_patterns("function")
+            if "const" not in p.regex and "let" not in p.regex and "var" not in p.regex
+        ]
         assert pats, "expected the plain function-declaration pattern"
         for p in pats:
             rx = _re.compile(p.regex.format(name="genSeq"))
@@ -80,8 +82,7 @@ class TestJsGeneratorSymbolPatterns:
 
     def test_generator_top_level_definitions_regex(self, provider):
         out = provider._find_top_level_definitions_regex(
-            "function* genSeq() {\n  yield 1;\n}\n\n"
-            "async function* stream() {\n  yield 2;\n}\n"
+            "function* genSeq() {\n  yield 1;\n}\n\nasync function* stream() {\n  yield 2;\n}\n"
         )
         names = [r[0] for r in out]
         assert "genSeq" in names, names
@@ -93,8 +94,6 @@ class TestJsGeneratorSymbolPatterns:
         from unittest.mock import patch
 
         with patch("external_llm.languages.tree_sitter_utils.is_available", return_value=False):
-            result = provider.find_symbol_in_file(
-                "app.js", "genSeq", "function* genSeq() {\n  yield 1;\n}\n"
-            )
+            result = provider.find_symbol_in_file("app.js", "genSeq", "function* genSeq() {\n  yield 1;\n}\n")
         assert result is not None
         assert result[0] == 1

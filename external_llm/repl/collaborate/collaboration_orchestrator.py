@@ -5,6 +5,7 @@ Flow (single-shot — run() executes exactly one analysis session, no iteration/
   1. asicode Preprocessing: digest generation (cheap engine)
   2. Claude Code Agent Analysis: receives digest, uses asicode MCP tools
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +14,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from config import CLAUDE_SDK_MAX_TURNS, CLAUDE_SESSION_TIMEOUT
 
@@ -28,9 +29,7 @@ from .claude_session import ClaudeSession, SessionEvent, SessionResult
 # Strip Claude Code SDK internal XML tool call tags (used in format_verdict_for_session etc.)
 # SDK internal tool tags (<invoke>, <parameter>) + structured verdict XML (<confidence>, <suggestions>, <plan>, <status>)
 # ※ <details>/<summary> are standard HTML5 tags, excluded from stripping
-_STRIP_XML_RE = re.compile(
-    r'</?(?:invoke|parameter|confidence|suggestions|plan|status)[^>]*>'
-)
+_STRIP_XML_RE = re.compile(r"</?(?:invoke|parameter|confidence|suggestions|plan|status)[^>]*>")
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +42,13 @@ DEFAULT_COLLAB_MODEL = "sonnet"
 @dataclass
 class CollaborationOrchestratorConfig:
     """Configuration for CollaborationOrchestrator."""
+
     # Max turns for the single analysis session (single-shot — no iteration loop,
     # kept as legacy name "per_iteration" for CLI arg compatibility).
     max_turns_per_iteration: int = CLAUDE_SDK_MAX_TURNS
     permission_mode: str = "bypassPermissions"
-    system_prompt: Optional[str] = None
-    model: Optional[str] = DEFAULT_COLLAB_MODEL
+    system_prompt: str | None = None
+    model: str | None = DEFAULT_COLLAB_MODEL
     digest_max_files: int = 8
     # digest includes only Project Info + Relevant Files by default.
     # git log/scan is often irrelevant to the task, and the agent can query
@@ -59,8 +59,8 @@ class CollaborationOrchestratorConfig:
     allow_write_tools: bool = False
     # Overall session timeout (seconds); None = config default (CLAUDE_SESSION_TIMEOUT).
     # On expiry ClaudeSession interrupts the agent and returns a failure verdict.
-    query_timeout: Optional[float] = CLAUDE_SESSION_TIMEOUT or None
-    event_callback: Optional[Callable[[SessionEvent], None]] = None
+    query_timeout: float | None = CLAUDE_SESSION_TIMEOUT or None
+    event_callback: Callable[[SessionEvent], None] | None = None
     repo_root: str = "."
 
 
@@ -76,15 +76,12 @@ class CollaborationOrchestrator:
     def __init__(
         self,
         registry: Any,  # ToolRegistry
-        config: Optional[CollaborationOrchestratorConfig] = None,
+        config: CollaborationOrchestratorConfig | None = None,
     ):
         self._registry = registry
         self._config = config or CollaborationOrchestratorConfig()
 
-        if (
-            self._config.allow_write_tools
-            and self._config.permission_mode == "bypassPermissions"
-        ):
+        if self._config.allow_write_tools and self._config.permission_mode == "bypassPermissions":
             logger.warning(
                 "allow_write_tools=True with bypassPermissions — "
                 "destructive tools (bash, apply_patch, …) will run "
@@ -99,7 +96,7 @@ class CollaborationOrchestrator:
         # pure; the SDK client is created in __aenter__).
         self._mcp_server: Any = None
         self._sdk_options: Any = None
-        self._session: Optional[ClaudeSession] = None
+        self._session: ClaudeSession | None = None
 
     def _ensure_session(self) -> ClaudeSession:
         """Lazily build the MCP server, SDK options and ClaudeSession.
@@ -146,17 +143,18 @@ class CollaborationOrchestrator:
         )
         return self._session
 
-    async def __aenter__(self) -> "CollaborationOrchestrator":
+    async def __aenter__(self) -> CollaborationOrchestrator:
         await self._ensure_session().__aenter__()
         return self
 
     async def __aexit__(self, *args) -> None:
+        assert self._session is not None  # __aenter__ created it via _ensure_session()
         await self._session.__aexit__(*args)
 
     async def run(
         self,
         task: str,
-        context: Optional[str] = None,
+        context: str | None = None,
         enable_preprocessing: bool = True,
     ) -> SessionResult:
         """Execute a collaboration session end-to-end.
@@ -272,7 +270,7 @@ class CollaborationOrchestrator:
         """
         return await asyncio.to_thread(self._generate_digest_sync, task)
 
-    def _build_prompt(self, task: str, digest: str, context: Optional[str]) -> str:
+    def _build_prompt(self, task: str, digest: str, context: str | None) -> str:
         """Build the user message for Claude Code Agent.
 
         Volatile content only (task + digest + extra context) — the static
@@ -311,7 +309,7 @@ class CollaborationOrchestrator:
             await self._session.interrupt()
 
     @property
-    def session(self) -> Optional[ClaudeSession]:
+    def session(self) -> ClaudeSession | None:
         return self._session
 
 
@@ -344,8 +342,7 @@ def build_session_handoff(
     # compressed_up_to (absolute index) → local index conversion
     local_cut = max(
         0,
-        getattr(session, "compressed_up_to", 0)
-        - getattr(session, "archived_count", 0),
+        getattr(session, "compressed_up_to", 0) - getattr(session, "archived_count", 0),
     )
     recent = turns[local_cut:][-max_turns:]
     recent_block = ""
@@ -374,11 +371,7 @@ def build_session_handoff(
             if len(summary) > avail:
                 # Trim from the oldest (front) to preserve the newest (tail) summary.
                 marker = "…(truncated) "
-                summary = (
-                    marker + summary[-(avail - len(marker)):]
-                    if avail > len(marker)
-                    else summary[-avail:]
-                )
+                summary = marker + summary[-(avail - len(marker)) :] if avail > len(marker) else summary[-avail:]
             summary_block = header + summary
 
     parts = [p for p in (summary_block, recent_block) if p]
@@ -388,7 +381,8 @@ def build_session_handoff(
 
 
 def format_verdict_for_session(
-    result: SessionResult, task: str,
+    result: SessionResult,
+    task: str,
 ) -> str:
     """Claude Code verdict -> text for injecting into asicode session.
 
@@ -423,28 +417,19 @@ def format_verdict_for_session(
         _cleaned_details = _STRIP_XML_RE.sub("", v.details)
         lines.append(f"details: {_cleaned_details}")
     if v.suggestions:
-        lines.append(
-            "suggestions:\n"
-            + "\n".join(f"- {s}" for s in v.suggestions)
-        )
+        lines.append("suggestions:\n" + "\n".join(f"- {s}" for s in v.suggestions))
     if v.plan is not None:
         # Structured plan (output_format schema: "structured plan for asicode to
         # execute") — parsed and stored but previously never surfaced to the
         # design session. default=str keeps untrusted/mixed-type model output
         # (timestamps, sets, …) from crashing the injection path; the same
         # SDK-XML strip as details keeps leaked tool tags out of the plan text.
-        _plan_json = _STRIP_XML_RE.sub(
-            "", json.dumps(v.plan, ensure_ascii=False, default=str)
-        )
+        _plan_json = _STRIP_XML_RE.sub("", json.dumps(v.plan, ensure_ascii=False, default=str))
         lines.append(f"plan: {_plan_json}")
     if v.metadata:
         # Arbitrary extra data (tool calls, tokens, timing) — surfaced so the
         # design LLM can gauge the analysis's grounding; same safety handling
         # as plan above.
-        _metadata_json = _STRIP_XML_RE.sub(
-            "", json.dumps(v.metadata, ensure_ascii=False, default=str)
-        )
+        _metadata_json = _STRIP_XML_RE.sub("", json.dumps(v.metadata, ensure_ascii=False, default=str))
         lines.append(f"metadata: {_metadata_json}")
     return "\n".join(lines)
-
-

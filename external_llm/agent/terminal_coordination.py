@@ -22,6 +22,7 @@ Protocol:
   * The log handler (asi ``_RowSafeEmitMixin``) checks ``row_pending()`` and,
     if set, writes one newline to break the live row before emitting the record.
 """
+
 from __future__ import annotations
 
 import threading

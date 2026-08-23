@@ -6,6 +6,7 @@ delegation, stream callback, exception mapping), _adapt_agent_result (success /
 max_turns / error statuses), _build_agent_context, and
 create_intelligent_service_from_env (env resolution, provider validation).
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -46,8 +47,12 @@ def _make_service(llm=None, provider="mock") -> IntelligentLLMService:
 
 def _analysis(**kw) -> RequestAnalysis:
     defaults = {
-        "original_request": "req", "intent": "create_feature", "feature_name": "login",
-        "suggested_files": ["a.py"], "tech_stack": ["flask"], "confidence": 0.9,
+        "original_request": "req",
+        "intent": "create_feature",
+        "feature_name": "login",
+        "suggested_files": ["a.py"],
+        "tech_stack": ["flask"],
+        "confidence": 0.9,
         "needs_planning": True,
     }
     defaults.update(kw)
@@ -56,9 +61,14 @@ def _analysis(**kw) -> RequestAnalysis:
 
 def _structure(**kw) -> ProjectStructure:
     defaults = {
-        "framework": "Flask", "frameworks": ["Flask"], "project_types": ["web"],
-        "directories": {"app": ["app/"]}, "naming_style": "snake_case",
-        "common_imports": ["os"], "entry_points": ["main.py"], "test_dir": "tests",
+        "framework": "Flask",
+        "frameworks": ["Flask"],
+        "project_types": ["web"],
+        "directories": {"app": ["app/"]},
+        "naming_style": "snake_case",
+        "common_imports": ["os"],
+        "entry_points": ["main.py"],
+        "test_dir": "tests",
         "example_files": {"route": "app/routes.py"},
     }
     defaults.update(kw)
@@ -94,9 +104,7 @@ def test_multi_file_llm_planner_used_when_client_present(tmp_path, monkeypatch):
             return _plan(_op("a.py"))
 
     monkeypatch.setattr(isi_mod, "LLMEnhancedMultiFilePlanner", _FakeLLMPlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=True
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=True)
     assert result["success"] is True
     assert captured["llm_client"] is svc.llm_service.client
     assert captured["llm_model"] == "fake-model"
@@ -117,9 +125,7 @@ def test_multi_file_rule_planner_without_client(tmp_path, monkeypatch):
             return _plan(_op("a.py"))
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False)
     assert result["success"] is True
     assert str(tmp_path) in captured["root"]
 
@@ -137,7 +143,11 @@ def test_multi_file_force_overrides_logged_and_applied(tmp_path, monkeypatch):
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
         llm_planning=False,
         force_output_mode=OutputMode.PLAN_JSON,
         force_context_variant="super",
@@ -160,8 +170,13 @@ def test_multi_file_force_files_filters_operations(tmp_path, monkeypatch):
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, force_files=["/keep.py"],
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        force_files=["/keep.py"],
     )
     assert result["success"] is True
     assert [c["target_file"] for c in llm.calls] == ["keep.py"]
@@ -180,8 +195,13 @@ def test_multi_file_force_files_no_match_runs_full_plan(tmp_path, monkeypatch):
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, force_files=["z.py", ""],
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        force_files=["z.py", ""],
     )
     assert result["success"] is True
     assert [c["target_file"] for c in llm.calls] == ["keep.py", "drop.py"]
@@ -202,8 +222,13 @@ def test_multi_file_force_files_filter_exception_falls_back(tmp_path, monkeypatc
     # force_files=[5] → (5 or "").strip() raises AttributeError inside the
     # try → caught by the except → warning logged → full plan runs.
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, force_files=[5],
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        force_files=[5],
     )
     assert result["success"] is True
     assert [c["target_file"] for c in llm.calls] == ["a.py"]
@@ -224,9 +249,7 @@ def test_multi_file_create_success_and_metadata(tmp_path, monkeypatch):
             return _plan(_op("a.py"), _op("b.py", operation="modify"))
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False)
     assert result["success"] is True
     assert result["mode"] == "multi_file"
     assert "P1" in result["patch"] and "P2" in result["patch"]
@@ -252,9 +275,7 @@ def test_multi_file_create_failure_falls_back_to_placeholder(tmp_path, monkeypat
             return _plan(_op("new.py"))
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False)
     assert result["success"] is True  # fallback placeholder counts as success
     assert result["operations"][0]["fallback_used"] is True
     assert (tmp_path / "new.py").exists()
@@ -278,9 +299,7 @@ def test_multi_file_modify_failure_and_all_success_false(tmp_path, monkeypatch):
             return _plan(_op("app.py", operation="modify"))
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False)
     assert result["success"] is False
     op = result["operations"][0]
     assert op["success"] is False
@@ -303,9 +322,7 @@ def test_multi_file_delete_operation(tmp_path, monkeypatch):
             return _plan(_op("gone.py", operation="delete"))
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False)
     assert result["success"] is True
     assert result["operations"][0]["operation"] == "delete"
 
@@ -326,8 +343,13 @@ def test_multi_file_force_diff_mode_retry_chain(tmp_path, monkeypatch):
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, force_output_mode=OutputMode.UNIFIED_DIFF,
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        force_output_mode=OutputMode.UNIFIED_DIFF,
     )
     assert result["success"] is True
     assert result["operations"][0]["output_mode_used"] == "full_file"
@@ -347,8 +369,13 @@ def test_multi_file_force_asicode_mode_uses_auto_string(tmp_path, monkeypatch):
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, force_output_mode=OutputMode.ASICODE_BLOCK,
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        force_output_mode=OutputMode.ASICODE_BLOCK,
     )
     assert result["success"] is True
     assert llm.calls[0]["output_mode"] == "auto"
@@ -368,8 +395,13 @@ def test_multi_file_progress_callback_direct_call(tmp_path, monkeypatch):
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
     events = []
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, progress_callback=lambda *a: events.append(a),
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        progress_callback=lambda *a: events.append(a),
     )
     assert result["success"] is True
     exec_events = [e for e in events if e[0] == "executing_operation"]
@@ -394,9 +426,7 @@ def test_multi_file_create_op_on_existing_file_fallback_empty(tmp_path, monkeypa
             return _plan(_op("existing.py", operation="create"))
 
     monkeypatch.setattr(isi_mod, "MultiFilePlanner", _FakePlanner)
-    result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False
-    )
+    result = svc._handle_multi_file(tmp_path, "req", _analysis(), _structure(), 0.0, llm_planning=False)
     assert result["success"] is False
     op = result["operations"][0]
     assert op["success"] is False
@@ -460,7 +490,10 @@ def test_handle_agent_mode_success(monkeypatch):
 
     monkeypatch.setattr("external_llm.agent.agent_loop.AgentLoop", _Loop)
     result = svc._handle_agent_mode(
-        Path("/tmp"), "make it", _analysis(), _structure(),
+        Path("/tmp"),
+        "make it",
+        _analysis(),
+        _structure(),
         progress_callback=lambda *a: events.append(a),
     )
     assert result["success"] is True
@@ -492,7 +525,10 @@ def test_handle_agent_mode_stream_callback_errors_swallowed(monkeypatch):
     monkeypatch.setattr("external_llm.agent.agent_loop.AgentLoop", _Loop)
     monkeypatch.setattr("external_llm.agent.tool_registry.ToolRegistry", _FakeToolRegistry)
     result = svc._handle_agent_mode(
-        Path("/tmp"), "r", _analysis(), _structure(),
+        Path("/tmp"),
+        "r",
+        _analysis(),
+        _structure(),
         progress_callback=lambda *a: events.append(a),
     )
     assert result["success"] is False
@@ -571,7 +607,9 @@ def test_handle_request_agent_mode_with_system_prompt(tmp_path, monkeypatch):
 
     monkeypatch.setattr("external_llm.agent.agent_loop.AgentLoop", _Loop)
     result = svc.handle_request(
-        repo_root=str(tmp_path), user_request="r", mode="agent",
+        repo_root=str(tmp_path),
+        user_request="r",
+        mode="agent",
         system_prompt="ignored-in-agent",
     )
     assert result["success"] is True
@@ -585,8 +623,10 @@ def test_adapt_agent_result_success():
     svc = _make_service()
     svc._agent_max_turns = 20
     res = AgentResult(
-        status="success", final_message="done",
-        applied_patches=["A", "B"], turns=[_turn(True), _turn(False)],
+        status="success",
+        final_message="done",
+        applied_patches=["A", "B"],
+        turns=[_turn(True), _turn(False)],
         metadata={"k": "v"},
     )
     out = svc._adapt_agent_result(res, _analysis())
@@ -638,9 +678,7 @@ def test_adapt_agent_result_empty_final_message():
 
 def test_build_agent_context_all_fields():
     svc = _make_service()
-    ctx = svc._build_agent_context(
-        Path("/repo"), _analysis(feature_name="login", tech_stack=["flask"]), _structure()
-    )
+    ctx = svc._build_agent_context(Path("/repo"), _analysis(feature_name="login", tech_stack=["flask"]), _structure())
     assert "Frameworks: Flask" in ctx
     assert "Project types: web" in ctx
     assert "Entry points: main.py" in ctx
@@ -756,8 +794,13 @@ def test_multi_file_raising_progress_callback_does_not_abort(tmp_path, monkeypat
         raise RuntimeError("ui broke")
 
     result = svc._handle_multi_file(
-        tmp_path, "req", _analysis(), _structure(), 0.0,
-        llm_planning=False, progress_callback=boom,
+        tmp_path,
+        "req",
+        _analysis(),
+        _structure(),
+        0.0,
+        llm_planning=False,
+        progress_callback=boom,
     )
     assert result["success"] is True
     assert len(llm.calls) == 2

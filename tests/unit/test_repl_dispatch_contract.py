@@ -28,6 +28,7 @@ The ``"ok"`` path and the orchestrator/ESC paths of ``_run_chat_turn`` need a
 live design-chat worker (LLM service), so they are deliberately out of scope
 for this unit suite.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -200,9 +201,7 @@ class TestDispatchCommandContract:
     def test_session_end_commands_return_break(self, repl, raw):
         assert repl.dispatch(raw) == ("break", raw)
 
-    @pytest.mark.parametrize(
-        "raw", ["/help", "/copy", "/think", "/auto off", "/unknownxyz"]
-    )
+    @pytest.mark.parametrize("raw", ["/help", "/copy", "/think", "/auto off", "/unknownxyz"])
     def test_utility_commands_return_continue(self, repl, raw):
         assert repl.dispatch(raw) == ("continue", raw)
 
@@ -231,12 +230,8 @@ class TestRunChatTurnContract:
         repl = _capture_closures(monkeypatch, tmp_path, session_mgr=mgr)
         assert repl.turn("hello") == "break"
 
-    def test_design_chat_error_returns_continue_and_records_error_turn(
-        self, monkeypatch, tmp_path
-    ):
-        mgr = _StubSessionMgr(
-            fail_on="build_context_messages", exc=RuntimeError("boom")
-        )
+    def test_design_chat_error_returns_continue_and_records_error_turn(self, monkeypatch, tmp_path):
+        mgr = _StubSessionMgr(fail_on="build_context_messages", exc=RuntimeError("boom"))
         repl = _capture_closures(monkeypatch, tmp_path, session_mgr=mgr)
         assert repl.turn("hello") == "continue"
         # user turn recorded first, then the error turn by the recovery handler

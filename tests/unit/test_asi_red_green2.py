@@ -2,6 +2,7 @@
 client creation, pip/vector installs, embedding warmup, restart, logging rich
 branch, main() argument paths. Source-free.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -19,6 +20,7 @@ import asi
 HAS_HUGGINGFACE_HUB = importlib.util.find_spec("huggingface_hub") is not None
 
 # ─── _SlashCommandCompleter (prompt_toolkit Completion available) ──────────────
+
 
 class _Doc:
     def __init__(self, text):
@@ -48,9 +50,12 @@ class TestSlashCommandCompleter:
 
     def test_async_delegates(self):
         import asyncio
+
         c = self._make()
+
         async def _collect():
             return [i async for i in c.get_completions_async(_Doc("/mo"), None)]
+
         items = asyncio.run(_collect())
         assert any(i.text.startswith("/model") for i in items)
 
@@ -100,6 +105,7 @@ class TestSlashCommandCompleter:
 
 # ─── _prompt_auth_retry_key / _commit_verified_api_key ─────────────────────────
 
+
 class TestPromptAuthRetryKey:
     def test_unsupported_model_steer(self, monkeypatch, capsys):
         svc = type("S", (), {"model": "m", "llm_service": type("L", (), {"client": None})()})()
@@ -110,6 +116,7 @@ class TestPromptAuthRetryKey:
 
     def test_empty_key_skips(self, monkeypatch):
         import builtins
+
         svc = type("S", (), {"llm_service": type("L", (), {"client": None})()})()
         monkeypatch.setattr(asi, "_API_KEY_ENV_MAP", {"x": "X_KEY"})
         monkeypatch.setattr(builtins, "input", lambda p="": "")
@@ -122,9 +129,11 @@ class TestPromptAuthRetryKey:
         svc = type("S", (), {"llm_service": type("L", (), {"client": None})()})()
         monkeypatch.setattr(asi, "_API_KEY_ENV_MAP", {"x": "X_KEY"})
         import builtins
+
         monkeypatch.setattr(builtins, "input", lambda p="": "newkey123")
         created = []
         import external_llm.client as cli
+
         monkeypatch.setattr(cli, "create_llm_client", lambda *a, **k: created.append(k.get("api_key")) or object())
         monkeypatch.setattr(cli, "resolve_provider_base_url", lambda p: "")
         printed = []
@@ -139,8 +148,10 @@ class TestPromptAuthRetryKey:
         svc = type("S", (), {"llm_service": type("L", (), {"client": None})()})()
         monkeypatch.setattr(asi, "_API_KEY_ENV_MAP", {"x": "X_KEY"})
         import builtins
+
         monkeypatch.setattr(builtins, "input", lambda p="": "badkey")
         import external_llm.client as cli
+
         monkeypatch.setattr(cli, "create_llm_client", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -165,8 +176,10 @@ class TestCommitVerifiedApiKey:
     def test_persist_failure_logs(self, monkeypatch):
         asi._PENDING_API_KEY.update({"env_var": "ASI_TK2", "key": "k2", "provider": "x"})
         monkeypatch.setattr(asi, "_resolve_repo_root", lambda r: "/tmp")
+
         def _boom(*a, **k):
             raise OSError("disk full")
+
         monkeypatch.setattr(asi, "_save_key_to_dotenv", _boom)
         asi._commit_verified_api_key()  # logs warning, no raise
         assert not asi._PENDING_API_KEY
@@ -184,42 +197,57 @@ class TestCommitVerifiedApiKey:
 
 # ─── _create_llm_client_for ────────────────────────────────────────────────────
 
+
 class TestCreateLlmClientFor:
     def test_ollama_no_key(self, monkeypatch):
         import external_llm.client as cli
+
         created = []
-        monkeypatch.setattr(cli, "create_llm_client", lambda provider, api_key, base_url: created.append((provider, api_key)) or object())
+        monkeypatch.setattr(
+            cli,
+            "create_llm_client",
+            lambda provider, api_key, base_url: created.append((provider, api_key)) or object(),
+        )
         monkeypatch.setattr(cli, "resolve_provider_base_url", lambda p: "http://localhost:11434")
         assert asi._create_llm_client_for("ollama") is not None
 
     def test_env_key_lookup(self, monkeypatch):
         import external_llm.client as cli
+
         monkeypatch.setenv("ASI_PROV_KEY", "envkey")
         monkeypatch.setattr(asi, "_API_KEY_ENV_MAP", {"prov": "ASI_PROV_KEY"})
         got = []
-        monkeypatch.setattr(cli, "create_llm_client", lambda provider, api_key, base_url: got.append(api_key) or object())
+        monkeypatch.setattr(
+            cli, "create_llm_client", lambda provider, api_key, base_url: got.append(api_key) or object()
+        )
         monkeypatch.setattr(cli, "resolve_provider_base_url", lambda p: "")
         asi._create_llm_client_for("prov")
         assert got == ["envkey"]
 
     def test_failure_returns_none(self, monkeypatch):
         import external_llm.client as cli
-        monkeypatch.setattr(cli, "create_llm_client", lambda *a, **k: (_ for _ in ()).throw(ModuleNotFoundError("no module")))
+
+        monkeypatch.setattr(
+            cli, "create_llm_client", lambda *a, **k: (_ for _ in ()).throw(ModuleNotFoundError("no module"))
+        )
         monkeypatch.setattr(cli, "resolve_provider_base_url", lambda p: "")
         assert asi._create_llm_client_for("prov") is None
 
 
 # ─── _handle_insights_archive (real temp repo) ─────────────────────────────────
 
+
 class TestHandleInsightsArchive:
     def _write_files(self, tmp_path):
         active_dir = tmp_path / ".asicode"
         active_dir.mkdir()
         (active_dir / "design_insights.md").write_text(
-            "# Design Chat Insights\n\n### [pattern] 2026-01-01 10:00 +0900\nbody-a\n")
+            "# Design Chat Insights\n\n### [pattern] 2026-01-01 10:00 +0900\nbody-a\n"
+        )
         (active_dir / "design_insights_archive.md").write_text(
             "# Archived\n\n### [pattern] 2026-01-02 10:00 +0900\nbody-b\n\n"
-            "### [pattern] 2026-01-03 10:00 +0900\nbody-c\n")
+            "### [pattern] 2026-01-03 10:00 +0900\nbody-c\n"
+        )
         return tmp_path
 
     def test_list(self, tmp_path, monkeypatch):
@@ -289,12 +317,15 @@ class TestHandleInsightsArchive:
 
 # ─── _restart_cli ──────────────────────────────────────────────────────────────
 
+
 class TestRestartCli:
     def test_execv_failure_prints(self, monkeypatch):
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
+
         def _boom(*a, **k):
             raise OSError("exec format error")
+
         monkeypatch.setattr(os, "execv", _boom)
         asi._restart_cli()
         assert any("auto-restart failed" in str(p) for p in printed)
@@ -302,8 +333,10 @@ class TestRestartCli:
     def test_prints_restart_message(self, monkeypatch):
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
+
         def _ok(*a, **k):
             raise OSError("gone")  # execv never returns; simulate process replacement
+
         monkeypatch.setattr(os, "execv", _ok)
         asi._restart_cli()
         assert any("Restarting asi" in str(p) for p in printed)
@@ -311,11 +344,13 @@ class TestRestartCli:
 
 # ─── _pip_install ──────────────────────────────────────────────────────────────
 
+
 class TestPipInstall:
     def test_success(self, monkeypatch):
         class P:
             returncode = 0
             stdout, stderr = "", ""
+
         monkeypatch.setattr(asi.subprocess, "run", lambda *a, **k: P())
         monkeypatch.setattr(asi, "_print", lambda *a, **k: None)
         assert asi._pip_install(["pkg"], timeout=5) is True
@@ -324,6 +359,7 @@ class TestPipInstall:
         class P:
             returncode = 1
             stdout, stderr = "bad", ""
+
         monkeypatch.setattr(asi.subprocess, "run", lambda *a, **k: P())
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -332,18 +368,23 @@ class TestPipInstall:
 
     def test_pep668_retry(self, monkeypatch):
         calls = []
+
         class P:
             returncode = 1
             stdout = ""
             stderr = "error: externally-managed-environment"
+
         def fake_run(*a, **k):
             calls.append(a)
             if len(calls) == 1:
                 return P()
+
             class P2:
                 returncode = 0
                 stdout, stderr = "", ""
+
             return P2()
+
         monkeypatch.setattr(asi.subprocess, "run", fake_run)
         monkeypatch.setattr(asi, "_print", lambda *a, **k: None)
         assert asi._pip_install(["pkg"], timeout=5) is True
@@ -352,8 +393,10 @@ class TestPipInstall:
 
     def test_timeout(self, monkeypatch):
         import subprocess as sp
+
         def _timeout(*a, **k):
             raise sp.TimeoutExpired("pip", 5)
+
         monkeypatch.setattr(asi.subprocess, "run", _timeout)
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -362,8 +405,10 @@ class TestPipInstall:
 
     def test_timeout_with_partial_output(self, monkeypatch):
         import subprocess as sp
+
         def _timeout(*a, **k):
             raise sp.TimeoutExpired("pip", 5, output=b"line1\nline2\nline3")
+
         monkeypatch.setattr(asi.subprocess, "run", _timeout)
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -373,6 +418,7 @@ class TestPipInstall:
     def test_oserror(self, monkeypatch):
         def _boom(*a, **k):
             raise OSError("pip missing")
+
         monkeypatch.setattr(asi.subprocess, "run", _boom)
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -381,10 +427,12 @@ class TestPipInstall:
 
     def test_break_retry_still_fails(self, monkeypatch):
         calls = []
+
         class P:
             returncode = 1
             stdout = ""
             stderr = "externally-managed-environment"
+
         monkeypatch.setattr(asi.subprocess, "run", lambda *a, **k: calls.append(a) or P())
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -394,6 +442,7 @@ class TestPipInstall:
 
 # ─── _install_tree_sitter_grammars ─────────────────────────────────────────────
 
+
 class TestInstallTreeSitterGrammars:
     def test_install_fails(self, monkeypatch):
         monkeypatch.setattr(asi, "_pip_install", lambda *a, **k: False)
@@ -402,6 +451,7 @@ class TestInstallTreeSitterGrammars:
     def test_core_missing_restart_pending(self, monkeypatch):
         monkeypatch.setattr(asi, "_pip_install", lambda *a, **k: True)
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(tsu, "is_available", lambda: False)
         monkeypatch.setattr(asi, "_DEPS_RESTART_PENDING", False)
         printed = []
@@ -412,6 +462,7 @@ class TestInstallTreeSitterGrammars:
     def test_core_present_live_refresh(self, monkeypatch):
         monkeypatch.setattr(asi, "_pip_install", lambda *a, **k: True)
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(tsu, "is_available", lambda: True)
         monkeypatch.setattr(tsu, "invalidate_caches", lambda: None)
         monkeypatch.setattr(tsu, "get_available_languages", lambda: {"python", "go"})
@@ -423,9 +474,12 @@ class TestInstallTreeSitterGrammars:
     def test_refresh_exception(self, monkeypatch):
         monkeypatch.setattr(asi, "_pip_install", lambda *a, **k: True)
         import external_llm.languages.tree_sitter_utils as tsu
+
         monkeypatch.setattr(tsu, "is_available", lambda: True)
+
         def _boom(*a, **k):
             raise RuntimeError("bad grammar")
+
         monkeypatch.setattr(tsu, "invalidate_caches", _boom)
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -435,18 +489,22 @@ class TestInstallTreeSitterGrammars:
 
 # ─── _maybe_prompt_vector_install ──────────────────────────────────────────────
 
+
 class TestMaybePromptVectorInstall:
     def _patch_vector_flags(self, monkeypatch, deps_ok=True, model_cached=False, fallback_cached=False):
         import external_llm.agent.vector_cache as vc
+
         monkeypatch.setattr(vc, "HAS_FAISS", deps_ok)
         monkeypatch.setattr(vc, "HAS_NUMPY", deps_ok)
         monkeypatch.setattr(vc, "HAS_SENTENCE_TRANSFORMERS", deps_ok)
         monkeypatch.setattr(vc, "get_configured_embedding_model_name", lambda: "preferred-model")
         monkeypatch.setattr(vc, "FALLBACK_EMBEDDING_MODELS", ["fallback-model"])
+
         def _cached(name):
             if name == "preferred-model":
                 return model_cached
             return fallback_cached
+
         monkeypatch.setattr(asi, "_is_embedding_model_cached", _cached)
 
     def test_deps_ok_model_cached(self, monkeypatch):
@@ -487,8 +545,10 @@ class TestMaybePromptVectorInstall:
 
     def test_deps_missing_eof(self, monkeypatch):
         self._patch_vector_flags(monkeypatch, deps_ok=False)
+
         def _eof(p=""):
             raise EOFError
+
         monkeypatch.setattr(asi, "_collect_input", _eof)
         asi._maybe_prompt_vector_install()
 
@@ -521,6 +581,7 @@ class TestMaybePromptVectorInstall:
 
 # ─── _download_embedding_model ─────────────────────────────────────────────────
 
+
 @pytest.mark.skipif(
     not HAS_HUGGINGFACE_HUB,
     reason="requires huggingface_hub (rag extra)",
@@ -528,15 +589,19 @@ class TestMaybePromptVectorInstall:
 class TestDownloadEmbeddingModel:
     def _patch_hf(self, monkeypatch):
         import huggingface_hub.constants as hf_c
+
         monkeypatch.setattr(hf_c, "HF_HUB_OFFLINE", None)
         import huggingface_hub as hf
+
         monkeypatch.setattr(hf, "snapshot_download", lambda *a, **k: None)
         import external_llm.agent.vector_cache as vc
+
         monkeypatch.setattr(vc, "_suppress_hf_progress", lambda: contextlib_nullcontext())
 
     def test_success(self, monkeypatch):
         self._patch_hf(monkeypatch)
         import external_llm.agent.vector_cache as vc
+
         monkeypatch.setattr(asi, "_is_embedding_model_cached", lambda m: True)
         monkeypatch.setattr(vc, "set_active_embedding_model", lambda m: object())
         printed = []
@@ -555,6 +620,7 @@ class TestDownloadEmbeddingModel:
     def test_model_none(self, monkeypatch):
         self._patch_hf(monkeypatch)
         import external_llm.agent.vector_cache as vc
+
         monkeypatch.setattr(asi, "_is_embedding_model_cached", lambda m: True)
         monkeypatch.setattr(vc, "set_active_embedding_model", lambda m: None)
         printed = []
@@ -565,8 +631,10 @@ class TestDownloadEmbeddingModel:
     def test_exception(self, monkeypatch):
         self._patch_hf(monkeypatch)
         import huggingface_hub as hf
+
         def _boom(*a, **k):
             raise RuntimeError("network")
+
         monkeypatch.setattr(hf, "snapshot_download", _boom)
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -575,9 +643,11 @@ class TestDownloadEmbeddingModel:
 
     def test_offline_bypass_restored(self, monkeypatch):
         import huggingface_hub.constants as hf_c
+
         monkeypatch.setattr(hf_c, "HF_HUB_OFFLINE", True)
         self._patch_hf(monkeypatch)
         import external_llm.agent.vector_cache as vc
+
         monkeypatch.setattr(asi, "_is_embedding_model_cached", lambda m: True)
         monkeypatch.setattr(vc, "set_active_embedding_model", lambda m: object())
         asi._download_embedding_model("m1")
@@ -586,16 +656,20 @@ class TestDownloadEmbeddingModel:
 
 # ─── _kick_embedding_model_warmup ──────────────────────────────────────────────
 
+
 class TestKickEmbeddingModelWarmup:
     def _patch(self, monkeypatch, deps=True, cached=True, fallback_cached=False):
         import external_llm.agent.vector_cache as vc
+
         monkeypatch.setattr(vc, "HAS_FAISS", deps)
         monkeypatch.setattr(vc, "HAS_NUMPY", deps)
         monkeypatch.setattr(vc, "HAS_SENTENCE_TRANSFORMERS", deps)
         monkeypatch.setattr(vc, "get_configured_embedding_model_name", lambda: "pref")
         monkeypatch.setattr(vc, "FALLBACK_EMBEDDING_MODELS", ["fall"])
+
         def _cached(name):
             return cached if name == "pref" else fallback_cached
+
         monkeypatch.setattr(asi, "_is_embedding_model_cached", _cached)
         monkeypatch.setattr(vc, "warmup_embedding_model", lambda: None)
         return vc
@@ -611,17 +685,21 @@ class TestKickEmbeddingModelWarmup:
     def test_starts_thread(self, monkeypatch):
         self._patch(monkeypatch, cached=True)
         started = []
+
         class FakeThread:
             def __init__(self, *a, **k):
                 started.append(k.get("name"))
+
             def start(self):
                 pass
+
         monkeypatch.setattr(threading, "Thread", FakeThread)
         asi._kick_embedding_model_warmup()
         assert "emb-warmup" in started
 
 
 # ─── _setup_logging rich branch ────────────────────────────────────────────────
+
 
 class TestSetupLoggingRich:
     @pytest.fixture(autouse=True)
@@ -648,16 +726,20 @@ class TestSetupLoggingRich:
 
 # ─── main() argument paths ─────────────────────────────────────────────────────
 
+
 class TestMainArgPaths:
     def _run_main(self, monkeypatch, argv, prompt_stdin_text=""):
         monkeypatch.setattr(asi.sys, "argv", ["asi", *argv])
         import io
+
         monkeypatch.setattr(asi.sys, "stdin", io.StringIO(prompt_stdin_text))
         # stub out the heavy entry points so main() never touches engines
         calls = {}
+
         def _run_once(a, p):
             calls["run_once"] = (a, p)
             return 0
+
         monkeypatch.setattr(asi, "run_once", _run_once)
         monkeypatch.setattr(asi, "run_repl", lambda a: calls.setdefault("run_repl", a))
         monkeypatch.setattr(asi, "run_subagent_worker", lambda a: calls.setdefault("subagent", a))
@@ -667,6 +749,7 @@ class TestMainArgPaths:
     def test_collaborate_subcommand(self, monkeypatch):
         entered = []
         import external_llm.repl.collaborate.cli as cli_mod
+
         monkeypatch.setattr(cli_mod, "main", lambda: entered.append(True))
         monkeypatch.setattr(asi.sys, "argv", ["asi", "collaborate"])
         asi.main()
@@ -675,6 +758,7 @@ class TestMainArgPaths:
     def test_mcp_subcommand(self, monkeypatch):
         entered = []
         import external_llm.repl.collaborate.cli as cli_mod
+
         monkeypatch.setattr(cli_mod, "main", lambda: entered.append(True))
         monkeypatch.setattr(asi.sys, "argv", ["asi", "mcp"])
         asi.main()
@@ -700,8 +784,10 @@ class TestMainArgPaths:
 
     def test_prompt_stdin_read_error(self, monkeypatch):
         self._run_main(monkeypatch, ["--prompt-stdin"])
+
         def _boom():
             raise OSError("closed")
+
         monkeypatch.setattr(asi.sys.stdin, "read", _boom)
         printed = []
         monkeypatch.setattr(asi, "_print", lambda *a, **k: printed.append(a))
@@ -762,4 +848,5 @@ class TestMainArgPaths:
 
 def contextlib_nullcontext():
     import contextlib
+
     return contextlib.nullcontext()

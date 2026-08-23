@@ -21,7 +21,6 @@ import os
 import re
 import shutil
 import subprocess
-from typing import Optional
 
 from external_llm.common.atomic_io import atomic_write_text
 from external_llm.common.indent_utils import (
@@ -47,33 +46,69 @@ from .repair_helpers import _strip_redundant_dataclass_decorator, _strip_redunda
 # JS/TS need regex-literal + template-escape aware lexing; a backtick or
 # quote inside a regex (``.replace(/```/g, "")``) otherwise reads as a string
 # opener and flips literal parity for every following line.
-_JS_FAMILY = frozenset({
-    LanguageId.JAVASCRIPT, LanguageId.TYPESCRIPT,
-})
+_JS_FAMILY = frozenset(
+    {
+        LanguageId.JAVASCRIPT,
+        LanguageId.TYPESCRIPT,
+    }
+)
 
-_BRACE_LANGUAGES_NO_COMPILER = frozenset({
-    LanguageId.KOTLIN, LanguageId.RUST, LanguageId.C, LanguageId.CPP,
-    LanguageId.JAVA, LanguageId.SCALA, LanguageId.SWIFT, LanguageId.CSHARP,
-    LanguageId.JAVASCRIPT, LanguageId.TYPESCRIPT, LanguageId.GO,
-})
+_BRACE_LANGUAGES_NO_COMPILER = frozenset(
+    {
+        LanguageId.KOTLIN,
+        LanguageId.RUST,
+        LanguageId.C,
+        LanguageId.CPP,
+        LanguageId.JAVA,
+        LanguageId.SCALA,
+        LanguageId.SWIFT,
+        LanguageId.CSHARP,
+        LanguageId.JAVASCRIPT,
+        LanguageId.TYPESCRIPT,
+        LanguageId.GO,
+    }
+)
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
 _DEFINITION_PREFIXES = (
-    "def ", "async def ", "class ",
-    "function ", "async function ", "export function ", "export async function ",
-    "export class ", "export default function ", "export default class ",
-    "export interface ", "export type ", "interface ", "type ",
-    "abstract class ", "export abstract class ",
-    "func ", "func(",
-    "public ", "private ", "protected ",
-    "static ", "final ", "synchronized ",
+    "def ",
+    "async def ",
+    "class ",
+    "function ",
+    "async function ",
+    "export function ",
+    "export async function ",
+    "export class ",
+    "export default function ",
+    "export default class ",
+    "export interface ",
+    "export type ",
+    "interface ",
+    "type ",
+    "abstract class ",
+    "export abstract class ",
+    "func ",
+    "func(",
+    "public ",
+    "private ",
+    "protected ",
+    "static ",
+    "final ",
+    "synchronized ",
     "enum ",
-    "fun ", "suspend fun ", "override fun ", "internal fun ",
-    "data class ", "sealed class ", "open class ", "inner class ",
-    "object ", "companion object ",
+    "fun ",
+    "suspend fun ",
+    "override fun ",
+    "internal fun ",
+    "data class ",
+    "sealed class ",
+    "open class ",
+    "inner class ",
+    "object ",
+    "companion object ",
 )
 
 
@@ -101,7 +136,7 @@ def _first_significant_line(text: str, skip_decorators: bool = True) -> str:
             idx = s.find("*/")
             if idx != -1:
                 in_block = False
-                tail = s[idx + 2:].strip()
+                tail = s[idx + 2 :].strip()
                 if tail and not tail.startswith(("#", "//")):
                     return tail
             continue
@@ -116,7 +151,7 @@ def _first_significant_line(text: str, skip_decorators: bool = True) -> str:
             if idx == -1:
                 in_block = True
                 continue
-            tail = s[idx + 2:].strip()
+            tail = s[idx + 2 :].strip()
             if tail and not tail.startswith(("#", "//")):
                 return tail
             continue
@@ -145,8 +180,7 @@ def _realign_dedented_leading_lines(code: str) -> str:
     """
     lines = code.splitlines()
     def_idx = next(
-        (i for i, ln in enumerate(lines)
-         if ln.strip().startswith(("def ", "async def ", "class "))),
+        (i for i, ln in enumerate(lines) if ln.strip().startswith(("def ", "async def ", "class "))),
         -1,
     )
     if def_idx <= 0:
@@ -165,7 +199,7 @@ def _realign_dedented_leading_lines(code: str) -> str:
     return "\n".join(lines) + ("\n" if code.endswith("\n") else "")
 
 
-def _trailing_foreign_stmt(code: str) -> Optional[str]:
+def _trailing_foreign_stmt(code: str) -> str | None:
     """Detect a def/class/decorator row PAST the symbol's own block.
 
     Diagnostic-only: consulted when composing the final syntax-blocked error,
@@ -185,22 +219,19 @@ def _trailing_foreign_stmt(code: str) -> Optional[str]:
     """
     lines = code.splitlines()
     def_idx = next(
-        (i for i, ln in enumerate(lines)
-         if ln.strip().startswith(("def ", "async def ", "class "))),
+        (i for i, ln in enumerate(lines) if ln.strip().startswith(("def ", "async def ", "class "))),
         -1,
     )
     if def_idx < 0:
         return None
     def_line = lines[def_idx]
     def_indent = len(def_line) - len(def_line.lstrip())
-    for ln in lines[def_idx + 1:]:
+    for ln in lines[def_idx + 1 :]:
         stripped = ln.strip()
         if not stripped:
             continue
         indent = len(ln) - len(ln.lstrip())
-        if indent <= def_indent and stripped.startswith(
-            ("def ", "async def ", "class ", "@")
-        ):
+        if indent <= def_indent and stripped.startswith(("def ", "async def ", "class ", "@")):
             return stripped[:80]
     return None
 
@@ -240,8 +271,7 @@ def _reindent_relative(
     # Dedent to column 0 so the fragment tokenizes as module-level code; row
     # numbers are preserved 1:1 with body_lines.
     dedented = "\n".join(
-        (bl[anchor_indent:] if len(bl) - len(bl.lstrip()) >= anchor_indent else bl.lstrip())
-        if bl.strip() else ""
+        (bl[anchor_indent:] if len(bl) - len(bl.lstrip()) >= anchor_indent else bl.lstrip()) if bl.strip() else ""
         for bl in body_lines
     )
     analysis = _analyze_logical_lines(dedented) if anchor_indent >= 0 else None
@@ -258,6 +288,7 @@ def _reindent_relative(
         if logical_indents:
             anchor_indent = min(logical_indents)
             from math import gcd as _gcd
+
             mu = 0
             for ind in logical_indents:
                 rel = ind - anchor_indent
@@ -322,11 +353,8 @@ def _mode_logical_indent(lines: list[str]) -> int:
     depth and lets the correction fire. Used by ``_correct_indent_drift``.
     """
     from collections import Counter
-    widths = [
-        len(ln) - len(ln.lstrip())
-        for ln in lines
-        if ln.strip()
-    ]
+
+    widths = [len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()]
     if not widths:
         return 0
     counts = Counter(widths)
@@ -352,9 +380,7 @@ def _block_parses_after_dedent(lines: list[str]) -> bool:
         return True
     common = min(len(ln) - len(ln.lstrip()) for ln in nonblank)
     dedented = [
-        (ln[common:] if len(ln) - len(ln.lstrip()) >= common else ln.lstrip())
-        if ln.strip() else ""
-        for ln in lines
+        (ln[common:] if len(ln) - len(ln.lstrip()) >= common else ln.lstrip()) if ln.strip() else "" for ln in lines
     ]
     try:
         ast.parse("\n".join(dedented))
@@ -426,15 +452,22 @@ def _correct_indent_drift(
             return reindented
         logger.info(
             "modify_symbol body-only indent drift (parse-fail fallback) for %s: "
-                "min_indent=%d mode_indent=%d expected=%d (delta=%d); "
-                "correcting over-indented lines",
-            symbol, actual, mode, target, delta,
+            "min_indent=%d mode_indent=%d expected=%d (delta=%d); "
+            "correcting over-indented lines",
+            symbol,
+            actual,
+            mode,
+            target,
+            delta,
         )
     else:
         logger.warning(
             "modify_symbol body-only indent drift for %s: min_indent=%d expected=%d "
-                "(delta=%d); applying corrective shift to over-indented lines",
-            symbol, actual, target, delta,
+            "(delta=%d); applying corrective shift to over-indented lines",
+            symbol,
+            actual,
+            target,
+            delta,
         )
     corrected = []
     for ln in reindented:
@@ -508,27 +541,26 @@ def _correct_full_block_body_drift(
         # be defensive): fall back to a simple row split — the first line
         # whose content starts with def/class is the header anchor.
         def_row = next(
-            (i + 1 for i, ln in enumerate(block_lines)
-             if ln.lstrip().startswith(("def ", "async def ", "class "))),
+            (i + 1 for i, ln in enumerate(block_lines) if ln.lstrip().startswith(("def ", "async def ", "class "))),
             1,
         )
         header_end = def_row
     else:
         owner, logical_rows = analysis
         def_row = next(
-            (r for r in sorted(logical_rows)
-             if 1 <= r <= len(block_lines)
-             and block_lines[r - 1].lstrip().startswith(("def ", "async def ", "class "))),
+            (
+                r
+                for r in sorted(logical_rows)
+                if 1 <= r <= len(block_lines)
+                and block_lines[r - 1].lstrip().startswith(("def ", "async def ", "class "))
+            ),
             None,
         )
         if def_row is None:
             return block_lines  # no def/class statement — nothing to anchor on
         # Header = the def row and every row owned by it (signature
         # continuations), plus any rows before it (decorators/comments).
-        header_end = max(
-            r for r in range(1, len(block_lines) + 1)
-            if r <= def_row or owner.get(r, r) == def_row
-        )
+        header_end = max(r for r in range(1, len(block_lines) + 1) if r <= def_row or owner.get(r, r) == def_row)
 
     header = block_lines[:header_end]
     body = block_lines[header_end:]
@@ -541,8 +573,10 @@ def _correct_full_block_body_drift(
 
     logger.info(
         "modify_symbol full-block body indent drift for %s: def_indent=%d "
-            "expected body_indent=%d; applying corrective shift to over-indented body lines",
-        symbol, def_indent, target,
+        "expected body_indent=%d; applying corrective shift to over-indented body lines",
+        symbol,
+        def_indent,
+        target,
     )
     return header + corrected_body
 
@@ -563,11 +597,11 @@ def _create_unified_diff(file_path: str, old_content: str, new_content: str) -> 
         new_lines,
         fromfile=f"a/{file_path}",
         tofile=f"b/{file_path}",
-        lineterm='',
+        lineterm="",
     )
-    result = '\n'.join(diff)
+    result = "\n".join(diff)
     if result:
-        result += '\n'
+        result += "\n"
     return result
 
 
@@ -575,8 +609,8 @@ def _find_symbol_ast_node(
     source: str,
     symbol: str,
     *,
-    tree: Optional[ast.AST] = None,
-) -> Optional[ast.AST]:
+    tree: ast.AST | None = None,
+) -> ast.AST | None:
     """Find the best matching AST node for a symbol name.
 
     Supports 'ClassName.method_name' notation for locating methods.
@@ -586,7 +620,7 @@ def _find_symbol_ast_node(
     that already parsed the source (e.g. :func:`_apply_ast_precise`) avoid a
     redundant second ``ast.parse`` of the same text.
     """
-    class_name: Optional[str] = None
+    class_name: str | None = None
     method_name = symbol
     if "." in symbol:
         parts = symbol.split(".", 1)
@@ -606,7 +640,11 @@ def _find_symbol_ast_node(
             continue
         if class_name:
             if isinstance(node, ast.ClassDef) and node.name == class_name:
-                candidates.extend(item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name)
+                candidates.extend(
+                    item
+                    for item in node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name
+                )
         elif node.name == method_name:
             candidates.append(node)
 
@@ -626,7 +664,7 @@ def _apply_ast_precise(
     file_path: str,
     symbol: str,
     code: str,
-) -> tuple[Optional[str], str]:
+) -> tuple[str | None, str]:
     """Apply AST-precise symbol body replacement.
 
     Returns (diff_or_None, mode_name).
@@ -658,7 +696,7 @@ def _apply_ast_precise(
     lines = source.splitlines(keepends=True)
 
     deco_list = getattr(target, "decorator_list", [])
-    deco_start_line = deco_list[0].lineno if deco_list else target.lineno
+    deco_start_line = deco_list[0].lineno if deco_list else target.lineno  # type: ignore[attr-defined]  # AST stmt nodes have lineno
 
     is_full_block = _looks_like_full_symbol_block(new_body)
 
@@ -669,7 +707,7 @@ def _apply_ast_precise(
         if start_idx < 0 or end_idx > len(lines):
             return None, "skipped_invalid_range"
 
-        original_indent = target.col_offset
+        original_indent = target.col_offset  # type: ignore[attr-defined]  # AST stmt nodes have col_offset
         block_lines = new_body.splitlines()
         new_first_line = next((nl for nl in block_lines if nl.strip()), "")
         new_indent = len(new_first_line) - len(new_first_line.lstrip()) if new_first_line else 0
@@ -685,12 +723,22 @@ def _apply_ast_precise(
         if new_indent != original_indent or model_char != file_char or model_unit != file_unit:
             logger.info(
                 "Reindent %s: orig=%d new=%d, model unit/char=%d/%r -> file %d/%r",
-                symbol, original_indent, new_indent, model_unit, model_char,
-                file_unit, file_char,
+                symbol,
+                original_indent,
+                new_indent,
+                model_unit,
+                model_char,
+                file_unit,
+                file_char,
             )
             corrected = _reindent_relative(
-                block_lines, new_indent, file_char * original_indent,
-                model_char, model_unit, file_char, file_unit,
+                block_lines,
+                new_indent,
+                file_char * original_indent,
+                model_char,
+                model_unit,
+                file_char,
+                file_unit,
             )
             new_body = "\n".join(corrected)
             block_lines = corrected
@@ -708,7 +756,11 @@ def _apply_ast_precise(
         # def line + signature continuation lines are owned by the def
         # statement and are excluded so the re-anchor on original_indent holds.
         block_lines = _correct_full_block_body_drift(
-            block_lines, file_char, original_indent, file_unit, symbol,
+            block_lines,
+            file_char,
+            original_indent,
+            file_unit,
+            symbol,
         )
         new_body = "\n".join(block_lines)
 
@@ -736,8 +788,7 @@ def _apply_ast_precise(
         # below is deliberately independent of _DEFINITION_PREFIXES so it catches
         # exactly the variants that slipped past the prefix heuristic.
         _first_stmt = next(
-            (ln.strip() for ln in new_body.splitlines()
-             if ln.strip() and not ln.strip().startswith(("#", "@"))),
+            (ln.strip() for ln in new_body.splitlines() if ln.strip() and not ln.strip().startswith(("#", "@"))),
             "",
         )
         # 'def'/'class' followed by a non-identifier boundary (space, tab, paren)
@@ -746,9 +797,10 @@ def _apply_ast_precise(
         if re.match(r"(async\s+def|def|class)(?![A-Za-z0-9_])", _first_stmt):
             logger.warning(
                 "modify_symbol mode misclassification risk for %s: body-only path "
-                    "taken but model code starts with a def/class statement (%r) "
-                    "— _looks_like_full_symbol_block did not match the prefix",
-                symbol, _first_stmt[:60],
+                "taken but model code starts with a def/class statement (%r) "
+                "— _looks_like_full_symbol_block did not match the prefix",
+                symbol,
+                _first_stmt[:60],
             )
         body_stmts = getattr(target, "body", [])
         if not body_stmts:
@@ -757,7 +809,7 @@ def _apply_ast_precise(
         body_start_line = body_stmts[0].lineno
 
         body_indent = "    "
-        for bl in lines[body_start_line - 1: end_lineno]:
+        for bl in lines[body_start_line - 1 : end_lineno]:
             stripped_bl = bl.rstrip("\n\r")
             if stripped_bl.strip():
                 body_indent = stripped_bl[: len(stripped_bl) - len(stripped_bl.lstrip())]
@@ -776,8 +828,13 @@ def _apply_ast_precise(
         model_char = detect_indent_char(model_lines)
         model_unit = indent_unit(new_body, model_char)
         reindented = _reindent_relative(
-            model_lines, anchor, body_indent,
-            model_char, model_unit, file_char, file_unit,
+            model_lines,
+            anchor,
+            body_indent,
+            model_char,
+            model_unit,
+            file_char,
+            file_unit,
         )
         # Defense-1: validate the re-anchor contract. The least-indented
         # logical line MUST sit at len(body_indent); a deeper result signals a
@@ -800,7 +857,9 @@ def _apply_ast_precise(
         if not header_lines:
             logger.warning(
                 "body_only: header_lines empty for %s (deco_start=%d body_start=%d) - skipping",
-                symbol, deco_start_line, body_start_line,
+                symbol,
+                deco_start_line,
+                body_start_line,
             )
             return None, "skipped_empty_header"
 
@@ -828,7 +887,7 @@ def _apply_surgical_edit(
     code: str,
     sym_start_line: int,
     sym_end_line: int,
-) -> Optional[str]:
+) -> str | None:
     """Apply a surgical search/replace edit within the symbol's line range."""
     lines = source.splitlines(keepends=True)
     sym_text = "".join(lines[sym_start_line:sym_end_line])
@@ -905,7 +964,7 @@ def _apply_surgical_edit(
     _si_base_indent = ""
     for _sil in search_text.splitlines():
         if _sil.strip():
-            _si_base_indent = _sil[:len(_sil) - len(_sil.lstrip())]
+            _si_base_indent = _sil[: len(_sil) - len(_sil.lstrip())]
             break
     # Use the LOGICAL file indent unit (docstring/continuation lines excluded) —
     # NOT the raw indent_unit(). Raw GCD across the whole source is poisoned by
@@ -919,7 +978,7 @@ def _apply_surgical_edit(
 
     match_pos = sym_text.find(search_text)
     if match_pos >= 0:
-        new_sym_text = sym_text[:match_pos] + _si_normalized_replace + sym_text[match_pos + len(search_text):]
+        new_sym_text = sym_text[:match_pos] + _si_normalized_replace + sym_text[match_pos + len(search_text) :]
         new_content = "".join(lines[:sym_start_line]) + new_sym_text + "".join(lines[sym_end_line:])
         if new_content != source:
             return _create_unified_diff(file_path, source, new_content)
@@ -989,19 +1048,13 @@ def _apply_surgical_edit(
             if adjusted_replace and not adjusted_replace[-1].endswith("\n"):
                 adjusted_replace[-1] += "\n"
 
-            new_content = (
-                "".join(lines[:best_start])
-                + "".join(adjusted_replace)
-                + "".join(lines[actual_end:])
-            )
+            new_content = "".join(lines[:best_start]) + "".join(adjusted_replace) + "".join(lines[actual_end:])
             if new_content != source:
                 return _create_unified_diff(file_path, source, new_content)
     return None  # pragma: no cover — unreachable: exact match always succeeds (see dead-block note above)
 
 
-def _find_symbol_def_line(
-    lines: list[str], bare: str, file_path: str
-) -> Optional[int]:
+def _find_symbol_def_line(lines: list[str], bare: str, file_path: str) -> int | None:
     """Find the 0-indexed line where symbol ``bare`` is defined.
 
     Uses the language provider's typed symbol patterns first — the single
@@ -1031,16 +1084,15 @@ def _find_symbol_def_line(
     # 2. Legacy prefix fallback (languages with no registered provider).
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if any(stripped.startswith((f"{p}{bare}", f"{p} {bare}"))
-               for p in ("async def ", "async function ", "def ", "class ",
-                         "func ", "function ", "fun ")):
+        if any(
+            stripped.startswith((f"{p}{bare}", f"{p} {bare}"))
+            for p in ("async def ", "async function ", "def ", "class ", "func ", "function ", "fun ")
+        ):
             return i
     return None
 
 
-def _find_symbol_range_via_treesitter(
-    source: str, symbol: str, file_path: str
-) -> Optional[tuple[int, int]]:
+def _find_symbol_range_via_treesitter(source: str, symbol: str, file_path: str) -> tuple[int, int] | None:
     """Locate a symbol's line range via the tree-sitter AST.
 
     Returns 0-indexed ``(start, exclusive_end)`` to match
@@ -1065,6 +1117,7 @@ def _find_symbol_range_via_treesitter(
     from ..languages.tree_sitter_utils import (
         is_language_available as _ts_language_available,
     )
+
     lang_id = LanguageId.from_path(file_path).value
     if lang_id not in _TS_LANG_MODULE_MAP or lang_id == "python":
         return None
@@ -1153,7 +1206,7 @@ def _py_brackets_balanced(text: str) -> bool:
     return depth == 0 and not quote
 
 
-def _python_class_block(lines: list[str], name: str) -> Optional[tuple[int, int]]:
+def _python_class_block(lines: list[str], name: str) -> tuple[int, int] | None:
     """0-indexed ``(body_start, body_end)`` of ``class <name>``'s body, else ``None``.
 
     Used to VERIFY a ``Class.method`` qualifier on the non-AST path. Returning
@@ -1179,7 +1232,7 @@ def _python_class_block(lines: list[str], name: str) -> Optional[tuple[int, int]
     return None
 
 
-def _find_python_symbol_line_range(source: str, symbol: str) -> Optional[tuple[int, int]]:
+def _find_python_symbol_line_range(source: str, symbol: str) -> tuple[int, int] | None:
     """Python-aware fallback for when the ``ast`` path cannot answer.
 
     Reached only when :func:`_find_symbol_ast_node` misses — in practice when the
@@ -1196,7 +1249,7 @@ def _find_python_symbol_line_range(source: str, symbol: str) -> Optional[tuple[i
     exactly: decorators included, trailing blank/comment lines excluded.
     """
     lines = source.splitlines()
-    class_name: Optional[str] = None
+    class_name: str | None = None
     bare = symbol
     if "." in symbol:
         class_name, bare = symbol.split(".", 1)
@@ -1230,9 +1283,7 @@ def _find_python_symbol_line_range(source: str, symbol: str) -> Optional[tuple[i
         pending.insert(0, line)
         chunk = "\n".join(pending)
         is_deco_head = (
-            stripped.startswith("@")
-            and len(line) - len(line.lstrip()) == def_indent
-            and _py_brackets_balanced(chunk)
+            stripped.startswith("@") and len(line) - len(line.lstrip()) == def_indent and _py_brackets_balanced(chunk)
         )
         if is_deco_head:
             start = j
@@ -1244,7 +1295,7 @@ def _find_python_symbol_line_range(source: str, symbol: str) -> Optional[tuple[i
     # ── Header end: the signature may span lines (``def f(\n  x,\n) -> T:``) ──
     sig_end = i
     for k in range(i, min(len(lines), i + 200)):
-        chunk = "\n".join(lines[i:k + 1])
+        chunk = "\n".join(lines[i : k + 1])
         if _py_brackets_balanced(chunk) and ":" in _py_code_part(lines[k]):
             sig_end = k
             break
@@ -1295,7 +1346,7 @@ def _python_symbol_miss_reason(source: str, symbol: str) -> str:
     return "no such symbol in this file"
 
 
-def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> Optional[tuple[int, int]]:
+def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> tuple[int, int] | None:
     """Find the line range (start_line, end_line) for a symbol.
 
     Returns 0-indexed (start, exclusive_end).
@@ -1306,7 +1357,7 @@ def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> Optiona
             end_lineno = getattr(node, "end_lineno", None)
             if end_lineno is not None:
                 deco_list = getattr(node, "decorator_list", [])
-                start = deco_list[0].lineno - 1 if deco_list else node.lineno - 1
+                start = deco_list[0].lineno - 1 if deco_list else node.lineno - 1  # type: ignore[attr-defined]  # AST stmt nodes have lineno
                 return (start, end_lineno)
         # ast missed: the file does not parse, or the symbol/qualifier is absent.
         # Answer with the Python-aware fallback and RETURN — falling through to
@@ -1482,9 +1533,7 @@ def _apply_hunk(
         result_lines.insert(hunk_start + i, nl if nl.endswith("\n") else nl + "\n")
 
 
-def _post_edit_syntax_ok(
-    content: str, path: str, source: str = "", _source_net: Optional[int] = None
-) -> bool:
+def _post_edit_syntax_ok(content: str, path: str, source: str = "", _source_net: int | None = None) -> bool:
     """Whether ``content`` is safe to write for ``path``.
 
     For PYTHON files, uses ``compile()`` to verify the candidate before it ever
@@ -1585,8 +1634,7 @@ def _post_edit_syntax_ok(
             # longer false-rejecting edits to files with a pre-existing imbalance.
             # ``_source_net`` (precomputed once by the caller for brace languages)
             # avoids re-scanning the same pre-edit content on each fallback tier.
-            src_net = (_source_net if _source_net is not None
-                       else net_brace_count(source, js_lexing=_js))
+            src_net = _source_net if _source_net is not None else net_brace_count(source, js_lexing=_js)
             if new_net != src_net:
                 return False
         elif new_net != 0:
@@ -1610,7 +1658,7 @@ def _post_edit_syntax_ok(
     return True
 
 
-def _ts_syntax_valid(text: str, lid: "LanguageId") -> Optional[bool]:
+def _ts_syntax_valid(text: str, lid: LanguageId) -> bool | None:
     """Whether *text* parses clean for *lid* (pure tree-sitter), or None.
 
     None (grammar missing, parser raised) is distinct from False and must be
@@ -1642,6 +1690,7 @@ def _ts_syntax_valid(text: str, lid: "LanguageId") -> Optional[bool]:
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
+
 def modify_symbol(
     file_path: str,
     symbol: str,
@@ -1671,17 +1720,18 @@ def modify_symbol(
     rel_path = os.path.relpath(abs_path, repo_root) if repo_root else file_path
 
     try:
-        with open(abs_path, encoding='utf-8') as f:
+        with open(abs_path, encoding="utf-8") as f:
             source = f.read()
     except Exception as e:
         return False, f"Failed to read {file_path}: {e}", ""
 
     # ── Empty code guard (all strategies) ──
     if not code or not code.strip():
-        return False, (
-            f"Empty replacement code for symbol '{symbol}' in {rel_path} — "
-            "cannot replace a symbol with nothing"
-        ), ""
+        return (
+            False,
+            (f"Empty replacement code for symbol '{symbol}' in {rel_path} — cannot replace a symbol with nothing"),
+            "",
+        )
 
     # Normalize the dedented-first-line artifact once, before any strategy:
     # all three anchor the block's indentation on its first line.
@@ -1694,7 +1744,7 @@ def modify_symbol(
 
     # Pre-edit net brace count, computed ONCE for brace languages so the three
     # fallback tiers don't each re-scan the same source (net_brace_count is O(n)).
-    source_net: Optional[int] = None
+    source_net: int | None = None
     _src_lid = LanguageId.from_path(rel_path)
     if _src_lid in _BRACE_LANGUAGES_NO_COMPILER:
         source_net = net_brace_count(source, js_lexing=_src_lid in _JS_FAMILY)
@@ -1709,8 +1759,8 @@ def modify_symbol(
                 return False, f"Diff apply failed after AST precise: {e}", ""
             if not _post_edit_syntax_ok(new_content, rel_path, source, _source_net=source_net):
                 logger.info(
-                    "AST precise diff reapplication produced invalid Python for %s "
-                    "- trying surgical fallback", symbol,
+                    "AST precise diff reapplication produced invalid Python for %s - trying surgical fallback",
+                    symbol,
                 )
                 syntax_blocked = True
             else:
@@ -1768,25 +1818,30 @@ def modify_symbol(
                     return True, diff, new_content
 
     if syntax_blocked:
-        foreign = (
-            _trailing_foreign_stmt(code)
-            if _looks_like_full_symbol_block(code) else None
-        )
+        foreign = _trailing_foreign_stmt(code) if _looks_like_full_symbol_block(code) else None
         if foreign:
-            return False, (
-                f"modify_symbol could not produce syntactically valid code for '{symbol}': "
-                f"the replacement block extends past the symbol boundary — it contains "
-                f"'{foreign}' at the symbol's own indent level after the '{symbol}' block. "
-                f"Trim the block to the '{symbol}' definition only and retry; edits outside "
-                "the symbol (e.g. blank lines between methods) belong to apply_patch."
-            ), ""
-        return False, (
-            f"modify_symbol could not produce syntactically valid code for '{symbol}' "
-            "(re-indentation/splice would break Python syntax). Retry with edit_text "
-            "(exact string match, always available), or apply_patch if this file has "
-            "not been edited this session — apply_patch refuses files already touched "
-            "by a text-editing tool, so naming it as the only alternative dead-ends."
-        ), ""
+            return (
+                False,
+                (
+                    f"modify_symbol could not produce syntactically valid code for '{symbol}': "
+                    f"the replacement block extends past the symbol boundary — it contains "
+                    f"'{foreign}' at the symbol's own indent level after the '{symbol}' block. "
+                    f"Trim the block to the '{symbol}' definition only and retry; edits outside "
+                    "the symbol (e.g. blank lines between methods) belong to apply_patch."
+                ),
+                "",
+            )
+        return (
+            False,
+            (
+                f"modify_symbol could not produce syntactically valid code for '{symbol}' "
+                "(re-indentation/splice would break Python syntax). Retry with edit_text "
+                "(exact string match, always available), or apply_patch if this file has "
+                "not been edited this session — apply_patch refuses files already touched "
+                "by a text-editing tool, so naming it as the only alternative dead-ends."
+            ),
+            "",
+        )
     # Locate failure. For Python, say WHY — a bad Class. qualifier and an
     # unparseable file are both common and need opposite next actions, and the
     # generic message previously sent the agent looking for a splice problem
@@ -1794,6 +1849,4 @@ def modify_symbol(
     detail = ""
     if LanguageId.from_path(rel_path) is LanguageId.PYTHON:
         detail = f": {_python_symbol_miss_reason(source, symbol)}"
-    return False, (
-        f"modify_symbol could not locate symbol '{symbol}' in {rel_path}{detail}"
-    ), ""
+    return False, (f"modify_symbol could not locate symbol '{symbol}' in {rel_path}{detail}"), ""

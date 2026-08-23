@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class SymbolKind(str, Enum):
@@ -31,6 +30,7 @@ class EdgeKind(str, Enum):
 @dataclass(frozen=True)
 class SymbolId:
     """Canonical identity for a symbol across the repository."""
+
     module: str
     qualname: str
     file_path: str
@@ -53,6 +53,7 @@ class SymbolId:
 @dataclass
 class SymbolNode:
     """Node representing a symbol (function, class, module) in the repository."""
+
     name: str
     qualname: str
     module: str
@@ -60,11 +61,11 @@ class SymbolNode:
     kind: str  # kept as str for backward compat; use SymbolKind values
     start_line: int
     end_line: int
-    language: Optional[str] = None  # e.g. "python", "typescript", "javascript"
-    signature_hash: Optional[str] = None
-    docstring: Optional[str] = None
-    signature: Optional[str] = None  # full function signature text with type annotations
-    bases: Optional[list[str]] = None  # parent class names (for class symbols only)
+    language: str | None = None  # e.g. "python", "typescript", "javascript"
+    signature_hash: str | None = None
+    docstring: str | None = None
+    signature: str | None = None  # full function signature text with type annotations
+    bases: list[str] | None = None  # parent class names (for class symbols only)
     # P3 Stage 2: CGI-convention reconstruction fields — RG's snapshot is the
     # SSOT for CallGraphIndexer, which needs (a) the async-ness CGI encodes in
     # its def kind ("async_function" vs "function") and (b) the CGI defs symbol
@@ -73,7 +74,7 @@ class SymbolNode:
     # defaults keep pre-P3 snapshots loadable: SymbolNode(**d) without these
     # keys still works, and the CGI conversion falls back to name/function.
     is_async: bool = False  # def is async def (CGI kind discriminator)
-    cgi_symbol: Optional[str] = None  # CGI-convention defs symbol
+    cgi_symbol: str | None = None  # CGI-convention defs symbol
     # P3 Stage 2: AST nesting depth of the symbol's definition (module=0,
     # class/function body=1, ...).  CGI collects defs via ``ast.walk`` (BFS:
     # ALL depth-k symbols before any depth-(k+1) symbol), while RG traverses
@@ -100,13 +101,14 @@ class SymbolNode:
 @dataclass
 class CallEdge:
     """Unified edge representing a function/method call."""
+
     caller_symbol: str
     caller_file: str
     caller_line: int
     callee_symbol: str
     callee_display: str
-    callee_file: Optional[str] = None
-    callee_line: Optional[int] = None
+    callee_file: str | None = None
+    callee_line: int | None = None
     confidence: float = 1.0
     edge_kind: EdgeKind = EdgeKind.CALLS
     call_args: list[str] = field(default_factory=list)
@@ -124,7 +126,8 @@ class CallEdge:
 @dataclass
 class ImportEdge:
     """Edge representing an import relationship."""
+
     importer: str
     imported: str
     import_type: str  # "import", "from", "import_from"
-    alias: Optional[str] = None
+    alias: str | None = None

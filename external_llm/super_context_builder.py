@@ -14,13 +14,14 @@ Integrates all context enhancement features:
 BEFORE: 60% understanding, simple file content
 AFTER: 95% understanding, rich structured context
 """
+
 from __future__ import annotations
 
 import contextlib
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from utils.string_helper import utf8_trailing_incomplete_len
 
@@ -47,6 +48,8 @@ def _bounded_head_text(p: Path, max_bytes: int = _PROMPT_HEAD_MAX_BYTES) -> str:
     if trim:
         raw = raw[:-trim]
     return raw.decode("utf-8", errors="replace")
+
+
 # SymbolAwareTestFinder has different interface (no find_tests_for_file).
 # This module is currently unused; kept for future context building.
 # Note: pattern_matcher.py was removed (it was a duplicate of context_builder.py
@@ -80,7 +83,7 @@ class SuperContextBuilder:
     def build_context(
         self,
         user_request: str,
-        target_file: Optional[str] = None,
+        target_file: str | None = None,
         include_dependencies: bool = True,
         include_git_context: bool = True,
         max_file_lines: int = 500,
@@ -129,10 +132,7 @@ class SuperContextBuilder:
             target_path = self.repo_root / target_file
 
             if target_path.exists():
-                file_ctx = self._build_enhanced_file_context(
-                    target_path,
-                    max_lines=max_file_lines
-                )
+                file_ctx = self._build_enhanced_file_context(target_path, max_lines=max_file_lines)
 
                 sections.append(f"## 🎯 Target File: `{target_file}`")
                 sections.append("")
@@ -177,7 +177,7 @@ class SuperContextBuilder:
             # Extract first paragraph
             with contextlib.suppress(OSError, UnicodeDecodeError):  # read race / binary file
                 content = _bounded_head_text(readme)
-                first_para = content.split('\n\n')[0]
+                first_para = content.split("\n\n")[0]
                 if len(first_para) < 500:
                     lines.append(f"> {first_para}")
 
@@ -185,8 +185,8 @@ class SuperContextBuilder:
         req_file = self._find_first_existing("requirements.txt", "requirements-dev.txt", "requirements.in")
         if req_file:
             with contextlib.suppress(OSError, UnicodeDecodeError):  # read race / binary file
-                reqs = _bounded_head_text(req_file).split('\n')
-                main_reqs = [r.split('==')[0] for r in reqs if r and not r.startswith('#')][:10]
+                reqs = _bounded_head_text(req_file).split("\n")
+                main_reqs = [r.split("==")[0] for r in reqs if r and not r.startswith("#")][:10]
                 if main_reqs:
                     lines.append(f"\n**Dependencies**: {', '.join(main_reqs)}")
 
@@ -201,7 +201,7 @@ class SuperContextBuilder:
             lines.append("\n**🤝 Collaboration Context**:")
             lines.append(collab_info)
 
-        return '\n'.join(lines) if lines else ""
+        return "\n".join(lines) if lines else ""
 
     def _extract_collaboration_metadata(self) -> str:
         """Extract collaboration-related metadata.
@@ -218,7 +218,9 @@ class SuperContextBuilder:
         authors, subjects = self._fetch_commit_subjects_authors(commits=20)
 
         # 1. Git recent contributors (most recent 10 commits' authors)
-        with contextlib.suppress(subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError):  # git best-effort
+        with contextlib.suppress(
+            subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError
+        ):  # git best-effort
             contributors = self._get_recent_contributors(commits=10, authors=authors)
             if contributors:
                 lines.append(f"- **Recent contributors**: {', '.join(contributors)}")
@@ -240,41 +242,42 @@ class SuperContextBuilder:
             if related_refs:
                 lines.append(f"- **Related issues/PRs**: {', '.join(related_refs[:3])}")
 
-        return '\n'.join(lines) if lines else ""
+        return "\n".join(lines) if lines else ""
 
     def _fetch_commit_subjects_authors(self, commits: int = 20):
-            """Single ``git log`` fetch returning ``(authors, subjects)`` for the
-            last N commits (most-recent first).
+        """Single ``git log`` fetch returning ``(authors, subjects)`` for the
+        last N commits (most-recent first).
 
-            ``%x09`` is a literal TAB, cleanly separating author and subject even
-            when subjects contain spaces. Replaces three separate subprocess
-            spawns in the collaboration-metadata path. Returns ``([], [])`` on any
-            failure (non-repo, timeout, non-zero exit).
-            """
-            try:
-                result = subprocess.run(
-                    ["git", "log", f"-{commits}", "--pretty=format:%an%x09%s"],
-                    cwd=str(self.repo_root),
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    return [], []
-                authors, subjects = [], []
-                for line in result.stdout.split('\n'):
-                    line = line.rstrip('\r')
-                    if '\t' in line:
-                        author, subject = line.split('\t', 1)
-                    else:
-                        author, subject = line, ""
-                    authors.append(author)
-                    subjects.append(subject)
-            except Exception:
+        ``%x09`` is a literal TAB, cleanly separating author and subject even
+        when subjects contain spaces. Replaces three separate subprocess
+        spawns in the collaboration-metadata path. Returns ``([], [])`` on any
+        failure (non-repo, timeout, non-zero exit).
+        """
+        try:
+            result = subprocess.run(
+                ["git", "log", f"-{commits}", "--pretty=format:%an%x09%s"],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if result.returncode != 0:
                 return [], []
-            else:
-                return authors, subjects
+            authors, subjects = [], []
+            for line in result.stdout.split("\n"):
+                line = line.rstrip("\r")
+                if "\t" in line:
+                    author, subject = line.split("\t", 1)
+                else:
+                    author, subject = line, ""
+                authors.append(author)
+                subjects.append(subject)
+        except Exception:
+            return [], []
+        else:
+            return authors, subjects
+
     def _get_recent_contributors(self, commits: int = 10, authors=None) -> list[str]:
         """Get recent git contributors.
 
@@ -310,10 +313,7 @@ class SuperContextBuilder:
         """Detect team coding conventions"""
 
         # Check for common convention files
-        convention_files = [
-            ".editorconfig", ".pre-commit-config.yaml",
-            ".flake8", ".pylintrc", "pyproject.toml"
-        ]
+        convention_files = [".editorconfig", ".pre-commit-config.yaml", ".flake8", ".pylintrc", "pyproject.toml"]
 
         conventions = [cf for cf in convention_files if (self.repo_root / cf).exists()]
 
@@ -337,9 +337,10 @@ class SuperContextBuilder:
             _, subjects = self._fetch_commit_subjects_authors(commits)
         subjects = subjects[:commits]
         import re
+
         patterns = [
-            r'#(\d+)',  # GitHub-style #123
-            r'(\w+-\d+)',  # JIRA-style PROJ-123
+            r"#(\d+)",  # GitHub-style #123
+            r"(\w+-\d+)",  # JIRA-style PROJ-123
         ]
         refs = []
         for msg in subjects:
@@ -421,7 +422,7 @@ class SuperContextBuilder:
                 )
                 return "\n".join(lines)
             content = file_path.read_text(encoding="utf-8", errors="replace")
-            content_lines = content.split('\n')
+            content_lines = content.split("\n")
 
             if len(content_lines) <= max_lines:
                 # Show full file with line numbers
@@ -431,11 +432,7 @@ class SuperContextBuilder:
                 lines.append("```")
             else:
                 # Smart snippet (important parts)
-                important_lines = self._select_important_lines(
-                    content_lines,
-                    analysis,
-                    max_lines
-                )
+                important_lines = self._select_important_lines(content_lines, analysis, max_lines)
 
                 lines.append("```python")
                 lines.append(f"# File has {len(content_lines)} lines, showing important sections:")
@@ -447,7 +444,7 @@ class SuperContextBuilder:
         except Exception as e:
             lines.append(f"*Error reading file: {e}*")
 
-        return '\n'.join(lines)
+        return "\n".join(lines)
 
     def _build_dependency_context(self, file_path: Path) -> str:
         """Build dependency and call graph context"""
@@ -483,8 +480,7 @@ class SuperContextBuilder:
         except Exception as e:
             logger.debug("Failed to build dependency context: %s", e)
 
-        return '\n'.join(lines) if lines else ""
-
+        return "\n".join(lines) if lines else ""
 
     def _build_git_context(self) -> str:
         """Build git context"""
@@ -504,13 +500,10 @@ class SuperContextBuilder:
             parts.append(recent)
             parts.append("```")
 
-        return '\n'.join(parts) if parts else ""
+        return "\n".join(parts) if parts else ""
 
     def _select_important_lines(
-        self,
-        all_lines: list[str],
-        analysis: Optional[any],
-        max_lines: int
+        self, all_lines: list[str], analysis: Any | None, max_lines: int
     ) -> list[tuple[int, str]]:
         """
         Intelligently select most important lines
@@ -545,7 +538,7 @@ class SuperContextBuilder:
         # Limit to max_lines
         return selected[:max_lines]
 
-    def _extract_type_info(self, analysis: any) -> str:
+    def _extract_type_info(self, analysis: Any) -> str:
         """Extract and format type information"""
         lines = []
 
@@ -554,7 +547,7 @@ class SuperContextBuilder:
             if var[0].isupper():  # Likely a type alias or constant
                 lines.append(f"{var} = {value}")
 
-        return '\n'.join(lines) if lines else ""
+        return "\n".join(lines) if lines else ""
 
     def _get_git_status(self) -> str:
         """Get git status (delegated to the shared get_git_snapshot SSOT)."""
@@ -579,7 +572,7 @@ class SuperContextBuilder:
                 return result.stdout.strip()
         return ""
 
-    def _find_first_existing(self, *names: str) -> Optional[Path]:
+    def _find_first_existing(self, *names: str) -> Path | None:
         """Return the first file in ``repo_root`` that exists, or None."""
         for name in names:
             candidate = self.repo_root / name
@@ -587,7 +580,7 @@ class SuperContextBuilder:
                 return candidate
         return None
 
-    def _get_enhanced_instructions(self, target_file: Optional[str]) -> str:
+    def _get_enhanced_instructions(self, target_file: str | None) -> str:
         """Get enhanced instructions for LLM"""
         file_hint = f" for `{target_file}`" if target_file else ""
 

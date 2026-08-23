@@ -17,13 +17,8 @@ def test_repo(tmp_path):
     src = tmp_path / "external_llm" / "agent"
     src.mkdir(parents=True)
     (src / "__init__.py").write_text("")
-    (src / "planner_agent.py").write_text(
-        "class PlannerAgent:\n    def create_plan(self): pass\n"
-    )
-    (src / "tool_registry.py").write_text(
-        "from .planner_agent import PlannerAgent\n"
-        "class ToolRegistry:\n    pass\n"
-    )
+    (src / "planner_agent.py").write_text("class PlannerAgent:\n    def create_plan(self): pass\n")
+    (src / "tool_registry.py").write_text("from .planner_agent import PlannerAgent\nclass ToolRegistry:\n    pass\n")
 
     # Test files
     tests = tmp_path / "tests" / "unit" / "agent"
@@ -34,20 +29,15 @@ def test_repo(tmp_path):
         "def test_create_plan():\n    p = PlannerAgent()\n"
     )
     (tests / "test_tool_registry.py").write_text(
-        "from external_llm.agent.tool_registry import ToolRegistry\n"
-        "def test_registry():\n    pass\n"
+        "from external_llm.agent.tool_registry import ToolRegistry\ndef test_registry():\n    pass\n"
     )
-    (tests / "test_unrelated.py").write_text(
-        "def test_something():\n    pass\n"
-    )
+    (tests / "test_unrelated.py").write_text("def test_something():\n    pass\n")
 
     # Another test dir
     graph_tests = tmp_path / "tests" / "unit" / "graph"
     graph_tests.mkdir(parents=True)
     (graph_tests / "__init__.py").write_text("")
-    (graph_tests / "test_graph_facade.py").write_text(
-        "def test_facade():\n    pass\n"
-    )
+    (graph_tests / "test_graph_facade.py").write_text("def test_facade():\n    pass\n")
 
     return str(tmp_path)
 
@@ -237,9 +227,7 @@ class TestSymbolAwareTestFinderGaps:
         (tmp_path / "pkg").mkdir()
         (tmp_path / "pkg" / "bridge.py").write_text("def run():\n    pass\n")
         (tmp_path / "tests").mkdir()
-        (tmp_path / "tests" / "test_bridge_adapters.py").write_text(
-            "def test_adapters():\n    pass\n"
-        )
+        (tmp_path / "tests" / "test_bridge_adapters.py").write_text("def test_adapters():\n    pass\n")
         finder = SymbolAwareTestFinder(str(tmp_path))
         targets = finder.discover_test_targets(target_files=["pkg/bridge.py"])
         assert len(targets) == 1
@@ -255,9 +243,7 @@ class TestSymbolAwareTestFinderGaps:
 
     def test_find_tests_for_symbol_by_file(self, test_repo):
         finder = SymbolAwareTestFinder(test_repo)
-        paths = finder.find_tests_for_symbol(
-            file_path="external_llm/agent/tool_registry.py"
-        )
+        paths = finder.find_tests_for_symbol(file_path="external_llm/agent/tool_registry.py")
         assert any("test_tool_registry" in p for p in paths)
 
     def test_find_tests_for_symbol_no_args(self, test_repo):
@@ -300,9 +286,7 @@ class TestSymbolAwareTestFinderGaps:
         def _raise_oserror(self, tf):
             raise OSError("denied")
 
-        monkeypatch.setattr(
-            SymbolAwareTestFinder, "_read_test_file", _raise_oserror, raising=True
-        )
+        monkeypatch.setattr(SymbolAwareTestFinder, "_read_test_file", _raise_oserror, raising=True)
         finder = SymbolAwareTestFinder(test_repo)
         assert finder._file_references_symbol("tests/x.py", "Foo") is False
 
@@ -314,19 +298,14 @@ class TestSymbolAwareTestFinderGaps:
         def _raise_oserror(self, tf):
             raise OSError("denied")
 
-        monkeypatch.setattr(
-            SymbolAwareTestFinder, "_read_test_file", _raise_oserror, raising=True
-        )
+        monkeypatch.setattr(SymbolAwareTestFinder, "_read_test_file", _raise_oserror, raising=True)
         finder = SymbolAwareTestFinder(test_repo)
         assert finder._file_imports_module("tests/x.py", "foo") is False
 
     def test_find_corresponding_test_returns_none(self, test_repo):
         finder = SymbolAwareTestFinder(test_repo)
         test_files = finder._find_all_test_files()
-        assert (
-            finder._find_corresponding_test("external_llm/agent/ghost.py", test_files)
-            is None
-        )
+        assert finder._find_corresponding_test("external_llm/agent/ghost.py", test_files) is None
 
     def test_internal_failure_degrades_to_empty(self, test_repo, monkeypatch):
         """Never raises — an internal failure returns an empty list instead."""
@@ -334,8 +313,6 @@ class TestSymbolAwareTestFinderGaps:
         def _boom(self):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(
-            SymbolAwareTestFinder, "_find_all_test_files", _boom, raising=True
-        )
+        monkeypatch.setattr(SymbolAwareTestFinder, "_find_all_test_files", _boom, raising=True)
         finder = SymbolAwareTestFinder(test_repo)
         assert finder.discover_test_targets(target_symbols=["PlannerAgent"]) == []

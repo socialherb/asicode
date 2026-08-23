@@ -1,8 +1,8 @@
 """CSS syntax provider — brace-balance and comment validation."""
+
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from .base import SyntaxProvider
 from .models import (
@@ -58,8 +58,8 @@ class CssSyntaxProvider(SyntaxProvider):
 
     def _check(self, file_path: str, content: str) -> list[SyntaxError_]:
         errors: list[SyntaxError_] = []
-        depth = 0           # brace nesting depth
-        in_string: Optional[str] = None    # '"' or "'"
+        depth = 0  # brace nesting depth
+        in_string: str | None = None  # '"' or "'"
         in_comment = False  # inside /* ... */
         line = 1
         i = 0
@@ -74,7 +74,7 @@ class CssSyntaxProvider(SyntaxProvider):
 
             # Inside block comment
             if in_comment:
-                if content[i:i+2] == "*/":
+                if content[i : i + 2] == "*/":
                     in_comment = False
                     i += 2
                     continue
@@ -92,13 +92,13 @@ class CssSyntaxProvider(SyntaxProvider):
                 continue
 
             # Start of block comment
-            if content[i:i+2] == "/*":
+            if content[i : i + 2] == "/*":
                 in_comment = True
                 i += 2
                 continue
 
             # Line comment (SCSS/Less support //)
-            if content[i:i+2] == "//":
+            if content[i : i + 2] == "//":
                 while i < n and content[i] != "\n":
                     i += 1
                 continue
@@ -115,32 +115,41 @@ class CssSyntaxProvider(SyntaxProvider):
             elif ch == "}":
                 depth -= 1
                 if depth < 0:
-                    errors.append(SyntaxError_(
-                        file=file_path,
-                        line=line,
-                        col=0,
-                        message="Unexpected '}' — no matching '{'",
-                    ))
+                    errors.append(
+                        SyntaxError_(
+                            file=file_path,
+                            line=line,
+                            col=0,
+                            message="Unexpected '}' — no matching '{'",
+                        )
+                    )
                     depth = 0  # reset to continue checking
 
             i += 1
 
         # End-of-file checks
         if in_comment:
-            errors.append(SyntaxError_(
-                file=file_path, line=line, col=0,
-                message="Unclosed block comment (/* ... */)",
-            ))
+            errors.append(
+                SyntaxError_(
+                    file=file_path,
+                    line=line,
+                    col=0,
+                    message="Unclosed block comment (/* ... */)",
+                )
+            )
         if in_string:
-            errors.append(SyntaxError_(
-                file=file_path, line=line, col=0,
-                message=f"Unclosed string literal ({in_string!r})",
-            ))
+            errors.append(
+                SyntaxError_(
+                    file=file_path,
+                    line=line,
+                    col=0,
+                    message=f"Unclosed string literal ({in_string!r})",
+                )
+            )
         if depth > 0:
-            errors.append(SyntaxError_(
-                file=file_path, line=line, col=0,
-                message=f"Unclosed block — {depth} unmatched " + "'{'"
-            ))
+            errors.append(
+                SyntaxError_(file=file_path, line=line, col=0, message=f"Unclosed block — {depth} unmatched " + "'{'")
+            )
 
         return errors
 
@@ -161,17 +170,13 @@ class CssSyntaxProvider(SyntaxProvider):
     def get_file_globs(self) -> list[str]:
         return ["*.css", "*.scss", "*.less"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

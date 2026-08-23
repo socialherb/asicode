@@ -7,13 +7,14 @@ dedup by (caller, callee, file_path, line).  These tests pin the equivalence
 against a reference implementation of the legacy scan and verify index
 invalidation on mutation.
 """
+
 import shutil
 import tempfile
 from pathlib import Path
 
 from external_llm.graph.repository_graph import RepositoryGraph
 
-SRC = '''\
+SRC = """\
 def helper():
     pass
 
@@ -43,7 +44,7 @@ def main():
     a.foo(); a.foo()  # same line -> identical (caller, callee, file, line)
     a.bar()
     B().foo()
-'''
+"""
 
 
 def _build_graph(source: str):
@@ -87,11 +88,23 @@ def test_index_matches_legacy_linear_scan():
     """Indexed queries must return exactly what the legacy scan returned."""
     g = _build_graph(SRC)
     queries = [
-        "helper", "top", "main",
-        "A.foo", "A.bar", "B.foo", "B.baz", "B.one_line",
-        "foo", "bar", "baz", "one_line",
-        "nonexistent", "A.nonexistent", "",
-        "A.foo.bar", "self.foo",
+        "helper",
+        "top",
+        "main",
+        "A.foo",
+        "A.bar",
+        "B.foo",
+        "B.baz",
+        "B.one_line",
+        "foo",
+        "bar",
+        "baz",
+        "one_line",
+        "nonexistent",
+        "A.nonexistent",
+        "",
+        "A.foo.bar",
+        "self.foo",
     ]
     for q in queries:
         assert _key(g.get_callers(q)) == _key(_legacy_edges(g, "callee", q)), q
@@ -154,9 +167,7 @@ def test_reparse_file_invalidates_index():
         assert g.get_callers("b") == []
 
         # New calls added -> index must include them.
-        fp.write_text(
-            "def a():\n    b()\n    c()\n\ndef b():\n    pass\n\ndef c():\n    pass\n"
-        )
+        fp.write_text("def a():\n    b()\n    c()\n\ndef b():\n    pass\n\ndef c():\n    pass\n")
         g.reparse_file(str(fp))
         assert {e.callee for e in g.get_callees("a")} == {"b", "c"}
     finally:

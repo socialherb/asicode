@@ -25,6 +25,7 @@ Patch correctness notes
   We feed it newline-stripped lines (keepends=False) and set lineterm="\\n".
   Then we join the generated diff lines with "" (not "\\n") to avoid double blank lines.
 """
+
 from __future__ import annotations
 
 import difflib
@@ -34,7 +35,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from common import ensure_trailing_newline
 from external_llm.common.indent_utils import detect_indent_char, indent_unit, reindent_to_match
@@ -58,7 +59,7 @@ _SUPPORTED_OPS = [
 
 
 class PlanCompileError(RuntimeError):
-    def __init__(self, message: str, *, details: Optional[dict[str, Any]] = None):
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.details = details or {}
 
@@ -117,7 +118,7 @@ def _norm_op_type(op_type_raw: str) -> str:
 _PLAN_READ_MAX_BYTES = 250_000
 
 
-def _read_text_if_exists(abs_path: Path) -> Optional[str]:
+def _read_text_if_exists(abs_path: Path) -> str | None:
     try:
         if abs_path.exists():
             if abs_path.stat().st_size > _PLAN_READ_MAX_BYTES:
@@ -150,20 +151,64 @@ def _read_text_if_exists(abs_path: Path) -> Optional[str]:
 _CODE_LIKE_EXTS = frozenset(
     {
         # general-purpose languages
-        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-        ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".c", ".h", ".cpp",
-        ".hpp", ".cc", ".cxx", ".mm", ".swift", ".rb", ".php", ".cs", ".m",
+        ".py",
+        ".pyi",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".mjs",
+        ".cjs",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".kts",
+        ".scala",
+        ".c",
+        ".h",
+        ".cpp",
+        ".hpp",
+        ".cc",
+        ".cxx",
+        ".mm",
+        ".swift",
+        ".rb",
+        ".php",
+        ".cs",
+        ".m",
         # jvm
-        ".clj", ".cljc",
+        ".clj",
+        ".cljc",
         # scripting / dynamic
-        ".pl", ".pm", ".lua", ".tcl", ".r", ".jl", ".ex", ".exs",
-        ".dart", ".groovy", ".gradle",
+        ".pl",
+        ".pm",
+        ".lua",
+        ".tcl",
+        ".r",
+        ".jl",
+        ".ex",
+        ".exs",
+        ".dart",
+        ".groovy",
+        ".gradle",
         # shell
-        ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".ps1",
+        ".bat",
+        ".cmd",
         # functional / lisp
-        ".el", ".scm", ".ss", ".lisp",
+        ".el",
+        ".scm",
+        ".ss",
+        ".lisp",
         # web markup that embeds code
-        ".vue", ".svelte", ".astro",
+        ".vue",
+        ".svelte",
+        ".astro",
     }
 )
 
@@ -251,9 +296,7 @@ def _normalize_str_content(s: str, *, path: str, recover_encoding: bool = True) 
     # The earlier ``'\\"' in s``-only test missed quote-free code whose only
     # encoded char was a newline (e.g. ``json.dumps("x = 1\\nprint(x)")`` ->
     # ``"x = 1\\nprint(x)"`` has no ``\\"``), leaving the outer quotes in the file.
-    if len(s) >= 2 and s[0] == '"' and s[-1] == '"' and (
-        '\\"' in s or '\\n' in s or '\\t' in s or '\\\\' in s
-    ):
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"' and ('\\"' in s or "\\n" in s or "\\t" in s or "\\\\" in s):
         try:
             decoded = json.loads(s)
         except ValueError:
@@ -316,7 +359,7 @@ def _normalize_insert_lines_payload(op_obj: dict[str, Any], *, path: str, conten
     return s.splitlines()
 
 
-def _unified_diff_for_file(rel_path: str, old: Optional[str], new: str) -> str:
+def _unified_diff_for_file(rel_path: str, old: str | None, new: str) -> str:
     """
     git-apply compatible:
       diff --git a/x b/x
@@ -448,12 +491,28 @@ def _strip_lno_prefixes(text: str) -> str:
 # Map decorative Unicode (box-drawing, em/en-dash) to ASCII equivalents so a
 # `before` block that uses a different separator glyph than the file still
 # matches in the decorative-tolerant fallback below.
-_DECORATIVE_TRANSLATION = str.maketrans({
-    "─": "-", "━": "-", "—": "-", "–": "-", "⎯": "-", "⏤": "-",
-    "═": "=",
-    "│": "|", "┃": "|", "┌": "|", "┐": "|", "└": "|", "┘": "|",
-    "├": "|", "┤": "|", "┬": "|", "┴": "|", "┼": "|",
-})
+_DECORATIVE_TRANSLATION = str.maketrans(
+    {
+        "─": "-",
+        "━": "-",
+        "—": "-",
+        "–": "-",
+        "⎯": "-",
+        "⏤": "-",
+        "═": "=",
+        "│": "|",
+        "┃": "|",
+        "┌": "|",
+        "┐": "|",
+        "└": "|",
+        "┘": "|",
+        "├": "|",
+        "┤": "|",
+        "┬": "|",
+        "┴": "|",
+        "┼": "|",
+    }
+)
 # Collapse runs (2+) of horizontal separator chars to a single char, so that
 # "# ── name ─────" and "# - name -------" normalize identically. LLMs almost
 # never reproduce the exact length of a decorative separator run.
@@ -538,8 +597,7 @@ def _apply_edit_blocks(
                 ctx_start = max(0, line_no - 2)
                 ctx_end = min(len(out_lines), line_no - 1 + before_line_count + 2)
                 snippet = "\n".join(
-                    f"{ctx_start + j + 1:4d}: {out_lines[ctx_start + j]}"
-                    for j in range(ctx_end - ctx_start)
+                    f"{ctx_start + j + 1:4d}: {out_lines[ctx_start + j]}" for j in range(ctx_end - ctx_start)
                 )
                 match_locations.append({"line": line_no, "snippet": snippet})
                 search_start = pos + len(before)
@@ -581,7 +639,8 @@ def _apply_edit_blocks(
                 actual_before = "\n".join(out_lines[fuzzy_start : fuzzy_start + blen])
                 logger.debug(
                     "edit_blocks fuzzy match at line %d (whitespace-normalized) for path=%s",
-                    fuzzy_start + 1, path,
+                    fuzzy_start + 1,
+                    path,
                 )
                 after_fixed = reindent_to_match(after, actual_before, file_unit=_file_unit)
                 if after_fixed != after:
@@ -602,10 +661,7 @@ def _apply_edit_blocks(
                 norm_before = [_normalize_decorative(b.strip()) for b in before_lines]
                 for si in range(len(out_lines) - blen + 1):
                     segment = out_lines[si : si + blen]
-                    if all(
-                        _normalize_decorative(a.strip()) == nb
-                        for a, nb in zip(segment, norm_before, strict=False)
-                    ):
+                    if all(_normalize_decorative(a.strip()) == nb for a, nb in zip(segment, norm_before, strict=False)):
                         fuzzy_start = si
                         break
 
@@ -613,7 +669,8 @@ def _apply_edit_blocks(
                 actual_before = "\n".join(out_lines[fuzzy_start : fuzzy_start + blen])
                 logger.debug(
                     "edit_blocks decorative-normalized match at line %d for path=%s",
-                    fuzzy_start + 1, path,
+                    fuzzy_start + 1,
+                    path,
                 )
                 after_fixed = reindent_to_match(after, actual_before, file_unit=_file_unit)
                 after_fixed = _restore_decorative_lines(after_fixed, actual_before)
@@ -626,9 +683,7 @@ def _apply_edit_blocks(
 
             similar_lines = []
             if before_first_line:
-                similar_lines = difflib.get_close_matches(
-                    before_first_line, out_lines, n=3, cutoff=0.6
-                )
+                similar_lines = difflib.get_close_matches(before_first_line, out_lines, n=3, cutoff=0.6)
 
             error_msg = (
                 f"edit_blocks: block not found. First line: '{before_preview}'"
@@ -636,9 +691,7 @@ def _apply_edit_blocks(
                 else "edit_blocks: block not found (empty before block)"
             )
             if similar_lines:
-                suggestions = ", ".join(
-                    f"'{ln[:60]}{'...' if len(ln) > 60 else ''}'" for ln in similar_lines[:2]
-                )
+                suggestions = ", ".join(f"'{ln[:60]}{'...' if len(ln) > 60 else ''}'" for ln in similar_lines[:2])
                 error_msg += f"\nDid you mean: {suggestions}"
 
             # Find best-matching location in the file via SequenceMatcher.
@@ -659,14 +712,11 @@ def _apply_edit_blocks(
                     best_ratio = ratio
                     best_start = si
 
-            file_context: Optional[str] = None
+            file_context: str | None = None
             if best_start >= 0 and best_ratio > 0.35:
                 ctx_start = max(0, best_start - 2)
                 ctx_end = min(len(out_lines), best_start + blen + 3)
-                ctx_lines = [
-                    f"{ctx_start + j + 1:4d}: {out_lines[ctx_start + j]}"
-                    for j in range(ctx_end - ctx_start)
-                ]
+                ctx_lines = [f"{ctx_start + j + 1:4d}: {out_lines[ctx_start + j]}" for j in range(ctx_end - ctx_start)]
                 file_context = "\n".join(ctx_lines)
                 error_msg += (
                     f"\n\nFile content near best match (line {best_start + 1}, "
@@ -697,32 +747,23 @@ def _find_anchor_line_index(lines: list[str], anchor: str, expect_unique: bool, 
     hits = [idx for idx, ln in enumerate(lines) if anchor in ln]
     if not hits:
         # Extract anchor preview (max 60 chars)
-        anchor_preview = anchor[:60] + ('...' if len(anchor) > 60 else '')
+        anchor_preview = anchor[:60] + ("..." if len(anchor) > 60 else "")
 
         # Find similar lines in the file
         similar_lines = []
         if anchor:
-            similar_lines = difflib.get_close_matches(
-                anchor,
-                lines,
-                n=3,
-                cutoff=0.6
-            )
+            similar_lines = difflib.get_close_matches(anchor, lines, n=3, cutoff=0.6)
 
         # Build error message with suggestions
         error_msg = f"anchor not found: '{anchor_preview}'" if anchor_preview else "anchor not found (empty anchor)"
 
         if similar_lines:
-            suggestions = ', '.join(f"'{line[:60]}{'...' if len(line) > 60 else ''}'" for line in similar_lines[:2])
+            suggestions = ", ".join(f"'{line[:60]}{'...' if len(line) > 60 else ''}'" for line in similar_lines[:2])
             error_msg += f"\nDid you mean: {suggestions}"
 
         raise PlanCompileError(
             error_msg,
-            details={
-                "path": path,
-                "anchor": anchor_preview,
-                "similar_lines": similar_lines[:2]
-            },
+            details={"path": path, "anchor": anchor_preview, "similar_lines": similar_lines[:2]},
         )
     if expect_unique and len(hits) != 1:
         raise PlanCompileError(
@@ -753,12 +794,8 @@ def _apply_insert_at(
 
 def _normalize_insert_lines(insert_lines: list[str]) -> list[str]:
     """Ensure every insert line has a trailing newline."""
-    ins = [
-        ensure_trailing_newline(ln).splitlines(keepends=True)[0] if "\n" not in ln else ln
-        for ln in insert_lines
-    ]
+    ins = [ensure_trailing_newline(ln).splitlines(keepends=True)[0] if "\n" not in ln else ln for ln in insert_lines]
     return [ln if ln.endswith("\n") else (ln + "\n") for ln in ins]
-
 
 
 def _apply_insert_after(
@@ -770,8 +807,12 @@ def _apply_insert_after(
     path: str,
 ) -> str:
     return _apply_insert_at(
-        text=text, anchor=anchor, insert_lines=insert_lines,
-        expect_unique=expect_unique, path=path, after=True,
+        text=text,
+        anchor=anchor,
+        insert_lines=insert_lines,
+        expect_unique=expect_unique,
+        path=path,
+        after=True,
     )
 
 
@@ -784,8 +825,12 @@ def _apply_insert_before(
     path: str,
 ) -> str:
     return _apply_insert_at(
-        text=text, anchor=anchor, insert_lines=insert_lines,
-        expect_unique=expect_unique, path=path, after=False,
+        text=text,
+        anchor=anchor,
+        insert_lines=insert_lines,
+        expect_unique=expect_unique,
+        path=path,
+        after=False,
     )
 
 
@@ -919,7 +964,8 @@ def compile_plan_to_unified_diff(
                         "this looks like accidental content loss. "
                         "Use edit_blocks for partial edits, or confirm the full replacement is intentional.",
                         details={
-                            "op_index": idx, "path": rel,
+                            "op_index": idx,
+                            "path": rel,
                             "old_chars": len(old_for_check),
                             "new_chars": len(new_content),
                             "ratio": round(ratio, 3),

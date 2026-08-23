@@ -22,6 +22,7 @@ The behaviour is to REPORT, not refuse: context-free hunks are legitimate
 malformed minority. The agent is the last thing that can notice a misplaced
 insert, so it is told which hunks were unverifiable.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -37,25 +38,31 @@ SRC = "def alpha():\n    a = 1\n    b = 2\n    return a + b\n\n\ndef beta():\n  
 
 CTX_FREE_INSERT = "--- a/m.py\n+++ b/m.py\n@@ -8,0 +9,2 @@\n+    x = 99\n+    y = 100\n"
 NORMAL_HUNK = (
-    "--- a/m.py\n+++ b/m.py\n@@ -1,4 +1,4 @@\n def alpha():\n     a = 1\n"
-    "-    b = 2\n+    b = 22\n     return a + b\n"
+    "--- a/m.py\n+++ b/m.py\n@@ -1,4 +1,4 @@\n def alpha():\n     a = 1\n-    b = 2\n+    b = 22\n     return a + b\n"
 )
 
 
 # ── detector ────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("name,patch,expected", [
-    ("pure insert", CTX_FREE_INSERT, ["m.py @@ -8,0 +9,2 @@"]),
-    ("with context", NORMAL_HUNK, []),
-    ("delete-only, no context",
-     "--- a/m.py\n+++ b/m.py\n@@ -3,2 +2,0 @@\n-    x = 1\n-    y = 2\n",
-     ["m.py @@ -3,2 +2,0 @@"]),
-    # A brand-new file has no prior content to be misplaced against.
-    ("new file excluded",
-     "--- /dev/null\n+++ b/n.py\n@@ -0,0 +1,2 @@\n+a = 1\n+b = 2\n", []),
-    ("mixed: only the bare one is flagged",
-     NORMAL_HUNK + "@@ -8,0 +9,1 @@\n+    z = 3\n", ["m.py @@ -8,0 +9,1 @@"]),
-    ("empty", "", []),
-])
+@pytest.mark.parametrize(
+    "name,patch,expected",
+    [
+        ("pure insert", CTX_FREE_INSERT, ["m.py @@ -8,0 +9,2 @@"]),
+        ("with context", NORMAL_HUNK, []),
+        (
+            "delete-only, no context",
+            "--- a/m.py\n+++ b/m.py\n@@ -3,2 +2,0 @@\n-    x = 1\n-    y = 2\n",
+            ["m.py @@ -3,2 +2,0 @@"],
+        ),
+        # A brand-new file has no prior content to be misplaced against.
+        ("new file excluded", "--- /dev/null\n+++ b/n.py\n@@ -0,0 +1,2 @@\n+a = 1\n+b = 2\n", []),
+        (
+            "mixed: only the bare one is flagged",
+            NORMAL_HUNK + "@@ -8,0 +9,1 @@\n+    z = 3\n",
+            ["m.py @@ -8,0 +9,1 @@"],
+        ),
+        ("empty", "", []),
+    ],
+)
 def test_context_free_hunk_detection(name, patch, expected):
     assert PatchEngine.context_free_hunks(patch) == expected, name
 
@@ -67,8 +74,7 @@ def repo():
     subprocess.run(["git", "init", "-q", "."], cwd=d, check=True)
     (d / "m.py").write_text(SRC, encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=d, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "init"], cwd=d, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], cwd=d, check=True)
     return d
 
 
@@ -104,8 +110,7 @@ def test_normal_hunk_gets_no_notice(repo):
 
 def test_failed_apply_gets_no_notice(repo):
     """A refusal already carries its own error; the notice would only confuse."""
-    bogus = ("--- a/m.py\n+++ b/m.py\n@@ -1,3 +1,3 @@\n def nonexistent():\n"
-             "-    zzz = 1\n+    zzz = 2\n     qqq = 3\n")
+    bogus = "--- a/m.py\n+++ b/m.py\n@@ -1,3 +1,3 @@\n def nonexistent():\n-    zzz = 1\n+    zzz = 2\n     qqq = 3\n"
     res = _apply(repo, bogus)
     if res.ok:
         pytest.skip("tolerant ladder applied the bogus patch; not this test's subject")
@@ -125,7 +130,9 @@ def test_notice_is_attached_regardless_of_which_success_path_ran(repo):
     reg = ToolRegistry(str(repo), AgentConfig())
     # Force an arbitrary alternative success shape out of the implementation.
     reg._tool_apply_patch_impl = lambda args: ToolResult(  # type: ignore[method-assign]
-        ok=True, content="applied via some other branch", error=None,
+        ok=True,
+        content="applied via some other branch",
+        error=None,
     )
     assert hasattr(wt.WriteToolsMixin, "_tool_apply_patch_impl")
     res = reg._tool_apply_patch({"patch": CTX_FREE_INSERT})

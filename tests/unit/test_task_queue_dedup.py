@@ -31,9 +31,7 @@ from external_llm.editor.agent.autonomous.trigger_policy import (
 
 
 def _ev(source_file=None):
-    return TriggerEvent(
-        kind=TriggerKind.FILE_MODIFIED, repo_root=".", source_file=source_file
-    )
+    return TriggerEvent(kind=TriggerKind.FILE_MODIFIED, repo_root=".", source_file=source_file)
 
 
 def _dec(priority, kind=ActionKind.AUTO_FIX):

@@ -7,6 +7,7 @@ semantics with straightforward ``ast.walk`` reference implementations and pin
 the fused walk to them — especially the scope boundary: ident tokens cover the
 signature (decorators/defaults/annotations) while body-only features do not.
 """
+
 from __future__ import annotations
 
 import ast
@@ -46,6 +47,7 @@ def _first_func(src: str) -> ast.FunctionDef:
 
 # ── Reference implementations (the pre-fusion semantics) ─────────────────────
 
+
 def _ref_collect_calls(body: list[ast.stmt]) -> list[str]:
     shapes = []
     for node in ast.walk(ast.Module(body=body, type_ignores=[])):
@@ -71,20 +73,24 @@ def _ref_exit_shapes(body: list[ast.stmt]) -> list[str]:
 def _ref_result_keys(body: list[ast.stmt], var_name: str = "result") -> list[str]:
     keys: set = set()
     for node in ast.walk(ast.Module(body=body, type_ignores=[])):
-        if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == var_name
-                and node.func.attr == "get"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == var_name
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
             keys.add(node.args[0].value)
-        if (isinstance(node, ast.Subscript)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == var_name
-                and isinstance(node.slice, ast.Constant)
-                and isinstance(node.slice.value, str)):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == var_name
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
             keys.add(node.slice.value)
     return sorted(keys)
 
@@ -100,8 +106,7 @@ def _ref_ident_tokens(func_node: ast.FunctionDef) -> list[str]:
             if n.id in params or n.id in _BUILTINS or n.id in ("self", "cls"):
                 continue
             toks.add(f"name:{n.id}")
-        elif (isinstance(n, ast.Constant)
-                and isinstance(n.value, str) and len(n.value) >= 3):
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and len(n.value) >= 3:
             toks.add(f"str:{n.value[:30]}")
         elif isinstance(n, ast.keyword) and n.arg:
             toks.add(f"kw:{n.arg}")
@@ -109,6 +114,7 @@ def _ref_ident_tokens(func_node: ast.FunctionDef) -> list[str]:
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
+
 
 def test_fused_walk_matches_reference_on_boundary_fixture():
     fn = _first_func(_FIXTURE)

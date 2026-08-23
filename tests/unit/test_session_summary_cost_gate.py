@@ -38,9 +38,7 @@ class TestSessionSummaryNeverShowsMoney:
         monkeypatch.delenv("ASICODE_HIDE_COST", raising=False)
         recorded = _capture_print(monkeypatch)
 
-        asi._print_session_summary(
-            {"prompt": 0, "completion": 0, "cost": 0.0}, asi.time.monotonic()
-        )
+        asi._print_session_summary({"prompt": 0, "completion": 0, "cost": 0.0}, asi.time.monotonic())
 
         assert recorded == []
 

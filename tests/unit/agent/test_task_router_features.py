@@ -3,6 +3,7 @@
 All requests go to MAIN_AGENT (PLANNER lane disabled by Tier 3 consolidation).
 The LLM tool loop handles all tasks directly. No keyword-based gate routing.
 """
+
 import pytest
 
 from external_llm.agent.task_router import (
@@ -20,6 +21,7 @@ def dc():
 
 # ── All requests → PLANNER ──────────────────────────────────────────────
 
+
 class TestUnifiedPlannerRouting:
     """Verify DeterministicClassifier routing for each request type.
 
@@ -28,49 +30,54 @@ class TestUnifiedPlannerRouting:
     filesystem-op, or read-only route to MAIN_AGENT by design.
     """
 
-    @pytest.mark.parametrize("req,expected_lane", [
-        # Bug fix requests
-        ("버그 수정해줘", Lane.MAIN_AGENT),  # ambiguous, no file/symbol target
-        ("fix the authentication bug", Lane.MAIN_AGENT),  # ambiguous
-        ("login 함수에 JWT 검증 추가해줘", Lane.MAIN_AGENT),  # no structured file target
-        # SWE-bench style issue reports
-        ("Modeling separability_matrix does not compute separability correctly", Lane.MAIN_AGENT),  # symbol detected
-        ("Set default FILE_UPLOAD_PERMISSION to 0o644", Lane.MAIN_AGENT),  # config-style, ambiguous
-        ("HttpResponse doesnt handle memoryview objects", Lane.MAIN_AGENT),  # symbol detected
-        ("delete() on instances of models without any dependencies doesnt clear PKs", Lane.MAIN_AGENT),  # ambiguous
-        # Trivial edits (formerly FAST_PATH) — has explicit file → MAIN_AGENT
-        ("main.py에 TODO 주석 한 줄 추가", Lane.MAIN_AGENT),
-        ("foo.py에 import os 추가", Lane.MAIN_AGENT),
-        # CSS/HTML edits — non-structured targets → MAIN_AGENT
-        ("styles.css에서 color 값만 #fff로 변경", Lane.MAIN_AGENT),
-        ("change the button color to blue", Lane.MAIN_AGENT),
-        # Filesystem ops
-        ("파일을 tests/로 이동해줘", Lane.MAIN_AGENT),  # no explicit structured target
-        ("move auth.py to utils/", Lane.MAIN_AGENT),  # file mentioned
-        # Read/explain requests
-        ("explain how the auth middleware works", Lane.MAIN_AGENT),  # ambiguous, no target
-        ("이 코드 설명해줘", Lane.MAIN_AGENT),  # ambiguous
-        ("what does this function do?", Lane.MAIN_AGENT),  # question form → read intent
-        ("라우팅 구조 설명해줘", Lane.MAIN_AGENT),  # ambiguous Korean
-        # Mixed intent
-        ("이 코드 분석해서 버그 고쳐줘", Lane.MAIN_AGENT),  # ambiguous, no target
-        # Ambiguous (formerly CLARIFY)
-        ("버그 잡아줘", Lane.MAIN_AGENT),
-        ("fix this", Lane.MAIN_AGENT),
-        # Refactoring
-        ("라우팅 구조를 단순화해줘", Lane.MAIN_AGENT),  # ambiguous, no explicit target
-        ("agent_loop.py의 종료 조건 리팩토링해줘", Lane.MAIN_AGENT),  # file mentioned
-        # Complex
-        ("함수명 바꾸고 호출부 전부 업데이트해줘", Lane.MAIN_AGENT),  # no explicit target
-    ])
+    @pytest.mark.parametrize(
+        "req,expected_lane",
+        [
+            # Bug fix requests
+            ("버그 수정해줘", Lane.MAIN_AGENT),  # ambiguous, no file/symbol target
+            ("fix the authentication bug", Lane.MAIN_AGENT),  # ambiguous
+            ("login 함수에 JWT 검증 추가해줘", Lane.MAIN_AGENT),  # no structured file target
+            # SWE-bench style issue reports
+            (
+                "Modeling separability_matrix does not compute separability correctly",
+                Lane.MAIN_AGENT,
+            ),  # symbol detected
+            ("Set default FILE_UPLOAD_PERMISSION to 0o644", Lane.MAIN_AGENT),  # config-style, ambiguous
+            ("HttpResponse doesnt handle memoryview objects", Lane.MAIN_AGENT),  # symbol detected
+            ("delete() on instances of models without any dependencies doesnt clear PKs", Lane.MAIN_AGENT),  # ambiguous
+            # Trivial edits (formerly FAST_PATH) — has explicit file → MAIN_AGENT
+            ("main.py에 TODO 주석 한 줄 추가", Lane.MAIN_AGENT),
+            ("foo.py에 import os 추가", Lane.MAIN_AGENT),
+            # CSS/HTML edits — non-structured targets → MAIN_AGENT
+            ("styles.css에서 color 값만 #fff로 변경", Lane.MAIN_AGENT),
+            ("change the button color to blue", Lane.MAIN_AGENT),
+            # Filesystem ops
+            ("파일을 tests/로 이동해줘", Lane.MAIN_AGENT),  # no explicit structured target
+            ("move auth.py to utils/", Lane.MAIN_AGENT),  # file mentioned
+            # Read/explain requests
+            ("explain how the auth middleware works", Lane.MAIN_AGENT),  # ambiguous, no target
+            ("이 코드 설명해줘", Lane.MAIN_AGENT),  # ambiguous
+            ("what does this function do?", Lane.MAIN_AGENT),  # question form → read intent
+            ("라우팅 구조 설명해줘", Lane.MAIN_AGENT),  # ambiguous Korean
+            # Mixed intent
+            ("이 코드 분석해서 버그 고쳐줘", Lane.MAIN_AGENT),  # ambiguous, no target
+            # Ambiguous (formerly CLARIFY)
+            ("버그 잡아줘", Lane.MAIN_AGENT),
+            ("fix this", Lane.MAIN_AGENT),
+            # Refactoring
+            ("라우팅 구조를 단순화해줘", Lane.MAIN_AGENT),  # ambiguous, no explicit target
+            ("agent_loop.py의 종료 조건 리팩토링해줘", Lane.MAIN_AGENT),  # file mentioned
+            # Complex
+            ("함수명 바꾸고 호출부 전부 업데이트해줘", Lane.MAIN_AGENT),  # no explicit target
+        ],
+    )
     def test_all_requests_go_to_planner(self, dc, req, expected_lane):
         result = dc.classify(req)
-        assert result.lane == expected_lane, (
-            f'"{req}" → {result.lane.value} (expected {expected_lane.value})'
-        )
+        assert result.lane == expected_lane, f'"{req}" → {result.lane.value} (expected {expected_lane.value})'
 
 
 # ── Feature extraction tests (still useful for SpecResolver hints) ──────
+
 
 class TestFeatureExtraction:
     """Verify feature extraction produces correct structural signals.
@@ -94,9 +101,12 @@ class TestFeatureExtraction:
         self.intent.lane_hint = None
         self.intent.scope_hint = None
         self.intent.complexity_hint = None
+
         def _reset_intent():
             self.intent.scope_hint = None
+
         self._reset_intent = _reset_intent
+
     """Verify feature extraction produces correct structural signals.
     Features are still extracted for SpecResolver hints, not for routing."""
 
@@ -146,6 +156,7 @@ class TestFeatureExtraction:
 
 # ── TaskRouter integration ────────────────────────────────────────────────
 
+
 class TestTaskRouterIntegration:
     """Verify TaskRouter.route() always returns MAIN_AGENT (PLANNER disabled)."""
 
@@ -153,10 +164,9 @@ class TestTaskRouterIntegration:
     def patch_intent_resolver(self, monkeypatch):
         """Patch create_intent_resolver to avoid needing a real model/LLM."""
         from unittest.mock import MagicMock
+
         mock_resolver = MagicMock()
-        mock_resolver.resolve.return_value = MagicMock(
-            intent_kind="edit", confidence=0.8, search_terms=[]
-        )
+        mock_resolver.resolve.return_value = MagicMock(intent_kind="edit", confidence=0.8, search_terms=[])
         monkeypatch.setattr(
             "external_llm.agent.task_router.create_intent_resolver",
             lambda **kwargs: mock_resolver,

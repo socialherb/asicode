@@ -6,6 +6,7 @@ to the same file re-captured it, ``restore()`` would put back the edited
 content and Undo would silently become a no-op — which is exactly the failure a
 green "a checkpoint exists" assertion would miss.
 """
+
 from __future__ import annotations
 
 import sys
@@ -33,6 +34,7 @@ def repo(tmp_path):
 
 # ── mode resolution ──────────────────────────────────────────────────────────
 
+
 @pytest.mark.parametrize("raw", ["0", "off", "false", "no", "OFF", " No ", "FALSE"])
 def test_disabled_modes(raw):
     assert resolve_checkpoint_mode(raw) == MODE_OFF
@@ -57,6 +59,7 @@ def test_gate_reads_the_env_var(repo, monkeypatch):
 
 # ── path filtering ───────────────────────────────────────────────────────────
 
+
 def test_resolve_in_repo_paths_keeps_missing_targets(repo):
     """Non-existent paths survive the filter — they become tombstones.
 
@@ -65,9 +68,7 @@ def test_resolve_in_repo_paths_keeps_missing_targets(repo):
     absent tombstone), so this filter is about repo containment only.
     """
     (repo / "sub").mkdir()
-    got = resolve_in_repo_paths(
-        [str(repo / "app.py"), str(repo / "missing.py"), str(repo / "sub")], str(repo)
-    )
+    got = resolve_in_repo_paths([str(repo / "app.py"), str(repo / "missing.py"), str(repo / "sub")], str(repo))
     assert got == [
         str((repo / "app.py").resolve()),
         str((repo / "missing.py").resolve()),
@@ -90,6 +91,7 @@ def test_resolve_in_repo_paths_rejects_escapes(repo, tmp_path):
 
 
 # ── the first-seen invariant ─────────────────────────────────────────────────
+
 
 def test_repeated_writes_keep_the_pre_run_content(repo):
     """The whole point of Undo: restore must rewind to before the FIRST write."""
@@ -201,12 +203,13 @@ def test_new_file_then_existing_file_still_gets_a_checkpoint(repo):
 
 def test_unknown_target_paths_do_not_crash(repo):
     gate = RunCheckpointGate(str(repo), mode="scoped")
-    gate.before_write(None)       # _extract_write_target_paths returned None
+    gate.before_write(None)  # _extract_write_target_paths returned None
     gate.before_write([])
     assert gate.checkpoint_id is None
 
 
 # ── modes ────────────────────────────────────────────────────────────────────
+
 
 def test_disabled_gate_never_touches_the_store(repo):
     gate = RunCheckpointGate(str(repo), mode="off")
@@ -234,14 +237,13 @@ def test_full_mode_fires_even_for_a_brand_new_file(repo):
 
 def test_gate_never_raises_on_store_failure(repo, monkeypatch):
     gate = RunCheckpointGate(str(repo), mode="scoped")
-    monkeypatch.setattr(
-        gate, "_get_store", lambda: (_ for _ in ()).throw(OSError("disk full"))
-    )
-    gate.before_write([str(repo / "app.py")])   # must not propagate
+    monkeypatch.setattr(gate, "_get_store", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    gate.before_write([str(repo / "app.py")])  # must not propagate
     assert gate.checkpoint_id is None
 
 
 # ── CheckpointStore.extend ───────────────────────────────────────────────────
+
 
 def test_extend_is_a_noop_for_unknown_id(repo):
     assert CheckpointStore(str(repo)).extend("nope", [str(repo / "app.py")]) == 0
@@ -282,6 +284,7 @@ def test_extend_round_trips_binary_files(repo):
 
 # ── concurrency ──────────────────────────────────────────────────────────────
 
+
 def test_concurrent_first_writes_produce_one_checkpoint(repo):
     """Subagents write in parallel; they must share a single Undo point.
 
@@ -318,6 +321,7 @@ def test_concurrent_first_writes_produce_one_checkpoint(repo):
 
 
 # ── wiring into the write path ───────────────────────────────────────────────
+
 
 def test_write_tool_dispatch_creates_and_restores_a_checkpoint(repo):
     from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
@@ -367,9 +371,7 @@ def test_clone_taken_before_any_write_still_shares_the_gate(repo):
 
     cfg = AgentConfig()
     reg = ToolRegistry(repo_root=str(repo), config=cfg)
-    assert reg._run_checkpoint_gate is not None, (
-        "gate must exist before the first write, else clones copy None"
-    )
+    assert reg._run_checkpoint_gate is not None, "gate must exist before the first write, else clones copy None"
     assert reg.run_checkpoint_id is None, "still nothing captured"
 
     clone = reg.clone_for_subagent(cfg)
@@ -382,8 +384,7 @@ def test_clone_taken_before_any_write_still_shares_the_gate(repo):
         {"file_path": "app.py", "old_text": "original app", "new_text": "subagent edit"},
     )
     assert reg.run_checkpoint_id is not None, (
-        "parent must see the subagent's checkpoint — agent_loop stamps the id "
-        "from the parent registry"
+        "parent must see the subagent's checkpoint — agent_loop stamps the id from the parent registry"
     )
     assert clone.run_checkpoint_id == reg.run_checkpoint_id
     assert len(CheckpointStore(str(repo)).list()) == 1
@@ -410,6 +411,7 @@ def test_constructing_a_registry_does_not_create_the_store(repo, tmp_path):
 
 
 # ── A refused write must leave no tombstone ─────────────────────────────────
+
 
 def test_a_refused_write_leaves_no_tombstone(repo):
     """before_write fires BEFORE the handler, so absence is not yet creation.
@@ -449,12 +451,12 @@ def test_a_pending_absence_survives_until_a_later_write_creates_it(repo):
     target = repo / "eventually.py"
 
     gate.before_write([str(target)])
-    gate.confirm_writes([str(target)])   # first attempt failed: still missing
+    gate.confirm_writes([str(target)])  # first attempt failed: still missing
     assert gate.checkpoint_id is None
 
     gate.before_write([str(target)])
     target.write_text("second attempt worked\n", encoding="utf-8")
-    gate.confirm_writes([str(target)])   # now it exists
+    gate.confirm_writes([str(target)])  # now it exists
     assert gate.checkpoint_id is not None
 
     assert CheckpointStore(str(repo)).restore(gate.checkpoint_id) is True

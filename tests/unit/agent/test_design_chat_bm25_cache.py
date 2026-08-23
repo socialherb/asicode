@@ -10,6 +10,7 @@ Covers:
   * Small archive skip: archives ≤ 2000 turns are not cached.
   * Environent-variable cap via ``ASICODE_ARCHIVED_BM25_CACHE_MAX``.
 """
+
 from __future__ import annotations
 
 import os
@@ -81,10 +82,12 @@ class TestArchivedBm25Cache:
 
     def test_cache_miss_builds_entries(self):
         """First call tokenises and caches entries."""
-        p = _make_archive([
-            '{"content": "hello world test"}',
-            '{"content": "another message here"}',
-        ])
+        p = _make_archive(
+            [
+                '{"content": "hello world test"}',
+                '{"content": "another message here"}',
+            ]
+        )
         try:
             mgr = _FakeSessionMgr(p)
             archived = [{"content": "hello world test"}, {"content": "another message here"}]
@@ -107,10 +110,10 @@ class TestArchivedBm25Cache:
             archived = [{"content": "hello world test"}]
             r1, sig1, fc1 = _archived_bm25_entries(mgr, "s1", archived)
             r2, sig2, fc2 = _archived_bm25_entries(mgr, "s1", archived)
-            assert r1 is r2         # object identity — not just equality
+            assert r1 is r2  # object identity — not just equality
             assert sig1 == sig2
-            assert fc1 is False     # first call: miss
-            assert fc2 is True      # second call: hit
+            assert fc1 is False  # first call: miss
+            assert fc2 is True  # second call: hit
         finally:
             os.unlink(p)
 
@@ -122,18 +125,20 @@ class TestArchivedBm25Cache:
             archived = [{"content": "hello world test"}]
             r1, _s1, fc1 = _archived_bm25_entries(mgr, "s1", archived)
             r2, _s2, fc2 = _archived_bm25_entries(mgr, "s2", archived)
-            assert r1 is not r2     # Different sig → different objects
+            assert r1 is not r2  # Different sig → different objects
             assert fc1 is False
-            assert fc2 is False     # s2 is a miss
+            assert fc2 is False  # s2 is a miss
         finally:
             os.unlink(p)
 
     def test_cache_returns_identical_ranking(self):
         """Cache hit produces the same BM25-relevant data (tc, doc_len) as fresh build."""
-        p = _make_archive([
-            '{"content": "hello world"}',
-            '{"content": "goodbye world"}',
-        ])
+        p = _make_archive(
+            [
+                '{"content": "hello world"}',
+                '{"content": "goodbye world"}',
+            ]
+        )
         try:
             mgr = _FakeSessionMgr(p)
             archived = [{"content": "hello world"}, {"content": "goodbye world"}]
@@ -227,11 +232,13 @@ class TestArchivedBm25Cache:
 
     def test_from_cache_flag(self):
         """from_cache=True only when BM25 cache actually hits."""
-        p = _make_archive([
-            '{"content": "turn one"}',
-            '{"content": "turn two"}',
-            '{"content": "turn three"}',
-        ])
+        p = _make_archive(
+            [
+                '{"content": "turn one"}',
+                '{"content": "turn two"}',
+                '{"content": "turn three"}',
+            ]
+        )
         try:
             mgr = _FakeSessionMgr(p)
             archived = [{"content": "turn one"}, {"content": "turn two"}, {"content": "turn three"}]

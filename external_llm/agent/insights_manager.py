@@ -13,6 +13,7 @@ This module is deliberately pure (no LLM client, no I/O side effects beyond the
 one explicit ``atomic_write_text``): the caller (asi) owns the LLM call and
 the user-confirmation flow.
 """
+
 from __future__ import annotations
 
 import calendar
@@ -29,7 +30,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     Any,  # f821-protected
-    Optional,
 )
 
 from ..common.file_lock import cross_process_flock
@@ -133,9 +133,9 @@ class InsightsStats:
     count: int = 0
     bytes_size: int = 0
     tokens: int = 0
-    mtime: Optional[float] = None
-    age_days: Optional[float] = None  # file mtime age (whole-file)
-    oldest_age_days: Optional[float] = None  # age of the OLDEST entry (per-entry)
+    mtime: float | None = None
+    age_days: float | None = None  # file mtime age (whole-file)
+    oldest_age_days: float | None = None  # age of the OLDEST entry (per-entry)
 
 
 def insights_path(repo_root: str) -> str:
@@ -188,7 +188,7 @@ def _parse_category(header_line: str) -> str:
     return ""
 
 
-def parse_timestamp(header_line: str) -> Optional[float]:
+def parse_timestamp(header_line: str) -> float | None:
     """Extract epoch-seconds from a ``### [cat] YYYY-MM-DD HH:MM [±HHMM]`` header.
 
     Two header generations coexist in insights files:
@@ -209,7 +209,7 @@ def parse_timestamp(header_line: str) -> Optional[float]:
     if s.startswith("["):  # strip optional [category]
         end = s.find("]")
         if end > 0:
-            s = s[end + 1:].strip()
+            s = s[end + 1 :].strip()
     # New format first: 'YYYY-MM-DD HH:MM ±HHMM' is exactly 22 chars. Without
     # this branch the offset suffix would be silently dropped and the LOCAL
     # wall-clock misread as UTC — skewing every age computation by the zone
@@ -222,7 +222,7 @@ def parse_timestamp(header_line: str) -> Optional[float]:
     return None
 
 
-def entry_age_days(entry: "InsightEntry", now: Optional[float] = None) -> Optional[float]:
+def entry_age_days(entry: InsightEntry, now: float | None = None) -> float | None:
     """Age of ``entry`` in days from its header timestamp, or ``None`` if the
     header has no parseable timestamp. ``now`` defaults to the current time;
     pass it explicitly for deterministic tests."""
@@ -233,9 +233,7 @@ def entry_age_days(entry: "InsightEntry", now: Optional[float] = None) -> Option
     return max(0.0, (now - ts) / 86400.0)
 
 
-def select_entries_older_than(
-    entries: list[InsightEntry], days: float, now: Optional[float] = None
-) -> list[int]:
+def select_entries_older_than(entries: list[InsightEntry], days: float, now: float | None = None) -> list[int]:
     """Return the 1-based indices of entries strictly older than ``days``.
 
     Entries whose header has no parseable timestamp are NEVER selected — a
@@ -325,7 +323,7 @@ def compute_stats(repo_root: str) -> InsightsStats:
     except OSError:
         return InsightsStats(exists=True, count=len(entries))
     now = time.time()
-    age_days: Optional[float] = None
+    age_days: float | None = None
     if st.st_mtime > 0:
         age_days = (now - st.st_mtime) / 86400.0
     # Per-entry age: the oldest entry is a far better staleness signal than the
@@ -368,9 +366,7 @@ def should_nudge(stats: InsightsStats) -> tuple[bool, str]:
         return False, ""
     return (
         True,
-        "💡 design_insights: "
-        + ", ".join(reasons)
-        + " /insights {list|verify|compact|drop <n>}",
+        "💡 design_insights: " + ", ".join(reasons) + " /insights {list|verify|compact|drop <n>}",
     )
 
 
@@ -393,7 +389,7 @@ def should_nudge(stats: InsightsStats) -> tuple[bool, str]:
 # lock is in use the weak entry stays alive and is shared across threads; when
 # idle it is GC'd. Re-entrant calls are safe: the outer ``with lock:`` frame
 # holds a strong ref for the duration of the nested call.
-_INSIGHTS_THREAD_LOCKS: "weakref.WeakValueDictionary[str, threading.RLock]" = weakref.WeakValueDictionary()
+_INSIGHTS_THREAD_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
 _INSIGHTS_LOCKS_GUARD = threading.Lock()
 # Per-thread "which repo flocks does THIS thread already hold" set. fcntl.flock
 # is per-open-file-description: a re-entrant call that opens a SECOND fd on the
@@ -514,7 +510,9 @@ def load_archive_file(repo_root: str) -> str:
 # demotion/restore/drop write — which rewrites the whole file via
 # ``atomic_write_text`` — invalidates instantly. Per-entry token-sets are cached
 # alongside so Layer 3 only re-tokenizes the (cheap) task query per turn.
-_ARCHIVE_WRITE_VERSIONS: dict[str, int] = {}  # path → monotonic counter; each archive path tracks its own write generation
+_ARCHIVE_WRITE_VERSIONS: dict[
+    str, int
+] = {}  # path → monotonic counter; each archive path tracks its own write generation
 _ARCHIVE_PARSED_CACHE: dict[str, tuple[int, int, int, list[InsightEntry]]] = {}
 _ARCHIVE_ANALYZED_CACHE: dict[
     str, tuple[int, int, int, list[InsightEntry], list[frozenset[str]], dict[str, int], float]
@@ -527,8 +525,11 @@ _ARCHIVE_CACHE_MAX_ENTRIES: int = 8
 
 
 def _archive_capped_put(
-    cache: dict, key, value,
-    sibling_versions: dict | None = None, sibling_cache: dict | None = None,
+    cache: dict,
+    key,
+    value,
+    sibling_versions: dict | None = None,
+    sibling_cache: dict | None = None,
 ) -> None:
     """Set ``cache[key] = value`` then evict the least-recently-used entry if over cap.
 
@@ -575,8 +576,9 @@ def _archive_capped_put(
             _oldest = next(iter(cache))
         except (RuntimeError, StopIteration):
             _logger.debug(
-                "_archive_capped_put: concurrent dict resize, stopping eviction "
-                "(cap=%s, size=%s)", _ARCHIVE_CACHE_MAX_ENTRIES, len(cache),
+                "_archive_capped_put: concurrent dict resize, stopping eviction (cap=%s, size=%s)",
+                _ARCHIVE_CACHE_MAX_ENTRIES,
+                len(cache),
             )
             break
         cache.pop(_oldest, None)
@@ -620,9 +622,13 @@ def _parsed_archive_cached(repo_root: str) -> list[InsightEntry]:
         return cached[3]
     content = load_archive_file(repo_root)
     entries = parse_insights(content)[1] if content.strip() else []
-    _archive_capped_put(_ARCHIVE_PARSED_CACHE, path, (mtime_ns, size, version, entries),
-                        sibling_versions=_ARCHIVE_WRITE_VERSIONS,
-                        sibling_cache=_ARCHIVE_ANALYZED_CACHE)
+    _archive_capped_put(
+        _ARCHIVE_PARSED_CACHE,
+        path,
+        (mtime_ns, size, version, entries),
+        sibling_versions=_ARCHIVE_WRITE_VERSIONS,
+        sibling_cache=_ARCHIVE_ANALYZED_CACHE,
+    )
     return entries
 
 
@@ -660,7 +666,8 @@ def _archive_analyzed_cached(
             df[t] = df.get(t, 0) + 1
     avgdl = (sum(len(et) for et in toksets) / len(entries)) if entries else 0.0
     _archive_capped_put(
-        _ARCHIVE_ANALYZED_CACHE, path,
+        _ARCHIVE_ANALYZED_CACHE,
+        path,
         (mtime_ns, size, version, entries, toksets, df, avgdl),
         sibling_versions=_ARCHIVE_WRITE_VERSIONS,
         sibling_cache=_ARCHIVE_PARSED_CACHE,
@@ -681,7 +688,6 @@ def _archive_invalidate(repo_root: str) -> None:
     _ARCHIVE_WRITE_VERSIONS[path] = _ARCHIVE_WRITE_VERSIONS.get(path, 0) + 1
     _ARCHIVE_PARSED_CACHE.pop(path, None)
     _ARCHIVE_ANALYZED_CACHE.pop(path, None)
-
 
 
 # ── Active insights file content cache ─────────────────────────────
@@ -720,16 +726,12 @@ def load_active_insights_cached(repo_root: str) -> str:
     path = insights_path(repo_root)
     mtime_ns, size, version = _active_signature(path)
     cached = _ACTIVE_CONTENT_CACHE.get(path)
-    if (
-        cached is not None
-        and cached[0] == mtime_ns
-        and cached[1] == size
-        and cached[2] == version
-    ):
+    if cached is not None and cached[0] == mtime_ns and cached[1] == size and cached[2] == version:
         return cached[3]
     content = _load_file_safe(path)
-    _archive_capped_put(_ACTIVE_CONTENT_CACHE, path, (mtime_ns, size, version, content),
-                        sibling_versions=_ACTIVE_WRITE_VERSIONS)
+    _archive_capped_put(
+        _ACTIVE_CONTENT_CACHE, path, (mtime_ns, size, version, content), sibling_versions=_ACTIVE_WRITE_VERSIONS
+    )
     return content
 
 
@@ -745,7 +747,7 @@ def _active_invalidate(repo_root: str) -> None:
     _ACTIVE_CONTENT_CACHE.pop(path, None)
 
 
-def _entry_bytes(entry: "InsightEntry") -> int:
+def _entry_bytes(entry: InsightEntry) -> int:
     """UTF-8 byte size of an entry's serialized lines."""
     return len("".join(entry.lines).encode("utf-8"))
 
@@ -753,7 +755,7 @@ def _entry_bytes(entry: "InsightEntry") -> int:
 def select_demotion_candidates(
     entries: list[InsightEntry],
     budget_bytes: int,
-    now: Optional[float] = None,
+    now: float | None = None,
 ) -> list[int]:
     """Return 1-based indices of entries to DEMOTE so the remaining entries fit
     ``budget_bytes``, preferring the OLDEST timestamped entries first.
@@ -797,9 +799,7 @@ def select_demotion_candidates(
     return demoted
 
 
-def append_entries_to_archive(
-    repo_root: str, entries: list[InsightEntry]
-) -> None:
+def append_entries_to_archive(repo_root: str, entries: list[InsightEntry]) -> None:
     """Append ``entries`` to the archive file (creating it with a preamble if new).
 
     Round-trip safe: parses the existing archive (preamble + entries), extends,
@@ -825,9 +825,7 @@ def append_entries_to_archive(
         path = insights_archive_path(repo_root)
         existing = load_archive_file(repo_root) or _ARCHIVE_PREAMBLE
         preamble, arch_entries = parse_insights(existing)
-        seen: set[tuple[str, str]] = {
-            (e.header_line, e.body) for e in arch_entries
-        }
+        seen: set[tuple[str, str]] = {(e.header_line, e.body) for e in arch_entries}
         for entry in entries:
             key = (entry.header_line, entry.body)
             if key in seen:
@@ -838,9 +836,7 @@ def append_entries_to_archive(
         _archive_invalidate(repo_root)  # proactive cache drop (mtime/size key also covers it)
 
 
-def enforce_budget_by_demotion(
-    repo_root: str, budget_bytes: int, now: Optional[float] = None
-) -> tuple[int, int]:
+def enforce_budget_by_demotion(repo_root: str, budget_bytes: int, now: float | None = None) -> tuple[int, int]:
     """HARD budget backstop — the single source of truth guaranteeing the active
     file is ≤ ``budget_bytes``.
 
@@ -893,9 +889,7 @@ def enforce_budget_by_demotion(
         return len(demoted), len(new_content.encode("utf-8"))
 
 
-def build_archive_index(
-    repo_root: str, max_entries: int = ARCHIVE_INDEX_MAX_ENTRIES
-) -> str:
+def build_archive_index(repo_root: str, max_entries: int = ARCHIVE_INDEX_MAX_ENTRIES) -> str:
     """Compact header-only index of archived entries, for always-on visibility.
 
     Returns ``""`` when there is no archive. Capped at ``max_entries`` (newest
@@ -909,8 +903,7 @@ def build_archive_index(
     shown = list(reversed(entries[-max_entries:]))  # newest archived first
     lines = [
         "",
-        "=== ARCHIVED INSIGHTS (not auto-injected; "
-        "/insights archive list | restore <n>) ===",
+        "=== ARCHIVED INSIGHTS (not auto-injected; /insights archive list | restore <n>) ===",
     ]
     # BYTE-STABILITY: show the absolute creation DATE, NOT a relative age ("Nd").
     # This index is injected into the cached 0c prompt-prefix block; a relative
@@ -962,6 +955,7 @@ def select_promotable_entries(
     global _TOKENIZER  # lazy sentinel
     if _TOKENIZER is None:
         from external_llm.agent.rag_configs import CodeTokenizer
+
         _TOKENIZER = CodeTokenizer()
     tok = _TOKENIZER
     qset = set(tok.tokenize(task_query))
@@ -1013,7 +1007,7 @@ def select_promotable_entries(
     return promoted
 
 
-def _age_reference_block(content: str, now: Optional[float] = None) -> str:
+def _age_reference_block(content: str, now: float | None = None) -> str:
     """Reference list of each entry's header + age, appended to the triage prompt.
 
     Lets the compact/verify model weigh staleness. Explicitly marked DO-NOT-COPY
@@ -1031,12 +1025,11 @@ def _age_reference_block(content: str, now: Optional[float] = None) -> str:
         return ""
     return (
         "\n\nEntry ages (recency reference for triage — DO NOT copy these ages "
-        "into the rewritten file; preserve each original header line verbatim):\n"
-        + "\n".join(rows)
+        "into the rewritten file; preserve each original header line verbatim):\n" + "\n".join(rows)
     )
 
 
-def build_compact_messages(content: str, budget_bytes: Optional[int] = None) -> list[dict]:
+def build_compact_messages(content: str, budget_bytes: int | None = None) -> list[dict]:
     """Build the LLM chat messages that compact the insights file.
 
     The model is asked to return the **entire rewritten file** (preamble +
@@ -1161,8 +1154,7 @@ def build_verify_messages(content: str) -> list[dict]:
         "Verify and curate this design-insights file against the current codebase. "
         "Read the actual code to confirm each claim, then edit the file in place to "
         "drop wrong/done/ephemeral entries and keep only durable long-term insights.\n\n"
-        f"{content}"
-        + _age_reference_block(content)
+        f"{content}" + _age_reference_block(content)
     )
     return [
         {"role": "system", "content": system},

@@ -8,6 +8,7 @@ per-file pattern as ``_python_symbol_map`` and ``_ts_module_map`` — so N
 lookups on one file parse it once, and ``invalidate_file_caches`` drops the
 map after the agent's own writes.
 """
+
 from __future__ import annotations
 
 import textwrap
@@ -53,6 +54,7 @@ def _ts_grammar_available(lang: str) -> bool:
     """True when the tree-sitter binding for ``lang`` is installed."""
     try:
         from external_llm.languages.tree_sitter_utils import get_available_languages
+
         return lang in get_available_languages()
     except Exception:
         return False
@@ -81,8 +83,7 @@ def _counting_searcher(tmp_path, monkeypatch):
     return searcher, calls
 
 
-@pytest.mark.skipif(not _ts_grammar_available("go"),
-                    reason="tree-sitter-go not installed")
+@pytest.mark.skipif(not _ts_grammar_available("go"), reason="tree-sitter-go not installed")
 class TestGoClassMethodsCache:
     def test_two_dotted_lookups_parse_file_once(self, tmp_path, monkeypatch):
         searcher, calls = _counting_searcher(tmp_path, monkeypatch)
@@ -97,14 +98,10 @@ class TestGoClassMethodsCache:
 
     def test_find_symbol_dotted_go_uses_cache(self, tmp_path, monkeypatch):
         searcher, calls = _counting_searcher(tmp_path, monkeypatch)
-        r1 = searcher.find_symbol(
-            "TodoList.Add", kind="method", search_path="server.go")
-        r2 = searcher.find_symbol(
-            "Server.Start", kind="method", search_path="server.go")
-        assert [(d.name, d.parent_class, d.line) for d in r1] == [
-            ("Add", "TodoList", 7)]
-        assert [(d.name, d.parent_class, d.line) for d in r2] == [
-            ("Start", "Server", 20)]
+        r1 = searcher.find_symbol("TodoList.Add", kind="method", search_path="server.go")
+        r2 = searcher.find_symbol("Server.Start", kind="method", search_path="server.go")
+        assert [(d.name, d.parent_class, d.line) for d in r1] == [("Add", "TodoList", 7)]
+        assert [(d.name, d.parent_class, d.line) for d in r2] == [("Start", "Server", 20)]
         assert r1[0].signature == "func (l *TodoList) Add(item string) error {"
         assert r1[0].end_line == 10
         # Two different structs, one file → one batch parse for both.
@@ -143,8 +140,7 @@ class TestGoClassMethodsCache:
         f = searcher.repo_root / "server.go"
         searcher._find_in_go(f, "Add", "any", parent_class="TodoList")
         # Content + size change → (mtime_ns, size) signature no longer matches.
-        f.write_text(
-            _GO_SRC + "\n\nfunc (l *TodoList) Clear() {}\n", encoding="utf-8")
+        f.write_text(_GO_SRC + "\n\nfunc (l *TodoList) Clear() {}\n", encoding="utf-8")
         found = searcher._find_in_go(f, "Clear", "any", parent_class="TodoList")
         assert [d.line for d in found] == [29]
         assert len(calls) == 2
@@ -169,10 +165,8 @@ class TestGoClassMethodsCache:
     def test_unknown_class_lookup_is_cheap_dict_get(self, tmp_path, monkeypatch):
         searcher, calls = _counting_searcher(tmp_path, monkeypatch)
         f = searcher.repo_root / "server.go"
-        assert searcher._find_in_go(
-            f, "Nope", "any", parent_class="Missing") == []
-        assert searcher._find_in_go(
-            f, "Nope", "any", parent_class="Missing") == []
+        assert searcher._find_in_go(f, "Nope", "any", parent_class="Missing") == []
+        assert searcher._find_in_go(f, "Nope", "any", parent_class="Missing") == []
         # A missing class is a dict miss on the cached map — no re-parse.
         assert len(calls) == 1
 
@@ -181,8 +175,7 @@ class TestGoClassMethodsCache:
         repo.mkdir()
         searcher = SymbolSearcher(str(repo))
         missing = repo / "nope.go"
-        assert searcher._find_in_go(
-            missing, "Add", "any", parent_class="TodoList") == []
+        assert searcher._find_in_go(missing, "Add", "any", parent_class="TodoList") == []
 
 
 class TestGoProviderBatchParity:
@@ -190,14 +183,11 @@ class TestGoProviderBatchParity:
         provider = GoSyntaxProvider()
         by_class = provider.find_all_class_methods(_GO_SRC)
         assert set(by_class) == {"TodoList", "Server"}
-        assert provider.find_class_methods(
-            _GO_SRC, "TodoList") == by_class["TodoList"]
-        assert provider.find_class_methods(
-            _GO_SRC, "Server") == by_class["Server"]
+        assert provider.find_class_methods(_GO_SRC, "TodoList") == by_class["TodoList"]
+        assert provider.find_class_methods(_GO_SRC, "Server") == by_class["Server"]
         assert provider.find_class_methods(_GO_SRC, "Missing") == []
 
-    @pytest.mark.skipif(not _ts_grammar_available("go"),
-                        reason="tree-sitter-go not installed")
+    @pytest.mark.skipif(not _ts_grammar_available("go"), reason="tree-sitter-go not installed")
     def test_regex_fallback_matches_tree_sitter(self, monkeypatch):
         provider = GoSyntaxProvider()
         expected = provider.find_all_class_methods(_GO_SRC)  # tree-sitter path
@@ -205,8 +195,7 @@ class TestGoProviderBatchParity:
         fallback = provider.find_all_class_methods(_GO_SRC)
         assert fallback == expected
 
-    @pytest.mark.skipif(not _ts_grammar_available("go"),
-                        reason="tree-sitter-go not installed")
+    @pytest.mark.skipif(not _ts_grammar_available("go"), reason="tree-sitter-go not installed")
     def test_extract_all_class_methods_matches_per_class_extract(self):
         grouped = _tsu.extract_all_class_methods(_GO_SRC, "go")
         assert grouped is not None

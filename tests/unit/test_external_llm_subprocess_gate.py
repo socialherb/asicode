@@ -58,8 +58,7 @@ def test_run_family_calls_have_timeout(path: str):
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     missing = run_family_without_timeout(tree)
     assert not missing, (
-        f"{Path(path).name}: {len(missing)} subprocess call(s) without timeout= at "
-        f"lines {[ln for _, ln in missing]}"
+        f"{Path(path).name}: {len(missing)} subprocess call(s) without timeout= at lines {[ln for _, ln in missing]}"
     )
 
 
@@ -81,8 +80,7 @@ def test_popen_with_pipe_is_bounded(path: str):
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     hits = popen_unbounded(tree)
     assert not hits, (
-        f"{Path(path).name}: {len(hits)} unbounded Popen call(s) at "
-        f"lines {[(ln, why) for _, ln, why in hits]}"
+        f"{Path(path).name}: {len(hits)} unbounded Popen call(s) at lines {[(ln, why) for _, ln, why in hits]}"
     )
 
 

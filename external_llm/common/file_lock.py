@@ -23,6 +23,7 @@ of the three copies:
     error. This prevents a transient/locking failure from crashing the
     caller's main work (which is what a lock *protects*, not *gates*).
 """
+
 from __future__ import annotations
 
 import logging
@@ -41,9 +42,14 @@ try:
     _HAS_LOCK = True
     _LOCK_IMPL = "fcntl"
 except ImportError:
-    with suppress(ImportError):
+    # Bind the names unconditionally (None on failure) so the import guards
+    # below can assert-narrow; tests monkeypatch file_lock.msvcrt/fcntl.
+    fcntl = None  # type: ignore[assignment]
+    try:
         import msvcrt  # type: ignore[import-not-found]
-
+    except ImportError:
+        msvcrt = None  # type: ignore[assignment]
+    else:
         _HAS_LOCK = True
         _LOCK_IMPL = "msvcrt"
 
@@ -75,9 +81,11 @@ def _held_exclusive(path: Path) -> Iterator[bool]:
             acquired = False
             try:
                 if _LOCK_IMPL == "fcntl":
+                    assert fcntl is not None
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 elif _LOCK_IMPL == "msvcrt":
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    assert msvcrt is not None
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
                 acquired = True
             except OSError as _err:
                 logger.debug("stale-lock probe: %s is in use (%s)", path, _err)
@@ -222,11 +230,13 @@ def cross_process_flock(lock_path: Path) -> Iterator[None]:
     locked = False
     try:
         if _LOCK_IMPL == "fcntl":
+            assert fcntl is not None
             fcntl.flock(fh, fcntl.LOCK_EX)
             locked = True
         elif _LOCK_IMPL == "msvcrt":
+            assert msvcrt is not None
             try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
                 locked = True
             except OSError:
                 logger.warning(
@@ -238,7 +248,9 @@ def cross_process_flock(lock_path: Path) -> Iterator[None]:
         if locked:
             with suppress(OSError):  # unlock on already-closed fd / EINVAL
                 if _LOCK_IMPL == "fcntl":
+                    assert fcntl is not None
                     fcntl.flock(fh, fcntl.LOCK_UN)
                 elif _LOCK_IMPL == "msvcrt":
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    assert msvcrt is not None
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
         fh.close()

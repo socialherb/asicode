@@ -20,6 +20,7 @@ disk is byte-identical to before the call.
 
 Run: pytest tests/unit/test_user_wip_protection.py -v
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -37,7 +38,8 @@ def git_repo(tmp_path):
     subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
 
-    (repo / "app.py").write_text(textwrap.dedent("""\
+    (repo / "app.py").write_text(
+        textwrap.dedent("""\
         def greet(name):
             msg = "Hello, " + name
             return msg
@@ -49,7 +51,8 @@ def git_repo(tmp_path):
 
         def multiply(a, b):
             return a * b
-    """))
+    """)
+    )
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True)
     return repo
@@ -81,7 +84,10 @@ class TestUserWipProtectionOnCheckFailure:
         from diff_apply import apply_patch
 
         return apply_patch(
-            git_repo, patch, file_path_hint="app.py", skip_3way=skip_3way,
+            git_repo,
+            patch,
+            file_path_hint="app.py",
+            skip_3way=skip_3way,
         )
 
     @staticmethod
@@ -119,9 +125,7 @@ class TestUserWipProtectionOnCheckFailure:
         assert d["rollback_skipped_reason"] == "check_is_dryrun_worktree_unchanged", d
 
         # THE FIX: worktree was never mutated by `--check`, so WIP must survive.
-        assert app.read_text() == wip, (
-            "user-WIP destroyed by skip_3way --check path!"
-        )
+        assert app.read_text() == wip, "user-WIP destroyed by skip_3way --check path!"
         assert "USER WIP" in app.read_text()
 
     def test_nonconflict_checkfailure_path_preserves_user_wip(self, git_repo, monkeypatch):
@@ -145,7 +149,8 @@ class TestUserWipProtectionOnCheckFailure:
         # Force --check failure to classify as non-CONFLICT -> skip 3-way/autostash
         # -> reach the generic --check-failure return (~line 881).
         monkeypatch.setattr(
-            diff_apply, "_classify_git_apply_output",
+            diff_apply,
+            "_classify_git_apply_output",
             lambda out: diff_apply.REASON_PATCH_MALFORMED,
         )
 
@@ -165,7 +170,5 @@ class TestUserWipProtectionOnCheckFailure:
         assert d["rollback_skipped_reason"] == "check_is_dryrun_worktree_unchanged", d
 
         # THE FIX: no _rollback -> no `git restore --worktree` -> WIP survives.
-        assert app.read_text() == wip, (
-            "user-WIP destroyed by non-conflict --check path!"
-        )
+        assert app.read_text() == wip, "user-WIP destroyed by non-conflict --check path!"
         assert "USER WIP" in app.read_text()

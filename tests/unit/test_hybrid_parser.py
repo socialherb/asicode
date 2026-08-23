@@ -9,6 +9,7 @@ patch then "applied" but never touched the other files.
 These tests pin the multi-fence join contract plus the surrounding strict
 validation / fallback behaviour so the join cannot silently weaken any gate.
 """
+
 from external_llm.hybrid_parser import HybridOutputParser, ParseResult
 from external_llm.output_modes import OutputMode
 
@@ -17,27 +18,13 @@ def _p() -> HybridOutputParser:
     return HybridOutputParser()
 
 
-_FOO_DIFF = (
-    "diff --git a/foo.py b/foo.py\n"
-    "--- a/foo.py\n"
-    "+++ b/foo.py\n"
-    "@@ -1,3 +1,3 @@\n"
-    " context\n"
-    "-old\n"
-    "+new\n"
-)
+_FOO_DIFF = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1,3 +1,3 @@\n context\n-old\n+new\n"
 
-_BAR_DIFF = (
-    "diff --git a/bar.py b/bar.py\n"
-    "--- a/bar.py\n"
-    "+++ b/bar.py\n"
-    "@@ -1,1 +1,1 @@\n"
-    "-x\n"
-    "+y\n"
-)
+_BAR_DIFF = "diff --git a/bar.py b/bar.py\n--- a/bar.py\n+++ b/bar.py\n@@ -1,1 +1,1 @@\n-x\n+y\n"
 
 
 # ── HP-B1: multi-fence join ────────────────────────────────────────────────
+
 
 def test_multi_fence_diff_preserves_all_files():
     """Each ```diff fence contributes a file; both must end up in the diff."""
@@ -69,14 +56,7 @@ def test_single_fence_multi_file_still_works():
 
 def test_three_fences_all_preserved():
     """Generalises the join beyond two fences."""
-    baz = (
-        "diff --git a/baz.py b/baz.py\n"
-        "--- a/baz.py\n"
-        "+++ b/baz.py\n"
-        "@@ -1,1 +1,1 @@\n"
-        "-p\n"
-        "+q\n"
-    )
+    baz = "diff --git a/baz.py b/baz.py\n--- a/baz.py\n+++ b/baz.py\n@@ -1,1 +1,1 @@\n-p\n+q\n"
     llm = f"```diff\n{_FOO_DIFF}```\n```diff\n{_BAR_DIFF}```\n```diff\n{baz}```\n"
     r = _p().parse(llm, OutputMode.UNIFIED_DIFF)
     assert r.success
@@ -101,6 +81,7 @@ def test_unfenced_raw_diff_still_parsed():
 
 # ── strict validation gates (must not be weakened by the join) ─────────────
 
+
 def test_reject_diff_missing_hunk():
     """Prose that merely starts with 'diff --git' but has no @@ hunk → reject."""
     llm = "```diff\ndiff --git a/foo.py b/foo.py\nsome explanation, no hunk\n```\n"
@@ -120,6 +101,7 @@ def test_reject_no_diff_markers():
 
 # ── NEEDS_DISAMBIGUATION short-circuit (parse-level, pre-dispatch) ─────────
 
+
 def test_needs_disambiguation_short_circuit():
     llm = "NEEDS_DISAMBIGUATION: which file do you mean?\n```diff\n{_FOO_DIFF}```\n"
     r = _p().parse(llm, OutputMode.UNIFIED_DIFF)
@@ -128,6 +110,7 @@ def test_needs_disambiguation_short_circuit():
 
 
 # ── fallback: expected mode fails → re-parsed as UNIFIED_DIFF with warning ─
+
 
 def test_fallback_to_unified_diff_adds_warning():
     """When the expected mode (FULL_FILE) fails but the text is a real diff,
@@ -140,6 +123,7 @@ def test_fallback_to_unified_diff_adds_warning():
 
 
 # ── ParseResult is the right type / raw passthrough ────────────────────────
+
 
 def test_parse_result_raw_output_preserved():
     llm = f"```diff\n{_FOO_DIFF}```\n"
@@ -156,25 +140,16 @@ def test_parse_result_raw_output_preserved():
 
 # ── _parse_asicode ─────────────────────────────────────────────────────────
 
+
 def test_asicode_valid_single_block():
-    llm = (
-        "ASICODE_BEGIN\n"
-        "BEFORE\n"
-        "old line\n"
-        "AFTER\n"
-        "new line\n"
-        "ASICODE_END\n"
-    )
+    llm = "ASICODE_BEGIN\nBEFORE\nold line\nAFTER\nnew line\nASICODE_END\n"
     r = _p().parse(llm, OutputMode.ASICODE_BLOCK)
     assert r.success and r.mode == OutputMode.ASICODE_BLOCK
     assert r.blocks == [{"before": "old line", "after": "new line"}]
 
 
 def test_asicode_multiple_blocks():
-    llm = (
-        "ASICODE_BEGIN\nBEFORE\na\nAFTER\nb\nASICODE_END\n"
-        "ASICODE_BEGIN\nBEFORE\nc\nAFTER\nd\nASICODE_END\n"
-    )
+    llm = "ASICODE_BEGIN\nBEFORE\na\nAFTER\nb\nASICODE_END\nASICODE_BEGIN\nBEFORE\nc\nAFTER\nd\nASICODE_END\n"
     r = _p().parse(llm, OutputMode.ASICODE_BLOCK)
     assert r.success and len(r.blocks) == 2
     assert r.blocks[0] == {"before": "a", "after": "b"}
@@ -195,14 +170,9 @@ def test_asicode_block_missing_before_after_rejected():
 
 # ── _parse_targeted ────────────────────────────────────────────────────────
 
+
 def test_targeted_valid():
-    llm = (
-        "FUNCTION: my_func\n"
-        "INSERT_AFTER: def other():\n"
-        "```python\n"
-        "    pass\n"
-        "```\n"
-    )
+    llm = "FUNCTION: my_func\nINSERT_AFTER: def other():\n```python\n    pass\n```\n"
     r = _p().parse(llm, OutputMode.TARGETED_BLOCK)
     assert r.success and r.mode == OutputMode.TARGETED_BLOCK
     assert r.code == "    pass"
@@ -228,6 +198,7 @@ def test_targeted_missing_code_block_rejected():
 
 
 # ── _parse_full_file ───────────────────────────────────────────────────────
+
 
 def test_full_file_fenced():
     llm = "FILE: mod.py\n```python\nprint('hi')\n```\n"
@@ -258,8 +229,9 @@ def test_full_file_empty_content_rejected():
 
 # ── _parse_plan ────────────────────────────────────────────────────────────
 
+
 def test_plan_valid():
-    llm = "```json\n{\"operations\": [{\"op\": \"create\", \"path\": \"a.py\"}]}\n```\n"
+    llm = '```json\n{"operations": [{"op": "create", "path": "a.py"}]}\n```\n'
     r = _p().parse(llm, OutputMode.PLAN_JSON)
     assert r.success and r.mode == OutputMode.PLAN_JSON
     assert r.plan == {"operations": [{"op": "create", "path": "a.py"}]}
@@ -277,16 +249,16 @@ def test_plan_invalid_json_rejected():
 
 
 def test_plan_missing_operations_rejected():
-    llm = "```json\n{\"steps\": []}\n```\n"
+    llm = '```json\n{"steps": []}\n```\n'
     r = _p().parse(llm, OutputMode.PLAN_JSON)
     assert not r.success
 
 
 # ── dispatch table: total-failure path ─────────────────────────────────────
 
+
 def test_total_parse_failure():
     """Expected mode rejects AND both fallback modes reject → generic failure."""
-    r = _p().parse("totally unstructured prose with no markers at all",
-                   OutputMode.TARGETED_BLOCK)
+    r = _p().parse("totally unstructured prose with no markers at all", OutputMode.TARGETED_BLOCK)
     assert not r.success
     assert r.raw_output == "totally unstructured prose with no markers at all"

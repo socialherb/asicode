@@ -4,6 +4,7 @@ Unified path security utilities for asicode.
 All repo-relative path validation and resolution goes through this module.
 Prevents path traversal, absolute paths, and escape from repo root.
 """
+
 from __future__ import annotations
 
 import logging
@@ -12,12 +13,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def normalize_rel_path(p: str) -> str:
+def normalize_rel_path(p: str, *, preserve_git_prefix: bool = False) -> str:
     """
     Normalize a repo-relative file path.
 
     - Strips quotes, whitespace
-    - Removes a/ or b/ prefixes (git diff convention)
+    - Removes a/ or b/ prefixes (git diff convention) — unless
+      ``preserve_git_prefix=True`` (use when the path is a real repo path
+      that may legitimately live under an ``a/`` or ``b/`` directory)
     - Removes leading ./
     - Strips leading slashes (absolute paths normalize to relative)
     - Rejects drive letters and traversal (..)
@@ -25,7 +28,7 @@ def normalize_rel_path(p: str) -> str:
     """
     p = (p or "").strip().strip('"').strip("'")
     p = p.replace("\\", "/")
-    if p.startswith(("a/", "b/")):
+    if not preserve_git_prefix and p.startswith(("a/", "b/")):
         p = p[2:]
     while p.startswith("./"):
         p = p[2:]
@@ -87,9 +90,7 @@ def resolve_under_repo_subdir(repo_root: str, subdir: str, candidate: str) -> Pa
     try:
         p.relative_to(allowed_dir)
     except ValueError as e:
-        raise ValueError(
-            f"path_outside_allowed: {candidate!r} resolves to {p}, not under {allowed_dir}"
-        ) from e
+        raise ValueError(f"path_outside_allowed: {candidate!r} resolves to {p}, not under {allowed_dir}") from e
     return p
 
 

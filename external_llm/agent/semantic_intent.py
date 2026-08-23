@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Optional
+from typing import Any
 
 from .vector_cache import get_global_embedding_model
 
@@ -55,8 +55,7 @@ class SemanticIntentMatcher:
     label) so the margin has something to measure against.
     """
 
-    def __init__(self, examples: dict[str, list[str]], threshold: float,
-                 margin: float = 0.0, name: str = ""):
+    def __init__(self, examples: dict[str, list[str]], threshold: float, margin: float = 0.0, name: str = ""):
         self._examples = {label: list(phrases) for label, phrases in examples.items()}
         self._threshold = float(threshold)
         self._margin = float(margin)
@@ -119,7 +118,7 @@ class SemanticIntentMatcher:
             }
             self._available = True
 
-    def classify(self, text: str) -> Optional[tuple[str, float]]:
+    def classify(self, text: str) -> tuple[str, float] | None:
         """Return ``(best_label, mean_cosine_score)`` if the top label clears the
         threshold and beats the runner-up label by the margin, else ``None``.
 
@@ -131,6 +130,7 @@ class SemanticIntentMatcher:
         self._ensure_built()
         if not self._available:
             return None
+        assert self._model is not None and np is not None  # _ensure_built guarantees both when available
         try:
             query = self._model.encode(
                 [text],

@@ -1,6 +1,7 @@
 """
 Python syntax provider — wraps existing AST-based logic.
 """
+
 from __future__ import annotations
 
 import ast
@@ -8,7 +9,6 @@ import contextlib
 import logging
 import os
 from dataclasses import replace
-from typing import Optional
 
 from .base import SyntaxProvider, detect_project_root
 from .models import (
@@ -35,7 +35,6 @@ def _tree_sitter_available() -> bool:
     from .tree_sitter_utils import is_available, is_language_available
 
     return is_available() and is_language_available("python")
-
 
 
 _CAPABILITIES = LanguageCapabilities(
@@ -73,12 +72,14 @@ class PythonSyntaxProvider(SyntaxProvider):
         try:
             ast.parse(content, filename=file_path)
         except SyntaxError as e:
-            errors.append(SyntaxError_(
-                file=file_path,
-                line=e.lineno or 0,
-                col=e.offset or 0,
-                message=f"Syntax error: {e.msg}",
-            ))
+            errors.append(
+                SyntaxError_(
+                    file=file_path,
+                    line=e.lineno or 0,
+                    col=e.offset or 0,
+                    message=f"Syntax error: {e.msg}",
+                )
+            )
             return SyntaxValidationResult(ok=False, errors=errors, language=LanguageId.PYTHON)
 
         # 2. compile() — stricter, catches some issues AST doesn't. Non-syntax
@@ -87,17 +88,23 @@ class PythonSyntaxProvider(SyntaxProvider):
             try:
                 compile(content, file_path, "exec")
             except SyntaxError as e:
-                errors.append(SyntaxError_(
-                    file=file_path,
-                    line=e.lineno or 0,
-                    col=e.offset or 0,
-                    message=f"Compile error: {e.msg}",
-                ))
+                errors.append(
+                    SyntaxError_(
+                        file=file_path,
+                        line=e.lineno or 0,
+                        col=e.offset or 0,
+                        message=f"Compile error: {e.msg}",
+                    )
+                )
             except ValueError as e:
-                errors.append(SyntaxError_(
-                    file=file_path, line=0, col=0,
-                    message=f"Compile error: {e}",
-                ))
+                errors.append(
+                    SyntaxError_(
+                        file=file_path,
+                        line=0,
+                        col=0,
+                        message=f"Compile error: {e}",
+                    )
+                )
 
         return SyntaxValidationResult(
             ok=len(errors) == 0,
@@ -130,7 +137,8 @@ class PythonSyntaxProvider(SyntaxProvider):
         return self.validate_semantics_batch([file_path])[file_path]
 
     def validate_semantics_batch(
-        self, file_paths: list[str],
+        self,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """Semantic-check *file_paths* with one pyright process per project root.
 
@@ -154,7 +162,8 @@ class PythonSyntaxProvider(SyntaxProvider):
             # append surface on every other skipped file.
             if not p or not os.path.exists(p):
                 out[p] = SyntaxValidationResult.unchecked(
-                    LanguageId.PYTHON, "the file is not on disk",
+                    LanguageId.PYTHON,
+                    "the file is not on disk",
                 )
                 continue
             groups.setdefault(detect_project_root(p), []).append(p)
@@ -163,7 +172,9 @@ class PythonSyntaxProvider(SyntaxProvider):
         return out
 
     def _run_pyright(
-        self, project_root: str, file_paths: list[str],
+        self,
+        project_root: str,
+        file_paths: list[str],
     ) -> dict[str, SyntaxValidationResult]:
         """One pyright invocation over *file_paths*, split back out per file.
 
@@ -175,16 +186,14 @@ class PythonSyntaxProvider(SyntaxProvider):
         import subprocess
 
         def _skip(reason: str) -> dict[str, SyntaxValidationResult]:
-            return {
-                p: SyntaxValidationResult.unchecked(LanguageId.PYTHON, reason)
-                for p in file_paths
-            }
+            return {p: SyntaxValidationResult.unchecked(LanguageId.PYTHON, reason) for p in file_paths}
 
         cmd = ["pyright", "--outputjson", *file_paths]
         try:
             proc = subprocess.run(
                 cmd,
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
                 # Advisory only — non-blocking, surfaced for LLM self-healing.
                 # Scales with the batch so a large turn is not cut off at the
                 # single-file budget; the base 30 s dominates for small batches
@@ -237,14 +246,16 @@ class PythonSyntaxProvider(SyntaxProvider):
                     owner = None
                 if owner is None:
                     continue
-                collected[owner].append(SyntaxError_(
-                    file=owner,
-                    line=(start.get("line") or 0) + 1,  # pyright is 0-indexed
-                    col=(start.get("character") or 0) + 1,
-                    message=d.get("message", "").strip(),
-                    severity=sev,
-                    code=d.get("rule") or "",
-                ))
+                collected[owner].append(
+                    SyntaxError_(
+                        file=owner,
+                        line=(start.get("line") or 0) + 1,  # pyright is 0-indexed
+                        col=(start.get("character") or 0) + 1,
+                        message=d.get("message", "").strip(),
+                        severity=sev,
+                        code=d.get("rule") or "",
+                    )
+                )
                 if sev == "error":
                     failed.add(owner)
         return {
@@ -261,17 +272,21 @@ class PythonSyntaxProvider(SyntaxProvider):
     def get_symbol_patterns(self, kind: str = "any") -> list[SymbolPattern]:
         patterns: list[SymbolPattern] = []
         if kind in ("function", "any"):
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"(?:async\s+)?def\s+{name}\s*\(",
-                description="Python function/method definition",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"(?:async\s+)?def\s+{name}\s*\(",
+                    description="Python function/method definition",
+                )
+            )
         if kind in ("class", "any"):
-            patterns.append(SymbolPattern(
-                kind="class",
-                regex=r"class\s+{name}\s*[:\(]",
-                description="Python class definition",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="class",
+                    regex=r"class\s+{name}\s*[:\(]",
+                    description="Python class definition",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -284,19 +299,15 @@ class PythonSyntaxProvider(SyntaxProvider):
 
     # ── Lint / test commands ──────────────────────────────────────────────
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return ["ruff", "check", "--output-format=json", file_path]
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return ["python", "-m", "pytest", "-q"] + (test_args or [])
 
     # ── Symbol finder (tree-sitter → LibCST → stdlib ast) ─────────────────
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         """Return ``(start_line, end_line)`` for *symbol_name*.
 
         Priority: tree-sitter → LibCST → stdlib ast.
@@ -362,7 +373,8 @@ class PythonSyntaxProvider(SyntaxProvider):
     # ── Structural query methods (ast.parse-based) ─────────────────────────
 
     def find_top_level_definitions(
-        self, content: str,
+        self,
+        content: str,
     ) -> list[tuple[str, str, int, int]]:
         """Return ``[(name, kind, start_line, end_line), ...]`` for Python.
 
@@ -386,7 +398,9 @@ class PythonSyntaxProvider(SyntaxProvider):
         return results
 
     def find_class_methods(
-        self, content: str, class_name: str,
+        self,
+        content: str,
+        class_name: str,
     ) -> list[tuple[str, int, int]]:
         """Return ``[(method_name, start_line, end_line), ...]`` for a Python class.
 
@@ -395,7 +409,8 @@ class PythonSyntaxProvider(SyntaxProvider):
         return self.find_all_class_methods(content).get(class_name, [])
 
     def find_all_class_methods(
-        self, content: str,
+        self,
+        content: str,
     ) -> dict[str, list[tuple[str, int, int]]]:
         """Return ``{class_name: [(method_name, start_line, end_line), ...]}``.
 
@@ -422,8 +437,10 @@ class PythonSyntaxProvider(SyntaxProvider):
         return result
 
     def find_symbol_body_range(
-        self, content: str, symbol_name: str,
-    ) -> Optional[tuple[int, int]]:
+        self,
+        content: str,
+        symbol_name: str,
+    ) -> tuple[int, int] | None:
         """Return ``(body_start_line, body_end_line)`` for a Python function/method.
 
         Body = the indented block after the ``def`` signature (``:`` line).
@@ -460,7 +477,6 @@ class PythonSyntaxProvider(SyntaxProvider):
                     return None
                 return (body_start, end)
         return None
-
 
     def get_definition_keywords(self) -> list[str]:
         return ["def ", "async def ", "class "]

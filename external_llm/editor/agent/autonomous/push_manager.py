@@ -42,18 +42,18 @@ import queue
 import threading
 import time
 from collections.abc import AsyncIterator
-from typing import Any, Optional
+from typing import Any
 
 from external_llm.agent.config.thresholds import config as _cfg
 
 logger = logging.getLogger(__name__)
 
 # Module-level singleton
-_push_manager: Optional["PushManager"] = None
+_push_manager: PushManager | None = None
 _push_manager_lock = threading.Lock()
 
 
-def get_push_manager() -> "PushManager":
+def get_push_manager() -> PushManager:
     """Return the global PushManager singleton, creating it if needed."""
     global _push_manager
     with _push_manager_lock:
@@ -77,7 +77,7 @@ class PushManager:
     """
 
     CLIENT_QUEUE_SIZE = _cfg.counts.PUSH_CLIENT_QUEUE_SIZE
-    CLIENT_TTL = 3600          # seconds of silence before a client is considered stale
+    CLIENT_TTL = 3600  # seconds of silence before a client is considered stale
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -198,9 +198,9 @@ class PushManager:
         now = time.time()
         with self._lock:
             stale = [
-                cid for cid, info in self._clients.items()
-                if info.get("wake_loop") is None
-                and now - info.get("last_active", now) > self.CLIENT_TTL
+                cid
+                for cid, info in self._clients.items()
+                if info.get("wake_loop") is None and now - info.get("last_active", now) > self.CLIENT_TTL
             ]
             for cid in stale:
                 del self._clients[cid]
@@ -243,7 +243,7 @@ class PushManager:
             while True:
                 # Fast path
                 try:
-                    item: Optional[tuple] = q.get_nowait()
+                    item: tuple | None = q.get_nowait()
                 except queue.Empty:
                     # Slow path: park on the wake event with a keepalive timeout.
                     wake_event.clear()
@@ -252,6 +252,7 @@ class PushManager:
                     try:
                         item = q.get_nowait()
                     except queue.Empty:
+                        park_task: asyncio.Task | None = None  # bound below; cancels in every exit path
                         try:
                             # Park on the wake event with a keepalive timeout.
                             # Event.wait() is wrapped in a Task: asyncio.wait_for
@@ -263,11 +264,13 @@ class PushManager:
                             park_task = asyncio.create_task(wake_event.wait())
                             await asyncio.wait_for(park_task, timeout=15.0)
                         except asyncio.TimeoutError:
-                            park_task.cancel()
+                            if park_task is not None:
+                                park_task.cancel()
                             yield ": keepalive\n\n"
                             continue
                         except (GeneratorExit, asyncio.CancelledError):
-                            park_task.cancel()
+                            if park_task is not None:
+                                park_task.cancel()
                             raise
                         # Woken — drain whatever landed
                         try:

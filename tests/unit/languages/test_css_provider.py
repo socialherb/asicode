@@ -1,4 +1,5 @@
 """Unit tests for CssSyntaxProvider."""
+
 from __future__ import annotations
 
 import pytest
@@ -14,6 +15,7 @@ def provider():
 
 # ── language_id / capabilities ────────────────────────────────────────────────
 
+
 def test_language_id(provider):
     assert provider.language_id() == LanguageId.CSS
 
@@ -23,6 +25,7 @@ def test_capabilities_has_syntax_validator(provider):
 
 
 # ── Valid CSS ────────────────────────────────────────────────────────────────
+
 
 def test_valid_simple_rule(provider):
     result = provider.validate_syntax("style.css", "body { color: red; }")
@@ -62,6 +65,7 @@ def test_valid_string_with_brace(provider):
 
 # ── Invalid CSS: brace errors ─────────────────────────────────────────────────
 
+
 def test_unclosed_brace(provider):
     result = provider.validate_syntax("bad.css", "body { color: red;")
     assert result.ok is False
@@ -81,6 +85,7 @@ def test_mismatched_braces(provider):
 
 # ── Invalid CSS: comment/string errors ────────────────────────────────────────
 
+
 def test_unclosed_block_comment(provider):
     result = provider.validate_syntax("bad.css", "/* open comment\nbody { color: red; }")
     assert result.ok is False
@@ -98,6 +103,7 @@ def test_unclosed_string_single_quote(provider):
 
 
 # ── Error location ─────────────────────────────────────────────────────────────
+
 
 def test_error_has_file_path(provider):
     result = provider.validate_syntax("my/path.css", "}")
@@ -118,6 +124,7 @@ def test_language_in_result(provider):
 
 # ── File globs ───────────────────────────────────────────────────────────────
 
+
 def test_file_globs(provider):
     globs = provider.get_file_globs()
     assert "*.css" in globs
@@ -131,6 +138,7 @@ def test_file_globs(provider):
 # AST via tree_sitter_utils.find_all_symbols, not from provider regex
 # patterns. The provider's get_symbol_patterns therefore returns an empty
 # list — this is intentional and keeps CSS off the rg spawn path entirely.
+
 
 def test_get_symbol_patterns_empty(provider):
     """CSS symbols come from the tree-sitter AST (find_all_symbols), so the

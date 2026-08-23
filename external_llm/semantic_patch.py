@@ -5,7 +5,6 @@ import difflib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +47,7 @@ class SemanticPatchEngine:
         self,
         file_path: str,
         new_code: str,
-    ) -> Optional[SemanticPatchResult]:
+    ) -> SemanticPatchResult | None:
         """
         Try semantic patching for a single top-level Python symbol.
 
@@ -92,7 +91,6 @@ class SemanticPatchEngine:
                     new_code=normalized,
                     class_name=node0.name,
                 )
-
 
         except Exception as e:
             logger.debug("Semantic patch apply failed for %s: %s", file_path, e)
@@ -138,7 +136,7 @@ class SemanticPatchEngine:
         new_code: str,
         function_name: str,
         kind: str,
-    ) -> Optional[SemanticPatchResult]:
+    ) -> SemanticPatchResult | None:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
                 return self._replace_node(
@@ -157,7 +155,7 @@ class SemanticPatchEngine:
         tree: ast.AST,
         new_code: str,
         class_name: str,
-    ) -> Optional[SemanticPatchResult]:
+    ) -> SemanticPatchResult | None:
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name == class_name:
                 return self._replace_node(
@@ -186,8 +184,8 @@ class SemanticPatchEngine:
         # decorators like @property / @lru_cache / @app.route). Start the
         # replacement at the topmost decorator when one is present.
         decorator_list = getattr(node, "decorator_list", []) or []
-        start = (min(d.lineno for d in decorator_list) - 1) if decorator_list else (node.lineno - 1)
-        end = node.end_lineno
+        start = (min(d.lineno for d in decorator_list) - 1) if decorator_list else (node.lineno - 1)  # type: ignore[attr-defined]  # AST stmt node
+        end = node.end_lineno  # type: ignore[attr-defined]  # AST stmt node
 
         lines = source.splitlines()
         new_lines = new_code.splitlines()

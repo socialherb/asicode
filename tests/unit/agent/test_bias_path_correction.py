@@ -15,6 +15,7 @@ silently rewrote /workspace inside a heredoc body — live reproduction: a
 <<'PYEOF' python fixture had its /workspace/asicode token rewritten to the
 real repo path before python3 ever saw it.
 """
+
 import types
 
 import pytest
@@ -36,6 +37,7 @@ def bias():
 
 # ── (1) bare arguments ARE rewritten — existing intent preserved ─────────────
 
+
 @pytest.mark.parametrize("bias_token", ["/workspace", "/app", "/project", "/code", "/repo"])
 def test_bare_bias_path_rewritten(bias, bias_token):
     out = bias(f"cat {bias_token}/myproj/tests/x.py")
@@ -48,6 +50,7 @@ def test_cd_bias_path_rewritten(bias):
 
 
 # ── (2) literal regions are PROTECTED — the fix under test ───────────────────
+
 
 def test_single_quoted_search_pattern_protected(bias):
     # The path is a grep SEARCH PATTERN, not a real path — rewriting it would
@@ -75,6 +78,7 @@ def test_unquoted_heredoc_body_protected(bias):
 
 # ── mixed: rewrite + protect coexist (offset-shift safety) ───────────────────
 
+
 def test_bare_rewrite_and_quoted_protect_in_same_command(bias):
     # A bare bias path is rewritten while a quoted one in the SAME command is
     # left intact. Guards against protected-interval offsets going stale after
@@ -92,6 +96,7 @@ def test_bare_rewrite_and_quoted_protect_in_same_command(bias):
 # literally named `rename/asicode` had `git rev-parse rename/asicode` rewritten
 # to `git rev-parse <repo_root>`, which resolves to nothing and reads as ref
 # corruption.
+
 
 @pytest.mark.parametrize(
     "cmd",
@@ -119,6 +124,7 @@ def test_absolute_embedded_basename_is_still_rewritten(bias, cmd, expected):
 
 # ── idempotency ──────────────────────────────────────────────────────────────
 
+
 def test_real_repo_path_is_idempotent(bias):
     cmd = f"cd {REPO_ROOT} && echo hi"
     assert bias(cmd) == cmd
@@ -135,6 +141,7 @@ def test_empty_input(bias):
 # wrong file). A matched path that actually EXISTS on disk is real user data,
 # not a training-data bias path, and must be left untouched; only nonexistent
 # (virtual) paths are corrected.
+
 
 def test_real_existing_dir_not_rewritten(bias, tmp_path):
     real_dir = tmp_path / "myproj"
@@ -174,6 +181,7 @@ def test_real_existing_workspace_dir_not_rewritten(bias, monkeypatch):
 # user-intended destinations, never bias paths — rewriting sends the command
 # at the real repository (tar/cp/mv/rsync have no approval gate → silent
 # destructive overwrite).
+
 
 @pytest.mark.parametrize(
     "cmd",

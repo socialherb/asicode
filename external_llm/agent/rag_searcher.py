@@ -10,6 +10,7 @@ RAGSearcher(repo_root)
   .find_relevant_files(query, top_k, *, file_glob)  -> List[SearchResult]
   .invalidate_files(changed_paths)  # incremental index update after edits
 """
+
 from __future__ import annotations
 
 import fnmatch
@@ -21,7 +22,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # Deterministic, source-prioritized descent order shared with the symbol /
 # call-graph walkers — keeps the RAG corpus reproducible and source-first.
@@ -68,6 +69,7 @@ def _rag_should_skip_dir(d: str) -> bool:
     """
     return _walk_should_skip_dir(d) or d in _RAG_EXTRA_SKIP_DIRS
 
+
 _MAX_FILES = _cfg.counts.RAG_MAX_FILES
 _MAX_FILE_CHARS = _cfg.lines.RAG_FILE_CHARS
 
@@ -81,12 +83,13 @@ _MAX_FILE_CHARS = _cfg.lines.RAG_FILE_CHARS
 
 # ── Data class ────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class SearchResult:
-    file: str           # relative path from repo root
+    file: str  # relative path from repo root
     score: float
-    snippet: str        # most relevant excerpt (~120 chars)
-    line: int = 0       # approximate line of best match
+    snippet: str  # most relevant excerpt (~120 chars)
+    line: int = 0  # approximate line of best match
 
 
 # ── Shared per-repo index ─────────────────────────────────────────────────────
@@ -175,6 +178,7 @@ _TOKENIZER = CodeTokenizer()
 
 # ── Snippet extraction ────────────────────────────────────────────────────────
 
+
 def _extract_snippet(text: str, query_tokens: list[str], window: int = 120) -> tuple[str, int]:
     """Return (snippet, 1-indexed line) for the best-matching line.
 
@@ -215,6 +219,7 @@ def _extract_snippet(text: str, query_tokens: list[str], window: int = 120) -> t
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
+
 class RAGSearcher:
     """
     Lightweight BM25 code searcher.
@@ -235,7 +240,7 @@ class RAGSearcher:
         self,
         repo_root: str,
         vector_cache_enabled: bool = True,
-        cancel_event: Optional[threading.Event] = None,
+        cancel_event: threading.Event | None = None,
         config: Any = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
@@ -282,7 +287,7 @@ class RAGSearcher:
         # only when that generation still matches, so a mutation by ANY
         # instance (which bumps the SHARED generation) cannot leave a stale
         # entry alive for the 5-min TTL in a sibling instance's cache.
-        self._search_cache: "OrderedDict[str, tuple[float, int, list[SearchResult]]]" = OrderedDict()
+        self._search_cache: OrderedDict[str, tuple[float, int, list[SearchResult]]] = OrderedDict()
         self._search_cache_lock = threading.Lock()
         self._search_cache_max = 256  # bound (LRU eviction) — match ToolResultCache
 
@@ -394,7 +399,7 @@ class RAGSearcher:
         query: str,
         top_k: int = 5,
         *,
-        file_glob: Optional[str] = None,
+        file_glob: str | None = None,
     ) -> list[SearchResult]:
         """
         Return top_k files most relevant to query using hybrid BM25 + vector search.
@@ -567,10 +572,7 @@ class RAGSearcher:
                 file_exists
                 and abs_path.suffix.lower() in _INDEXED_EXTS
                 and not Path(norm_path).name.endswith(_WALK_SKIP_FILE_SUFFIXES)
-                and not any(
-                    _rag_should_skip_dir(part)
-                    for part in Path(norm_path).parts[:-1]
-                )
+                and not any(_rag_should_skip_dir(part) for part in Path(norm_path).parts[:-1])
             )
             if not is_indexable:
                 continue
@@ -702,9 +704,7 @@ class RAGSearcher:
         # match the mutated arrays (rebuilt wholesale — list.pop shifts every
         # later index, so incremental maintenance within the loop is unsafe).
         self._index_generation += 1
-        self._rel_path_to_idx = {
-            _p: _i for _i, _p in enumerate(self._rel_paths)
-        }
+        self._rel_path_to_idx = {_p: _i for _i, _p in enumerate(self._rel_paths)}
         return vc_updates
 
     def _fingerprint_diff_locked(self) -> tuple[list[str], list[str], list[str], bool]:
@@ -755,7 +755,7 @@ class RAGSearcher:
 
     # ── hybrid search methods ────────────────────────────────────────────────
 
-    def _bm25_search(self, query: str, top_k: int, file_glob: Optional[str] = None) -> list[SearchResult]:
+    def _bm25_search(self, query: str, top_k: int, file_glob: str | None = None) -> list[SearchResult]:
         """BM25-only search returning SearchResult objects."""
         q_tokens = _TOKENIZER.tokenize(query)
         if not q_tokens:
@@ -787,23 +787,22 @@ class RAGSearcher:
                 if s > 0:
                     scored.append((s, i))
             scored.sort(reverse=True)
-            winners = [
-                (s, rel_paths[idx], doc_texts[idx])
-                for s, idx in scored[:top_k]
-            ]
+            winners = [(s, rel_paths[idx], doc_texts[idx]) for s, idx in scored[:top_k]]
 
         results: list[SearchResult] = []
         for s, path, text in winners:
             snippet, line = _extract_snippet(text, q_tokens)
-            results.append(SearchResult(
-                file=path,
-                score=round(s, 3),
-                snippet=snippet,
-                line=line,
-            ))
+            results.append(
+                SearchResult(
+                    file=path,
+                    score=round(s, 3),
+                    snippet=snippet,
+                    line=line,
+                )
+            )
         return results
 
-    def _vector_search(self, query: str, top_k: int, file_glob: Optional[str] = None) -> list[SearchResult]:
+    def _vector_search(self, query: str, top_k: int, file_glob: str | None = None) -> list[SearchResult]:
         """Vector cache search returning SearchResult objects."""
         if not self.vector_cache_enabled or self.vector_cache_manager is None:
             return []
@@ -848,26 +847,30 @@ class RAGSearcher:
             # BM25 scores are typically 0-15+, so we scale vector scores
             vector_score = item["score"] * 10.0  # Scale to 0-10 range
 
-            results.append(SearchResult(
-                file=file_path,
-                score=round(vector_score, 3),
-                snippet=snippet,
-                line=line,
-            ))
+            results.append(
+                SearchResult(
+                    file=file_path,
+                    score=round(vector_score, 3),
+                    snippet=snippet,
+                    line=line,
+                )
+            )
 
         return results
 
-    def _merge_results(self, bm25_results: list[SearchResult], vector_results: list[SearchResult], top_k: int) -> list[SearchResult]:
+    def _merge_results(
+        self, bm25_results: list[SearchResult], vector_results: list[SearchResult], top_k: int
+    ) -> list[SearchResult]:
         """Merge and deduplicate BM25 and vector search results using Reciprocal Rank Fusion."""
         all_files = {r.file for r in bm25_results} | {r.file for r in vector_results}
 
         # Reciprocal Rank Fusion — no score normalization needed, just ranks
-        RRF_K = 60.0
+        _rrf_k = 60.0
 
         def _rrf_score(file: str, rank_list: list[SearchResult]) -> float:
             for rank, r in enumerate(rank_list):
                 if r.file == file:
-                    return 1.0 / (RRF_K + rank)
+                    return 1.0 / (_rrf_k + rank)
             return 0.0
 
         scored_files: list[tuple[float, str]] = []
@@ -886,25 +889,29 @@ class RAGSearcher:
             vector_result = next((r for r in vector_results if r.file == file), None)
 
             if bm25_result:
-                final_results.append(SearchResult(
-                    file=file,
-                    score=round(score, 4),
-                    snippet=bm25_result.snippet,
-                    line=bm25_result.line,
-                ))
+                final_results.append(
+                    SearchResult(
+                        file=file,
+                        score=round(score, 4),
+                        snippet=bm25_result.snippet,
+                        line=bm25_result.line,
+                    )
+                )
             elif vector_result:
-                final_results.append(SearchResult(
-                    file=file,
-                    score=round(score, 4),
-                    snippet=vector_result.snippet,
-                    line=vector_result.line,
-                ))
+                final_results.append(
+                    SearchResult(
+                        file=file,
+                        score=round(score, 4),
+                        snippet=vector_result.snippet,
+                        line=vector_result.line,
+                    )
+                )
 
         return final_results
 
     # ── internal ──────────────────────────────────────────────────────────────
 
-    def _make_cache_key(self, query: str, top_k: int, file_glob: Optional[str]) -> str:
+    def _make_cache_key(self, query: str, top_k: int, file_glob: str | None) -> str:
         """Generate cache key for search parameters."""
         key_data = f"{query}:{top_k}:{file_glob if file_glob else ''}"
         return hashlib.md5(key_data.encode(), usedforsecurity=False).hexdigest()
@@ -936,7 +943,9 @@ class RAGSearcher:
                         "RAG index for %s TRUNCATED at %d files (cap %d) — files beyond "
                         "the cap are INVISIBLE to find_relevant_files. Raise "
                         "RAG_MAX_FILES if the repo is larger.",
-                        self.repo_root, self._n_docs, _MAX_FILES,
+                        self.repo_root,
+                        self._n_docs,
+                        _MAX_FILES,
                     )
                 self._built = True
                 self._reconciled = True
@@ -959,7 +968,8 @@ class RAGSearcher:
                     return
                 logger.debug(
                     "RAG index rebuilt (cap-mode): %d docs in %.2fs",
-                    self._n_docs, time.monotonic() - t0,
+                    self._n_docs,
+                    time.monotonic() - t0,
                 )
                 self._built = True
                 self._reconciled = True
@@ -987,7 +997,7 @@ class RAGSearcher:
                     logger.debug("RAG vector-cache update failed: %s", e)
         self._reconciled = True
 
-    def _get_cancel_event(self) -> Optional[threading.Event]:
+    def _get_cancel_event(self) -> threading.Event | Any:  # composite cancel duck-types is_set()
         """Return the live cooperative-cancel event.
 
         Reads ``config.cancel_event`` FRESH (call-time, not construction-time)
@@ -1142,6 +1152,7 @@ class RAGSearcher:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _match_glob(path: str, pattern: str) -> bool:
     return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(Path(path).name, pattern)

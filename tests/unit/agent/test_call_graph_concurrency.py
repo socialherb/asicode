@@ -126,9 +126,7 @@ def test_concurrent_read_and_invalidate_no_crash(tmp_path: Path) -> None:
     finally:
         sys.setswitchinterval(prev_interval)
 
-    assert not errors, (
-        f"concurrent access raised: {[type(e).__name__ for e in errors]}"
-    )
+    assert not errors, f"concurrent access raised: {[type(e).__name__ for e in errors]}"
 
 
 def test_concurrent_build_no_lost_updates(tmp_path: Path) -> None:
@@ -158,12 +156,8 @@ def test_concurrent_build_no_lost_updates(tmp_path: Path) -> None:
     with idx._lock:
         assert idx._built, "index not built after concurrent first-access"
         for k in range(_N_MODS):
-            assert f"Klass{k}.method_{k}" in idx._nodes, (
-                f"missing qualified node Klass{k}.method_{k} (lost update)"
-            )
-            assert f"Klass{k}.helper_{k}" in idx._nodes, (
-                f"missing qualified node Klass{k}.helper_{k} (lost update)"
-            )
+            assert f"Klass{k}.method_{k}" in idx._nodes, f"missing qualified node Klass{k}.method_{k} (lost update)"
+            assert f"Klass{k}.helper_{k}" in idx._nodes, f"missing qualified node Klass{k}.helper_{k} (lost update)"
     # Known edges resolve under the public API.
     callees = idx.get_callees("method_0")  # suffix-fallback
     callee_syms = {e.callee_symbol for e in callees}
@@ -194,6 +188,7 @@ def test_invalidate_then_read_rebuilds_consistently(tmp_path: Path) -> None:
 # ``analyze_change_impact``) must bail out promptly on ESC / Ctrl-C and leave NO
 # partially-built index visible to the in-flight query (which would otherwise
 # run ``_lookup_edges`` on a torn ``_forward``).
+
 
 def test_build_with_pre_set_cancel_event_no_partial_index(tmp_path: Path) -> None:
     """A pre-set cancel_event short-circuits build() at the first checkpoint."""
@@ -267,23 +262,25 @@ def test_build_without_cancel_event_unchanged(tmp_path: Path) -> None:
 # call-time fresh read vulture uses in analysis_tools. ``config=`` (not
 # ``cancel_event=``) is the ToolRegistry wiring.
 
+
 def test_build_honors_per_turn_config_mutation(tmp_path: Path) -> None:
     """ESC pressed via a config.cancel_event set AFTER construction is honored."""
     import types
+
     _seed_repo(tmp_path, n=10)
-    cfg = types.SimpleNamespace(cancel_event=None)      # asi.py:6703 state at construction
-    idx = CallGraphIndexer(str(tmp_path), config=cfg)   # ToolRegistry wiring (config=)
-    assert idx._cancel_event is None                    # construction-time value frozen
-    assert idx._get_cancel_event() is None              # no event yet
+    cfg = types.SimpleNamespace(cancel_event=None)  # asi.py:6703 state at construction
+    idx = CallGraphIndexer(str(tmp_path), config=cfg)  # ToolRegistry wiring (config=)
+    assert idx._cancel_event is None  # construction-time value frozen
+    assert idx._get_cancel_event() is None  # no event yet
 
     # Per-turn mutation (asi.py:8536): a live event lands on config AFTER build.
     ev = threading.Event()
     cfg.cancel_event = ev
-    ev.set()                                           # ESC pressed
-    assert idx._cancel_event is None                   # STILL frozen None ...
-    assert idx._get_cancel_event() is ev               # ... but fresh read sees live event
+    ev.set()  # ESC pressed
+    assert idx._cancel_event is None  # STILL frozen None ...
+    assert idx._get_cancel_event() is ev  # ... but fresh read sees live event
     idx.build()
-    assert idx._built is False                         # fresh read → cancel honored
+    assert idx._built is False  # fresh read → cancel honored
     assert len(idx._nodes) == 0 and len(idx._forward) == 0
 
     # Clear ESC → same indexer now builds (fresh read reflects the clear).
@@ -296,6 +293,7 @@ def test_build_honors_per_turn_config_mutation(tmp_path: Path) -> None:
 def test_build_with_config_no_event_builds_normally(tmp_path: Path) -> None:
     """config passed but cancel_event stays None → builds exactly as before."""
     import types
+
     _seed_repo(tmp_path, n=10)
     cfg = types.SimpleNamespace(cancel_event=None)
     idx = CallGraphIndexer(str(tmp_path), config=cfg)

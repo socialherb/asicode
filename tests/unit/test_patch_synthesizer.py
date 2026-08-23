@@ -5,6 +5,7 @@ whitespace that the BEFORE block lacks, the ASICODE_BLOCK synthesis must
 still emit a real diff (previously it produced an empty diff, silently
 losing the change).
 """
+
 from __future__ import annotations
 
 import os
@@ -44,7 +45,7 @@ def test_fallback1_trailing_whitespace_applies_change():
     """Trailing whitespace in file line (absent in BEFORE) must still apply."""
     with tempfile.TemporaryDirectory() as td:
         content = "def foo():\n    return 1   \n"  # trailing ws
-        before = "def foo():\n    return 1\n"   # no trailing ws
+        before = "def foo():\n    return 1\n"  # no trailing ws
         after = "def foo():\n    return 2\n"
         diff = _synth(td, content, before, after)
         # Regression: previously this returned "" (silent no-op).
@@ -68,8 +69,8 @@ def test_fallback2_reindents_after_to_window_base():
     """Fallback 2 must shift AFTER to the matched window's base indent (8 cols)."""
     with tempfile.TemporaryDirectory() as td:
         content = "        x = 1\n        y = 2\n"
-        before = "    x = 1\n    y = 2\n"      # before base = 4
-        after = "    x = 9\n    y = 2\n"       # after at 4 -> must shift to 8
+        before = "    x = 1\n    y = 2\n"  # before base = 4
+        after = "    x = 9\n    y = 2\n"  # after at 4 -> must shift to 8
         diff = _synth(td, content, before, after)
         # applied AFTER line should be at 8-col indent, not 4
         assert "+        x = 9" in diff
@@ -102,6 +103,7 @@ def test_full_file_mode_creates_diff():
 # ---------------------------------------------------------------------------
 # P23-1: size gate + errors="replace" on synthesis target reads
 # ---------------------------------------------------------------------------
+
 
 def test_oversized_file_raises_file_too_large_full_file():
     """FULL_FILE synthesis of an oversized target must raise, not read unbounded."""
@@ -144,6 +146,7 @@ def test_invalid_utf8_replaced_not_dropped():
 # ---------------------------------------------------------------------------
 # P9-2: SSOT regression gates — duplicated policy values must not reappear
 # ---------------------------------------------------------------------------
+
 
 def test_p9_2_synthesis_cap_is_single_source_of_truth():
     """_MAX_SYNTHESIZE_FILE_CHARS must be an alias of PatchEngine._MAX_FILE_CHARS,

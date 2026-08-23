@@ -1,4 +1,5 @@
 """Tests for external_llm/analysis/parse_cache.py."""
+
 from __future__ import annotations
 
 import tempfile
@@ -58,8 +59,7 @@ def test_ensure_capacity_grows_cache():
     parse_cache.ensure_capacity(1000)
     info = parse_cache.cache_info()
     # 1000 + headroom, capped at _MAX_CACHE_SIZE.
-    assert info.maxsize == min(1000 + parse_cache._CAPACITY_HEADROOM,
-                               parse_cache._MAX_CACHE_SIZE)
+    assert info.maxsize == min(1000 + parse_cache._CAPACITY_HEADROOM, parse_cache._MAX_CACHE_SIZE)
 
 
 def test_ensure_capacity_is_capped():

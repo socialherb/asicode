@@ -6,6 +6,7 @@ Covers:
   - DesignChatLoop plan gate: nudge on early exit, honest exit after nudges,
     no gate without a plan, ephemeral plan re-injection
 """
+
 from types import SimpleNamespace
 
 from external_llm.agent.design_chat_loop import DesignChatLoop
@@ -22,12 +23,16 @@ from external_llm.client import LLMMessage
 # plan_state
 # ---------------------------------------------------------------------------
 
+
 class TestValidatePlan:
     def test_valid_plan_normalizes(self):
-        plan, err = validate_plan("build X", [
-            {"title": "step 1"},
-            {"title": "step 2", "status": "in_progress"},
-        ])
+        plan, err = validate_plan(
+            "build X",
+            [
+                {"title": "step 1"},
+                {"title": "step 2", "status": "in_progress"},
+            ],
+        )
         assert err == ""
         assert plan["goal"] == "build X"
         assert plan["items"][0]["status"] == "pending"
@@ -68,12 +73,15 @@ class TestValidatePlan:
 
 class TestOpenItemsAndRender:
     def test_open_items_filters_terminal(self):
-        plan, _ = validate_plan("g", [
-            {"title": "a", "status": "done"},
-            {"title": "b", "status": "pending"},
-            {"title": "c", "status": "blocked", "note": "x"},
-            {"title": "d", "status": "in_progress"},
-        ])
+        plan, _ = validate_plan(
+            "g",
+            [
+                {"title": "a", "status": "done"},
+                {"title": "b", "status": "pending"},
+                {"title": "c", "status": "blocked", "note": "x"},
+                {"title": "d", "status": "in_progress"},
+            ],
+        )
         titles = [it["title"] for it in open_items(plan)]
         assert titles == ["b", "d"]
 
@@ -81,10 +89,13 @@ class TestOpenItemsAndRender:
         assert open_items(None) == []
 
     def test_render_contains_goal_and_progress(self):
-        plan, _ = validate_plan("build X", [
-            {"title": "a", "status": "done"},
-            {"title": "b"},
-        ])
+        plan, _ = validate_plan(
+            "build X",
+            [
+                {"title": "a", "status": "done"},
+                {"title": "b"},
+            ],
+        )
         out = render_plan(plan)
         assert "Goal: build X" in out
         assert "[x] a" in out
@@ -93,9 +104,12 @@ class TestOpenItemsAndRender:
 
     def test_render_with_note(self):
         """render_plan includes note text when present (line 132)."""
-        plan, _ = validate_plan("g", [
-            {"title": "a", "note": "waiting on review"},
-        ])
+        plan, _ = validate_plan(
+            "g",
+            [
+                {"title": "a", "note": "waiting on review"},
+            ],
+        )
         out = render_plan(plan)
         assert "[ ] a — waiting on review" in out
 
@@ -139,6 +153,7 @@ class TestDiffPlans:
 # _tool_update_plan handler
 # ---------------------------------------------------------------------------
 
+
 class _FakeHost(AgentToolsMixin):
     def _make_result(self, ok, content, error=None, metadata=None):
         return SimpleNamespace(ok=ok, content=content, error=error, metadata=metadata or {})
@@ -168,9 +183,14 @@ class TestUpdatePlanHandler:
         host = _FakeHost()
         res1 = host._tool_update_plan({"goal": "g", "items": [{"title": "a"}, {"title": "b"}]})
         assert res1.content.splitlines()[0].startswith("Plan created: 2 item(s)")
-        res2 = host._tool_update_plan({"items": [
-            {"title": "a", "status": "done"}, {"title": "b", "status": "in_progress"},
-        ]})
+        res2 = host._tool_update_plan(
+            {
+                "items": [
+                    {"title": "a", "status": "done"},
+                    {"title": "b", "status": "in_progress"},
+                ]
+            }
+        )
         first = res2.content.splitlines()[0]
         assert "'a' pending→done" in first and "'b' pending→in_progress" in first
         assert res2.metadata["summary"] == first
@@ -180,11 +200,17 @@ class TestUpdatePlanHandler:
 # DesignChatLoop plan completion gate
 # ---------------------------------------------------------------------------
 
+
 def _resp(content):
     return SimpleNamespace(
-        tool_calls=[], content=content, raw_response={},
-        tokens_used=10, prompt_tokens=8, completion_tokens=2,
-        cache_read_input_tokens=0, cache_creation_input_tokens=0,
+        tool_calls=[],
+        content=content,
+        raw_response={},
+        tokens_used=10,
+        prompt_tokens=8,
+        completion_tokens=2,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
         provider="fake",
     )
 
@@ -220,11 +246,13 @@ class _FakeRegistry:
 
 
 def _make_plan(statuses):
-    plan, err = validate_plan("big goal", [
-        {"title": f"item {i}", "status": s,
-         **({"note": "reason"} if s in ("skipped", "blocked") else {})}
-        for i, s in enumerate(statuses)
-    ])
+    plan, err = validate_plan(
+        "big goal",
+        [
+            {"title": f"item {i}", "status": s, **({"note": "reason"} if s in ("skipped", "blocked") else {})}
+            for i, s in enumerate(statuses)
+        ],
+    )
     assert err == ""
     return plan
 

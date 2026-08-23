@@ -13,6 +13,7 @@ as two separate files, so a crash mid-save can leave them inconsistent:
 
 These tests use the REAL faiss/numpy stack (skipped when unavailable).
 """
+
 from __future__ import annotations
 
 import json

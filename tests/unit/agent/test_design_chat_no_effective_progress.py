@@ -14,6 +14,7 @@ end-to-end wiring contract between ``DesignChatLoop._process_tool_call`` and the
   two-regime split documented on the gate);
 * predicate error               → fail-open (ok preserved).
 """
+
 from __future__ import annotations
 
 from unittest import mock

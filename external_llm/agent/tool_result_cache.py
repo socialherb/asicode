@@ -1,6 +1,7 @@
 """
 Tool result cache for safe reuse of read-only tool results.
 """
+
 import hashlib
 import json
 import logging
@@ -9,7 +10,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def _paths_overlap(a: str, b: str) -> bool:
     return b.startswith(a_dir) or a.startswith(b_dir)
 
 
-def _path_sig(path: str) -> Optional[tuple[int, int, int]]:
+def _path_sig(path: str) -> tuple[int, int, int] | None:
     """``(st_mtime_ns, st_size, st_ino)`` of *path*, or None if it does not exist.
 
     Compared on every cache hit to detect external writers that bypass the
@@ -55,6 +56,7 @@ def _path_sig(path: str) -> Optional[tuple[int, int, int]]:
 @dataclass
 class CachedResult:
     """A cached tool result with metadata."""
+
     result: dict[str, Any]  # Serializable ToolResult fields
     timestamp: float
     ttl: int
@@ -62,11 +64,12 @@ class CachedResult:
     # is unknown/repo-wide (e.g. a search with no path filter). Entries with
     # unknown scope are conservatively dropped by invalidate_paths() since we
     # can't prove they don't depend on whatever was just written.
-    paths: Optional[frozenset[str]] = None
+    paths: frozenset[str] | None = None
     # Path -> (st_mtime_ns, st_size) captured at READ time (pre-handler, by
     # the dispatch pre-capture) — a hit whose current signature differs is
     # dropped. None when ``paths`` is None.
-    file_sigs: Optional[dict[str, Optional[tuple[int, int]]]] = None
+    file_sigs: dict[str, tuple[int, int, int] | None] | None = None
+
 
 class ToolResultCache:
     """TTL-based LRU cache for tool results.
@@ -105,12 +108,13 @@ class ToolResultCache:
                 "Tool result cache key for %r includes non-JSON-serializable "
                 "arg(s); if its str() varies across calls (e.g. contains an "
                 "object id), this call will never cache-hit: %r",
-                tool_name, args,
+                tool_name,
+                args,
             )
         key_str = f"{tool_name}:{stable_args}"
         return hashlib.sha256(key_str.encode()).hexdigest()
 
-    def get(self, tool_name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def get(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
         """Retrieve cached result if present and not expired."""
         key = self._make_key(tool_name, args)
         with self._lock:
@@ -145,9 +149,13 @@ class ToolResultCache:
             return cached.result
 
     def set(
-        self, tool_name: str, args: dict[str, Any], result: dict[str, Any],
-        ttl: Optional[int] = None, paths: Optional[frozenset[str]] = None,
-        file_sigs: Optional[dict[str, Optional[tuple[int, int]]]] = None,
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        ttl: int | None = None,
+        paths: frozenset[str] | None = None,
+        file_sigs: dict[str, tuple[int, int, int] | None] | None = None,
     ):
         """Store a result in the cache.
 
@@ -185,10 +193,7 @@ class ToolResultCache:
                 file_sigs=(
                     None
                     if paths is None
-                    else (
-                        file_sigs if file_sigs is not None
-                        else {p: _path_sig(p) for p in paths}
-                    )
+                    else (file_sigs if file_sigs is not None else {p: _path_sig(p) for p in paths})
                 ),
             )
 
@@ -220,9 +225,9 @@ class ToolResultCache:
             return before
         with self._lock:
             stale_keys = [
-                key for key, cached in self._cache.items()
-                if cached.paths is None
-                or any(_paths_overlap(p, wp) for p in cached.paths for wp in paths)
+                key
+                for key, cached in self._cache.items()
+                if cached.paths is None or any(_paths_overlap(p, wp) for p in cached.paths for wp in paths)
             ]
             for key in stale_keys:
                 del self._cache[key]

@@ -1,4 +1,5 @@
 """Tests for PatchEngine (external_llm/patch_engine.py)."""
+
 import os
 from unittest.mock import MagicMock, patch
 
@@ -6,13 +7,7 @@ import pytest
 
 from external_llm.patch_engine import PatchContext, PatchEngine, PatchResult
 
-MINIMAL_DIFF = (
-    "--- a/foo.py\n"
-    "+++ b/foo.py\n"
-    "@@ -1,2 +1,2 @@\n"
-    "-x = 1\n"
-    "+x = 2\n"
-)
+MINIMAL_DIFF = "--- a/foo.py\n+++ b/foo.py\n@@ -1,2 +1,2 @@\n-x = 1\n+x = 2\n"
 
 
 @pytest.fixture
@@ -28,6 +23,7 @@ def engine(tmp_repo):
 
 
 # ── PatchContext / PatchResult dataclasses ────────────────────────────────────
+
 
 class TestPatchContextResult:
     def test_patch_context_defaults(self):
@@ -65,6 +61,7 @@ class TestPatchContextResult:
 
 # ── _looks_like_unified_diff ──────────────────────────────────────────────────
 
+
 class TestLooksLikeUnifiedDiff:
     def test_valid_diff_detected(self, engine):
         assert engine._looks_like_unified_diff(MINIMAL_DIFF) is True
@@ -93,6 +90,7 @@ class TestLooksLikeUnifiedDiff:
 
 # ── normalize_and_validate ────────────────────────────────────────────────────
 
+
 class TestNormalizeAndValidate:
     def test_empty_patch_returns_error(self, engine):
         _p, err = engine.normalize_and_validate("", None)
@@ -114,12 +112,13 @@ class TestNormalizeAndValidate:
         diff_no_newline = MINIMAL_DIFF.rstrip("\n")
         # After normalization, trailing newline should be present
         # (we mock git check to avoid real git dependency)
-        with patch.object(engine, '_git_apply_check_best_effort', return_value=(True, None)):
+        with patch.object(engine, "_git_apply_check_best_effort", return_value=(True, None)):
             p, _err = engine.normalize_and_validate(diff_no_newline, None)
         assert p.endswith("\n")
 
 
 # ── _output_mode_to_enum ──────────────────────────────────────────────────────
+
 
 class TestOutputModeToEnum:
     def test_known_modes_mapped(self, engine):
@@ -144,6 +143,7 @@ class TestOutputModeToEnum:
 
 # ── apply_patch (without real git) ────────────────────────────────────────────
 
+
 class TestApplyPatch:
     def test_empty_patch_fails(self, engine):
         result = engine.apply_patch("", target_file=None)
@@ -165,7 +165,7 @@ class TestApplyPatch:
         with open(foo_path, "w") as f:
             f.write("x = 1\n")
         engine._diff_apply = MagicMock(return_value=(True, None, "git_apply_success", {}))
-        with patch.object(engine, 'normalize_and_validate', return_value=(MINIMAL_DIFF, None)):
+        with patch.object(engine, "normalize_and_validate", return_value=(MINIMAL_DIFF, None)):
             result = engine.apply_patch(MINIMAL_DIFF)
         assert result.success is True
         assert result.metadata["mode"] == "git_apply"
@@ -173,12 +173,17 @@ class TestApplyPatch:
     def test_diff_apply_failure_falls_through(self, engine):
         """When _diff_apply fails, repair ladder is attempted."""
         engine._diff_apply = MagicMock(return_value=(False, "hunk mismatch", "hunk_mismatch", {}))
-        with patch.object(engine, 'normalize_and_validate', return_value=(MINIMAL_DIFF, None)), \
-             patch.object(engine, '_tolerant_git_apply', return_value=(False, "fail", "tol")), \
-             patch.object(engine, '_exact_reanchor_patch', return_value=None), \
-             patch.object(engine, '_reanchor_patch', return_value=None), \
-             patch.object(engine, 'repair_patch', return_value=PatchResult(
-                 success=False, metadata={"fallback_used": [], "error": "all failed"})):
+        with (
+            patch.object(engine, "normalize_and_validate", return_value=(MINIMAL_DIFF, None)),
+            patch.object(engine, "_tolerant_git_apply", return_value=(False, "fail", "tol")),
+            patch.object(engine, "_exact_reanchor_patch", return_value=None),
+            patch.object(engine, "_reanchor_patch", return_value=None),
+            patch.object(
+                engine,
+                "repair_patch",
+                return_value=PatchResult(success=False, metadata={"fallback_used": [], "error": "all failed"}),
+            ),
+        ):
             result = engine.apply_patch(MINIMAL_DIFF)
         assert result.success is False
 
@@ -189,18 +194,24 @@ class TestApplyPatch:
         with open(foo_path, "w") as f:
             f.write("x = 1\n")
         engine._diff_apply = None
-        with patch.object(engine, 'normalize_and_validate', return_value=(MINIMAL_DIFF, None)), \
-             patch.object(engine, '_tolerant_git_apply', return_value=(False, "fail", "tol")), \
-             patch.object(engine, '_exact_reanchor_patch', return_value=None), \
-             patch.object(engine, '_reanchor_patch', return_value=None), \
-             patch.object(engine, 'repair_patch', return_value=PatchResult(
-                 success=False, metadata={"fallback_used": [], "error": "no diff"})):
+        with (
+            patch.object(engine, "normalize_and_validate", return_value=(MINIMAL_DIFF, None)),
+            patch.object(engine, "_tolerant_git_apply", return_value=(False, "fail", "tol")),
+            patch.object(engine, "_exact_reanchor_patch", return_value=None),
+            patch.object(engine, "_reanchor_patch", return_value=None),
+            patch.object(
+                engine,
+                "repair_patch",
+                return_value=PatchResult(success=False, metadata={"fallback_used": [], "error": "no diff"}),
+            ),
+        ):
             result = engine.apply_patch(MINIMAL_DIFF)
         assert result.success is False
         assert "diff_apply module not available" in result.metadata.get("first_fail_reason", "")
 
 
 # ── _try_synthesize_diff_from_file_blocks ─────────────────────────────────────
+
 
 class TestSynthesizeDiffFromFileBlocks:
     def test_missing_target_file(self, engine, tmp_repo):
@@ -223,10 +234,8 @@ class TestSynthesizeDiffFromFileBlocks:
         content = "x = 1\n"
         with open(target, "w") as f:
             f.write(content)
-        llm_text = f'FILE: same.py\n```\n{content}```\n'
-        _diff, reason = engine._try_synthesize_diff_from_file_blocks(
-            tmp_repo, "same.py", llm_text
-        )
+        llm_text = f"FILE: same.py\n```\n{content}```\n"
+        _diff, reason = engine._try_synthesize_diff_from_file_blocks(tmp_repo, "same.py", llm_text)
         assert reason == "no_changes"
 
     def test_valid_file_block_produces_diff(self, engine, tmp_repo):
@@ -237,23 +246,16 @@ class TestSynthesizeDiffFromFileBlocks:
         with open(target, "w") as f:
             f.write("x = 1\ny = 2\nz = 3\n")
         llm_text = "FILE: mod.py\n```\nx = 1\ny = 9\nz = 3\n```\n"
-        diff, reason = engine._try_synthesize_diff_from_file_blocks(
-            tmp_repo, "mod.py", llm_text
-        )
+        diff, reason = engine._try_synthesize_diff_from_file_blocks(tmp_repo, "mod.py", llm_text)
         assert reason in ("file_block_synth", "") or "@@ " in diff
+
     class TestExactReanchorPatch:
         def test_substring_false_positive_rejected(self, engine, tmp_repo):
             target = os.path.join(tmp_repo, "test_substring.py")
             with open(target, "w") as f:
                 f.write("return validate(self):\n")
                 f.write("something else\n")
-            diff = (
-                "--- a/test_substring.py\n"
-                "+++ b/test_substring.py\n"
-                "@@ -1,2 +1,2 @@\n"
-                "-return val\n"
-                "+return other\n"
-            )
+            diff = "--- a/test_substring.py\n+++ b/test_substring.py\n@@ -1,2 +1,2 @@\n-return val\n+return other\n"
             result = engine._exact_reanchor_patch(diff, target)
             assert result is None, "Substring match should not reanchor"
 
@@ -264,13 +266,7 @@ class TestSynthesizeDiffFromFileBlocks:
                 f.write("something else\n")
             # Diff claims the hunk is at line 5, but the actual content is at line 1.
             # offset_diff = |0 - 4| = 4 → triggers reanchoring.
-            diff = (
-                "--- a/test_exact.py\n"
-                "+++ b/test_exact.py\n"
-                "@@ -5,2 +5,2 @@\n"
-                "-return val\n"
-                "+return other\n"
-            )
+            diff = "--- a/test_exact.py\n+++ b/test_exact.py\n@@ -5,2 +5,2 @@\n-return val\n+return other\n"
             result = engine._exact_reanchor_patch(diff, target)
             assert result is not None, "Exact match should reanchor when offset is wrong"
             assert "@@ -1," in result, "Reanchored header should point to line 1"
@@ -303,23 +299,33 @@ class TestRepairPatchMethodHeader:
         engine.hybrid_parser = None
         return engine
 
-    @pytest.mark.parametrize("header, expect_class, expect_method", [
-        ("METHOD:A.method", "A", "method"),
-        ("METHOD:A.B.method", "A.B", "method"),
-        ("METHOD:A.B.C.method", "A.B.C", "method"),
-    ])
+    @pytest.mark.parametrize(
+        "header, expect_class, expect_method",
+        [
+            ("METHOD:A.method", "A", "method"),
+            ("METHOD:A.B.method", "A.B", "method"),
+            ("METHOD:A.B.C.method", "A.B.C", "method"),
+        ],
+    )
     def test_method_header_class_chain_rsplit(
-        self, engine, tmp_repo, header, expect_class, expect_method,
+        self,
+        engine,
+        tmp_repo,
+        header,
+        expect_class,
+        expect_method,
     ):
         target = os.path.join(tmp_repo, "target.py")
         llm_output = header + "\nFILE: target.py\n```\ndef method(self):\n    return 42\n```\n"
         self._isolate_ast_rewrite(engine)
 
-        fake_blocks = [{
-            "path": "target.py",
-            "text": "def method(self):\n    return 42\n",
-            "content": "def method(self):\n    return 42\n",
-        }]
+        fake_blocks = [
+            {
+                "path": "target.py",
+                "text": "def method(self):\n    return 42\n",
+                "content": "def method(self):\n    return 42\n",
+            }
+        ]
         with patch("external_llm.patch_engine.parse_file_blocks", return_value=fake_blocks):
             result = engine.repair_patch(
                 patch_text="garbage",
@@ -338,6 +344,7 @@ class TestRepairPatchMethodHeader:
 
 
 # ── _sanitize_patch_lines: hunk-body region tracking ──────────────────────────
+
 
 class TestSanitizePatchLinesBodyRegion:
     """``_sanitize_patch_lines`` must distinguish the *header* region (between
@@ -362,7 +369,7 @@ class TestSanitizePatchLinesBodyRegion:
             "--- a/notes.md\n"
             "+++ b/notes.md\n"
             "@@ -1,3 +1,3 @@\n"
-            " +++ b/other.py\n"   # context: 1 space + marker-like content
+            " +++ b/other.py\n"  # context: 1 space + marker-like content
             "-old line\n"
             "+new line\n"
         )
@@ -385,7 +392,7 @@ class TestSanitizePatchLinesBodyRegion:
             "  @@ -1,1 +1,1 @@\n"
             " -x\n"
             " +y\n"
-            "  diff --git a/b.py b/b.py\n"   # indented 2nd section header
+            "  diff --git a/b.py b/b.py\n"  # indented 2nd section header
             "  --- a/b.py\n"
             "  +++ b/b.py\n"
             "  @@ -1,1 +1,1 @@\n"
@@ -408,9 +415,9 @@ class TestSanitizePatchLinesBodyRegion:
             "--- a/r.md\n"
             "+++ b/r.md\n"
             "@@ -1,4 +1,4 @@\n"
-            " ```\n"          # context: bare fence (old code dropped this)
+            " ```\n"  # context: bare fence (old code dropped this)
             " old code\n"
-            " ```\n"          # context: bare fence (old code dropped this)
+            " ```\n"  # context: bare fence (old code dropped this)
             "+new code\n"
         )
         out = self._sanitize(patch)
@@ -420,14 +427,7 @@ class TestSanitizePatchLinesBodyRegion:
 
     def test_header_markers_still_deindented(self):
         """Regression guard: header-region markers are STILL de-indented."""
-        patch = (
-            "  diff --git a/x b/x\n"
-            "  --- a/x\n"
-            "  +++ b/x\n"
-            "  @@ -1,1 +1,1 @@\n"
-            " -a\n"
-            " +b\n"
-        )
+        patch = "  diff --git a/x b/x\n  --- a/x\n  +++ b/x\n  @@ -1,1 +1,1 @@\n -a\n +b\n"
         out = self._sanitize(patch)
         out_lines = out.splitlines()
         assert out_lines[0] == "diff --git a/x b/x"
@@ -437,6 +437,7 @@ class TestSanitizePatchLinesBodyRegion:
 
 
 # ── _salvage_small_model_output: large-file guard ─────────────────────────────
+
 
 class TestSalvageLargeFileGuard:
     """``_salvage_small_model_output`` runs an O(NxMxL) sliding-window
@@ -466,6 +467,7 @@ class TestSalvageLargeFileGuard:
 
 # ── _apply_diff_once: header synthesis (no duplicates) ───────────────────────
 
+
 class TestApplyDiffOnceHeaderSynthesis:
     """``_apply_diff_once`` synthesizes missing ``---``/``+++`` headers for
     fragment-only diffs. When EXACTLY ONE header was present, the old code
@@ -491,12 +493,7 @@ class TestApplyDiffOnceHeaderSynthesis:
         synthesize exactly one pair from the ``b/`` path (no body fragment to
         duplicate)."""
         cap = self._capture(engine)
-        patch = (
-            "diff --git a/foo.py b/foo.py\n"
-            "@@ -1,1 +1,1 @@\n"
-            "-old\n"
-            "+new\n"
-        )
+        patch = "diff --git a/foo.py b/foo.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
         engine._apply_diff_once(patch, "foo.py")
         lines = cap["normalized"].splitlines()
         assert sum(1 for ln in lines if ln.startswith("--- ")) == 1
@@ -521,6 +518,7 @@ class TestApplyDiffOnceHeaderSynthesis:
 
 
 # ── _keep_only_target_file_section: exact-vs-basename matching ────────────────
+
 
 class TestKeepOnlyTargetFileSectionMatching:
     """``_keep_only_target_file_section`` picks which ``diff --git`` section to
@@ -562,19 +560,13 @@ class TestKeepOnlyTargetFileSectionMatching:
     def test_basename_fallback_when_no_exact_match(self):
         """No exact path match anywhere → basename fallback still selects the
         section whose basename equals the target's basename."""
-        patch = (
-            "diff --git a/lib/x.py b/lib/x.py\n"
-            "--- a/lib/x.py\n"
-            "+++ b/lib/x.py\n"
-            "@@ -1,1 +1,1 @@\n"
-            "-a\n"
-            "+b\n"
-        )
+        patch = "diff --git a/lib/x.py b/lib/x.py\n--- a/lib/x.py\n+++ b/lib/x.py\n@@ -1,1 +1,1 @@\n-a\n+b\n"
         out = self._keep(patch, "x.py")
         assert "diff --git a/lib/x.py b/lib/x.py" in out
 
 
 # ── P22 round regressions ─────────────────────────────────────────────────────
+
 
 class TestP22FileBlockRegressions:
     def test_large_file_single_line_edit_passes_rewrite_valve(self, engine, tmp_repo):
@@ -594,9 +586,7 @@ class TestP22FileBlockRegressions:
             f.write(content)
         new_content = content.replace("return 1999 + 1  # pad", "return 9999  # pad", 1)
         llm_text = f"FILE: big_mod.py\n```\n{new_content}```\n"
-        diff, reason = engine._try_synthesize_diff_from_file_blocks(
-            tmp_repo, "big_mod.py", llm_text
-        )
+        diff, reason = engine._try_synthesize_diff_from_file_blocks(tmp_repo, "big_mod.py", llm_text)
         assert reason != "file_rewrite_too_large", reason
         assert reason in ("file_block_synth", "") or "@@ " in diff
 
@@ -659,12 +649,6 @@ class TestP22FileBlockRegressions:
                 return "PATCHED"
 
         monkeypatch.setattr("external_llm.ast_rewrite.ASTRewriter", _FakeRewriter)
-        patch = (
-            "@@ -1,3 +1,3 @@\n"
-            "-def foo():\n"
-            "-    return 1\n"
-            "+def foo():\n"
-            "+    return 2\n"
-        )
+        patch = "@@ -1,3 +1,3 @@\n-def foo():\n-    return 1\n+def foo():\n+    return 2\n"
         out = engine._auto_repair_patch(patch, "latin.py")
         assert out == "PATCHED"

@@ -7,6 +7,7 @@ guard (webapp) had no counterpart here.
 Fix under test: stat-based 64 MiB refusal (same policy as P19-4) before any
 read; normal files unchanged.
 """
+
 from __future__ import annotations
 
 import pytest

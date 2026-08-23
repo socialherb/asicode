@@ -16,6 +16,7 @@ both load-bearing — pytest's summary is at the end, the failing command at the
 start) and the REPORTED size, which is no longer ``len(content)`` and would
 otherwise describe a 108 MB run by the slice that was kept.
 """
+
 from __future__ import annotations
 
 import resource
@@ -49,7 +50,7 @@ class TestBoundedCapture:
         body = "HEAD" + "x" * 5000 + "TAIL"
         cap = _BoundedCapture(10)
         for i in range(0, len(body), chunk):
-            cap.feed(body[i:i + chunk])
+            cap.feed(body[i : i + chunk])
         text = cap.text()
         assert text.startswith("HEAD")
         assert text.endswith("TAIL")
@@ -61,9 +62,9 @@ class TestBoundedCapture:
             cap.feed("y" * 100)
         assert cap.total == 100_000
         assert len(cap.text()) < 1000
-        assert cap.dropped == cap.total - (len(cap.text()) - len(
-            f"\n... [{cap.dropped:,} chars dropped (middle)] ...\n"
-        ))
+        assert cap.dropped == cap.total - (
+            len(cap.text()) - len(f"\n... [{cap.dropped:,} chars dropped (middle)] ...\n")
+        )
 
     def test_retention_covers_what_truncation_will_slice(self):
         """Each side keeps the FULL cap, so the rendered result is unchanged.
@@ -78,7 +79,7 @@ class TestBoundedCapture:
         cap.feed(body)
         rendered = _truncate_bash_output(cap.text(), cap_chars, true_len=cap.total)
         assert rendered.startswith(body[: cap_chars // 2])
-        assert rendered.endswith(body[-(cap_chars // 2):])
+        assert rendered.endswith(body[-(cap_chars // 2) :])
 
 
 class TestTruncationReportsTheRealSize:

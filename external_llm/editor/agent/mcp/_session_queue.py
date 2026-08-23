@@ -23,7 +23,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from typing import Any, Optional
+from http.server import BaseHTTPRequestHandler
+from typing import Any
 
 from external_llm.agent.tool_registry import ToolRegistry
 
@@ -49,12 +50,45 @@ _SESSION_SWEEP_INTERVAL_SECONDS = 60
 JsonRpcHandler = Callable[[ToolRegistry, dict[str, Any]], dict[str, Any]]
 
 
+class QuietHttpHandler(BaseHTTPRequestHandler):
+    """HTTP handler that treats a client disconnect as a normal event.
+
+    ``BaseHTTPRequestHandler.handle_one_request`` only catches ``TimeoutError``;
+    a client that closes the connection mid-read (RST or FIN) raises
+    ``ConnectionResetError``/``BrokenPipeError`` out of ``rfile.readline``,
+    which ``socketserver`` then prints as a traceback — log spam for a routine
+    disconnect.  This is especially likely on HTTP/1.1 keep-alive connections:
+    after any response whose handler did not set ``close_connection``, the
+    server loops back and tries to read the next request line from a socket
+    the client already closed.
+
+    Subclasses keep their own ``log_message``; this only adds the quiet
+    disconnect path on top of the stdlib behaviour.
+    """
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            # Client vanished between requests (or mid-request).  The stdlib
+            # lets this escape to socketserver, which prints a traceback;
+            # for a local dev server a dropped client is routine, not an
+            # error.  Close the connection and move on.
+            self.close_connection = True
+
+
 class _SessionQueueMixin:
     """Shared session-queue + lifecycle plumbing for the MCP HTTP transports.
 
     Requires ``registry`` and ``_handle`` (set by the subclass ``__init__``)
     and ``httpd`` (bound before :meth:`_init_session_plumbing` is called).
     """
+
+    # Attributes injected by the concrete subclass __init__ — declared here so
+    # pyright treats them as known mixin members (dynamic-attribute contract).
+    httpd: Any = None
+    _handle: Any = None
+    registry: Any = None
 
     # -- setup ----------------------------------------------------------------
 
@@ -70,16 +104,14 @@ class _SessionQueueMixin:
         Call at the END of the subclass ``__init__`` (after ``httpd`` is
         bound) so a construction failure cannot leak the daemon thread.
         """
-        self._sessions: dict[str, queue.Queue[Optional[str]]] = {}
+        self._sessions: dict[str, queue.Queue[str | None]] = {}
         self._last_active: dict[str, float] = {}
         self._lock = threading.Lock()
         self._session_idle_ttl = session_idle_ttl
         self._sweep_interval = sweep_interval
         self._sweep_stop = threading.Event()
         # Background reaper for sessions whose client vanished without DELETE.
-        self._sweep_thread = threading.Thread(
-            target=self._sweep_loop, name=thread_name, daemon=True
-        )
+        self._sweep_thread = threading.Thread(target=self._sweep_loop, name=thread_name, daemon=True)
         self._sweep_thread.start()
 
     # -- lifecycle ------------------------------------------------------------
@@ -106,17 +138,17 @@ class _SessionQueueMixin:
 
     # -- session plumbing -----------------------------------------------------
 
-    def _new_session(self) -> tuple[str, queue.Queue[Optional[str]]]:
+    def _new_session(self) -> tuple[str, queue.Queue[str | None]]:
         """Register a fresh session; returns (session_id, message queue)."""
         session_id = uuid.uuid4().hex
-        messages: queue.Queue[Optional[str]] = queue.Queue(maxsize=_MAX_QUEUED_EVENTS)
+        messages: queue.Queue[str | None] = queue.Queue(maxsize=_MAX_QUEUED_EVENTS)
         now = time.monotonic()
         with self._lock:
             self._sessions[session_id] = messages
             self._last_active[session_id] = now
         return session_id, messages
 
-    def _get_session(self, session_id: str) -> Optional[queue.Queue[Optional[str]]]:
+    def _get_session(self, session_id: str) -> queue.Queue[str | None] | None:
         with self._lock:
             messages = self._sessions.get(session_id)
             if messages is not None:
@@ -150,7 +182,7 @@ class _SessionQueueMixin:
     def _enqueue_if_current(
         self,
         session_id: str,
-        session: queue.Queue[Optional[str]],
+        session: queue.Queue[str | None],
         payload: str,
     ) -> str:
         """Queue an SSE payload iff ``session`` is still the registered session.
@@ -182,25 +214,23 @@ class _SessionQueueMixin:
         """Close and drop sessions idle past the TTL (idempotent, thread-safe)."""
         now = time.monotonic()
         with self._lock:
-            idle = [
-                sid
-                for sid, last in self._last_active.items()
-                if now - last >= self._session_idle_ttl
-            ]
+            idle = [sid for sid, last in self._last_active.items() if now - last >= self._session_idle_ttl]
         for sid in idle:
             self._close_session(sid)
 
     # -- JSON-RPC -------------------------------------------------------------
 
-    def _handle_request(self, request: dict) -> Optional[str]:
+    def _handle_request(self, request: dict) -> str | None:
         """Run the JSON-RPC handler; returns the response payload, None for notifications."""
         request_id = request.get("id")
         if request_id is None:
             return None  # notification — the 202 response is the only ack
         if self._handle is None:
-            return json.dumps({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32000, "message": "no JSON-RPC handler configured"},
-            })
+            return json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32000, "message": "no JSON-RPC handler configured"},
+                }
+            )
         return json.dumps(self._handle(self.registry, request))

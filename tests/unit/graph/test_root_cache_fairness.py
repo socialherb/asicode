@@ -258,9 +258,9 @@ def test_concurrent_admit_iterate_sweep_no_races():
             t.join(timeout=15)
         assert not errors, f"concurrent RootCache access raised: {errors[:3]}"
         with c._lock:
-            assert c._total == sum(
-                len(inner) for inner in c._roots.values()
-            ), "O(1) _total counter desynced from live entries"
+            assert c._total == sum(len(inner) for inner in c._roots.values()), (
+                "O(1) _total counter desynced from live entries"
+            )
     finally:
         sys.setswitchinterval(old)
 

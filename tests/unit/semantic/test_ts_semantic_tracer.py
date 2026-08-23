@@ -1,4 +1,5 @@
 """Tests for TS/JS Semantic Tracer — Core IR."""
+
 from __future__ import annotations
 
 import textwrap
@@ -13,9 +14,7 @@ from external_llm.editor.semantic.ts_semantic_tracer import (
 )
 from external_llm.languages.tree_sitter_utils import is_available
 
-pytestmark = pytest.mark.skipif(
-    not is_available(), reason="tree-sitter not installed"
-)
+pytestmark = pytest.mark.skipif(not is_available(), reason="tree-sitter not installed")
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
 
@@ -202,8 +201,7 @@ def test_core_call_graph(ts_tracer):
     assert "createUser" in callers
 
     # Method call detection
-    log_site = next(
-        cs for cs in m.call_sites if cs.callee == "log")
+    log_site = next(cs for cs in m.call_sites if cs.callee == "log")
     assert log_site.is_method_call is True
     assert log_site.receiver == "console"
 
@@ -405,6 +403,7 @@ def test_core_node_pattern(ts_tracer):
 
 # ── empty ────────────────────────────────────────────────────────────────────
 
+
 def test_core_empty(ts_tracer):
     m = ts_tracer.analyze_core("", "empty.ts")
     assert m.functions == []
@@ -445,6 +444,7 @@ def test_core_javascript(js_tracer):
 
 
 # ── IRNodeMeta on all nodes ──────────────────────────────────────────────────
+
 
 def test_execution_ir_function_meta(ts_tracer):
     """Every function should have IRNodeMeta with stable identity."""
@@ -508,6 +508,7 @@ def test_execution_ir_callsite_meta(ts_tracer):
 
 
 # ── symbol table ─────────────────────────────────────────────────────────────
+
 
 def test_symbol_table_function(ts_tracer):
     code = "function greet(name) { console.log(name) }"
@@ -593,6 +594,7 @@ function foo(x) {
 
 # ── usage graph ──────────────────────────────────────────────────────────────
 
+
 def test_usage_graph(ts_tracer):
     code = """\
 import { validate } from './v'
@@ -625,6 +627,7 @@ def test_usage_meta(ts_tracer):
 
 
 # ── assignment / data flow ───────────────────────────────────────────────────
+
 
 def test_assignment_from_call(ts_tracer):
     code = """\
@@ -828,6 +831,7 @@ def test_ir_module_lookup_conveniences():
 def test_parser_degradation_paths(monkeypatch):
     """Parser unavailable/failure paths degrade to None/empty (L83-99,
     L151-163, L202)."""
+
     # Grammar loader failure → builders return None.
     def _boom(*_a, **_k):
         raise ImportError("grammar missing")
@@ -859,9 +863,7 @@ def test_parser_degradation_paths(monkeypatch):
 
 def test_export_clause_and_default(ts_tracer):
     """export { X, Y as Z } and export default expr (L246-247, L339-354)."""
-    m = ts_tracer.analyze_core(
-        "export { foo, bar as baz };\nexport default myThing;\n", "mod.ts"
-    )
+    m = ts_tracer.analyze_core("export { foo, bar as baz };\nexport default myThing;\n", "mod.ts")
     names = {(e.name, e.kind.value) for e in m.exports}
     assert ("foo", "named") in names
     assert ("baz", "named") in names
@@ -878,9 +880,7 @@ def test_import_type_only(ts_tracer):
 def test_variable_initializer_classification(ts_tracer):
     """Initializer classification: identifier → variable, unknown node
     (ternary) → None (L481, L523)."""
-    m = ts_tracer.analyze_core(
-        "const a = b;\nconst f = () => 1;\nconst t = a ? b : c;\n", "v.ts"
-    )
+    m = ts_tracer.analyze_core("const a = b;\nconst f = () => 1;\nconst t = a ? b : c;\n", "v.ts")
     assert {"a", "t"} <= {v.name for v in m.variables}
     assert "f" in {fn.name for fn in m.functions}
     # The ternary initializer is an unclassified node → source_type None.
@@ -935,18 +935,14 @@ def test_interface_extends(ts_tracer):
 def test_assignment_new_expression(ts_tracer):
     """new-expression initializer records its class as source inside a
     function body (L806-809)."""
-    m = ts_tracer.analyze_core(
-        "const f = () => { const a = new Foo(); };\n", "n.ts"
-    )
+    m = ts_tracer.analyze_core("const f = () => { const a = new Foo(); };\n", "n.ts")
     assert any(ass.target == "a" and ass.source == "Foo" for ass in m.assignments)
 
 
 def test_usage_skip_import_specifier_and_member_property(ts_tracer):
     """Usage collection skips import specifiers and member properties
     (L767, L772)."""
-    m = ts_tracer.analyze_core(
-        'import { helper } from "m";\nfunction f() { obj.prop; helper(); }\n', "u.ts"
-    )
+    m = ts_tracer.analyze_core('import { helper } from "m";\nfunction f() { obj.prop; helper(); }\n', "u.ts")
     assert all(u.symbol != "prop" for u in m.usages)
     assert any(u.symbol == "obj" for u in m.usages)
 
@@ -971,9 +967,7 @@ def test_function_symbol_loop_skips_unrelated(ts_tracer):
 def test_params_forms_js(js_tracer):
     """JS param forms: rest_pattern, object_pattern, array_pattern directly
     under formal_parameters (L857, L860, L862)."""
-    m = js_tracer.analyze_core(
-        "function f(...args) {}\nfunction g({x}, [y]) {}\n", "f.js"
-    )
+    m = js_tracer.analyze_core("function f(...args) {}\nfunction g({x}, [y]) {}\n", "f.js")
     by_name = {fn.name: fn for fn in m.functions}
     assert by_name["f"].params[0].is_rest is True
     assert by_name["g"].params[0].name == "{...}"
@@ -982,9 +976,7 @@ def test_params_forms_js(js_tracer):
 
 def test_typed_params_ts(ts_tracer):
     """TS typed/optional params still extract plain names (L845)."""
-    m = ts_tracer.analyze_core(
-        "function typed(a: number, b?: string) {}\n", "p.ts"
-    )
+    m = ts_tracer.analyze_core("function typed(a: number, b?: string) {}\n", "p.ts")
     params = m.functions[0].params
     assert [p.name for p in params] == ["a", "b"]
 
@@ -999,7 +991,5 @@ def test_callee_name_and_walk_leaf(ts_tracer):
 def test_syntax_error_tolerance(ts_tracer):
     """Broken constructs degrade without crashing (L301, L406, L707, L826,
     L832, L839)."""
-    m = ts_tracer.analyze_core(
-        "import {\nconst = 5;\nfunction nope\nfoo(\nconst z = obj.;\n", "bad.ts"
-    )
+    m = ts_tracer.analyze_core("import {\nconst = 5;\nfunction nope\nfoo(\nconst z = obj.;\n", "bad.ts")
     assert isinstance(m, ts_mod.TSModule)

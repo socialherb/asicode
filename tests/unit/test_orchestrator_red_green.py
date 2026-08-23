@@ -6,6 +6,7 @@ OrderedEventDispatcher, _resolve_subagent_base_max_turns, OrchestratorConfig
 validation, _build_git_context, coercers, directory expansion, batch conflict
 splitting, snapshot capture/restore, infra-path filter, symbol hints.
 """
+
 from __future__ import annotations
 
 import os
@@ -43,6 +44,7 @@ from external_llm.agent.orchestrator import (
 
 # ── asr_subagent_argv ────────────────────────────────────────────────────────
 
+
 def test_asr_subagent_argv_prefers_repo_asi_py(tmp_path):
     (tmp_path / "asi.py").write_text("")
     argv = asr_subagent_argv(str(tmp_path))
@@ -56,6 +58,7 @@ def test_asr_subagent_argv_falls_back_to_bare_asi(tmp_path):
 
 # ── _DummyLock ───────────────────────────────────────────────────────────────
 
+
 def test_dummy_lock_is_noop():
     lock = _DummyLock()
     assert lock.acquire() is True
@@ -67,6 +70,7 @@ def test_dummy_lock_is_noop():
 
 
 # ── FileLockManager ──────────────────────────────────────────────────────────
+
 
 def _fresh_manager(tmp_path):
     return FileLockManager(str(tmp_path))
@@ -188,6 +192,7 @@ def test_filelock_release_all_and_runtime_error_guard(tmp_path):
 
 # ── OrderedEventDispatcher ───────────────────────────────────────────────────
 
+
 def test_ordered_dispatcher_sequence_and_metadata():
     seen = []
     d = OrderedEventDispatcher(lambda ev, data: seen.append((ev, data)))
@@ -218,6 +223,7 @@ def test_ordered_dispatcher_does_not_mutate_input():
 
 # ── _resolve_subagent_base_max_turns / OrchestratorConfig ───────────────────
 
+
 def test_resolve_base_max_turns_uses_agent_config():
     class FakeAgentConfig:
         max_turns = 7
@@ -244,6 +250,7 @@ def test_orchestrator_config_accepts_policies():
 
 # ── _build_git_context ───────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def git_repo(tmp_path):
     repo = tmp_path / "repo"
@@ -251,24 +258,28 @@ def git_repo(tmp_path):
     subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.email", "t@example.com"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     subprocess.run(
         ["git", "-C", str(repo), "config", "user.name", "t"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     (repo / "f.py").write_text("x=1\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo), "commit", "-q", "-m", "init"],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     for i in range(3):
         (repo / "f.py").write_text(f"x={i}\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
         subprocess.run(
             ["git", "-C", str(repo), "commit", "-q", "-m", f"change {i}"],
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
         )
     return repo
 
@@ -292,6 +303,7 @@ def test_build_git_context_failure_returns_empty(tmp_path):
 
 # ── coercers ─────────────────────────────────────────────────────────────────
 
+
 def test_coerce_priority():
     assert _coerce_priority(2) == 2
     assert _coerce_priority("3") == 3
@@ -308,6 +320,7 @@ def test_coerce_str_list():
 
 
 # ── _expand_directory_assignments / _norm_assigned_file ─────────────────────
+
 
 def test_expand_directory_assignments_basic(tmp_path):
     (tmp_path / "pkg").mkdir()
@@ -357,6 +370,7 @@ def test_norm_assigned_file():
 
 # ── _split_batch_by_file_conflict ───────────────────────────────────────────
 
+
 def _spec(task_id, files):
     return SubTaskSpec(task_id=task_id, title=task_id, description=task_id, assigned_files=files)
 
@@ -401,6 +415,7 @@ def test_kind_initial():
 
 # ── _read_synth_diff_head extra ──────────────────────────────────────────────
 
+
 def test_read_synth_diff_head_exact_max(tmp_path):
     p = tmp_path / "x.txt"
     p.write_bytes(b"abcdef")
@@ -416,6 +431,7 @@ def test_read_synth_diff_head_truncated_ascii(tmp_path):
 
 
 # ── _capture_assigned_snapshots ─────────────────────────────────────────────
+
 
 def test_capture_snapshots_basic(tmp_path):
     (tmp_path / "a.py").write_bytes(b"one")
@@ -458,6 +474,7 @@ def test_capture_snapshots_no_repo_root(tmp_path):
 
 
 # ── _restore_assigned_snapshots ──────────────────────────────────────────────
+
 
 def test_restore_snapshots_writes_back(tmp_path):
     (tmp_path / "a.py").write_bytes(b"MUTATED")
@@ -504,6 +521,7 @@ def test_restore_snapshots_bad_path_warns(tmp_path):
 
 
 # ── _is_infra_path / _snapshot_dirty_path_set ───────────────────────────────
+
 
 def test_is_infra_path():
     assert _is_infra_path("")
@@ -618,6 +636,7 @@ def _make_orch(tmp_path, **cfg_overrides):
 
 # ── _get_git_diff / _cached_git_diff / _patch_files_have_wt_changes ─────────
 
+
 def test_get_git_diff(git_repo):
     (git_repo / "f.py").write_text("x=42\n", encoding="utf-8")
     o = _make_orch(git_repo)
@@ -670,6 +689,7 @@ def test_patch_files_have_wt_changes_non_repo(tmp_path):
 
 # ── _synthesize_untracked_diff ──────────────────────────────────────────────
 
+
 def test_synthesize_untracked_diff(git_repo):
     (git_repo / "brand_new.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
     out = OrchestratorAgent._synthesize_untracked_diff(str(git_repo), ["brand_new.py"])
@@ -692,7 +712,9 @@ def test_synthesize_untracked_diff_char_limit(git_repo):
     (git_repo / "big.py").write_text("x" * 500, encoding="utf-8")
     (git_repo / "big2.py").write_text("y" * 500, encoding="utf-8")
     out = OrchestratorAgent._synthesize_untracked_diff(
-        str(git_repo), ["big.py", "big2.py"], char_limit=50,
+        str(git_repo),
+        ["big.py", "big2.py"],
+        char_limit=50,
     )
     assert "further untracked files omitted" in out
 
@@ -707,13 +729,12 @@ def test_synthesize_untracked_diff_prefix_dir_match(git_repo):
 
 # ── _revert_unassigned_changes / _checkout_one / _unlink_one ────────────────
 
+
 def test_revert_unassigned_changes_tracked_and_untracked(git_repo):
     (git_repo / "f.py").write_text("x=999\n", encoding="utf-8")  # tracked modified
     (git_repo / "stray.py").write_text("stray\n", encoding="utf-8")  # untracked
     o = _make_orch(git_repo)
-    reverted = o._revert_unassigned_changes(
-        str(git_repo), [{"file": "f.py"}, {"file": "stray.py"}]
-    )
+    reverted = o._revert_unassigned_changes(str(git_repo), [{"file": "f.py"}, {"file": "stray.py"}])
     assert "f.py" in reverted and "stray.py" in reverted
     assert (git_repo / "f.py").read_text() == "x=2\n"  # back to committed content
     assert not (git_repo / "stray.py").exists()
@@ -746,6 +767,7 @@ def test_revert_unassigned_changes_perfile_fallback(git_repo, monkeypatch):
     (git_repo / "f.py").write_text("x=8\n", encoding="utf-8")
     o = _make_orch(git_repo)
     import subprocess as _sp
+
     real_run = _sp.run
 
     def flaky_run(cmd, **kw):
@@ -761,6 +783,7 @@ def test_revert_unassigned_changes_perfile_fallback(git_repo, monkeypatch):
 
 # ── scope filtering helpers ─────────────────────────────────────────────────
 
+
 def test_capture_scope_baseline(git_repo):
     (git_repo / ".env").write_text("dirty\n", encoding="utf-8")
     o = _make_orch(git_repo)
@@ -775,10 +798,10 @@ def test_filter_unassigned_changes(git_repo):
     o = _make_orch(git_repo)
     o._capture_scope_baseline(str(git_repo), [])
     reported = [
-        {"file": ".env"},            # baseline dirt → filtered
-        {"file": ".asicode/log"},    # infra → filtered
-        {"file": "peer.py"},         # global assigned (peer) → filtered
-        {"file": "real_stray.py"},   # genuine → kept
+        {"file": ".env"},  # baseline dirt → filtered
+        {"file": ".asicode/log"},  # infra → filtered
+        {"file": "peer.py"},  # global assigned (peer) → filtered
+        {"file": "real_stray.py"},  # genuine → kept
     ]
     o._global_assigned_paths = {"peer.py"}
     out = o._filter_unassigned_changes(reported, own_assigned=["mine.py"])
@@ -798,6 +821,7 @@ def test_git_status_changed_paths(git_repo):
 
 def tmp_path_fresh():
     import tempfile
+
     return tempfile.mkdtemp()
 
 
@@ -808,6 +832,7 @@ def test_detect_genuine_violations_raw(git_repo):
 
 
 # ── _apply_scope_violation_policy ───────────────────────────────────────────
+
 
 def test_apply_scope_violation_policy_warn(git_repo):
     o = _make_orch(git_repo, scope_violation_policy="warn")
@@ -839,6 +864,7 @@ def test_apply_scope_violation_policy_empty(git_repo):
 
 
 # ── _compute_diff_verdict / _locate_symbol ──────────────────────────────────
+
 
 def test_compute_diff_verdict_verified(git_repo):
     (git_repo / "f.py").write_text("x=42\n", encoding="utf-8")
@@ -904,6 +930,7 @@ def test_locate_symbol_unreadable(tmp_path):
 
 # ── _review_subagent_result (LLM mocked) ────────────────────────────────────
 
+
 def _patch_llm(monkeypatch, raw):
     # orchestrator binds simple_llm_call at import time (from utils.llm_utils
     # import simple_llm_call), so patch the module-global name, not the source.
@@ -957,11 +984,15 @@ def test_review_subagent_result_no_changes_rejected(git_repo, monkeypatch):
 
 # ── synthesis helpers ───────────────────────────────────────────────────────
 
+
 def test_synthesize_from_subtasks():
     o = _make_orch("/tmp")
     pairs = [
         (SubTaskSpec(task_id="a", title="A", description="d"), AgentResult(status="success", final_message="ok")),
-        (SubTaskSpec(task_id="b", title="B", description="d"), AgentResult(status="max_turns", final_message="partial")),
+        (
+            SubTaskSpec(task_id="b", title="B", description="d"),
+            AgentResult(status="max_turns", final_message="partial"),
+        ),
         (SubTaskSpec(task_id="c", title="C", description="d"), None),
         (SubTaskSpec(task_id="d", title="D", description="d"), AgentResult(status="error", final_message="bad")),
     ]
@@ -983,10 +1014,15 @@ def test_paired_subtask_results(tmp_path):
 
 # ── _extract_subagent_summary / shared memory ───────────────────────────────
 
+
 def test_extract_subagent_summary():
     o = _make_orch("/tmp")
     st = SubTaskSpec(task_id="d1", title="Do it", description="d")
-    r = AgentResult(status="success", final_message="all done", applied_patches=[{"file": "a.py"}, {"file": "a.py"}, {"file": "b.py"}])
+    r = AgentResult(
+        status="success",
+        final_message="all done",
+        applied_patches=[{"file": "a.py"}, {"file": "a.py"}, {"file": "b.py"}],
+    )
     s = o._extract_subagent_summary(st, r)
     assert s == "[d1: Do it → completed | Files: a.py, b.py] all done"
     # non-dict patch with file_path
@@ -1019,6 +1055,7 @@ def test_cap_shared_memory_injection(tmp_path, monkeypatch):
 
 
 # ── model resolution / gc / build task context ──────────────────────────────
+
 
 def test_resolve_subagent_model():
     o = _make_orch("/tmp", subagent_models={"1": ("ollama", "qwen", "k1"), "2": ("ollama", "deep", "k2")})
@@ -1061,17 +1098,15 @@ def test_build_task_with_predecessor_context():
     assert "[ghost:" in text3
     # shared memory injection
     o._shared_memory = ["[d9: X → completed] z"]
-    text4 = o._build_task_with_predecessor_context(
-        SubTaskSpec(task_id="d2", title="t", description="d"), {}, {}
-    )
+    text4 = o._build_task_with_predecessor_context(SubTaskSpec(task_id="d2", title="t", description="d"), {}, {})
     assert "[Orchestration progress]" in text4
 
 
 # ── _detect_cycles_kahn / _break_cycles / _find_current_cycles ──────────────
 
+
 def _specs_from_deps(deps: dict[str, list[str]]):
-    return {tid: SubTaskSpec(task_id=tid, title=tid, description=tid, dependencies=d)
-            for tid, d in deps.items()}
+    return {tid: SubTaskSpec(task_id=tid, title=tid, description=tid, dependencies=d) for tid, d in deps.items()}
 
 
 def test_detect_cycles_kahn_acyclic():
@@ -1129,6 +1164,7 @@ def test_has_dependencies():
 
 # ── _OrchestratorBackedRegistry ─────────────────────────────────────────────
 
+
 def _make_orch_with_registry(tmp_path):
     base = _FakeRegistry(str(tmp_path))
     o = _make_orch(tmp_path)
@@ -1161,14 +1197,16 @@ def test_obr_dispatch_native_and_fallback(tmp_path, monkeypatch):
     assert tr.ok is True and "Sub-agents:" in tr.content
     # native tool error → ok=False without traceback
     monkeypatch.setattr(
-        obr._obr_orch, "_dispatch_native_tool",
+        obr._obr_orch,
+        "_dispatch_native_tool",
         lambda n, a: (_ for _ in ()).throw(_NativeToolError("bad args")),
     )
     tr2 = obr.dispatch("spawn_subagent", {})
     assert tr2.ok is False and "bad args" in tr2.error
     # unexpected exception → logged, ok=False
     monkeypatch.setattr(
-        obr._obr_orch, "_dispatch_native_tool",
+        obr._obr_orch,
+        "_dispatch_native_tool",
         lambda n, a: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     tr3 = obr.dispatch("spawn_subagent", {})
@@ -1185,6 +1223,7 @@ def test_dispatch_native_tool_unknown(tmp_path):
 
 
 # ── native schemas / format helpers ─────────────────────────────────────────
+
 
 def test_native_orchestrator_schemas(tmp_path):
     o = _make_orch(tmp_path)
@@ -1233,6 +1272,7 @@ def test_tool_list_subagents(tmp_path):
 
 # ── tool poll handlers ──────────────────────────────────────────────────────
 
+
 def test_tool_poll_subagent_bad_args(tmp_path):
     o = _make_orch(tmp_path)
     with pytest.raises(_NativeToolError):
@@ -1258,8 +1298,15 @@ def test_poll_any_agent_unknown(tmp_path):
 def test_poll_any_agent_none_done_nonblocking(tmp_path):
     o = _make_orch(tmp_path)
     from concurrent.futures import Future
+
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": Future(), "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": Future(),
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     out = o._poll_any_agent(["x"], 0)
     assert "None of 1 sub-agents have completed yet" in out
 
@@ -1268,7 +1315,14 @@ def test_poll_single_agent_running_queued(tmp_path):
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="x", title="X", description="d")
     from concurrent.futures import Future
-    o._bg_subagents["x"] = {"future": Future(), "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+
+    o._bg_subagents["x"] = {
+        "future": Future(),
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     out = o._poll_single_agent("x", 0)
     assert "queued" in out  # future not started → waiting for a slot
 
@@ -1277,12 +1331,20 @@ def test_poll_any_agent_duplicate_ids(tmp_path):
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="x", title="X", description="d")
     from concurrent.futures import Future
-    o._bg_subagents["x"] = {"future": Future(), "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+
+    o._bg_subagents["x"] = {
+        "future": Future(),
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     out = o._poll_any_agent(["x", "x"], 0)  # dedup, no crash
     assert "None of 1 sub-agents" in out
 
 
 # ── background executor / drain / shutdown ──────────────────────────────────
+
 
 def test_bg_executor_lifecycle(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
@@ -1297,7 +1359,9 @@ def test_bg_executor_lifecycle(tmp_path, monkeypatch):
 def test_run_subagent_background_and_check(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="b1", title="B", description="d")
-    monkeypatch.setattr(o, "_run_subagent", lambda *a, **kw: AgentResult(status="success", final_message="bg done", turns=[]))
+    monkeypatch.setattr(
+        o, "_run_subagent", lambda *a, **kw: AgentResult(status="success", final_message="bg done", turns=[])
+    )
     aid = o._run_subagent_background(st)
     assert aid == "b1"
     status, result = o._check_bg_subagent("b1", timeout_s=10)
@@ -1310,15 +1374,24 @@ def test_run_subagent_background_and_check(tmp_path, monkeypatch):
     assert o._check_bg_subagent("ghost") == ("unknown", None)
     # running state before completion
     from concurrent.futures import Future
-    o._bg_subagents["b2"] = {"future": Future(), "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+
+    o._bg_subagents["b2"] = {
+        "future": Future(),
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     assert o._check_bg_subagent("b2")[0] == "running"
 
 
 def test_bg_job_exception_returns_error_result(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="b3", title="B", description="d")
+
     def boom(*a, **kw):
         raise RuntimeError("crash")
+
     monkeypatch.setattr(o, "_run_subagent", boom)
     aid = o._run_subagent_background(st)
     status, result = o._check_bg_subagent(aid, timeout_s=10)
@@ -1329,6 +1402,7 @@ def test_bg_job_exception_returns_error_result(tmp_path, monkeypatch):
 def test_future_is_queued(tmp_path):
     o = _make_orch(tmp_path)
     from concurrent.futures import Future
+
     f = Future()
     assert o._future_is_queued({"future": f}) is True  # neither running nor done
     f.set_result("x")
@@ -1347,7 +1421,13 @@ def test_drain_background_subagents_cancelled(tmp_path):
     ev.set()
     o = _make_orch(tmp_path, cancel_event=ev)
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": None, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": None,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     o._drain_background_subagents(per_agent_timeout=600)
     assert True  # returned immediately
 
@@ -1355,10 +1435,17 @@ def test_drain_background_subagents_cancelled(tmp_path):
 def test_gather_done_futures(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     from concurrent.futures import Future
+
     f = Future()
     f.set_result(AgentResult(status="success", final_message="done", turns=[]))
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": f, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": f,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     completed, pending = o._gather_done_futures([("x", f)])
     assert len(completed) == 1 and pending == []
     assert o._bg_results  # appended exactly once
@@ -1367,10 +1454,17 @@ def test_gather_done_futures(tmp_path, monkeypatch):
 def test_check_bg_subagent_future_exception(tmp_path):
     o = _make_orch(tmp_path)
     from concurrent.futures import Future
+
     f = Future()
     f.set_exception(ValueError("inner"))
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": f, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": f,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     status, result = o._check_bg_subagent("x", timeout_s=0)
     assert status == "error" and "inner" in result.error
 
@@ -1384,8 +1478,9 @@ def test_check_bg_subagent_future_exception(tmp_path):
 class _FakeResult:
     """AgentResult-like object with all attrs _run_subagent_ipc touches."""
 
-    def __init__(self, status="success", final_message="done", turns=1,
-                 applied_patches=None, error=None, unassigned_changes=None):
+    def __init__(
+        self, status="success", final_message="done", turns=1, applied_patches=None, error=None, unassigned_changes=None
+    ):
         self.status = status
         self.final_message = final_message
         self.turns = turns
@@ -1396,13 +1491,24 @@ class _FakeResult:
 
 def test_run_subagent_ipc_success(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", ipc_timeout_s=30)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     calls = {}
-    monkeypatch.setattr(sipc, "clear_result", lambda *a, **k: calls.setdefault("clear", 0) or calls.__setitem__("clear", calls["clear"] + 1))
-    monkeypatch.setattr(sipc, "write_task", lambda *a, **k: calls.setdefault("write", 0) or calls.__setitem__("write", calls["write"] + 1))
-    monkeypatch.setattr(sipc, "wait_for_result", lambda *a, **k: _FakeResult(status="success", final_message="ipc done", turns=2))
+    monkeypatch.setattr(
+        sipc,
+        "clear_result",
+        lambda *a, **k: calls.setdefault("clear", 0) or calls.__setitem__("clear", calls["clear"] + 1),
+    )
+    monkeypatch.setattr(
+        sipc,
+        "write_task",
+        lambda *a, **k: calls.setdefault("write", 0) or calls.__setitem__("write", calls["write"] + 1),
+    )
+    monkeypatch.setattr(
+        sipc, "wait_for_result", lambda *a, **k: _FakeResult(status="success", final_message="ipc done", turns=2)
+    )
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     monkeypatch.setattr(o, "_return_worker_to_pool", lambda wid: None)
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
@@ -1417,6 +1523,7 @@ def test_run_subagent_ipc_success(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_timeout_abandon(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", ipc_timeout_s=1)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -1425,8 +1532,11 @@ def test_run_subagent_ipc_timeout_abandon(tmp_path, monkeypatch):
     monkeypatch.setattr(sipc, "wait_for_result", lambda *a, **k: None)  # timeout
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     abandons = {}
-    monkeypatch.setattr(o, "_abandon_ipc_worker",
-                        lambda *a, **k: abandons.setdefault("n", 0) or abandons.__setitem__("n", abandons["n"] + 1) or False)
+    monkeypatch.setattr(
+        o,
+        "_abandon_ipc_worker",
+        lambda *a, **k: abandons.setdefault("n", 0) or abandons.__setitem__("n", abandons["n"] + 1) or False,
+    )
     res = o._run_subagent_ipc(st)
     assert res.status == "error"
     assert "timed out" in res.final_message
@@ -1435,12 +1545,15 @@ def test_run_subagent_ipc_timeout_abandon(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_cancelled_revert_and_grace(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", ipc_timeout_s=1)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     monkeypatch.setattr(sipc, "clear_result", lambda *a, **k: None)
     monkeypatch.setattr(sipc, "write_task", lambda *a, **k: None)
-    monkeypatch.setattr(sipc, "wait_for_result", lambda *a, **k: _FakeResult(status="cancelled", final_message="c", turns=0))
+    monkeypatch.setattr(
+        sipc, "wait_for_result", lambda *a, **k: _FakeResult(status="cancelled", final_message="c", turns=0)
+    )
     monkeypatch.setattr(sipc, "read_worker_idle_heartbeat_state", lambda *a, **k: "idle")
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     monkeypatch.setattr(o, "_return_worker_to_pool", lambda wid: None)
@@ -1454,6 +1567,7 @@ def test_run_subagent_ipc_cancelled_revert_and_grace(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_review_retry(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", review_enabled=True, review_max_retries=1)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -1474,7 +1588,8 @@ def test_run_subagent_ipc_review_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_filter_unassigned_changes", lambda r, own: r)
     monkeypatch.setattr(o, "_apply_scope_violation_policy", lambda *a, **k: [])
     monkeypatch.setattr(
-        o, "_review_subagent_result",
+        o,
+        "_review_subagent_result",
         lambda **kw: (False, "needs work"),
     )
     res = o._run_subagent_ipc(st)
@@ -1484,6 +1599,7 @@ def test_run_subagent_ipc_review_retry(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_review_retry_timeout(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", review_enabled=True, review_max_retries=1)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -1501,7 +1617,8 @@ def test_run_subagent_ipc_review_retry_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     monkeypatch.setattr(o, "_abandon_ipc_worker", lambda *a, **k: False)
     monkeypatch.setattr(
-        o, "_review_subagent_result",
+        o,
+        "_review_subagent_result",
         lambda **kw: (False, "needs work"),
     )
     res = o._run_subagent_ipc(st)
@@ -1511,13 +1628,13 @@ def test_run_subagent_ipc_review_retry_timeout(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_reuse_worker(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc")
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     writes = {}
     monkeypatch.setattr(sipc, "clear_result", lambda *a, **k: None)
-    monkeypatch.setattr(sipc, "write_task",
-                        lambda repo, task, worker_id=None: writes.__setitem__("wid", worker_id))
+    monkeypatch.setattr(sipc, "write_task", lambda repo, task, worker_id=None: writes.__setitem__("wid", worker_id))
     monkeypatch.setattr(sipc, "wait_for_result", lambda *a, **k: _FakeResult(status="success", turns=0))
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: "worker_9")
     monkeypatch.setattr(o, "_return_worker_to_pool", lambda wid: None)
@@ -1534,6 +1651,7 @@ def test_run_subagent_ipc_reuse_worker(tmp_path, monkeypatch):
 )
 def test_run_subagent_ipc_auto_launch_terminal(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", auto_launch_terminal=True)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -1543,8 +1661,9 @@ def test_run_subagent_ipc_auto_launch_terminal(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     monkeypatch.setattr(o, "_return_worker_to_pool", lambda wid: None)
     launched = {}
-    monkeypatch.setattr(o, "_launch_ipc_worker_terminal_macos",
-                        lambda aid, wid: launched.__setitem__("n", True) or True)
+    monkeypatch.setattr(
+        o, "_launch_ipc_worker_terminal_macos", lambda aid, wid: launched.__setitem__("n", True) or True
+    )
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
     monkeypatch.setattr(o, "_filter_unassigned_changes", lambda r, own: r)
     monkeypatch.setattr(o, "_apply_scope_violation_policy", lambda *a, **k: [])
@@ -1562,9 +1681,11 @@ def test_launch_ipc_worker_terminal_macos(tmp_path, monkeypatch):
     assert popens and popens[0][0][0] == "osascript"
     # missing command → False
     assert o._launch_ipc_worker_terminal_macos("dev_2", "w2") is False
+
     # Popen failure → False
     def boom(*a, **k):
         raise OSError("no osascript")
+
     monkeypatch.setattr("subprocess.Popen", boom)
     assert o._launch_ipc_worker_terminal_macos("dev_1", "w1") is False
 
@@ -1575,9 +1696,11 @@ def test_spawn_ipc_worker_background(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.Popen", lambda *a, **k: proc)
     assert o._spawn_ipc_worker_background(str(tmp_path), "w1", "p", "m") is True
     assert o._ipc_worker_procs["w1"] is proc
+
     # failure → False
     def boom(*a, **k):
         raise OSError("spawn failed")
+
     monkeypatch.setattr("subprocess.Popen", boom)
     assert o._spawn_ipc_worker_background(str(tmp_path), "w2", "", "") is False
 
@@ -1595,6 +1718,7 @@ def test_spawn_ipc_worker_background_rotates_log(tmp_path, monkeypatch):
 
 
 # ── _run_subagent (in-process) ──────────────────────────────────────────────
+
 
 class _FakeLoop:
     def __init__(self, result):
@@ -1637,6 +1761,7 @@ def test_run_subagent_inprocess_error_reverts(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "NO_CHANGES")
     monkeypatch.setattr(o, "_detect_genuine_violations", lambda *a, **k: [])
     monkeypatch.setattr(o, "_apply_scope_violation_policy", lambda *a, **k: [])
+
     class _MutatingLoop(_FakeLoop):
         def run(self, text):
             (tmp_path / "a.py").write_text("MUTATED")  # after snapshot capture
@@ -1663,10 +1788,12 @@ def test_run_subagent_inprocess_review_retry(tmp_path, monkeypatch):
             runs.append(text)
             return self._results.pop(0)
 
-    loops = _RetryLoop([
-        AgentResult(status="success", final_message="first", turns=[1]),
-        AgentResult(status="success", final_message="second", turns=[1]),
-    ])
+    loops = _RetryLoop(
+        [
+            AgentResult(status="success", final_message="first", turns=[1]),
+            AgentResult(status="success", final_message="second", turns=[1]),
+        ]
+    )
     monkeypatch.setattr(agent_loop_mod, "AgentLoop", lambda **kw: loops)
     monkeypatch.setattr(o._registry_proto, "clone_for_subagent", lambda cfg: o._registry_proto)
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
@@ -1723,6 +1850,7 @@ def test_run_subagent_inprocess_task_text_passthrough(tmp_path, monkeypatch):
 
 # ── continue_subagent / run (decomposition) ─────────────────────────────────
 
+
 def test_continue_subagent_cancelled(tmp_path):
     ev = threading.Event()
     ev.set()
@@ -1735,9 +1863,15 @@ def test_continue_subagent_runs(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     ran = {}
     monkeypatch.setattr(
-        o, "_run_subagent",
-        lambda subtask, extra_turns=0: ran.__setitem__("st", subtask) or AgentResult(
-            status="success", final_message="continued", turns=[1],
+        o,
+        "_run_subagent",
+        lambda subtask, extra_turns=0: (
+            ran.__setitem__("st", subtask)
+            or AgentResult(
+                status="success",
+                final_message="continued",
+                turns=[1],
+            )
         ),
     )
     res = o.continue_subagent("dev_1", "more", prior_context="PRIOR")
@@ -1761,7 +1895,8 @@ def test_run_decomposition_full(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_decompose_task", lambda req: subtasks)
     monkeypatch.setattr(o, "_capture_scope_baseline", lambda rr, sts: None)
     monkeypatch.setattr(
-        o, "_run_dependency_aware",
+        o,
+        "_run_dependency_aware",
         lambda sts, original_request="": [AgentResult(status="success", final_message="ok", turns=[1])],
     )
     monkeypatch.setattr(o, "_synthesize", lambda *a, **k: "summary text")
@@ -1789,7 +1924,8 @@ def test_run_decomposition_partial(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_decompose_task", lambda req: subtasks)
     monkeypatch.setattr(o, "_capture_scope_baseline", lambda rr, sts: None)
     monkeypatch.setattr(
-        o, "_run_dependency_aware",
+        o,
+        "_run_dependency_aware",
         lambda sts, original_request="": [AgentResult(status="error", final_message="bad", error="e", turns=[])],
     )
     monkeypatch.setattr(o, "_synthesize", lambda *a, **k: "sum")
@@ -1800,6 +1936,7 @@ def test_run_decomposition_partial(tmp_path, monkeypatch):
 
 def test_decompose_task_parses_and_remaps(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     o = _make_orch(tmp_path)
     raw = (
         '{"subtasks": ['
@@ -1821,9 +1958,12 @@ def test_decompose_task_parses_and_remaps(tmp_path, monkeypatch):
 
 def test_decompose_task_bad_json(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     o = _make_orch(tmp_path)
     monkeypatch.setattr(orchm, "simple_llm_call", lambda *a, **k: "not json")
     assert o._decompose_task("task") == []
+
+
 def test_run_dependency_aware_order_and_cancel(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     specs = [
@@ -1858,8 +1998,9 @@ def test_run_dependency_aware_cycles(tmp_path, monkeypatch):
     evs = []
     monkeypatch.setattr(o, "_cb", lambda ev, data: evs.append(data.get("type", ev)))
     # _break_cycles will produce acyclic specs → recursive call runs them
-    monkeypatch.setattr(o, "_run_subagent",
-                        lambda st, **kw: AgentResult(status="success", final_message="ok", turns=[1]))
+    monkeypatch.setattr(
+        o, "_run_subagent", lambda st, **kw: AgentResult(status="success", final_message="ok", turns=[1])
+    )
     results = o._run_dependency_aware(specs)
     assert len(results) == 2
     assert "dependency_cycle" in evs
@@ -1873,8 +2014,9 @@ def test_run_dependency_aware_no_ready_fallback(tmp_path, monkeypatch):
         SubTaskSpec(task_id="a", title="A", description="d", dependencies=["a"]),
     ]
     monkeypatch.setattr(o, "_break_cycles", lambda sts, cyc: None)
-    monkeypatch.setattr(o, "_run_subagent",
-                        lambda st, **kw: AgentResult(status="success", final_message="ok", turns=[1]))
+    monkeypatch.setattr(
+        o, "_run_subagent", lambda st, **kw: AgentResult(status="success", final_message="ok", turns=[1])
+    )
     evs = []
     monkeypatch.setattr(o, "_cb", lambda ev, data: evs.append(data.get("type", ev)))
     results = o._run_dependency_aware(specs)
@@ -1885,8 +2027,9 @@ def test_run_dependency_aware_no_ready_fallback(tmp_path, monkeypatch):
 def test_run_parallel_batch_single_and_multi(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     specs = [SubTaskSpec(task_id="a", title="A", description="d")]
-    monkeypatch.setattr(o, "_run_subagent",
-                        lambda st, *a, **kw: AgentResult(status="success", final_message="ok", turns=[1]))
+    monkeypatch.setattr(
+        o, "_run_subagent", lambda st, *a, **kw: AgentResult(status="success", final_message="ok", turns=[1])
+    )
     res = o._run_parallel_batch(specs, {}, {})
     assert len(res) == 1 and res[0].status == "success"
     # multi with failure
@@ -1931,6 +2074,7 @@ def test_run_parallel_batch_cancel(tmp_path, monkeypatch):
 
 # ── _tool_spawn_subagent ────────────────────────────────────────────────────
 
+
 def test_tool_spawn_subagent(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     monkeypatch.setattr(o, "_run_subagent_background", lambda subtask, original_request="": None)
@@ -1962,6 +2106,7 @@ def test_tool_spawn_subagent_conflict_warning(tmp_path, monkeypatch):
 
 # ── _claim_reusable_worker / _return / _cleanup / _abandon ─────────────────
 
+
 def test_claim_reusable_worker_no_pool(tmp_path):
     o = _make_orch(tmp_path)
     assert o._claim_reusable_worker(str(tmp_path)) is None
@@ -1978,6 +2123,7 @@ def test_claim_reusable_worker_busy(tmp_path):
 
 def test_claim_reusable_worker_dead_proc(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     o._reusable_worker_ids.add("w1")
     monkeypatch.setattr(sipc, "read_worker_idle_heartbeat_state", lambda *a, **k: "idle")
@@ -1990,6 +2136,7 @@ def test_claim_reusable_worker_dead_proc(tmp_path, monkeypatch):
 
 def test_claim_reusable_worker_exited_heartbeat(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     o._reusable_worker_ids.add("w1")
     monkeypatch.setattr(sipc, "read_worker_idle_heartbeat_state", lambda *a, **k: "exited")
@@ -1999,6 +2146,7 @@ def test_claim_reusable_worker_exited_heartbeat(tmp_path, monkeypatch):
 
 def test_claim_reusable_worker_stale_hb_terminal(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, ipc_heartbeat_stale_s=30)
     o._reusable_worker_ids.add("w1")
     monkeypatch.setattr(sipc, "read_worker_idle_heartbeat_state", lambda *a, **k: "idle")
@@ -2008,6 +2156,7 @@ def test_claim_reusable_worker_stale_hb_terminal(tmp_path, monkeypatch):
 
 def test_claim_reusable_worker_alive(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     o._reusable_worker_ids.add("w1")
     monkeypatch.setattr(sipc, "read_worker_idle_heartbeat_state", lambda *a, **k: "idle")
@@ -2032,6 +2181,7 @@ def test_cleanup_ipc_workers_non_ipc(tmp_path):
 
 def test_cleanup_ipc_workers_writes_sentinels(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc")
     o._ipc_worker_ids.add("w1")
     calls = []
@@ -2043,6 +2193,7 @@ def test_cleanup_ipc_workers_writes_sentinels(tmp_path, monkeypatch):
 
 def test_cleanup_ipc_workers_terminates_procs(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc")
     monkeypatch.setattr(sipc, "write_cancel_all", lambda r, w: None)
     monkeypatch.setattr(sipc, "write_shutdown_all", lambda r, w: None)
@@ -2059,6 +2210,7 @@ def test_cleanup_ipc_workers_terminates_procs(tmp_path, monkeypatch):
 
 def test_abandon_ipc_worker_soft_quiesce(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     d = tmp_path / ".asicode" / "subagents" / "w1"
     d.mkdir(parents=True)
@@ -2070,6 +2222,7 @@ def test_abandon_ipc_worker_soft_quiesce(tmp_path, monkeypatch):
 
 def test_abandon_ipc_worker_already_dead(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     monkeypatch.setattr(sipc, "write_cancel_sentinel", lambda r, w: None)
     proc = SimpleNamespace(poll=lambda: 1, returncode=9)
@@ -2080,6 +2233,7 @@ def test_abandon_ipc_worker_already_dead(tmp_path, monkeypatch):
 
 def test_abandon_ipc_worker_hard_cancel(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     ev = threading.Event()
     ev.set()
     o = _make_orch(tmp_path, cancel_event=ev)
@@ -2098,9 +2252,12 @@ def test_abandon_ipc_worker_hard_cancel(tmp_path, monkeypatch):
 
 def test_abandon_ipc_worker_cancel_sentinel_failure(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
+
     def boom(r, w):
         raise OSError("no dir")
+
     monkeypatch.setattr(sipc, "write_cancel_sentinel", boom)
     reusable = o._abandon_ipc_worker(str(tmp_path), "w1", grace_s=1)
     assert reusable is False  # sentinel failed → not quiesced → not reusable
@@ -2202,6 +2359,7 @@ def test_run_tool_loop_session_inheritance_failure(tmp_path, monkeypatch):
 
 def test_run_tool_loop_cancelled(tmp_path, monkeypatch):
     from external_llm.agent.agent_loop_types import AgentCancelled
+
     o = _make_orch(tmp_path, tool_loop_enabled=True)
     calls = {}
 
@@ -2288,7 +2446,10 @@ def test_run_tool_loop_with_bg_results(tmp_path, monkeypatch):
         def respond(self, msgs, **kw):
             # run()/_run_tool_loop clear bg state at entry, so populate during respond
             st = SubTaskSpec(task_id="dev_1", title="T", description="d")
-            o._bg_subagents["dev_1"] = {"subtask": st, "result": AgentResult(status="success", final_message="r", turns=[1])}
+            o._bg_subagents["dev_1"] = {
+                "subtask": st,
+                "result": AgentResult(status="success", final_message="r", turns=[1]),
+            }
             o._bg_results.append(o._bg_subagents["dev_1"]["result"])
             return _FakeDCResult(content="")
 
@@ -2303,8 +2464,10 @@ def test_run_tool_loop_with_bg_results(tmp_path, monkeypatch):
 
 # ── _on_poll heartbeat path (via _run_subagent_ipc) ─────────────────────────
 
+
 def test_run_subagent_ipc_on_poll_heartbeat(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc")
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -2324,7 +2487,9 @@ def test_run_subagent_ipc_on_poll_heartbeat(tmp_path, monkeypatch):
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
     monkeypatch.setattr(o, "_filter_unassigned_changes", lambda r, own: r)
     monkeypatch.setattr(o, "_apply_scope_violation_policy", lambda *a, **k: [])
-    monkeypatch.setattr(o, "_event_dispatcher", SimpleNamespace(emit=lambda aid, ev, data: seen_polls.append((aid, ev, data))))
+    monkeypatch.setattr(
+        o, "_event_dispatcher", SimpleNamespace(emit=lambda aid, ev, data: seen_polls.append((aid, ev, data)))
+    )
     o._run_subagent_ipc(st)
     waits = [e for e in seen_polls if e[1] == "subagent_waiting_ipc"]
     assert waits, "waiting events must be emitted"
@@ -2335,6 +2500,7 @@ def test_run_subagent_ipc_on_poll_heartbeat(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_provider_model_argv(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", subagent_provider="ollama", subagent_model="qwen")
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -2356,14 +2522,18 @@ def test_run_subagent_ipc_provider_model_argv(tmp_path, monkeypatch):
 
 def test_run_subagent_ipc_scope_policy_revert(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", scope_violation_policy="revert")
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     (tmp_path / "stray.py").write_text("s")
     monkeypatch.setattr(sipc, "clear_result", lambda *a, **k: None)
     monkeypatch.setattr(sipc, "write_task", lambda *a, **k: None)
-    monkeypatch.setattr(sipc, "wait_for_result",
-                        lambda *a, **k: _FakeResult(status="success", turns=0, unassigned_changes=[{"file": "stray.py"}]))
+    monkeypatch.setattr(
+        sipc,
+        "wait_for_result",
+        lambda *a, **k: _FakeResult(status="success", turns=0, unassigned_changes=[{"file": "stray.py"}]),
+    )
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     monkeypatch.setattr(o, "_return_worker_to_pool", lambda wid: None)
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
@@ -2374,6 +2544,7 @@ def test_run_subagent_ipc_scope_policy_revert(tmp_path, monkeypatch):
 
 
 # ── _break_cycles edges ─────────────────────────────────────────────────────
+
 
 def test_break_cycles_weakest_edge_removal():
     o = _make_orch("/tmp")
@@ -2414,15 +2585,19 @@ def test_break_cycles_short_cycle_skipped():
 def test_break_cycles_none_when_unbreakable(monkeypatch):
     o = _make_orch("/tmp")
     monkeypatch.setattr(o, "_detect_cycles_kahn", lambda m: ([], [["x", "y"]]))
-    specs = [SubTaskSpec(task_id="x", title="x", description="d", dependencies=["y"]),
-             SubTaskSpec(task_id="y", title="y", description="d", dependencies=["x"])]
+    specs = [
+        SubTaskSpec(task_id="x", title="x", description="d", dependencies=["y"]),
+        SubTaskSpec(task_id="y", title="y", description="d", dependencies=["x"]),
+    ]
     assert o._break_cycles(specs, [["x", "y"]]) is None
 
 
 # ── _revert_unassigned_changes edge failures ────────────────────────────────
 
+
 def test_revert_unassigned_batched_checkout_failure_perfile_fallback(git_repo, monkeypatch):
     import subprocess as _sp
+
     (git_repo / "f.py").write_text("x=7\n", encoding="utf-8")
     o = _make_orch(git_repo)
     real_run = _sp.run
@@ -2448,6 +2623,7 @@ def test_revert_unassigned_unlink_missing_file(git_repo):
 
 # ── _format_poll_any_results heads ──────────────────────────────────────────
 
+
 def test_format_poll_any_results():
     o = _make_orch("/tmp")
     r1 = AgentResult(status="success", final_message="one", turns=[1])
@@ -2466,8 +2642,10 @@ def test_format_poll_any_results():
 
 # ── _synthesize (LLM summary) ───────────────────────────────────────────────
 
+
 def test_synthesize(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     o = _make_orch(tmp_path)
     monkeypatch.setattr(orchm, "simple_llm_call", lambda *a, **k: "SYNTH")
     st = SubTaskSpec(task_id="dev_1", title="T", description="d")
@@ -2484,11 +2662,11 @@ def test_synthesize(tmp_path, monkeypatch):
 
 # ── _run_parallel_batch cancel-drain exception edges ────────────────────────
 
+
 def test_run_parallel_batch_future_exception_results(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     # 2 specs so the ThreadPoolExecutor path (not the single-task fast path) runs
-    specs = [SubTaskSpec(task_id="a", title="A", description="d"),
-             SubTaskSpec(task_id="b", title="B", description="d")]
+    specs = [SubTaskSpec(task_id="a", title="A", description="d"), SubTaskSpec(task_id="b", title="B", description="d")]
 
     def boom(st, *a, **kw):
         raise ValueError("inner boom")
@@ -2501,12 +2679,15 @@ def test_run_parallel_batch_future_exception_results(tmp_path, monkeypatch):
 
 # ── _gc_subagent_artifacts failure edges ────────────────────────────────────
 
+
 def test_gc_subagent_artifacts_exception_handled(tmp_path, monkeypatch):
     base = tmp_path / ".asicode" / "subagents"
     base.mkdir(parents=True)
     (base / "d1").mkdir()
+
     def boom(*a, **k):
         raise OSError("listdir boom")
+
     monkeypatch.setattr(os, "listdir", boom)
     OrchestratorAgent._gc_subagent_artifacts(str(tmp_path))  # must not raise
 
@@ -2515,13 +2696,16 @@ def test_gc_subagent_artifacts_getmtime_failure(tmp_path, monkeypatch):
     base = tmp_path / ".asicode" / "subagents"
     d = base / "d1"
     d.mkdir(parents=True)
+
     def boom(p):
         raise OSError("mtime boom")
+
     monkeypatch.setattr(os.path, "getmtime", boom)
     OrchestratorAgent._gc_subagent_artifacts(str(tmp_path))  # must not raise
 
 
 # ── _capture/_restore edge failures ─────────────────────────────────────────
+
 
 def test_capture_snapshots_agg_cap_warns_once(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "_SNAPSHOT_AGGREGATE_MAX_BYTES", 4)
@@ -2535,8 +2719,10 @@ def test_capture_snapshots_agg_cap_warns_once(tmp_path, monkeypatch):
 
 def test_restore_snapshots_removedirs_failure(tmp_path, monkeypatch):
     (tmp_path / "new.py").write_bytes(b"x")
+
     def boom(p):
         raise OSError("removedirs boom")
+
     monkeypatch.setattr(os, "removedirs", boom)
     reverted = _restore_assigned_snapshots(str(tmp_path), {"new.py": _MISSING_SNAP})
     assert reverted == ["new.py"]  # removedirs failure is non-fatal
@@ -2544,13 +2730,17 @@ def test_restore_snapshots_removedirs_failure(tmp_path, monkeypatch):
 
 def test_restore_snapshots_write_failure_reverts_and_raises(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_bytes(b"orig")
+
     class _Boom:
         def __enter__(self):
             return self
+
         def __exit__(self, *a):
             return False
+
         def write(self, data):
             raise OSError("disk full")
+
     monkeypatch.setattr("tempfile.mkstemp", lambda **kw: (3, str(tmp_path / "tmp")))
     monkeypatch.setattr(os, "fdopen", lambda fd, mode: _Boom())
     # write failure is swallowed + skipped (best-effort restore contract)
@@ -2560,13 +2750,21 @@ def test_restore_snapshots_write_failure_reverts_and_raises(tmp_path, monkeypatc
 
 # ── _check_bg_subagent future exception edge ────────────────────────────────
 
+
 def test_check_bg_subagent_future_exception_cached(tmp_path):
     o = _make_orch(tmp_path)
     from concurrent.futures import Future
+
     f = Future()
     f.set_exception(ValueError("boom"))
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": f, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": f,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     status, result = o._check_bg_subagent("x", timeout_s=0)
     assert status == "error" and "boom" in result.error
     # second call — cached, no double append
@@ -2577,15 +2775,20 @@ def test_check_bg_subagent_future_exception_cached(tmp_path):
 
 # ── _cb handler raise edge ──────────────────────────────────────────────────
 
+
 def test_cb_handler_raise_swallowed(tmp_path):
     def bad(ev, data):
         raise RuntimeError("cb boom")
-    o = _make_orch(tmp_path, )
+
+    o = _make_orch(
+        tmp_path,
+    )
     o._cb_fn = bad
     o._cb("ev", {})  # must not raise
 
 
 # ── _symbol_hint_for_source tree-sitter failure fallback ────────────────────
+
 
 def test_symbol_hint_tree_sitter_failure_falls_back_to_ast(tmp_path, monkeypatch):
     # ast fallback still yields hints for python files (tree-sitter or not)
@@ -2598,6 +2801,7 @@ def test_symbol_def_line_unknown_lang():
 
 
 # ── _tool_poll_subagent timeout coercion ────────────────────────────────────
+
 
 def test_tool_poll_subagent_bad_timeout_coerced(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
@@ -2614,8 +2818,10 @@ def test_poll_single_agent_unknown_raises(tmp_path):
 
 # ── _decompose_task unscoped warning / git context ──────────────────────────
 
+
 def test_decompose_task_unscoped_warning(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     o = _make_orch(tmp_path)
     raw = '{"subtasks": [{"id": "x", "title": "T", "description": "d", "assigned_files": []}]}'
     monkeypatch.setattr(orchm, "simple_llm_call", lambda *a, **k: raw)
@@ -2631,8 +2837,9 @@ def test_run_dependency_aware_conflict_split(tmp_path, monkeypatch):
     ]
     evs = []
     monkeypatch.setattr(o, "_cb", lambda ev, data: evs.append(data.get("type", ev)))
-    monkeypatch.setattr(o, "_run_subagent",
-                        lambda st, **kw: AgentResult(status="success", final_message="ok", turns=[1]))
+    monkeypatch.setattr(
+        o, "_run_subagent", lambda st, **kw: AgentResult(status="success", final_message="ok", turns=[1])
+    )
     results = o._run_dependency_aware(specs)
     assert len(results) == 2
     assert "file_conflict_serialized" in evs
@@ -2642,16 +2849,26 @@ def test_run_dependency_aware_conflict_split(tmp_path, monkeypatch):
 # Round 5: _poll_any_agent blocking, _run_subagent dedicated-model branches
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_poll_any_agent_blocking_completes(tmp_path, monkeypatch):
     from concurrent.futures import Future
+
     o = _make_orch(tmp_path, ipc_timeout_s=5)
     f = Future()
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": f, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": f,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
+
     # complete the future in a background thread after a moment
     def complete():
         time.sleep(0.1)
         f.set_result(AgentResult(status="success", final_message="done", turns=[1]))
+
     t = threading.Thread(target=complete, daemon=True)
     t.start()
     out = o._poll_any_agent(["x"], timeout_s=2)
@@ -2662,9 +2879,16 @@ def test_poll_any_agent_blocking_cancel(tmp_path):
     ev = threading.Event()
     o = _make_orch(tmp_path, ipc_timeout_s=5, cancel_event=ev)
     from concurrent.futures import Future
+
     f = Future()
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": f, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": f,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     ev.set()
     out = o._poll_any_agent(["x"], timeout_s=5)
     assert "interrupted by cancellation" in out
@@ -2672,31 +2896,42 @@ def test_poll_any_agent_blocking_cancel(tmp_path):
 
 def test_poll_any_agent_blocking_timeout_none_done(tmp_path):
     from concurrent.futures import Future
+
     o = _make_orch(tmp_path, ipc_timeout_s=5)
     f = Future()
     st = SubTaskSpec(task_id="x", title="X", description="d")
-    o._bg_subagents["x"] = {"future": f, "result": None, "status": "running", "subtask": st, "started_at": time.monotonic()}
+    o._bg_subagents["x"] = {
+        "future": f,
+        "result": None,
+        "status": "running",
+        "subtask": st,
+        "started_at": time.monotonic(),
+    }
     out = o._poll_any_agent(["x"], timeout_s=0.3)
     assert "None of 1 sub-agents completed within" in out
 
 
 def test_run_subagent_dedicated_model(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path, subagent_provider="ollama", subagent_model="qwen2.5", subagent_api_key="k")
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     loop = _FakeLoop(AgentResult(status="success", final_message="ok", turns=[1]))
     monkeypatch.setattr(agent_loop_mod, "AgentLoop", lambda **kw: loop)
     import external_llm.client as client_mod
+
     monkeypatch.setattr(client_mod, "create_llm_client", lambda **kw: "NEW-CLIENT")
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
     monkeypatch.setattr(o, "_detect_genuine_violations", lambda *a, **k: [])
     monkeypatch.setattr(o, "_apply_scope_violation_policy", lambda *a, **k: [])
     o._run_subagent(st)
     assert loop.calls  # ran
+
     # create_llm_client failure → falls back to orchestrator client
     def boom(**kw):
         raise ValueError("client boom")
+
     monkeypatch.setattr(client_mod, "create_llm_client", boom)
     loop2 = _FakeLoop(AgentResult(status="success", final_message="ok", turns=[1]))
     monkeypatch.setattr(agent_loop_mod, "AgentLoop", lambda **kw: loop2)
@@ -2706,6 +2941,7 @@ def test_run_subagent_dedicated_model(tmp_path, monkeypatch):
 
 def test_run_subagent_symbol_hint_injected(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["mod.py"])
     (tmp_path / "mod.py").write_text("def helper():\n    pass\n", encoding="utf-8")
@@ -2720,6 +2956,7 @@ def test_run_subagent_symbol_hint_injected(tmp_path, monkeypatch):
 
 def test_run_subagent_sub_cb_routes(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -2738,6 +2975,7 @@ def test_run_subagent_sub_cb_routes(tmp_path, monkeypatch):
 
 def test_run_subagent_route_decision_set(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
@@ -2753,11 +2991,18 @@ def test_run_subagent_route_decision_set(tmp_path, monkeypatch):
 
 def test_run_subagent_parallel_disables_rag(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path, parallel=True)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     configs = []
-    monkeypatch.setattr(agent_loop_mod, "AgentLoop", lambda **kw: configs.append(kw.get("config")) or _FakeLoop(AgentResult(status="success", final_message="ok", turns=[1])))
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "AgentLoop",
+        lambda **kw: (
+            configs.append(kw.get("config")) or _FakeLoop(AgentResult(status="success", final_message="ok", turns=[1]))
+        ),
+    )
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
     monkeypatch.setattr(o, "_detect_genuine_violations", lambda *a, **k: [])
     monkeypatch.setattr(o, "_apply_scope_violation_policy", lambda *a, **k: [])
@@ -2767,6 +3012,7 @@ def test_run_subagent_parallel_disables_rag(tmp_path, monkeypatch):
 
 def test_run_subagent_model_context_scope(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path)
     entered = []
 
@@ -2774,6 +3020,7 @@ def test_run_subagent_model_context_scope(tmp_path, monkeypatch):
         def __enter__(self):
             entered.append(True)
             return self
+
         def __exit__(self, *a):
             return False
 
@@ -2793,18 +3040,23 @@ def test_run_subagent_model_context_scope(tmp_path, monkeypatch):
 # Round 6: defensive except-branch edges (lock rollback, spawn failures, …)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_filelock_acquire_rollback_on_held_meta_error(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     m = _fresh_manager(tmp_path)
     (tmp_path / "a.py").write_text("x")
 
     # _held update happens under _file_locks_meta; make the with-block raise
     real_meta = orchm._file_locks_meta
+
     class _BoomMeta:
         def __enter__(self):
             raise MemoryError("meta boom")
+
         def __exit__(self, *a):
             return False
+
     monkeypatch.setattr(orchm, "_file_locks_meta", _BoomMeta())
     try:
         with pytest.raises(MemoryError):
@@ -2816,13 +3068,17 @@ def test_filelock_acquire_rollback_on_held_meta_error(tmp_path, monkeypatch):
 
 def test_filelock_acquire_by_normalized_rollback(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     m = _fresh_manager(tmp_path)
     real_meta = orchm._file_locks_meta
+
     class _BoomMeta:
         def __enter__(self):
             raise RuntimeError("boom")
+
         def __exit__(self, *a):
             return False
+
     monkeypatch.setattr(orchm, "_file_locks_meta", _BoomMeta())
     try:
         with pytest.raises(RuntimeError):
@@ -2833,13 +3089,17 @@ def test_filelock_acquire_by_normalized_rollback(tmp_path, monkeypatch):
 
 def test_filelock_acquire_repo_rollback(tmp_path, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     m = _fresh_manager(tmp_path)
     real_meta = orchm._file_locks_meta
+
     class _BoomMeta:
         def __enter__(self):
             raise MemoryError("boom")
+
         def __exit__(self, *a):
             return False
+
     monkeypatch.setattr(orchm, "_file_locks_meta", _BoomMeta())
     try:
         with pytest.raises(MemoryError):
@@ -2869,14 +3129,18 @@ def test_spawn_ipc_worker_background_log_rotation_failures(tmp_path, monkeypatch
     log.write_bytes(b"x" * (orch._WORKER_LOG_ROTATE_BYTES + 10))
     # os.replace fails → rotate skipped, still spawns
     real_replace = os.replace
+
     def boom_replace(src, dst):
         raise OSError("replace boom")
+
     monkeypatch.setattr(os, "replace", boom_replace)
     assert o._spawn_ipc_worker_background(str(tmp_path), "w1", "", "") is True
     monkeypatch.setattr(os, "replace", real_replace)
+
     # log open fails → DEVNULL fallback
     def boom_open(path, mode):
         raise OSError("open boom")
+
     monkeypatch.setattr("builtins.open", boom_open)
     assert o._spawn_ipc_worker_background(str(tmp_path), "w2", "", "") is True
 
@@ -2893,8 +3157,10 @@ def test_spawn_ipc_worker_background_win32_flags(tmp_path, monkeypatch):
 
 def test_capture_snapshots_unreadable_oserror(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_bytes(b"x")
+
     def boom(p):
         raise OSError("perm denied")
+
     monkeypatch.setattr(os.path, "getsize", boom)
     snaps = _capture_assigned_snapshots(str(tmp_path), ["a.py"])
     assert snaps == {}  # unreadable → skipped
@@ -2904,11 +3170,13 @@ def test_capture_snapshots_read_exception_missing_sentinel(tmp_path, monkeypatch
     (tmp_path / "a.py").write_bytes(b"x")
     real_open = open
     calls = {"n": 0}
+
     def flaky(path, mode="r", **kw):
         if str(path).endswith("a.py") and mode == "rb" and calls["n"] == 0:
             calls["n"] += 1
             raise PermissionError("read boom")
         return real_open(path, mode, **kw)
+
     monkeypatch.setattr("builtins.open", flaky)
     # getsize succeeds, read fails with non-FileNotFoundError → skipped (no sentinel)
     snaps = _capture_assigned_snapshots(str(tmp_path), ["a.py"])
@@ -2918,8 +3186,10 @@ def test_capture_snapshots_read_exception_missing_sentinel(tmp_path, monkeypatch
 def test_symbol_def_line_tree_sitter_failure(tmp_path, monkeypatch):
     # force tree-sitter import path to raise → ast fallback
     import external_llm.languages.tree_sitter_utils as tsu
+
     def boom(*a, **k):
         raise RuntimeError("grammar missing")
+
     monkeypatch.setattr(tsu, "find_all_symbols", boom)
     out = _symbol_def_line("def f():\n    pass\n", "m.py", "f")
     assert out == 1
@@ -2929,6 +3199,7 @@ def test_symbol_def_line_tree_sitter_failure(tmp_path, monkeypatch):
 
 def test_symbol_hint_tree_sitter_returns_syms(tmp_path, monkeypatch):
     import external_llm.languages.tree_sitter_utils as tsu
+
     monkeypatch.setattr(tsu, "find_all_symbols", lambda src, lang: [("foo", "function", 1, 2)])
     out = _symbol_hint_for_source("x", "m.ts")
     assert out == ["F foo L1-L2"]
@@ -2936,32 +3207,40 @@ def test_symbol_hint_tree_sitter_returns_syms(tmp_path, monkeypatch):
 
 def test_norm_assigned_file_exception_fallback(tmp_path, monkeypatch):
     import path_security as ps
+
     def boom(p):
         raise ValueError("bad path")
+
     monkeypatch.setattr(ps, "normalize_rel_path", boom)
     assert _norm_assigned_file("weird") == "weird"  # raw fallback
 
 
 def test_build_git_context_subprocess_error(tmp_path, monkeypatch):
     import subprocess as _sp
+
     def boom(*a, **k):
         raise _sp.TimeoutExpired(cmd=["git"], timeout=5)
+
     monkeypatch.setattr(_sp, "run", boom)
     assert _build_git_context(str(tmp_path)) == ""
 
 
 def test_snapshot_dirty_path_set_exception(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     def boom(*a, **k):
         raise subprocess.CalledProcessError(1, "git")
+
     monkeypatch.setattr(sipc, "partition_changed_files", boom)
     assert _snapshot_dirty_path_set(str(tmp_path)) == set()
 
 
 def test_git_status_changed_paths_exception(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     def boom(*a, **k):
         raise subprocess.CalledProcessError(1, "git")
+
     monkeypatch.setattr(sipc, "partition_changed_files", boom)
     o = _make_orch(tmp_path)
     assert o._git_status_changed_paths(str(tmp_path)) == []
@@ -2969,6 +3248,7 @@ def test_git_status_changed_paths_exception(tmp_path, monkeypatch):
 
 def test_compute_diff_verdict_attach_failure(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
+
     class _LockedResult:
         def __init__(self):
             object.__setattr__(self, "status", "error")
@@ -2977,6 +3257,7 @@ def test_compute_diff_verdict_attach_failure(tmp_path, monkeypatch):
 
         def __setattr__(self, name, value):
             raise AttributeError("frozen")
+
     r = _LockedResult()
     verdict = o._compute_diff_verdict(agent_id="a", result=r, repo_root=None, diff_cache=None)
     assert verdict == "UNVERIFIABLE"  # attach failure swallowed
@@ -2984,9 +3265,11 @@ def test_compute_diff_verdict_attach_failure(tmp_path, monkeypatch):
 
 def test_run_subagent_attach_unassigned_failure(tmp_path, monkeypatch):
     import external_llm.agent.agent_loop as agent_loop_mod
+
     o = _make_orch(tmp_path)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
+
     class _LockedResult2:
         def __init__(self):
             object.__setattr__(self, "status", "success")
@@ -2996,6 +3279,7 @@ def test_run_subagent_attach_unassigned_failure(tmp_path, monkeypatch):
 
         def __setattr__(self, name, value):
             raise AttributeError("frozen")
+
     loop = _FakeLoop(_LockedResult2())
     monkeypatch.setattr(agent_loop_mod, "AgentLoop", lambda **kw: loop)
     monkeypatch.setattr(o, "_compute_diff_verdict", lambda **kw: "VERIFIED")
@@ -3022,6 +3306,7 @@ def test_review_subagent_result_target_symbol_hint(git_repo, monkeypatch):
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── FileLockManager defensive tails ─────────────────────────────────────────
+
 
 def test_filelock_normalize_path_realpath_fallback(tmp_path, monkeypatch):
     m = _fresh_manager(tmp_path)
@@ -3113,11 +3398,12 @@ def test_filelock_reset_release_error_guard(tmp_path):
     m.acquire("s.py")
     norm = next(iter(m._held))
     m._held[norm].release()  # someone else released the underlying lock
-    m.reset()                # m's release() → RuntimeError → guarded
+    m.reset()  # m's release() → RuntimeError → guarded
     assert m._held == {}
 
 
 # ── snapshot / symbol-hint / expansion / registry-facade tails ──────────────
+
 
 def test_capture_snapshots_open_toctou_missing(tmp_path, monkeypatch):
     real_getsize = os.path.getsize
@@ -3161,8 +3447,10 @@ def test_backed_registry_setattr_private_names(tmp_path):
 
 # ── _decompose_task git-context branch ──────────────────────────────────────
 
+
 def test_decompose_task_git_context_appended(git_repo, monkeypatch):
     import external_llm.agent.orchestrator as orchm
+
     o = _make_orch(git_repo)  # real git history → git_context non-empty
     raw = '{"subtasks": [{"id": "x1", "title": "T", "description": "d"}]}'
     captured = {}
@@ -3178,6 +3466,7 @@ def test_decompose_task_git_context_appended(git_repo, monkeypatch):
 
 
 # ── _synthesize_untracked_diff tails ────────────────────────────────────────
+
 
 def test_synthesize_untracked_diff_no_match_skip(git_repo):
     (git_repo / "new.py").write_text("n\n", encoding="utf-8")  # untracked
@@ -3200,18 +3489,19 @@ def test_synthesize_untracked_diff_read_failure_returns_empty(git_repo, monkeypa
 def test_synthesize_untracked_diff_cap_outer_break(git_repo):
     for f in ("u1.py", "u2.py", "u3.py"):
         (git_repo / f).write_text("line\n", encoding="utf-8")
-    out = OrchestratorAgent._synthesize_untracked_diff(
-        str(git_repo), ["u1.py", "u2.py", "u3.py"], char_limit=1)
+    out = OrchestratorAgent._synthesize_untracked_diff(str(git_repo), ["u1.py", "u2.py", "u3.py"], char_limit=1)
     assert "omitted" in out  # cap marker → _cap_hit → outer-loop break
 
 
 # ── _revert_unassigned_changes tails ────────────────────────────────────────
+
 
 def test_revert_batch_checkout_failure_perfile_fallback(git_repo, monkeypatch):
     (git_repo / "f.py").write_text("x=999\n", encoding="utf-8")
     (git_repo / "g.py").write_text("y=1\n", encoding="utf-8")
     o = _make_orch(git_repo)
     import subprocess as _sp
+
     real_run = _sp.run
 
     def checkout_boom(cmd, **kw):
@@ -3229,6 +3519,7 @@ def test_revert_checkout_always_fails_logged(git_repo, monkeypatch):
     (git_repo / "f.py").write_text("x=999\n", encoding="utf-8")
     o = _make_orch(git_repo)
     import subprocess as _sp
+
     real_run = _sp.run
 
     def boom(cmd, **kw):
@@ -3250,13 +3541,14 @@ def test_revert_perfile_ls_files_failure_unlinks(tmp_path, monkeypatch):
     (repo / "ok.py").write_text("o\n", encoding="utf-8")
     o = _make_orch(repo)
     import subprocess as _sp
+
     real_run = _sp.run
 
     def flaky(cmd, **kw):
         if cmd[:2] == ["git", "ls-files"] and "-z" in cmd:
-            raise OSError("batch ls-files boom")          # → per-file fallback
+            raise OSError("batch ls-files boom")  # → per-file fallback
         if cmd[:2] == ["git", "ls-files"] and "--error-unmatch" in cmd and cmd[-1] == "boom.py":
-            raise OSError("per-file ls-files boom")       # → treated as untracked
+            raise OSError("per-file ls-files boom")  # → treated as untracked
         return real_run(cmd, **kw)
 
     monkeypatch.setattr(_sp, "run", flaky)
@@ -3294,11 +3586,13 @@ def test_revert_unlink_failure_logged(git_repo, monkeypatch):
 
 # ── _compute_diff_verdict object-patch branch ───────────────────────────────
 
+
 def test_compute_diff_verdict_object_patch_file_path(git_repo):
     (git_repo / "f.py").write_text("x=999\n", encoding="utf-8")
     o = _make_orch(git_repo, parallel=True)
     r = SimpleNamespace(
-        status="success", final_message="ok",
+        status="success",
+        final_message="ok",
         applied_patches=[SimpleNamespace(file_path="f.py")],
     )
     verdict = o._compute_diff_verdict(agent_id="a1", result=r, repo_root=str(git_repo), diff_cache={})
@@ -3308,12 +3602,15 @@ def test_compute_diff_verdict_object_patch_file_path(git_repo):
 
 # ── _run_parallel_batch cancel-drain interleavings ──────────────────────────
 
+
 def test_run_parallel_batch_cancel_drain_cancelled_futures(tmp_path, monkeypatch):
     ev = threading.Event()
     ev.set()  # cancel BEFORE dispatch
     o = _make_orch(tmp_path, cancel_event=ev, max_subagents=1)
-    specs = [SubTaskSpec(task_id="t0", title="T0", description="d"),
-             SubTaskSpec(task_id="t1", title="T1", description="d")]
+    specs = [
+        SubTaskSpec(task_id="t0", title="T0", description="d"),
+        SubTaskSpec(task_id="t1", title="T1", description="d"),
+    ]
 
     def quick(st, *a, **kw):
         # Finish INSIDE the 2s drain window: the worker then dequeues the
@@ -3334,8 +3631,7 @@ def test_run_parallel_batch_cancel_drain_exception_future(tmp_path, monkeypatch)
     ev = threading.Event()
     ev.set()
     o = _make_orch(tmp_path, cancel_event=ev)  # max_subagents=3 → both start
-    specs = [SubTaskSpec(task_id="a", title="A", description="d"),
-             SubTaskSpec(task_id="b", title="B", description="d")]
+    specs = [SubTaskSpec(task_id="a", title="A", description="d"), SubTaskSpec(task_id="b", title="B", description="d")]
     release = threading.Event()
 
     def mixed(st, *a, **kw):
@@ -3356,9 +3652,9 @@ def test_run_parallel_batch_cancel_drain_exception_future(tmp_path, monkeypatch)
 
 def test_run_parallel_batch_first_completed_cancelled_drain(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
+
     o = _make_orch(tmp_path, max_subagents=1)
-    specs = [SubTaskSpec(task_id="a", title="A", description="d"),
-             SubTaskSpec(task_id="b", title="B", description="d")]
+    specs = [SubTaskSpec(task_id="a", title="A", description="d"), SubTaskSpec(task_id="b", title="B", description="d")]
     recorded = []
     both_submitted = threading.Event()
 
@@ -3386,6 +3682,7 @@ def test_run_parallel_batch_first_completed_cancelled_drain(tmp_path, monkeypatc
 
 
 # ── _sub_cb stream-callback forwarding (in-process _run_subagent) ───────────
+
 
 class _CallbackLoop:
     def __init__(self, **kw):
@@ -3418,6 +3715,7 @@ def test_run_subagent_stream_callback_forwards_agent_id(tmp_path, monkeypatch):
 
 # ── _run_subagent_ipc result-attach guard tail ──────────────────────────────
 
+
 class _SlotsResult:
     """AgentResult stand-in whose __slots__ reject _orch_unassigned (line 2517)."""
 
@@ -3430,15 +3728,18 @@ class _SlotsResult:
 
 def test_run_subagent_ipc_attach_unassigned_guard(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc", ipc_timeout_s=30)
     st = SubTaskSpec(task_id="dev_1", title="T", description="D", assigned_files=["a.py"])
     (tmp_path / "a.py").write_text("x")
     monkeypatch.setattr(sipc, "clear_result", lambda *a, **k: None)
     monkeypatch.setattr(sipc, "write_task", lambda *a, **k: None)
     monkeypatch.setattr(
-        sipc, "wait_for_result",
-        lambda *a, **k: _FakeResult(status="success", final_message="done", turns=1,
-                                    unassigned_changes=[{"file": "stray.py"}]),
+        sipc,
+        "wait_for_result",
+        lambda *a, **k: _FakeResult(
+            status="success", final_message="done", turns=1, unassigned_changes=[{"file": "stray.py"}]
+        ),
     )
     monkeypatch.setattr(o, "_claim_reusable_worker", lambda repo: None)
     monkeypatch.setattr(o, "_return_worker_to_pool", lambda wid: None)
@@ -3451,6 +3752,7 @@ def test_run_subagent_ipc_attach_unassigned_guard(tmp_path, monkeypatch):
 
 
 # ── _spawn_ipc_worker_background log tails ──────────────────────────────────
+
 
 def test_spawn_ipc_worker_background_log_stat_error(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
@@ -3489,12 +3791,13 @@ def test_spawn_ipc_worker_background_log_close_error(tmp_path, monkeypatch):
 
 # ── _tool_spawn_subagent tails ──────────────────────────────────────────────
 
+
 def test_tool_spawn_subagent_skips_finished_entries(tmp_path, monkeypatch):
     o = _make_orch(tmp_path)
     st_finished = SubTaskSpec(task_id="dev_0", title="T", description="d", assigned_files=["x.py"])
     st_running = SubTaskSpec(task_id="dev_1", title="T", description="d", assigned_files=["share.py"])
     o._bg_subagents["dev_0"] = {"result": object(), "subtask": st_finished}  # finished → skip
-    o._bg_subagents["dev_1"] = {"result": None, "subtask": st_running}       # running → overlap
+    o._bg_subagents["dev_1"] = {"result": None, "subtask": st_running}  # running → overlap
     monkeypatch.setattr(o, "_run_subagent_background", lambda subtask, original_request="": None)
     out = o._tool_spawn_subagent({"task_description": "Do it", "assigned_files": ["share.py"]}, "")
     assert "overlap" in out and "dev_1" in out
@@ -3510,8 +3813,10 @@ def test_tool_spawn_subagent_queued_note(tmp_path, monkeypatch):
 
 # ── _claim_reusable_worker reader-failure tail ──────────────────────────────
 
+
 def test_claim_reusable_worker_heartbeat_readers_raise(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     o._reusable_worker_ids.add("w1")
 
@@ -3526,8 +3831,10 @@ def test_claim_reusable_worker_heartbeat_readers_raise(tmp_path, monkeypatch):
 
 # ── _abandon_ipc_worker / _cleanup_ipc_workers terminate-failure tails ──────
 
+
 def test_abandon_ipc_worker_soft_terminate_failure(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path)
     monkeypatch.setattr(sipc, "write_cancel_sentinel", lambda r, w: None)
     proc = SimpleNamespace(poll=lambda: None)
@@ -3543,6 +3850,7 @@ def test_abandon_ipc_worker_soft_terminate_failure(tmp_path, monkeypatch):
 
 def test_abandon_ipc_worker_hard_terminate_failure(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     ev = threading.Event()
     ev.set()
     o = _make_orch(tmp_path, cancel_event=ev)
@@ -3565,6 +3873,7 @@ def test_abandon_ipc_worker_hard_terminate_failure(tmp_path, monkeypatch):
 
 def test_cleanup_ipc_workers_terminate_failure(tmp_path, monkeypatch):
     import external_llm.agent.subagent_ipc as sipc
+
     o = _make_orch(tmp_path, subagent_mode="ipc")
     o._ipc_worker_ids.add("w1")
     monkeypatch.setattr(sipc, "write_cancel_all", lambda r, w: None)

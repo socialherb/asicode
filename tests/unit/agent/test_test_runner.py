@@ -4,6 +4,7 @@ Covers the pure output-parsing helpers exhaustively (summary/failing/traceback
 extraction, structured pytest parse), the command builder, the provider factory,
 and the core subprocess runner via a real trivial subprocess + a timeout path.
 """
+
 from __future__ import annotations
 
 import errno
@@ -176,9 +177,14 @@ class TestParsePytestOutput:
     def test_empty_returns_zeros(self):
         r = self.tr._parse_pytest_output("")
         assert r == {
-            "passed": 0, "failed": 0, "errors": 0,
-            "skipped": 0, "xpassed": 0, "xfailed": 0,
-            "failed_tests": [], "error_tests": [],
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "xpassed": 0,
+            "xfailed": 0,
+            "failed_tests": [],
+            "error_tests": [],
         }
 
     def test_count_parsing(self):
@@ -197,10 +203,7 @@ class TestParsePytestOutput:
         assert r["errors"] == 1
 
     def test_failed_test_detail_with_error_type(self):
-        out = (
-            "FAILED tests/test_a.py::test_one - AssertionError: boom\n"
-            "2 passed, 1 failed in 0.1s\n"
-        )
+        out = "FAILED tests/test_a.py::test_one - AssertionError: boom\n2 passed, 1 failed in 0.1s\n"
         r = self.tr._parse_pytest_output(out)
         assert len(r["failed_tests"]) == 1
         ft = r["failed_tests"][0]
@@ -217,11 +220,7 @@ class TestParsePytestOutput:
         assert ft["message"] == "no colon here"
 
     def test_error_tests_parsing(self):
-        out = (
-            "ERROR tests/test_e.py::test_setup - setup err\n"
-            "ERROR tests/test_e.py::test_setup2\n"
-            "1 error in 0.1s\n"
-        )
+        out = "ERROR tests/test_e.py::test_setup - setup err\nERROR tests/test_e.py::test_setup2\n1 error in 0.1s\n"
         r = self.tr._parse_pytest_output(out)
         assert len(r["error_tests"]) == 2
         assert r["error_tests"][0]["test_id"] == "tests/test_e.py::test_setup"
@@ -423,7 +422,7 @@ class TestTimeoutTeardown:
             "import subprocess, sys, time\n"
             "subprocess.Popen([sys.executable, '-c',\n"
             f"    \"import os, time; open({str(pidfile)!r}, 'w').write(str(os.getpid()));\"\n"
-            f"    \"time.sleep({sleep_s})\"])\n"
+            f'    "time.sleep({sleep_s})"])\n'
             f"time.sleep({sleep_s})\n"
         )
         return [sys.executable, str(script)]
@@ -513,7 +512,8 @@ class TestTimeoutTeardown:
         tr = _tr.TestRunner(
             str(tmp_path),
             test_command=[
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 f"import sys\nfor i in range({n_lines}): sys.stdout.write(f'{{i:07d}} ' + 'x'*{_BULK_PAD} + '\\n')",
             ],
         )
@@ -533,7 +533,8 @@ class TestTimeoutTeardown:
         tr = _tr.TestRunner(
             str(tmp_path),
             test_command=[
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 "import sys\n"
                 "print('collected 999 items')\n"
                 f"for i in range({n_lines}): sys.stdout.write(f'{{i:07d}} ' + 'x'*{_BULK_PAD} + '\\n')\n"
@@ -542,7 +543,7 @@ class TestTimeoutTeardown:
         )
         r = tr._run_cmd(tr.test_command, timeout_sec=60)
 
-        assert "collected 999 items" in r.combined          # head survived
+        assert "collected 999 items" in r.combined  # head survived
         assert "1 failed, 998 passed in 12.34s" in r.combined  # tail survived
         # ...and the tail is still what the extractors read.
         assert r.summary_line == "1 failed, 998 passed in 12.34s"
@@ -589,7 +590,8 @@ class TestKillProcessGroupSafety:
 
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             start_new_session=True,
         )
         try:
@@ -605,3 +607,47 @@ class TestKillProcessGroupSafety:
             for _s in (proc.stdout, proc.stderr):
                 if _s is not None:
                     _s.close()
+
+    def test_pgid_none_falls_back_to_child_kill(self, monkeypatch):
+        """A leader reaped before pgid resolution must not crash the group kill.
+
+        ``_run_cmd`` resolves the pgid immediately after Popen; under parallel
+        load an instantly-exiting command can be reaped before ``getpgid``,
+        which then raises ProcessLookupError. The degraded value is None —
+        there is no group to signal — and ``_kill_process_group`` must fall
+        through to killing the (already-dead) child without raising.
+        """
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(_tr.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+        killed: list[bool] = []
+
+        class _DeadLeaderProc:
+            pid = 999999999  # not resolvable
+
+            def kill(self):
+                killed.append(True)
+
+        # Must not raise TypeError (killpg(None, SIGKILL)) nor ProcessLookupError.
+        _tr._kill_process_group(_DeadLeaderProc(), None)
+
+        assert calls == [], f"killpg must not be called with None: {calls}"
+        assert killed == [True], "must still attempt the direct child kill"
+
+    def test_run_cmd_survives_instant_exit_race(self, monkeypatch, tmp_path):
+        """Popen→getpgid race (ProcessLookupError) must not crash _run_cmd.
+
+        Regression for the parallel-suite flake: an `echo`-fast command reaped
+        between Popen return and os.getpgid made the whole _run_cmd raise
+        ProcessLookupError instead of returning the captured output. The
+        resolution is wrapped so a reaped leader yields pgid=None, and the
+        group-kill falls back to the direct child.
+        """
+        monkeypatch.setattr(
+            _tr.os,
+            "getpgid",
+            lambda pid: (_ for _ in ()).throw(ProcessLookupError(pid)),
+        )
+        tr = _tr.TestRunner(str(tmp_path))
+        r = tr._run_cmd(["echo", "1 passed"])
+        assert r.combined == "1 passed"
+        assert r.passed_count == 0  # 'echo' is not a pytest command

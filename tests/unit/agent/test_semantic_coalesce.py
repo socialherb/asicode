@@ -13,6 +13,7 @@ those edits, which ``agent_loop._append_semantic_diagnostics`` renders exactly
 like a clean check. An edit that introduces an undefined name then reaches the
 model looking verified. Coalescing must therefore observe the LAST write.
 """
+
 from __future__ import annotations
 
 import json
@@ -74,9 +75,7 @@ def reg(tool_registry, monkeypatch):
 
 
 def _edit(reg, old, new):
-    return reg.dispatch(
-        "edit_text", {"file_path": "sample.py", "old_string": old, "new_string": new}
-    )
+    return reg.dispatch("edit_text", {"file_path": "sample.py", "old_string": old, "new_string": new})
 
 
 def _syntax_check(result) -> dict:
@@ -144,14 +143,11 @@ def test_two_files_are_checked_in_one_spawn(reg, temp_repo_root):
     Path(temp_repo_root, "other.py").write_text("def g():\n    return 1\n", encoding="utf-8")
     reg.begin_semantic_turn()
     _edit(reg, '    return "world"', '    return "world"  # a')
-    reg.dispatch("edit_text", {"file_path": "other.py",
-                               "old_string": "    return 1", "new_string": "    return 2"})
+    reg.dispatch("edit_text", {"file_path": "other.py", "old_string": "    return 1", "new_string": "    return 2"})
     drained = reg.drain_pending_semantic_checks()
     assert len(drained) == 2
     assert len(reg._sem_calls) == 2, "each file must still be examined"
-    assert len(reg._sem_spawns) == 1, (
-        f"expected the pair to share one toolchain spawn, got {reg._sem_spawns}"
-    )
+    assert len(reg._sem_spawns) == 1, f"expected the pair to share one toolchain spawn, got {reg._sem_spawns}"
 
 
 def test_a_broken_file_does_not_taint_its_batch_partner(reg, temp_repo_root):
@@ -164,8 +160,7 @@ def test_a_broken_file_does_not_taint_its_batch_partner(reg, temp_repo_root):
     Path(temp_repo_root, "other.py").write_text("def g():\n    return 1\n", encoding="utf-8")
     reg.begin_semantic_turn()
     _edit(reg, "        return a + b", f"        return {BROKEN}(a, b)")
-    reg.dispatch("edit_text", {"file_path": "other.py",
-                               "old_string": "    return 1", "new_string": "    return 2"})
+    reg.dispatch("edit_text", {"file_path": "other.py", "old_string": "    return 1", "new_string": "    return 2"})
 
     drained = reg.drain_pending_semantic_checks()
 
@@ -203,9 +198,7 @@ def test_without_an_open_turn_the_check_runs_inline(reg):
     """
     syn = _syntax_check(_edit(reg, "        return a + b", f"        return {BROKEN}(a, b)"))
     assert syn.get("semantic_deferred") is None
-    assert [d["message"] for d in syn.get("semantic_diagnostics") or []] == [
-        f'"{BROKEN}" is not defined'
-    ]
+    assert [d["message"] for d in syn.get("semantic_diagnostics") or []] == [f'"{BROKEN}" is not defined']
     assert len(reg._sem_calls) == 1
 
 
@@ -229,9 +222,7 @@ def test_end_semantic_turn_restores_inline_behaviour(reg):
     reg.begin_semantic_turn()
     assert reg.defer_semantic_check("/x.py") is True, "defers while a turn is open"
     reg.end_semantic_turn()
-    assert reg.defer_semantic_check("/y.py") is False, (
-        "after end_semantic_turn a dispatch must run inline again"
-    )
+    assert reg.defer_semantic_check("/y.py") is False, "after end_semantic_turn a dispatch must run inline again"
     # Pending entries from the abandoned turn are discarded, not carried over.
     reg.begin_semantic_turn()
     assert reg._semantic_pending == {}
@@ -252,10 +243,17 @@ class _Msg:
 
 def _msg_for(result) -> _Msg:
     """The shape ``_build_tool_result_message`` produces: a JSON payload."""
-    return _Msg(json.dumps({"ok": result.ok, "content": result.content,
-                            "error": result.error,
-                            "metadata": dict(result.metadata or {})},
-                           ensure_ascii=False))
+    return _Msg(
+        json.dumps(
+            {
+                "ok": result.ok,
+                "content": result.content,
+                "error": result.error,
+                "metadata": dict(result.metadata or {}),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def test_settle_fills_the_last_message_for_the_file(reg):
@@ -267,9 +265,7 @@ def test_settle_fills_the_last_message_for_the_file(reg):
     _Pipeline(reg)._settle_deferred_semantics(msgs)
 
     syn2 = json.loads(m2.content)["metadata"]["syntax_check"]
-    assert [d["message"] for d in syn2["semantic_diagnostics"]] == [
-        f'"{BROKEN}" is not defined'
-    ]
+    assert [d["message"] for d in syn2["semantic_diagnostics"]] == [f'"{BROKEN}" is not defined']
     assert "semantic_deferred" not in syn2
 
     # The superseded write must not gain an empty list — that is the false
@@ -367,6 +363,7 @@ def test_provider_groups_run_concurrently(tool_registry, temp_repo_root, monkeyp
             if arrived[other].wait(timeout=3):
                 overlapped.append(tag)
             return {p: _Res() for p in file_paths}
+
         return _batch
 
     monkeypatch.setattr(pp.PythonSyntaxProvider, "validate_semantics_batch", _make("py"))
@@ -375,20 +372,20 @@ def test_provider_groups_run_concurrently(tool_registry, temp_repo_root, monkeyp
     Path(temp_repo_root, "app.ts").write_text("export const a = 1;\n", encoding="utf-8")
     tool_registry.begin_semantic_turn()
     _edit(tool_registry, '    return "world"', '    return "world"  # a')
-    tool_registry.dispatch("edit_text", {
-        "file_path": "app.ts",
-        "old_string": "export const a = 1;",
-        "new_string": "export const a = 2;",
-    })
+    tool_registry.dispatch(
+        "edit_text",
+        {
+            "file_path": "app.ts",
+            "old_string": "export const a = 1;",
+            "new_string": "export const a = 2;",
+        },
+    )
 
     drained = tool_registry.drain_pending_semantic_checks()
 
-    assert sorted(entered) == ["py", "ts"], (
-        f"both provider groups must run; entered={entered}"
-    )
+    assert sorted(entered) == ["py", "ts"], f"both provider groups must run; entered={entered}"
     assert sorted(overlapped) == ["py", "ts"], (
-        f"the two toolchains did not overlap — drain ran them serially; "
-        f"overlapped={overlapped}"
+        f"the two toolchains did not overlap — drain ran them serially; overlapped={overlapped}"
     )
     assert len(drained) == 2
     assert all(v.diagnostics == [] and v.checked for v in drained.values())
@@ -415,7 +412,9 @@ def test_one_provider_group_never_touches_the_pool(reg, monkeypatch):
 
 
 def test_one_group_failing_does_not_cost_the_other_its_diagnostics(
-    tool_registry, temp_repo_root, monkeypatch,
+    tool_registry,
+    temp_repo_root,
+    monkeypatch,
 ):
     """A provider that raises is caught per group — including in a future."""
     from external_llm.languages import python_provider as pp
@@ -443,11 +442,14 @@ def test_one_group_failing_does_not_cost_the_other_its_diagnostics(
     Path(temp_repo_root, "app.ts").write_text("export const a = 1;\n", encoding="utf-8")
     tool_registry.begin_semantic_turn()
     _edit(tool_registry, '    return "world"', '    return "world"  # a')
-    tool_registry.dispatch("edit_text", {
-        "file_path": "app.ts",
-        "old_string": "export const a = 1;",
-        "new_string": "export const a = 2;",
-    })
+    tool_registry.dispatch(
+        "edit_text",
+        {
+            "file_path": "app.ts",
+            "old_string": "export const a = 1;",
+            "new_string": "export const a = 2;",
+        },
+    )
 
     drained = tool_registry.drain_pending_semantic_checks()
 
@@ -472,7 +474,8 @@ def unavailable(tool_registry, monkeypatch):
     def _absent(self, file_paths):
         return {
             p: SyntaxValidationResult.unchecked(
-                LanguageId.PYTHON, "pyright is not installed",
+                LanguageId.PYTHON,
+                "pyright is not installed",
             )
             for p in file_paths
         }
@@ -506,15 +509,11 @@ def test_settle_tells_the_model_the_check_was_skipped(unavailable):
     payload = json.loads(m.content)
     syn = payload["metadata"]["syntax_check"]
     assert syn.get("semantic_check_skipped") == "pyright is not installed"
-    assert "semantic_diagnostics" not in syn, (
-        "an empty diagnostics list is exactly the false 'clean' signal"
-    )
+    assert "semantic_diagnostics" not in syn, "an empty diagnostics list is exactly the false 'clean' signal"
     # The internal markers must never ship, skipped or not.
     assert "semantic_deferred" not in syn
     assert "semantic_deferred_path" not in syn
-    assert "<file_diagnostics>" not in (payload.get("content") or ""), (
-        "a skipped check has nothing to render"
-    )
+    assert "<file_diagnostics>" not in (payload.get("content") or ""), "a skipped check has nothing to render"
 
 
 def test_a_genuinely_clean_check_is_still_reported_as_checked(reg):
@@ -612,9 +611,9 @@ def test_drain_cancel_event_skips_pending_groups(reg, monkeypatch, tmp_path):
     assert not t.is_alive(), "drain did not return after cancel"
     assert "fast" in calls, "first (inline) group should still have run"
     assert drained[str(fast_file)].checked
-    assert drained[str(slow_file)].skip_reason == (
-        "cancelled before the semantic check ran"), (
-        f"pending group must be skipped on cancel, got {drained[str(slow_file)].skip_reason!r}")
+    assert drained[str(slow_file)].skip_reason == ("cancelled before the semantic check ran"), (
+        f"pending group must be skipped on cancel, got {drained[str(slow_file)].skip_reason!r}"
+    )
     # Release the still-blocked pool worker so the shared pool can wind down
     # without keeping the interpreter alive for the full wait.
     blocked.set()

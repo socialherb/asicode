@@ -18,6 +18,7 @@ Impact:
     allowed_tools/blocked_tools. Without the attribute, the gate is always
     skipped — subagent tool restrictions were silently unenforced.
 """
+
 import subprocess
 
 from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
@@ -63,13 +64,7 @@ def test_clone_for_subagent_apply_patch_dispatch_succeeds(tmp_path):
     registry = ToolRegistry(repo_root, AgentConfig())
     clone = registry.clone_for_subagent(AgentConfig())
 
-    patch = (
-        "--- a/a.py\n"
-        "+++ b/a.py\n"
-        "@@ -1 +1 @@\n"
-        "-x = 1\n"
-        "+x = 2\n"
-    )
+    patch = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"
     result = clone.dispatch("apply_patch", {"patch": patch, "path": "a.py"})
 
     assert result.ok, result.error
@@ -84,6 +79,7 @@ def test_clone_for_subagent_apply_patch_dispatch_succeeds(tmp_path):
 # until both clones mirror it (or it's added to the intentional-skip list
 # below WITH a reason).
 # ---------------------------------------------------------------------------
+
 
 # The expected set is read off a LIVE instance rather than written out here.
 # A literal list cannot be the forcing function this test is for: it drifts in

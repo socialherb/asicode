@@ -12,6 +12,7 @@ reuse the caches exist for, correctness above the gate, and the
 ``cache_clear()`` surface ``invalidate_caches()`` depends on for grammar
 hot-reload.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -24,9 +25,7 @@ from external_llm.languages.tree_sitter_utils import (
     parse_to_tree,
 )
 
-pytestmark = pytest.mark.skipif(
-    not is_available(), reason="tree-sitter not installed"
-)
+pytestmark = pytest.mark.skipif(not is_available(), reason="tree-sitter not installed")
 
 _SMALL = "def f():\n    return 1\n"
 # Comfortably over the gate without depending on its exact value.

@@ -32,6 +32,7 @@ Verified to produce identical return types to the subprocess approach:
 ``_nonpy_index_for`` -> ``dict``, ``_outline_ripgrep`` -> ``list``,
 ``find_symbol(absent)`` -> ``[]``, a real Python symbol still resolves.
 """
+
 from __future__ import annotations
 
 import shutil

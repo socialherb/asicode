@@ -13,16 +13,19 @@ Covers:
      resolve against the real (moved) modules.
   2. dispatch() rolls back the file even when the repair path crashes.
 """
+
 from __future__ import annotations
 
 import os
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
 from external_llm.agent.tool_registry import ToolRegistry, ToolResult
 
 # ── 1. Lazy import resolution (the original ModuleNotFoundError) ────────────
+
 
 class TestRepairPathImports:
     def test_repair_verify_failure_imports_resolve(self):
@@ -51,9 +54,13 @@ class TestRepairPathImports:
 
 # ── 2. Rollback guarantee when the repair path crashes ──────────────────────
 
+
 class TestDispatchRollbackOnRepairCrash:
     def test_rollback_runs_when_repair_path_raises(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         """A crash inside _repair_verify_failure must not escape dispatch():
         the snapshot rollback below it is the last line of defense keeping a
@@ -72,7 +79,8 @@ class TestDispatchRollbackOnRepairCrash:
 
         monkeypatch.setattr(tool_registry, "_tool_edit_file", _fake_edit_file)
         monkeypatch.setattr(
-            tool_registry, "_verify_after_write",
+            tool_registry,
+            "_verify_after_write",
             lambda snaps: (False, f"{path}:2:9: Syntax error: unexpected indent"),
         )
 
@@ -89,7 +97,10 @@ class TestDispatchRollbackOnRepairCrash:
             assert f.read() == original  # rolled back, not left broken
 
     def test_rollback_runs_when_soft_fail_classifier_raises(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         """Same guarantee for the soft-fail classification step: a crash there
         must be treated as hard fail (rollback), never propagate."""
@@ -105,18 +116,23 @@ class TestDispatchRollbackOnRepairCrash:
 
         monkeypatch.setattr(tool_registry, "_tool_edit_file", _fake_edit_file)
         monkeypatch.setattr(
-            tool_registry, "_verify_after_write",
+            tool_registry,
+            "_verify_after_write",
             lambda snaps: (False, f"{path}:1:3: Syntax error: invalid syntax"),
         )
         monkeypatch.setattr(
-            tool_registry, "_repair_verify_failure", lambda snapshots: False,
+            tool_registry,
+            "_repair_verify_failure",
+            lambda snapshots: False,
         )
 
         def _crashing_classifier(verify_detail, snapshots):
             raise RuntimeError("simulated classifier crash")
 
         monkeypatch.setattr(
-            tool_registry, "_should_soft_fail_verify", _crashing_classifier,
+            tool_registry,
+            "_should_soft_fail_verify",
+            _crashing_classifier,
         )
 
         result = tool_registry.dispatch("edit_file", {"path": "mod2.py"})
@@ -136,8 +152,10 @@ class TestDispatchRollbackOnRepairCrash:
 # syntax error silently on disk. The fix adds a full _verify_after_write gate
 # before returning True.
 
+
 class _SyntaxRes:
     """Lightweight validation result used by the fake providers below."""
+
     def __init__(self, ok, errors=None):
         self.ok = ok
         self.errors = errors or []
@@ -145,7 +163,10 @@ class _SyntaxRes:
 
 class TestAllFilesRepairContract:
     def test_partial_repair_does_not_leave_other_file_broken(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         """Multi-file snapshot: file_a is ARGUMENT_MISMATCH (repairable),
         file_b is a genuine SYNTAX_ERROR (unrepairable). Repair fixes file_a
@@ -165,8 +186,8 @@ class TestAllFilesRepairContract:
         snapshots = {file_a: orig_a, file_b: orig_b}
 
         # Simulate the write having corrupted both files on disk.
-        broken_a = "def a(\n    pass\n"          # repairable-looking break
-        broken_b = "def b(:\n    pass\n"         # genuine syntax error
+        broken_a = "def a(\n    pass\n"  # repairable-looking break
+        broken_b = "def b(:\n    pass\n"  # genuine syntax error
         with open(file_a, "w") as f:
             f.write(broken_a)
         with open(file_b, "w") as f:
@@ -178,6 +199,7 @@ class TestAllFilesRepairContract:
         # BOTH are restored to valid Python.
         def _real_verify(snaps):
             import ast as _ast
+
             for p in snaps:
                 with open(p, encoding="utf-8", errors="replace") as fh:
                     src = fh.read()
@@ -197,40 +219,45 @@ class TestAllFilesRepairContract:
         class _FakeClassifier:
             def classify(self, verrs):
                 msg = verrs[0].message.lower()
-                return (
-                    FailureType.ARGUMENT_MISMATCH
-                    if "positional argument" in msg
-                    else FailureType.SYNTAX_ERROR
-                )
+                return FailureType.ARGUMENT_MISMATCH if "positional argument" in msg else FailureType.SYNTAX_ERROR
+
+            def classify_typed(self, verrs):
+                return SimpleNamespace(type=self.classify(verrs), symbol="", fix_hint=None)
 
         class _FakeProvider:
             def language_id(self):
                 class _L:
                     value = "python"
+
                 return _L()
 
             def capabilities(self):
                 class _C:
                     has_syntax_validator = True
+
                 return _C()
 
             def validate_syntax(self, path, content):
                 import ast as _ast
 
                 from external_llm.languages.models import SyntaxError_ as _SE
+
                 try:
                     _ast.parse(content, filename=path)
                     compile(content, path, "exec")
                 except SyntaxError as _e:
-                    msg = (
-                        "missing 1 required positional argument"
-                        if path == file_a
-                        else "Syntax error: unexpected EOF"
+                    msg = "missing 1 required positional argument" if path == file_a else "Syntax error: unexpected EOF"
+                    return _SyntaxRes(
+                        ok=False,
+                        errors=[
+                            _SE(
+                                file=path,
+                                line=_e.lineno or 1,
+                                col=_e.offset or 1,
+                                message=msg,
+                            )
+                        ],
                     )
-                    return _SyntaxRes(ok=False, errors=[_SE(
-                        file=path, line=_e.lineno or 1, col=_e.offset or 1,
-                        message=msg,
-                    )])
                 return _SyntaxRes(ok=True, errors=[])
 
         _fake_provider = _FakeProvider()
@@ -253,7 +280,9 @@ class TestAllFilesRepairContract:
 
         monkeypatch.setattr(_langpkg, "LanguageRegistry", _FakeLR, raising=False)
         monkeypatch.setattr(
-            "external_llm.languages.LanguageRegistry", _FakeLR, raising=False,
+            "external_llm.languages.LanguageRegistry",
+            _FakeLR,
+            raising=False,
         )
 
         # Stub the registry/classifier so file_a is repairable, file_b is not.
@@ -273,9 +302,7 @@ class TestAllFilesRepairContract:
 
             def get(self, ftype):
                 if ftype == FailureType.ARGUMENT_MISMATCH:
-                    return lambda code, verr, clf: [_FakeOp(
-                        {"__raw_code__": "def a():\n    return 1\n"}
-                    )]
+                    return lambda code, verr, clf: [_FakeOp({"__raw_code__": "def a():\n    return 1\n"})]
                 return None
 
         monkeypatch.setattr(_rr, "RepairRegistry", _FakeRegistry)
@@ -285,9 +312,7 @@ class TestAllFilesRepairContract:
 
         # Before the fix this returned True (only file_a was checked). The
         # all-files gate now catches the still-broken file_b.
-        assert repaired is False, (
-            "partial repair must not claim success while another file is broken"
-        )
+        assert repaired is False, "partial repair must not claim success while another file is broken"
 
         # And the caller (dispatch) would then roll back — here we assert the
         # contract directly: a False return is the signal to restore snapshots.
@@ -298,7 +323,10 @@ class TestAllFilesRepairContract:
             assert f.read() == orig_b
 
     def test_full_repair_returns_true_when_all_files_clean(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         """Positive control: when ALL files in the snapshot are repairable,
         _repair_verify_failure still returns True (the gate must not be
@@ -323,6 +351,7 @@ class TestAllFilesRepairContract:
 
         def _real_verify(snaps):
             import ast as _ast
+
             for p in snaps:
                 with open(p, encoding="utf-8", errors="replace") as fh:
                     src = fh.read()
@@ -342,29 +371,42 @@ class TestAllFilesRepairContract:
             def classify(self, verrs):
                 return FailureType.ARGUMENT_MISMATCH
 
+            def classify_typed(self, verrs):
+                return SimpleNamespace(type=self.classify(verrs), symbol="", fix_hint=None)
+
         class _FakeProvider:
             def language_id(self):
                 class _L:
                     value = "python"
+
                 return _L()
 
             def capabilities(self):
                 class _C:
                     has_syntax_validator = True
+
                 return _C()
 
             def validate_syntax(self, path, content):
                 import ast as _ast
 
                 from external_llm.languages.models import SyntaxError_ as _SE
+
                 try:
                     _ast.parse(content, filename=path)
                     compile(content, path, "exec")
                 except SyntaxError as _e:
-                    return _SyntaxRes(ok=False, errors=[_SE(
-                        file=path, line=_e.lineno or 1, col=_e.offset or 1,
-                        message="missing 1 required positional argument",
-                    )])
+                    return _SyntaxRes(
+                        ok=False,
+                        errors=[
+                            _SE(
+                                file=path,
+                                line=_e.lineno or 1,
+                                col=_e.offset or 1,
+                                message="missing 1 required positional argument",
+                            )
+                        ],
+                    )
                 return _SyntaxRes(ok=True, errors=[])
 
         _fake_provider = _FakeProvider()
@@ -382,7 +424,9 @@ class TestAllFilesRepairContract:
         monkeypatch.setattr(_ts, "LanguageRegistry", _FakeLR, raising=False)
         monkeypatch.setattr(_langpkg, "LanguageRegistry", _FakeLR, raising=False)
         monkeypatch.setattr(
-            "external_llm.languages.LanguageRegistry", _FakeLR, raising=False,
+            "external_llm.languages.LanguageRegistry",
+            _FakeLR,
+            raising=False,
         )
 
         import external_llm.editor._editor_core.vm.failure_classifier as _fc
@@ -406,15 +450,14 @@ class TestAllFilesRepairContract:
                         # Infer the file from the stored path on the verr-like;
                         # fallback to a.py.
                         return [_FakeOp({"__raw_code__": "def x():\n    return 1\n"})]
+
                     return _strategy
                 return None
 
         monkeypatch.setattr(_rr, "RepairRegistry", _FakeRegistry)
 
         repaired = tool_registry._repair_verify_failure(snapshots)
-        assert repaired is True, (
-            "all-files-clean write must still pass the repair gate"
-        )
+        assert repaired is True, "all-files-clean write must still pass the repair gate"
 
 
 # ── 4. edit_text language-neutral syntax gate ──────────────────────────────
@@ -426,6 +469,7 @@ class TestAllFilesRepairContract:
 # broken new_string went straight to disk. The fix runs the SAME
 # provider.validate_syntax the dispatch path uses, mirroring soft-fail so
 # edit_text is neither stricter nor looser than apply_patch/edit_file.
+
 
 class TestEditTextLanguageNeutralGate:
     """edit_text must refuse broken non-Python edits in-memory (no rollback)."""
@@ -442,11 +486,14 @@ class TestEditTextLanguageNeutralGate:
         the only thing keeping broken TS off the disk)."""
         original = "function add(a: number, b: number): number {\n  return a + b;\n}\n"
         path = self._write(temp_repo_root, "app.ts", original)
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "app.ts",
-            "old_string": "  return a + b;",
-            "new_string": "  return a + ;",
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "app.ts",
+                "old_string": "  return a + b;",
+                "new_string": "  return a + ;",
+            },
+        )
         assert result.ok is False
         assert "syntax error" in (result.error or "").lower()
         with open(path) as f:
@@ -456,11 +503,14 @@ class TestEditTextLanguageNeutralGate:
         """A valid .ts edit must still apply — the gate must not over-fire."""
         original = "function add(a: number, b: number): number {\n  return a + b;\n}\n"
         path = self._write(temp_repo_root, "app.ts", original)
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "app.ts",
-            "old_string": "  return a + b;",
-            "new_string": "  return a - b;",
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "app.ts",
+                "old_string": "  return a + b;",
+                "new_string": "  return a - b;",
+            },
+        )
         assert result.ok
         with open(path) as f:
             assert "return a - b" in f.read()
@@ -468,11 +518,14 @@ class TestEditTextLanguageNeutralGate:
     def test_refuses_broken_json(self, tool_registry, temp_repo_root):
         original = '{"a": 1, "b": 2}'
         path = self._write(temp_repo_root, "cfg.json", original)
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "cfg.json",
-            "old_string": '"b": 2',
-            "new_string": '"b": ,',
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "cfg.json",
+                "old_string": '"b": 2',
+                "new_string": '"b": ,',
+            },
+        )
         assert result.ok is False
         with open(path) as f:
             assert f.read() == original
@@ -483,11 +536,14 @@ class TestEditTextLanguageNeutralGate:
         matching the Python branch's ``_orig_parses`` skip."""
         pre_broken = "function f() {\n  return 1 + ;\n}\n"
         path = self._write(temp_repo_root, "broken.ts", pre_broken)
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "broken.ts",
-            "old_string": "  return 1 + ;",
-            "new_string": "  return 2 + ;",
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "broken.ts",
+                "old_string": "  return 1 + ;",
+                "new_string": "  return 2 + ;",
+            },
+        )
         assert result.ok
         with open(path) as f:
             assert "return 2 +" in f.read()
@@ -495,11 +551,14 @@ class TestEditTextLanguageNeutralGate:
     def test_unknown_language_skips_gate(self, tool_registry, temp_repo_root):
         """Files with no language provider (e.g. .txt) must apply normally."""
         path = self._write(temp_repo_root, "notes.txt", "hello world\n")
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "notes.txt",
-            "old_string": "hello",
-            "new_string": "goodbye",
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "notes.txt",
+                "old_string": "hello",
+                "new_string": "goodbye",
+            },
+        )
         assert result.ok
         with open(path) as f:
             assert "goodbye" in f.read()
@@ -509,32 +568,34 @@ class TestEditTextLanguageNeutralGate:
         refuses broken .py edits (the non-Python gate must not disturb it)."""
         original = "def f():\n    return 1\n"
         path = self._write(temp_repo_root, "mod.py", original)
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "mod.py",
-            "old_string": "    return 1",
-            "new_string": "    return 1 +",
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "mod.py",
+                "old_string": "    return 1",
+                "new_string": "    return 1 +",
+            },
+        )
         assert result.ok is False
         with open(path) as f:
             assert f.read() == original
 
-    @pytest.mark.skipif(
-        shutil.which("go") is None, reason="go toolchain not installed"
-    )
-    def test_go_soft_fail_undefined_is_kept(
-        self, tool_registry, temp_repo_root
-    ):
+    @pytest.mark.skipif(shutil.which("go") is None, reason="go toolchain not installed")
+    def test_go_soft_fail_undefined_is_kept(self, tool_registry, temp_repo_root):
         """Consistency with dispatch: a Go edit introducing ``undefined: foo``
         (a cross-file resolvable reference) must be KEPT, not refused — exactly
         as apply_patch/edit_file keep soft-fail errors. A naive gate that
         refuses on ``not ok`` would make edit_text stricter than its siblings."""
         original = "package main\n\nfunc work() int {\n\treturn 1\n}\n"
         path = self._write(temp_repo_root, "f.go", original)
-        result = tool_registry.dispatch("edit_text", {
-            "file_path": "f.go",
-            "old_string": "\treturn 1",
-            "new_string": "\treturn helperFunc()",
-        })
+        result = tool_registry.dispatch(
+            "edit_text",
+            {
+                "file_path": "f.go",
+                "old_string": "\treturn 1",
+                "new_string": "\treturn helperFunc()",
+            },
+        )
         assert result.ok, "Go soft-fail (undefined) must be kept, not refused"
         with open(path) as f:
             assert "helperFunc()" in f.read()
@@ -569,6 +630,7 @@ class _FakeCaps:
 
 class _FakeProvider:
     """validate_syntax fails iff content contains the marker 'MISSING_DEP'."""
+
     _lang = "kotlin"
 
     def language_id(self):
@@ -583,11 +645,13 @@ class _FakeProvider:
 
 class _FakeLangRegistry:
     """Stand-in for LanguageRegistry.instance().get() during the unit test."""
+
     @classmethod
     def instance(cls):
         class _Inst:
             def get(self, path):
                 return _FakeProvider() if str(path).endswith(".kt") else None
+
         return _Inst()
 
 
@@ -600,10 +664,11 @@ class TestOriginSkipGuard:
             create_failure_classifier,
         )
         from external_llm.editor._editor_core.vm.models import VerifyError
+
         c = create_failure_classifier("kotlin")
-        ft = c.classify([VerifyError(
-            message="cannot infer type for type parameter 'T'. Specify it explicitly.",
-            line=0, column=0)])
+        ft = c.classify(
+            [VerifyError(message="cannot infer type for type parameter 'T'. Specify it explicitly.", line=0, column=0)]
+        )
         assert ft == FailureType.TYPE_MISMATCH
 
     def test_origin_skip_keeps_edit_when_origin_also_broken(self, monkeypatch):
@@ -613,9 +678,13 @@ class TestOriginSkipGuard:
         back a correct modify_symbol on an Android/Kotlin file without its deps."""
         monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
         snapshots = {"/repo/Foo.kt": "class Foo { val x: MISSING_DEP = TODO() }"}
-        assert ToolRegistry._should_soft_fail_verify(
-            "/repo/Foo.kt:1:1: cannot infer type for type parameter 'T'", snapshots,
-        ) is True
+        assert (
+            ToolRegistry._should_soft_fail_verify(
+                "/repo/Foo.kt:1:1: cannot infer type for type parameter 'T'",
+                snapshots,
+            )
+            is True
+        )
 
     def test_origin_skip_does_not_mask_genuine_syntax_error(self, monkeypatch):
         """Negative case: origin parses OK, edit introduces a genuine syntax
@@ -623,9 +692,13 @@ class TestOriginSkipGuard:
         fire here because the origin validated clean."""
         monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
         snapshots = {"/repo/Foo.kt": "class Foo { fun bar() {} }"}  # origin OK
-        assert ToolRegistry._should_soft_fail_verify(
-            "/repo/Foo.kt:1:1: expecting '}'", snapshots,
-        ) is False
+        assert (
+            ToolRegistry._should_soft_fail_verify(
+                "/repo/Foo.kt:1:1: expecting '}'",
+                snapshots,
+            )
+            is False
+        )
 
     def test_origin_skip_skipped_for_new_file_snapshot(self, monkeypatch):
         """A new-file snapshot holds the _MISSING_SNAP sentinel (not str) — no
@@ -633,11 +706,16 @@ class TestOriginSkipGuard:
         the normal classifier so a genuine syntax error in a NEW file still
         hard-fails."""
         from external_llm.agent.tool_safety import _MISSING_SNAP
+
         monkeypatch.setattr("external_llm.languages.LanguageRegistry", _FakeLangRegistry)
         snapshots = {"/repo/New.kt": _MISSING_SNAP}
-        assert ToolRegistry._should_soft_fail_verify(
-            "/repo/New.kt:1:1: expecting '}'", snapshots,
-        ) is False
+        assert (
+            ToolRegistry._should_soft_fail_verify(
+                "/repo/New.kt:1:1: expecting '}'",
+                snapshots,
+            )
+            is False
+        )
 
     # ── Bug #1: multi-file snapshot origin-skip ────────────────────────────────
     # _should_soft_fail_verify must use the FILE THAT PRODUCED THE ERROR for
@@ -657,11 +735,11 @@ class TestOriginSkipGuard:
             "/repo/B.kt": "class Bar {}",  # clean
         }
         result = ToolRegistry._should_soft_fail_verify(
-            "/repo/B.kt:1:1: expecting '}'", snapshots,
+            "/repo/B.kt:1:1: expecting '}'",
+            snapshots,
         )
         assert result is False, (
-            "origin from B.kt (clean) must not trigger origin-skip; "
-            "expecting '}' is SYNTAX_ERROR → hard fail"
+            "origin from B.kt (clean) must not trigger origin-skip; expecting '}' is SYNTAX_ERROR → hard fail"
         )
 
     def test_multi_file_second_file_origin_broken_triggers_origin_skip(self, monkeypatch):
@@ -675,11 +753,10 @@ class TestOriginSkipGuard:
             "/repo/B.kt": "class Bar { val x: MISSING_DEP = TODO() }",  # broken
         }
         result = ToolRegistry._should_soft_fail_verify(
-            "/repo/B.kt:1:1: expecting '}'", snapshots,
+            "/repo/B.kt:1:1: expecting '}'",
+            snapshots,
         )
-        assert result is True, (
-            "origin from B.kt (broken) must trigger origin-skip → soft fail"
-        )
+        assert result is True, "origin from B.kt (broken) must trigger origin-skip → soft fail"
 
 
 class TestRollbackRestoresTextEditedFiles:
@@ -690,7 +767,10 @@ class TestRollbackRestoresTextEditedFiles:
     edited this session'."""
 
     def test_rollback_undoes_handler_recording(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         original = "x = 1\n"
         path = os.path.join(temp_repo_root, "mod_b.py")
@@ -710,15 +790,20 @@ class TestRollbackRestoresTextEditedFiles:
 
         monkeypatch.setattr(tool_registry, "_tool_modify_symbol", _fake_modify_symbol)
         monkeypatch.setattr(
-            tool_registry, "_verify_after_write",
+            tool_registry,
+            "_verify_after_write",
             lambda snaps: (False, f"{path}:1:3: Syntax error: invalid syntax"),
         )
         monkeypatch.setattr(
-            tool_registry, "_repair_verify_failure", lambda snapshots: False,
+            tool_registry,
+            "_repair_verify_failure",
+            lambda snapshots: False,
         )
         # Force hard fail: no soft-fail, no origin-skip
         monkeypatch.setattr(
-            ToolRegistry, "_should_soft_fail_verify", staticmethod(lambda d, s: False),
+            ToolRegistry,
+            "_should_soft_fail_verify",
+            staticmethod(lambda d, s: False),
         )
 
         result = tool_registry.dispatch("modify_symbol", {"path": "mod_b.py"})
@@ -746,6 +831,7 @@ class TestRollbackRestoresTextEditedFiles:
 # _should_soft_fail_verify, and keep the strict refuse for Python (compile() is
 # self-contained) + genuine syntax errors on a valid baseline.
 
+
 class TestAnchorEditLanguageNeutralGate:
     """anchor_edit must refuse genuine syntax errors but keep origin-skip /
     soft-fail edits — matching edit_text/dispatch, not the old hardcoded gate."""
@@ -760,18 +846,17 @@ class TestAnchorEditLanguageNeutralGate:
         """A .ts anchor_edit that introduces a genuine parse error must be
         refused and the file left untouched (anchor_edit has no rollback, so
         the in-handler gate is the only safety net — see insight A68)."""
-        original = (
-            "function add(a: number, b: number): number {\n"
-            "  return a + b;\n"
-            "}\n"
-        )
+        original = "function add(a: number, b: number): number {\n  return a + b;\n}\n"
         path = self._write(temp_repo_root, "app.ts", original)
-        result = tool_registry.dispatch("anchor_edit", {
-            "file_path": "app.ts",
-            "anchor_pattern": "  return a + b;",
-            "edit_mode": "insert_after",
-            "code_snippet": "  return a + ;",
-        })
+        result = tool_registry.dispatch(
+            "anchor_edit",
+            {
+                "file_path": "app.ts",
+                "anchor_pattern": "  return a + b;",
+                "edit_mode": "insert_after",
+                "code_snippet": "  return a + ;",
+            },
+        )
         assert result.ok is False
         with open(path) as f:
             assert f.read() == original  # disk preserved
@@ -782,12 +867,15 @@ class TestAnchorEditLanguageNeutralGate:
         pre-broken baseline). The old hardcoded gate refused every such edit."""
         pre_broken = "function f() {\n  return 1 + ;\n}\n"
         path = self._write(temp_repo_root, "broken.ts", pre_broken)
-        result = tool_registry.dispatch("anchor_edit", {
-            "file_path": "broken.ts",
-            "anchor_pattern": "  return 1 + ;",
-            "edit_mode": "replace_line",
-            "code_snippet": "  return 2 + ;",
-        })
+        result = tool_registry.dispatch(
+            "anchor_edit",
+            {
+                "file_path": "broken.ts",
+                "anchor_pattern": "  return 1 + ;",
+                "edit_mode": "replace_line",
+                "code_snippet": "  return 2 + ;",
+            },
+        )
         assert result.ok, "origin-skip must keep edits on a pre-broken baseline"
         with open(path) as f:
             assert "return 2 +" in f.read()
@@ -795,18 +883,17 @@ class TestAnchorEditLanguageNeutralGate:
     def test_applies_valid_typescript_insert(self, tool_registry, temp_repo_root):
         """A valid .ts anchor_edit must still apply — the gate must not over-fire
         on a clean baseline."""
-        original = (
-            "function add(a: number, b: number): number {\n"
-            "  return a + b;\n"
-            "}\n"
-        )
+        original = "function add(a: number, b: number): number {\n  return a + b;\n}\n"
         path = self._write(temp_repo_root, "app.ts", original)
-        result = tool_registry.dispatch("anchor_edit", {
-            "file_path": "app.ts",
-            "anchor_pattern": "  return a + b;",
-            "edit_mode": "insert_after",
-            "code_snippet": "  console.log(a);",
-        })
+        result = tool_registry.dispatch(
+            "anchor_edit",
+            {
+                "file_path": "app.ts",
+                "anchor_pattern": "  return a + b;",
+                "edit_mode": "insert_after",
+                "code_snippet": "  console.log(a);",
+            },
+        )
         assert result.ok
         with open(path) as f:
             assert "console.log(a)" in f.read()
@@ -817,12 +904,15 @@ class TestAnchorEditLanguageNeutralGate:
         not weaken the Python gate."""
         original = "def f():\n    return 1\n"
         path = self._write(temp_repo_root, "mod.py", original)
-        result = tool_registry.dispatch("anchor_edit", {
-            "file_path": "mod.py",
-            "anchor_pattern": "    return 1",
-            "edit_mode": "replace_line",
-            "code_snippet": "    return 1 +",
-        })
+        result = tool_registry.dispatch(
+            "anchor_edit",
+            {
+                "file_path": "mod.py",
+                "anchor_pattern": "    return 1",
+                "edit_mode": "replace_line",
+                "code_snippet": "    return 1 +",
+            },
+        )
         assert result.ok is False
         with open(path) as f:
             assert f.read() == original
@@ -875,6 +965,7 @@ class TestRepairUsesAtomicWrite:
 
         def _real_verify(snaps):
             import ast as _ast
+
             for p in snaps:
                 with open(p, encoding="utf-8", errors="replace") as fh:
                     src = fh.read()
@@ -894,29 +985,42 @@ class TestRepairUsesAtomicWrite:
             def classify(self, verrs):
                 return FailureType.ARGUMENT_MISMATCH
 
+            def classify_typed(self, verrs):
+                return SimpleNamespace(type=self.classify(verrs), symbol="", fix_hint=None)
+
         class _Prov:
             def language_id(self):
                 class _L:
                     value = "python"
+
                 return _L()
 
             def capabilities(self):
                 class _C:
                     has_syntax_validator = True
+
                 return _C()
 
             def validate_syntax(self, path, content):
                 import ast as _ast
 
                 from external_llm.languages.models import SyntaxError_ as _SE
+
                 try:
                     _ast.parse(content, filename=path)
                     compile(content, path, "exec")
                 except SyntaxError as _e:
-                    return _SyntaxRes(ok=False, errors=[_SE(
-                        file=path, line=_e.lineno or 1, col=_e.offset or 1,
-                        message="missing 1 required positional argument",
-                    )])
+                    return _SyntaxRes(
+                        ok=False,
+                        errors=[
+                            _SE(
+                                file=path,
+                                line=_e.lineno or 1,
+                                col=_e.offset or 1,
+                                message="missing 1 required positional argument",
+                            )
+                        ],
+                    )
                 return _SyntaxRes(ok=True, errors=[])
 
         class _FLR:
@@ -929,14 +1033,18 @@ class TestRepairUsesAtomicWrite:
 
         import external_llm.agent.tool_safety as _ts
         import external_llm.languages as _langpkg
+
         monkeypatch.setattr(_ts, "LanguageRegistry", _FLR, raising=False)
         monkeypatch.setattr(_langpkg, "LanguageRegistry", _FLR, raising=False)
         monkeypatch.setattr(
-            "external_llm.languages.LanguageRegistry", _FLR, raising=False,
+            "external_llm.languages.LanguageRegistry",
+            _FLR,
+            raising=False,
         )
 
         import external_llm.editor._editor_core.vm.failure_classifier as _fc
         import external_llm.editor._editor_core.vm.repair_registry as _rr
+
         monkeypatch.setattr(_fc, "create_failure_classifier", lambda lang: _FC())
 
         class _Op:
@@ -950,20 +1058,24 @@ class TestRepairUsesAtomicWrite:
 
             def get(self, ftype):
                 if ftype == FailureType.ARGUMENT_MISMATCH:
-                    return lambda code, verr, clf: [_Op(
-                        {"__raw_code__": repaired_code}
-                    )]
+                    return lambda code, verr, clf: [_Op({"__raw_code__": repaired_code})]
                 return None
 
         monkeypatch.setattr(_rr, "RepairRegistry", _Reg)
         return file_a, snapshots
 
     def test_repair_write_uses_atomic_write(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         # Valid repaired code → re-verify ok → success write path.
         file_a, snapshots = self._install_repair_stubs(
-            tool_registry, temp_repo_root, monkeypatch, "def a():\n    return 1\n",
+            tool_registry,
+            temp_repo_root,
+            monkeypatch,
+            "def a():\n    return 1\n",
         )
         writes = _spy_write_opens(monkeypatch, file_a)
         tool_registry._repair_verify_failure(snapshots)
@@ -973,18 +1085,23 @@ class TestRepairUsesAtomicWrite:
         )
 
     def test_repair_rollback_uses_atomic_write(
-        self, tool_registry: ToolRegistry, temp_repo_root: str, monkeypatch,
+        self,
+        tool_registry: ToolRegistry,
+        temp_repo_root: str,
+        monkeypatch,
     ):
         # Invalid repaired code → re-verify fails → rollback restore path. Both
         # the repair write and the rollback restore must be atomic.
         file_a, snapshots = self._install_repair_stubs(
-            tool_registry, temp_repo_root, monkeypatch, "def a(\n",
+            tool_registry,
+            temp_repo_root,
+            monkeypatch,
+            "def a(\n",
         )
         writes = _spy_write_opens(monkeypatch, file_a)
         tool_registry._repair_verify_failure(snapshots)
         assert writes == [], (
-            "verify-repair rollback restore used a truncating open(path,'w'); "
-            "must route through atomic_write_text"
+            "verify-repair rollback restore used a truncating open(path,'w'); must route through atomic_write_text"
         )
 
 
@@ -1000,7 +1117,8 @@ def test_repair_methods_have_no_truncating_open_w():
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     repair_methods = {
         os.path.join(here, "external_llm", "agent", "tool_registry.py"): {
-            "_repair_verify_failure", "_dispatch_impl",
+            "_repair_verify_failure",
+            "_dispatch_impl",
         },
         os.path.join(here, "external_llm", "agent", "tool_safety.py"): {
             "auto_repair_semantic",
@@ -1012,10 +1130,12 @@ def test_repair_methods_have_no_truncating_open_w():
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name in methods:
                 for call in ast.walk(node):
-                    if not (isinstance(call, ast.Call)
-                            and isinstance(call.func, ast.Name)
-                            and call.func.id == "open"
-                            and len(call.args) >= 2):
+                    if not (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "open"
+                        and len(call.args) >= 2
+                    ):
                         continue
                     mode_arg = call.args[1]
                     if isinstance(mode_arg, ast.Constant):

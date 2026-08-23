@@ -11,6 +11,7 @@ the same way when given a path arg, but used to report ``None`` (unknown scope)
 pattern in the edit→verify loop. These tests pin the fix and the three
 exclusions that keep it from going stale.
 """
+
 from __future__ import annotations
 
 import os
@@ -40,28 +41,31 @@ def _registry(repo: Path) -> ToolRegistry:
 class TestSymbolReadScope:
     """Direct mapping checks — the turn-980 measurement matrix, now pinned."""
 
-    @pytest.mark.parametrize("tool, args, scoped", [
-        # A path arg narrows the walk → result depends only on that subtree.
-        ("read_symbol", {"name": "foo", "file_path": "src/c.py"}, True),
-        ("find_symbol", {"name": "foo", "search_path": "src"}, True),
-        ("find_references", {"name": "foo", "search_path": "src"}, True),
-        # No path arg → repo-wide search → unknown scope.
-        ("read_symbol", {"name": "foo"}, None),
-        ("find_symbol", {"name": "foo"}, None),
-        ("find_references", {"name": "foo"}, None),
-        # find_symbol + include_inheritance enriches with subclasses/refs found
-        # ANYWHERE in the repo (get_symbol_info) → repo-wide.
-        ("find_symbol", {"name": "foo", "search_path": "src", "include_inheritance": True}, None),
-        # A path escaping the repo: find_references falls back to a repo-wide rg
-        # (_resolve_search_root(...) or self.repo_root), so it can't be scoped.
-        ("find_references", {"name": "foo", "search_path": "../outside"}, None),
-        ("find_symbol", {"name": "foo", "search_path": "/etc"}, None),
-        ("read_symbol", {"name": "foo", "file_path": "../outside"}, None),
-        # Graph traversal tools are repo-wide by nature — a file_path arg only
-        # disambiguates the symbol, it does not bound the traversal.
-        ("analyze_change_impact", {"symbol": "foo", "file_path": "src/c.py"}, None),
-        ("query_dependency_graph", {"source": "src/", "mode": "subgraph"}, None),
-    ])
+    @pytest.mark.parametrize(
+        "tool, args, scoped",
+        [
+            # A path arg narrows the walk → result depends only on that subtree.
+            ("read_symbol", {"name": "foo", "file_path": "src/c.py"}, True),
+            ("find_symbol", {"name": "foo", "search_path": "src"}, True),
+            ("find_references", {"name": "foo", "search_path": "src"}, True),
+            # No path arg → repo-wide search → unknown scope.
+            ("read_symbol", {"name": "foo"}, None),
+            ("find_symbol", {"name": "foo"}, None),
+            ("find_references", {"name": "foo"}, None),
+            # find_symbol + include_inheritance enriches with subclasses/refs found
+            # ANYWHERE in the repo (get_symbol_info) → repo-wide.
+            ("find_symbol", {"name": "foo", "search_path": "src", "include_inheritance": True}, None),
+            # A path escaping the repo: find_references falls back to a repo-wide rg
+            # (_resolve_search_root(...) or self.repo_root), so it can't be scoped.
+            ("find_references", {"name": "foo", "search_path": "../outside"}, None),
+            ("find_symbol", {"name": "foo", "search_path": "/etc"}, None),
+            ("read_symbol", {"name": "foo", "file_path": "../outside"}, None),
+            # Graph traversal tools are repo-wide by nature — a file_path arg only
+            # disambiguates the symbol, it does not bound the traversal.
+            ("analyze_change_impact", {"symbol": "foo", "file_path": "src/c.py"}, None),
+            ("query_dependency_graph", {"source": "src/", "mode": "subgraph"}, None),
+        ],
+    )
     def test_scope_mapping(self, repo: Path, tool: str, args: dict, scoped):
         result = _registry(repo)._extract_read_scope_paths(tool, args)
         if scoped is None:
@@ -142,4 +146,3 @@ class TestSymbolCacheSurvivesNonOverlappingWrite:
         removed = cache.invalidate_paths(frozenset({os.path.normpath(str(repo / "a.py"))}))
         assert removed == 1
         assert cache.get("find_symbol", args) is None
-

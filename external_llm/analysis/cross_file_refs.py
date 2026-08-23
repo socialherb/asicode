@@ -48,7 +48,6 @@ import ast
 import json
 import logging
 import os
-from typing import Optional
 
 from external_llm.common.atomic_io import atomic_write_json
 
@@ -83,7 +82,7 @@ def _scanner_resident_entry_points() -> set:
         return set()
 
 
-def _dotted_chain(node) -> Optional[str]:
+def _dotted_chain(node) -> str | None:
     """Rebuild ``a.b.c`` from a Name/Attribute chain, or None if dynamic."""
     parts: list[str] = []
     while isinstance(node, ast.Attribute):
@@ -95,7 +94,7 @@ def _dotted_chain(node) -> Optional[str]:
     return None
 
 
-def _add_python_import_names(tree, names: set) -> set:
+def _add_python_import_names(tree, names: set) -> tuple[set, list]:
     """Add every name an AST's imports bind or reference; return the local bindings.
 
     For ``from m import X as Y`` both X (the name defined in m — what
@@ -203,8 +202,8 @@ def compute_cross_file_referenced_names_light(
     graph,
     repo_root: str,
     candidate_files: list[str],
-    imported_names: Optional[set] = None,
-) -> Optional[set]:
+    imported_names: set | None = None,
+) -> set | None:
     """O(n) cross-file referenced-name computation — the single implementation,
     used by both the structural gate and the tool path.
 
@@ -407,7 +406,7 @@ def _extract_importer_exports(tree: ast.Module, importer: str) -> dict[str, set]
     return index
 
 
-def _ie_stat(abs_path: str) -> Optional[tuple[int, int]]:
+def _ie_stat(abs_path: str) -> tuple[int, int] | None:
     """(st_mtime_ns, st_size) — delegates to the canonical parse_cache helper
     (single stat code path; order contract documented there, B1)."""
     return parse_cache.stat_fingerprint(abs_path)

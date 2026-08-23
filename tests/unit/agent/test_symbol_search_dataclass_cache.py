@@ -7,6 +7,7 @@ it now reads the class's ``SymbolDef.decorators`` from the same cached map
 the lookup just built — so the parent file is parsed exactly once per
 ``find_symbol`` call.
 """
+
 from __future__ import annotations
 
 from external_llm.agent.symbol_search import SymbolSearcher
@@ -59,9 +60,7 @@ class TestDataclassFallbackUsesCache:
     def test_plain_class_init_fallback_not_triggered(self, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()
-        (repo / "widget.py").write_text(
-            "class Bar:\n    def method(self):\n        pass\n"
-        )
+        (repo / "widget.py").write_text("class Bar:\n    def method(self):\n        pass\n")
         searcher = SymbolSearcher(str(repo))
         res = searcher.find_symbol("Bar.__init__")
         # No @dataclass → no fallback; __init__ does not exist.

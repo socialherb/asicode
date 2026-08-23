@@ -32,12 +32,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import Any, ClassVar
 
 from external_llm.agent.config.thresholds import config as _cfg
 from external_llm.agent.terminal_coordination import (
     TERM_WRITE_LOCK as _TERM_WRITE_LOCK,
 )
+from external_llm.client import LLMClient
 from external_llm.common.atomic_io import atomic_write_json
 from external_llm.image_utils import _check_clipboard_image, _extract_images_from_input
 from external_llm.model_catalog import (
@@ -98,7 +99,7 @@ def _set_completer_context(provider: str, model: str) -> None:
 # Ollama model list cache (optimizes 3 calls within run_repl). None = not yet
 # fetched — a pre-populated [] would pass the ``is not None`` TTL guard and
 # make the FIRST call (within 10s of process start) return an empty list.
-_ollama_cache: Optional[list[str]] = None
+_ollama_cache: list[str] | None = None
 _ollama_cache_ts: float = 0.0
 
 # ESC watcher pause event — prevents _run_esc_watcher from intercepting input
@@ -107,7 +108,7 @@ _esc_watcher_pause = threading.Event()
 # The printer currently showing a spinner — exposed at module level so _cli_checkpoint_cb can
 # stop the spinner before outputting a question (stream callback and checkpoint cb are called
 # from the same engine thread, so no lock needed).
-_active_spinner_printer: Optional["_ProgressPrinter"] = None
+_active_spinner_printer: _ProgressPrinter | None = None
 
 
 class _ProgressPrinter:
@@ -123,7 +124,7 @@ class _ProgressPrinter:
         # Track concurrently running (ThreadPoolExecutor) tools by call_id.
         # design_tool_call events may lack call_id (provider-specific tool-call id
         # missing), falling back to anon-key. {{call_id: {tool, hint, t0}}}, insertion order = start order.
-        self._inflight: "dict[str, dict]" = {}
+        self._inflight: dict[str, dict] = {}
         self._inflight_ctr: int = 0  # Monotonically increasing counter to make anon keys unique when call_id is missing
         self._live_drawn: bool = False  # Whether a pending live line (no trailing newline) is at the bottom of screen
         self._pending_llm_tokens: int = 0  # Cache miss tokens from the last LLM call (billing accounting; ↑ display sums with hits via total_input_tokens())
@@ -133,11 +134,11 @@ class _ProgressPrinter:
             0  # Cache-creation (write) tokens from last LLM call (separate accounting only >0; ↑ sum + hit% numerator)
         )
         # Long-running tool ticker: periodically re-render the ○ line with spinner+elapsed time (prevents perceived freeze)
-        self._ticker_stop: Optional[threading.Event] = None
-        self._ticker_thread: Optional[threading.Thread] = None
+        self._ticker_stop: threading.Event | None = None
+        self._ticker_thread: threading.Thread | None = None
         # thinking ticker: re-renders spinner as "<spinner> thinking · Ns" every 0.1s during LLM calls.
-        self._think_tick_stop: Optional[threading.Event] = None
-        self._think_tick_thread: Optional[threading.Thread] = None
+        self._think_tick_stop: threading.Event | None = None
+        self._think_tick_thread: threading.Thread | None = None
         self._think_tick_t0: float = 0.0
         self._preview_active: bool = False  # tool_call_preview emitted but tool_call hasn't arrived yet
         self._preview_suffix: str = ""
@@ -147,9 +148,9 @@ class _ProgressPrinter:
         self._muted: bool = False
         # ── Spinner (displayed while waiting for LLM response) ──
         self._spinner_running: bool = False
-        self._spinner_thread: Optional[threading.Thread] = None
-        self._spinner_live: Optional[Any] = None  # Rich Live instance
-        self._spinner_obj: Optional[Any] = None  # Rich Spinner instance (preserves start_time)
+        self._spinner_thread: threading.Thread | None = None
+        self._spinner_live: Any | None = None  # Rich Live instance
+        self._spinner_obj: Any | None = None  # Rich Spinner instance (preserves start_time)
         self._spinner_msg: str = ""
         self._spinner_chars = "◴◷◶◵"
 
@@ -252,7 +253,7 @@ class _ProgressPrinter:
         _suffix = f"  {self._spinner_safe(_hint, max(0, _avail))}" if _hint and _avail > 4 else ""
         return f"{_base}{_suffix}{_extra}{_tail}"
 
-    def _pop_inflight(self, call_id: Optional[str]) -> Optional[dict]:
+    def _pop_inflight(self, call_id: str | None) -> dict | None:
         """Match a completion/error event to an in-flight entry and pop it.
 
         - Exact call_id match takes priority (the normal path, when the
@@ -452,7 +453,7 @@ class _ProgressPrinter:
         return f"\x1b[38;2;{r};{g};{b}m", "\x1b[39m"
 
     @classmethod
-    def _style_row(cls, s: str, icon_hex: Optional[str] = None) -> str:
+    def _style_row(cls, s: str, icon_hex: str | None = None) -> str:
         """Colorize a plain line already width-fitted by _fit_row (width unchanged).
 
         Dims the leading "[…]" token, then colors the first non-space
@@ -511,9 +512,7 @@ class _ProgressPrinter:
             out.append(on + ch + off)
         return "".join(out)
 
-    def _event(
-        self, elapsed: float, icon: str, msg: str, color: str = "text", icon_color: Optional[str] = None
-    ) -> None:
+    def _event(self, elapsed: float, icon: str, msg: str, color: str = "text", icon_color: str | None = None) -> None:
         """Print one observation line: dim [elapsed] · colored icon · body.
 
         color/icon_color are either _C palette keys or a style/hex string to use as-is.
@@ -581,7 +580,7 @@ class _ProgressPrinter:
         else:
             print("  " + "".join(_txt for _txt, _ in parts))
 
-    def _render_plan_update(self, plan: dict, prev_statuses: Optional[dict]) -> None:
+    def _render_plan_update(self, plan: dict, prev_statuses: dict | None) -> None:
         """Render the full plan as a bordered box below the update_plan ✓ line.
 
         Layout (a frame visually separated from the conversation flow):
@@ -1223,7 +1222,14 @@ class _ProgressPrinter:
                 # Dollar amount intentionally omitted from the user-facing token line
                 # (cost is an estimate, not a precise charge). Debug _log keeps it.
                 # Per-turn + session cumulative cache hit% (DeepSeek-style)
+                # Pre-bind OUTSIDE the try: the except path never assigns
+                # _turn_hit/_sess_hit, so the log f-string below would
+                # NameError on a cache_hit_pct failure. (The try body
+                # overwrites these on the success path; _hit_suffix is bound
+                # to "" here and only replaced when the hit ratio is > 0.)
                 _hit_suffix = ""
+                _turn_hit = 0.0
+                _sess_hit = 0.0
                 if _prov and (crt or tcrt):
                     try:
                         from external_llm.agent._shared_utils import cache_hit_pct
@@ -1236,6 +1242,10 @@ class _ProgressPrinter:
                         # already does this via _cache_hit_ratio — keep parity.)
                         _cct = data.get("cache_creation_tokens", 0) or 0
                         _tcct = data.get("total_cache_creation_tokens", 0) or 0
+                        # Pre-bind before the two cache_hit_pct calls so an
+                        # exception (handled by the except below) cannot leave
+                        # the per-turn token line's f-strings with unbound
+                        # names (NameError would kill the whole line).
                         _turn_hit = cache_hit_pct(_prov, pt, crt, _cct) if crt else 0.0
                         _sess_hit = cache_hit_pct(_prov, tpt, tcrt, _tcct) if tcrt else 0.0
                         if _sess_hit > 0:
@@ -1501,7 +1511,7 @@ class _ProgressPrinter:
                     # Live "… thinking" spinner has ended — switch to completion label.
                     # Title: 💭 thought for 6.2s. Body is markdown-rendered.
                     if _RICH and asi._out_console:
-                        _RichMD = _rich_markdown_cls()
+                        _rich_md = _rich_markdown_cls()
                         from rich.segment import Segment as _Seg
                         from rich.segment import Segments as _Segs
                         from rich.style import Style as _Style
@@ -1522,7 +1532,7 @@ class _ProgressPrinter:
                         asi._out_console.print()
                         asi._out_console.print(_RichTxt(_hdr, style=f"bold {_C['mauve']}"))
                         _md_opts = asi._out_console.options.update(width=max(10, asi._out_console.width - 3))
-                        _md_lines = asi._out_console.render_lines(_RichMD(content.strip()), _md_opts, pad=False)
+                        _md_lines = asi._out_console.render_lines(_rich_md(content.strip()), _md_opts, pad=False)
 
                         def _is_blank(_l):
                             return all(not _s.text.strip() for _s in _l)
@@ -1582,7 +1592,7 @@ class _ProgressPrinter:
                 else:  # "issues"
                     _content = (data.get("content", "") or "").strip()
                     if _RICH and asi._out_console:
-                        _RichMD = _rich_markdown_cls()
+                        _rich_md = _rich_markdown_cls()
                         from rich.text import Text as _RichTxt
 
                         _f = asi._out_console.file
@@ -1593,7 +1603,7 @@ class _ProgressPrinter:
                         asi._out_console.print()
                         asi._out_console.print(
                             _bar_panel(
-                                _RichMD(_content) if _content else _RichTxt("(no detail)"),
+                                _rich_md(_content) if _content else _RichTxt("(no detail)"),
                                 title=_title,
                                 color=_C["yellow"],
                             )
@@ -1757,7 +1767,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
         logging.getLogger(__name__).debug("checkpoint: terminal state save failed", exc_info=True)
 
     # Pre-initialise so finally block can safely reference these even on ValueError
-    _M2 = " " * (_CONSOLE_MARGIN + 2)  # "      " (nested items)
+    _m2 = " " * (_CONSOLE_MARGIN + 2)  # "      " (nested items)
     answer = ""
     try:
         question = question_data.get("question", "")
@@ -1770,61 +1780,61 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
             timeout = 120
 
         # Print question to terminal — indent to match _CONSOLE_MARGIN (4 spaces)
-        _M = " " * _CONSOLE_MARGIN  # "    "
-        _SEP_W = 60 - _CONSOLE_MARGIN  # separator width (fits within standard margin)
-        print("\n" + _M + "─" * _SEP_W)
-        print(_M + "🔔 [User Checkpoint] LLM has a question:")
-        print(_M + "─" * _SEP_W)
+        _m = " " * _CONSOLE_MARGIN  # "    "
+        _sep_w = 60 - _CONSOLE_MARGIN  # separator width (fits within standard margin)
+        print("\n" + _m + "─" * _sep_w)
+        print(_m + "🔔 [User Checkpoint] LLM has a question:")
+        print(_m + "─" * _sep_w)
         # Wrap long lines (e.g. dangerous shell commands) to the terminal width
         # so soft-wrapped continuation rows keep a left margin instead of falling
-        # flush against the terminal edge. _M2 (hanging indent) marks continuations.
+        # flush against the terminal edge. _m2 (hanging indent) marks continuations.
         import shutil as _sh_q
 
         # Leave 1 col of right slack so a full-width CJK glyph never tips the
         # line over the terminal edge (which would re-wrap it at column 0).
         _wrap_w = max(20, _sh_q.get_terminal_size((80, 24)).columns - _CONSOLE_MARGIN - 1)
         # Question body: markdown-rendered (**bold**, `code`, # header, - bullet).
-        # _out_console auto-injects left _CONSOLE_MARGIN margin via _MarginIO, so manual _M
+        # _out_console auto-injects left _CONSOLE_MARGIN margin via _MarginIO, so manual _m
         # prefix is unnecessary — aligns at same column (4) as header/option lines (same pattern as
         # design_thinking·self-review). reset_bol() syncs _MarginIO's _bol state to BOL after a raw print.
         # Falls back to existing _wrap_cjk plain-text loop when Rich is unavailable.
         if _RICH and asi._out_console:
-            _RichMD = _rich_markdown_cls()
+            _rich_md = _rich_markdown_cls()
             _f = asi._out_console.file
             if hasattr(_f, "reset_bol"):
                 _f.reset_bol()
-            asi._out_console.print(_RichMD(question))
+            asi._out_console.print(_rich_md(question))
         else:
             for _qline in question.splitlines():
                 if not _qline.strip():
-                    print(_M)
+                    print(_m)
                     continue
-                for _wline in _wrap_cjk(_qline, _wrap_w, initial_indent=_M, subsequent_indent=_M2):
+                for _wline in _wrap_cjk(_qline, _wrap_w, initial_indent=_m, subsequent_indent=_m2):
                     print(_wline)
         if options:
-            print(_M)
-            print(_M + "Options:")
+            print(_m)
+            print(_m + "Options:")
             for i, opt in enumerate(options, 1):
                 # Wrap long options to prevent falling to col 0 — continuation lines get hanging indent
-                # of (_M2 + number width) for alignment.
+                # of (_m2 + number width) for alignment.
                 _pfx = f"{i}. "
                 for _wline in _wrap_cjk(
-                    f"{_pfx}{opt}", _wrap_w, initial_indent=_M2, subsequent_indent=_M2 + " " * len(_pfx)
+                    f"{_pfx}{opt}", _wrap_w, initial_indent=_m2, subsequent_indent=_m2 + " " * len(_pfx)
                 ):
                     print(_wline)
         if default:
-            print(_M)
+            print(_m)
             # [Default: …] (auto-applied in Ns) is long; if the terminal soft-wraps,
             # the continuation "(auto-applied …)" drops to col 0. Wrap with _wrap_cjk
-            # (same as body) to maintain left margin (_M2) on continuation lines.
+            # (same as body) to maintain left margin (_m2) on continuation lines.
             for _wline in _wrap_cjk(
-                f"[Default: {default}] (auto-applied in {timeout}s)", _wrap_w, initial_indent=_M, subsequent_indent=_M2
+                f"[Default: {default}] (auto-applied in {timeout}s)", _wrap_w, initial_indent=_m, subsequent_indent=_m2
             ):
                 print(_wline)
-        print(_M + "─" * _SEP_W)
+        print(_m + "─" * _sep_w)
 
         # Show a prompt indicator so the user knows to type something
-        _sys.stdout.write(f"{_M}❯ ")
+        _sys.stdout.write(f"{_m}❯ ")
         _sys.stdout.flush()
 
         # Wait for input with timeout
@@ -1840,7 +1850,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
             if _milestones and remaining <= _milestones[0]:
                 while _milestones and remaining <= _milestones[0]:
                     _milestones.pop(0)  # Consume already-passed milestones in a batch
-                _sys.stdout.write(f"\n{_M}⏳ default auto-applies in {max(remaining, 1)}s\n{_M}❯ ")
+                _sys.stdout.write(f"\n{_m}⏳ default auto-applies in {max(remaining, 1)}s\n{_m}❯ ")
                 _sys.stdout.flush()
             timeout_sec = max(0, min(1, remaining))
             rlist, _, _ = _sel.select([_sys.stdin], [], [], timeout_sec)
@@ -1861,7 +1871,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
                 elif _user_responded:
                     # Number entered but out of option range — silently passing the original text
                     # would send the wrong answer to the LLM. State that it's treated as free text.
-                    print(f"{_M2}(no option #{answer} — passing it through as a free-form answer)")
+                    print(f"{_m2}(no option #{answer} — passing it through as a free-form answer)")
             except (ValueError, IndexError):
                 # Non-numeric free-text answers are the normal path — pass through
                 logging.getLogger(__name__).debug("checkpoint: non-numeric free-text answer")
@@ -1877,7 +1887,7 @@ def _cli_checkpoint_cb(question_data: dict) -> dict:
         # Resume ESC watcher
         _esc_watcher_pause.clear()
 
-    print(f"{_M2}→ Answer: {answer}\n")
+    print(f"{_m2}→ Answer: {answer}\n")
     # Restart the spinner we stopped — the run continues after the answer
     if _spinner_owner is not None:
         try:
@@ -1902,14 +1912,14 @@ class EngineConfig:
     request_text: str
     provider: str
     model: str
-    api_key: Optional[str]
+    api_key: str | None
     max_turns: int
     stream_cb: Callable[..., None]
-    cancel_event: Optional[threading.Event]
+    cancel_event: threading.Event | None
     svc: Any = None
     route_decision: Any = None
-    thinking_mode: Optional[bool] = None
-    reasoning_effort: Optional[str] = None
+    thinking_mode: bool | None = None
+    reasoning_effort: str | None = None
     scoped_verification: bool = True
 
 
@@ -1979,8 +1989,8 @@ def _run_with_cancel(
     request: str,
     context: str,
     cancel_event: threading.Event,
-    esc_watcher_stop: Optional[threading.Event] = None,
-    stream_callback: Optional[Callable] = None,
+    esc_watcher_stop: threading.Event | None = None,
+    stream_callback: Callable | None = None,
 ):
     """Run loop.run() in a separate thread and return the result.
 
@@ -2242,7 +2252,7 @@ _AUTO_CONTINUE_DELAY: float = _parse_auto_continue_delay()
 _AUTO_SUGGESTION_MAX_LEN = 300
 
 
-def _parse_auto_arg(arg: str, cur_on: bool) -> tuple[Optional[bool], Optional[int], Optional[str]]:
+def _parse_auto_arg(arg: str, cur_on: bool) -> tuple[bool | None, int | None, str | None]:
     """Parse the ``/auto`` argument → ``(new_on, new_cap, error)``.
 
     ``new_cap`` is ``None`` when the cap is unchanged. Pure — unit-tested in
@@ -2289,7 +2299,7 @@ def _text_has_hangul(s: str) -> bool:
     return False
 
 
-def _validate_next_suggestion(text: str, user_request: str, max_len: int = 140) -> Optional[str]:
+def _validate_next_suggestion(text: str, user_request: str, max_len: int = 140) -> str | None:
     """Enforce the rules stated in ``_NEXT_SUGGEST_SYSTEM`` structurally.
 
     The system prompt already tells the model: one short imperative line, same
@@ -2714,6 +2724,7 @@ def _eval_ctrlc_armed(
         return (False, True)  # second Ctrl+C → raise
     return (True, False)  # first Ctrl+C → arm
 
+
 def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
     """Read user input using prompt_toolkit.
 
@@ -2789,7 +2800,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                     )
 
                 _PtApp._on_resize = _debounced_on_resize
-                _PtApp._asr_resize_debounced = True
+                _PtApp._asr_resize_debounced = True  # type: ignore[attr-defined]  # dynamic ptk class attr
         except Exception:  # pragma: no cover — ptk API drift fallback
             logging.getLogger(__name__).debug("pt on_resize debounce patch failed", exc_info=True)
 
@@ -2920,7 +2931,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             key_bindings=kb,
             style=_pt_app_style,
             auto_suggest=_NextTaskAutoSuggest(),
-            completer=_SlashCommandCompleter(
+            completer=_SlashCommandCompleter(  # type: ignore[arg-type]  # duck-typed: no ptk Completer base (asi.py:2100)
                 get_provider_fn=lambda: _completer_provider,
                 get_model_fn=lambda: _completer_model,
                 get_dev_models_fn=lambda: _completer_dev_models,
@@ -3046,7 +3057,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
     except RuntimeError:
         logging.getLogger(__name__).debug("no running asyncio loop")
 
-    _MAX_INPUT_CHARS = 50000  # Default limit, generously above _cfg.lines.DESIGN_TURN_MAX_CHARS
+    _max_input_chars = 50000  # Default limit, generously above _cfg.lines.DESIGN_TURN_MAX_CHARS
     # ── Input underline: bottom_toolbar=True enables session layout's separator/filler/
     #    external completion menu flag (layout ConditionalContainer
     #    references this global every render). Regular prompts (False) have flag off,
@@ -3143,9 +3154,9 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                 logging.getLogger(__name__).debug("SIGWINCH registration failed — non-main thread", exc_info=True)
             _handle_terminal_resize()
 
-    if len(text) > _MAX_INPUT_CHARS:
-        _print(f"  ▲ input truncated to {_MAX_INPUT_CHARS} chars.", _C["yellow"])
-        text = text[:_MAX_INPUT_CHARS]
+    if len(text) > _max_input_chars:
+        _print(f"  ▲ input truncated to {_max_input_chars} chars.", _C["yellow"])
+        text = text[:_max_input_chars]
     # After input confirm, leave one separator line in scrollback. prompt_toolkit
     # clears the live underline on is_done (prevents history pollution each turn), so submitting
     # removes the underline and tool output appears right after the prompt. Here, emit the same
@@ -3212,8 +3223,8 @@ def _show_result(
     result,
     elapsed: float,
     *,
-    repo_root: Optional[str] = None,
-    baseline: Optional[dict] = None,
+    repo_root: str | None = None,
+    baseline: dict | None = None,
 ) -> None:
     """Display execution result, then a colored diff of what the run changed."""
     status_icon = {
@@ -3241,12 +3252,12 @@ def _show_result(
     if _RICH and asi._out_console:
         from rich.console import Group
 
-        _RichMD = _rich_markdown_cls()
+        _rich_md = _rich_markdown_cls()
         from rich.text import Text
 
         renderables = []
         if msg:
-            renderables.append(_RichMD(msg.strip()))
+            renderables.append(_rich_md(msg.strip()))
         if result.error:
             renderables.append(Text(f"  {result.error[:1000]}", style=_C["red"]))
         if token_line:
@@ -3297,7 +3308,7 @@ async def _run_collaborate_session(
     registry: Any,
     config: Any,
     task: str,
-    context: Optional[str] = None,
+    context: str | None = None,
 ) -> Any:
     """Run a single collaboration session (async wrapper for REPL /claude)."""
     from external_llm.repl.collaborate import CollaborationOrchestrator
@@ -3365,7 +3376,7 @@ def _list_provider_model_choices() -> list[tuple[str, str]]:
     return choices
 
 
-def _interactive_provider_setup(repo_root: Optional[str]) -> Optional[tuple[str, str]]:
+def _interactive_provider_setup(repo_root: str | None) -> tuple[str, str] | None:
     """Interactively pick a provider/model when none is configured.
 
     Shows the same provider/model combinations as ``/model`` as a numbered
@@ -3420,11 +3431,11 @@ def _interactive_provider_setup(repo_root: Optional[str]) -> Optional[tuple[str,
 
 def _retry_create_svc_with_api_key_prompt(
     factory: Callable,
-    provider: Optional[str],
-    model: Optional[str],
+    provider: str | None,
+    model: str | None,
     *,
-    api_key: Optional[str] = None,
-    repo_root: Optional[str] = None,
+    api_key: str | None = None,
+    repo_root: str | None = None,
 ) -> Any:
     """Create the LLM service — if no API key is set, prompt the user and retry.
 
@@ -3509,7 +3520,7 @@ def _get_ollama_models(timeout: int = 5) -> list[str]:
         return _names
 
 
-def _resolve_repo_root(repo_arg: Optional[str]) -> str:
+def _resolve_repo_root(repo_arg: str | None) -> str:
     """Resolve the repository root directory.
 
     Priority:
@@ -3537,7 +3548,7 @@ def _resolve_repo_root(repo_arg: Optional[str]) -> str:
     return str(Path(os.getcwd()).resolve())
 
 
-def _terminal_config_path(repo_root: str) -> Optional[str]:
+def _terminal_config_path(repo_root: str) -> str | None:
     """Per-terminal config path for isolated /model switches, or None if no TTY.
 
     Each terminal (TTY) gets its own config file under
@@ -3665,8 +3676,8 @@ def _init_session_state(repo_root: str, svc, design_config) -> dict:
     if _term_state_cfg:
         _seed_terminal_config(_term_state_cfg, _shared_state_path)
         _thinking_state_path = _term_state_cfg
-    _thinking_state: Optional[bool] = None  # /think on/off (None=not explicitly set; provider decides)
-    _reasoning_effort: Optional[str] = None  # /think high|max (None=provider default)
+    _thinking_state: bool | None = None  # /think on/off (None=not explicitly set; provider decides)
+    _reasoning_effort: str | None = None  # /think high|max (None=provider default)
     # ── /code·/general mode — per-terminal independence (persisted to terminal config, not shared session) ──
     # Putting chat_mode in session (shared via _session_id=repo_root) would let one terminal's /code
     # propagate to other terminals via _adopt_from_disk. So, like /model·/think·/helper,
@@ -3724,7 +3735,7 @@ def _init_session_state(repo_root: str, svc, design_config) -> dict:
 
     # Design chat worker that was ESC-interrupted and is finishing in background
     # (collected just before next input processing to guarantee session turn order)
-    _pending_dc: Optional[dict] = None
+    _pending_dc: dict | None = None
 
     return {
         "session_tokens": _session_tokens,
@@ -3745,7 +3756,7 @@ def _init_session_state(repo_root: str, svc, design_config) -> dict:
     }
 
 
-def _init_repl_engine(args: argparse.Namespace, repo_root: str) -> Optional[dict]:
+def _init_repl_engine(args: argparse.Namespace, repo_root: str) -> dict | None:
     """Initialize the LLM engine/provider and design-chat core (P1-1 Phase B).
 
     Extracted from the ``_run_repl_impl`` monolith. Returns a dict of the
@@ -3992,9 +4003,9 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
 
     # Sentinel: marks that helper client creation already failed once.
     # Prevents re-attempting (and re-logging) on every compress call.
-    _HELPER_CREATION_FAILED = object()
+    _helper_creation_failed = object()
 
-    def _get_compress_llm():
+    def _get_compress_llm() -> tuple[LLMClient, str]:
         """Return ``(client, model_name)`` for context compression.
 
         Uses the dedicated helper model when set (lazy-creating + caching its
@@ -4008,15 +4019,15 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 # Lazy-create + cache. If creation fails (e.g. missing API key),
                 # log once and fall back to the main model rather than crash.
                 _h = _create_llm_client_for(_helper_provider_str)
-                if _h is not None:
+                if _h is not None and isinstance(_h, LLMClient):
                     _helper_client = _h
                 else:
                     logging.getLogger(__name__).warning(
                         "helper client creation failed for %s — using main model",
                         _helper_provider_str,
                     )
-                    _helper_client = _HELPER_CREATION_FAILED  # don't retry
-            if _helper_client is not _HELPER_CREATION_FAILED:
+                    _helper_client = _helper_creation_failed  # don't retry
+            if _helper_client is not _helper_creation_failed and isinstance(_helper_client, LLMClient):
                 return _helper_client, _helper_model_str
         return svc.llm_service.client, (svc.model or "")
 
@@ -4075,7 +4086,19 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
 
         _ci_llm_logger = logging.getLogger("external_llm")
         _ci_suppress = _SuppressInfoFilter()
-        _ci_notice: Optional[str] = None
+        _ci_notice: str | None = None
+        # Pre-bind compaction-state locals so the post-try logging/sanity gates
+        # never trip pyright's possibly-unbound analysis.  These are only
+        # assigned inside the try block; on early-failure paths the gates are
+        # skipped (``not _ci_result``/notice branches return before use), so the
+        # defaults are never read at runtime — they exist purely to make the
+        # type checker's dataflow happy without changing behavior.
+        from external_llm.agent._response_utils import _TRUNCATION_REASONS
+
+        _ci_model: str = ""
+        _ci_pt_total = _ci_ct_total = _ci_crt_total = 0
+        _ci_finish_reason: str | None = None
+        _ci_result: str = ""
         try:
             from external_llm.client import LLMMessage
 
@@ -4117,7 +4140,6 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             if _ci_is_reasoning(_ci_model):
                 _ci_max_tokens = max(_ci_max_tokens, 32000)
             _ci_llm_logger.addFilter(_ci_suppress)
-            from external_llm.agent._response_utils import _TRUNCATION_REASONS
             from external_llm.agent._shared_utils import coerce_token_count
 
             # Retry on finish_reason=length/truncated with doubled budget (capped at 128k).
@@ -5709,7 +5731,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         try:
                             from rich.console import Group as _RichGroup
 
-                            _RichMD = _rich_markdown_cls()
+                            _rich_md = _rich_markdown_cls()
                             from rich.text import Text as _RichTxt
 
                             _f = asi._out_console.file
@@ -5717,7 +5739,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                                 _f.reset_bol()
                             _orch_rend: list = []
                             if _orch_body:
-                                _orch_rend.append(_RichMD(_orch_body))
+                                _orch_rend.append(_rich_md(_orch_body))
                             if _orch_ws:  # pragma: no cover - orchestrator results carry no workspace summary in tests
                                 _orch_rend.append(_RichTxt(_orch_ws, style=_C["muted"]))
                             asi._out_console.print()
@@ -5883,6 +5905,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 _thinking=_thinking_state,
                 _effort=_reasoning_effort,
             ):
+                _t_dc0: float = 0.0  # pre-bound: set on first successful entry of try
                 try:
                     # NOTE: token_callback not passed — CLI does not use token-by-token streaming.
                     # Uses only design_thinking_start/stop events
@@ -6121,7 +6144,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 try:
                     from rich.console import Group as _RichGroup
 
-                    _RichMD = _rich_markdown_cls()
+                    _rich_md = _rich_markdown_cls()
                     from rich.text import Text as _RichTxt
 
                     # Final answer also gets left gutter bar — same family as … thinking (mid-utterance),
@@ -6131,7 +6154,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         _f.reset_bol()
                     _renderables: list = []
                     if _dc_body:
-                        _renderables.append(_RichMD(_dc_body))
+                        _renderables.append(_rich_md(_dc_body))
                     asi._out_console.print()
                     asi._out_console.print(
                         _bar_panel(
@@ -6538,7 +6561,7 @@ def _run_orchestrate_single_shot(
     prompt: str,
     _stream_cb,
     cancel_event,
-) -> "Any":
+) -> Any:
     """F5: build and run a single-shot OrchestratorAgent (``--orchestrate``).
 
     Mirrors the interactive REPL's orchestrator construction but for the
@@ -6619,16 +6642,14 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
     # Safe because the engine treats stream_callback purely as a callable
     # (stream_callback(event, data)); it never reaches for printer-only methods.
     _use_json_blob = bool(getattr(args, "json", False)) and not _use_json_stream
-    if _use_json_stream:
 
-        def _stream_cb(event, payload=None, **kw):
+    def _stream_cb(event, payload=None, **kw):
+        # Single definition for all three modes — avoids redeclare and keeps
+        # the JSON-blob mode's stdout purity (human printer never writes here).
+        if _use_json_stream:
             _json_stream_emit(event, payload, **kw)
-    elif _use_json_blob:
-
-        def _stream_cb(*_a, **_k):
-            pass
-    else:
-        _stream_cb = printer
+        elif not _use_json_blob:
+            printer(event, payload if payload is not None else {}, **kw)
 
     def _sigint_handler(sig, frame):
         if cancel_event.is_set():
@@ -6763,7 +6784,6 @@ def run_once(args: argparse.Namespace, prompt: str) -> int:
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────────
-
 
 
 # ─── R1: sub-agent worker moved to repl_subagent.py (extracted seam) ─────────

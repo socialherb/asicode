@@ -155,4 +155,3 @@ class TestClassifierFactory:
     def test_unsupported_language(self):
         with pytest.raises(ValueError, match="No failure classifier"):
             create_failure_classifier("rust")
-

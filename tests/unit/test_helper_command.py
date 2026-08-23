@@ -5,6 +5,7 @@ Covers the reusable model-resolution + client-creation helpers that back
 routing) is exercised via the ``_get_compress_llm`` resolution contract:
 helper model wins when set, otherwise the main model falls back.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -59,6 +60,7 @@ class TestResolveModelInteractiveRejectsNaturalLanguage:
 
     def _src(self) -> str:
         import inspect
+
         return inspect.getsource(asi._resolve_model_interactive)
 
     def test_slash_path_has_provider_space_guard(self):
@@ -99,10 +101,12 @@ class TestPerTerminalModelRestore:
 
     def _main_src(self) -> str:
         import inspect
+
         return inspect.getsource(asi.main)
 
     def _repl_src(self) -> str:
         import inspect
+
         # P1-1 split: svc creation moved to _init_repl_engine; source-contract
         # guards inspect that implementation.
         return inspect.getsource(asi._init_repl_engine)
@@ -113,8 +117,8 @@ class TestPerTerminalModelRestore:
         src = self._main_src()
         assert "_terminal_config_path" in src
         assert "_seed_terminal_config" in src
-        assert "_saved_cfg.get(\"provider\", \"\")" in src
-        assert "_saved_cfg.get(\"model\", \"\")" in src
+        assert '_saved_cfg.get("provider", "")' in src
+        assert '_saved_cfg.get("model", "")' in src
 
     def test_svc_creation_uses_resolved_strings_not_raw_args(self):
         # svc must be created from _provider_str/_model_str (which carry the
@@ -122,8 +126,8 @@ class TestPerTerminalModelRestore:
         # the restore is overwritten by the (None) args.
         src = self._repl_src()
         # find the svc creation call and assert it references _provider_str
-        assert "_provider_str if _provider_str != \"(env)\"" in src
-        assert "_model_str if _model_str != \"(env)\"" in src
+        assert '_provider_str if _provider_str != "(env)"' in src
+        assert '_model_str if _model_str != "(env)"' in src
 
     def test_args_override_takes_priority(self):
         # The restore must be gated on `not args.provider` / `not args.model`
@@ -171,6 +175,7 @@ class TestHelperCommandRegistration:
         # The dispatch guard that routes /model etc. must include /helper,
         # otherwise a bare ``/helper`` falls through to design chat.
         import inspect
+
         src = inspect.getsource(asi._run_repl_impl)
         assert '"/helper"' in src
 
@@ -190,6 +195,7 @@ class TestInsightsCompactUsesHelperModel:
 
     def _src(self) -> str:
         import inspect
+
         # P1-1 split: the closure lives in _run_repl_impl.
         return inspect.getsource(asi._run_repl_impl)
 
@@ -237,6 +243,7 @@ class TestInsightsCompactBudgetBackstopUsesPostWriteSize:
 
     def _src(self) -> str:
         import inspect
+
         # P1-1 split: the closure lives in _run_repl_impl.
         return inspect.getsource(asi._run_repl_impl)
 
@@ -246,7 +253,10 @@ class TestInsightsCompactBudgetBackstopUsesPostWriteSize:
         assert "elif _ci_a_b > COMPACT_BUDGET_BYTES:" in src
         # The pre-write flag must NOT gate either the demotion call or the
         # post-write "could not reach budget" warning.
-        assert "if _ci_over_budget:\n            try:\n                from external_llm.agent.insights_manager import (\n                    enforce_budget_by_demotion" not in src
+        assert (
+            "if _ci_over_budget:\n            try:\n                from external_llm.agent.insights_manager import (\n                    enforce_budget_by_demotion"
+            not in src
+        )
         assert "elif _ci_over_budget and _ci_a_b > COMPACT_BUDGET_BYTES:" not in src
 
 
@@ -260,15 +270,20 @@ class TestRunOnceJsonErrorPaths:
     def _args(self, tmp_path):
         return argparse.Namespace(
             repo=str(tmp_path),
-            provider="x", model="x", api_key=None,
-            max_turns=10, verbose=False,
-            thinking_mode=None, reasoning_effort=None,
+            provider="x",
+            model="x",
+            api_key=None,
+            max_turns=10,
+            verbose=False,
+            thinking_mode=None,
+            reasoning_effort=None,
             json=True,
         )
 
     def test_runtime_error_emits_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
-            repl_impl, "_build_engine",
+            repl_impl,
+            "_build_engine",
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no provider configured")),
         )
 
@@ -281,7 +296,8 @@ class TestRunOnceJsonErrorPaths:
 
     def test_unexpected_exception_emits_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
-            repl_impl, "_build_engine",
+            repl_impl,
+            "_build_engine",
             lambda *a, **kw: (_ for _ in ()).throw(ValueError("weird internal state")),
         )
 

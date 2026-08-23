@@ -1,9 +1,9 @@
 """HTML syntax provider — stdlib html.parser based validation."""
+
 from __future__ import annotations
 
 import logging
 from html.parser import HTMLParser
-from typing import Optional
 
 # HTMLParseError was removed in Python 3.14; fall back to Exception for older versions.
 try:
@@ -27,10 +27,24 @@ _CAPABILITIES = LanguageCapabilities(
 )
 
 # Void elements that don't need a closing tag (HTML5 spec)
-_VOID_ELEMENTS = frozenset({
-    "area", "base", "br", "col", "embed", "hr", "img", "input",
-    "link", "meta", "param", "source", "track", "wbr",
-})
+_VOID_ELEMENTS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 
 
 class _TagTracker(HTMLParser):
@@ -94,12 +108,14 @@ class HtmlSyntaxProvider(SyntaxProvider):
                 errors.append(SyntaxError_(file=file_path, line=lineno, col=0, message=msg))
 
         except HTMLParseError as e:
-            errors.append(SyntaxError_(
-                file=file_path,
-                line=getattr(e, "lineno", 0) or 0,
-                col=getattr(e, "offset", 0) or 0,
-                message=str(e.msg) if hasattr(e, "msg") else str(e),
-            ))
+            errors.append(
+                SyntaxError_(
+                    file=file_path,
+                    line=getattr(e, "lineno", 0) or 0,
+                    col=getattr(e, "offset", 0) or 0,
+                    message=str(getattr(e, "msg", "") or e),
+                )
+            )
         except Exception as e:
             logger.debug("HTML syntax check failed unexpectedly: %s", e)
             # Non-blocking fallback
@@ -119,17 +135,13 @@ class HtmlSyntaxProvider(SyntaxProvider):
     def get_file_globs(self) -> list[str]:
         return ["*.html", "*.htm"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

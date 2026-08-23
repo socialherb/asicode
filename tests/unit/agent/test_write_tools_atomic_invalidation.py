@@ -9,6 +9,7 @@ observed here must have come from
 ``atomic_write_text -> invalidate_for_written_path`` — a plain
 ``Path.write_text`` would leave the pre-write listing cached until TTL.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -45,6 +46,7 @@ class _Harness(WriteToolsMixin):
 
     def _secure_path(self, path, *, confine=False):
         from pathlib import Path as _Path
+
         repo = _Path(self.repo_root).resolve()
         p = _Path(path)
         resolved = p.resolve() if p.is_absolute() else (repo / path).resolve()
@@ -93,10 +95,12 @@ def _assert_invalidated(key):
 
 # ── edit_file ───────────────────────────────────────────────────────────────
 
+
 def test_edit_file_success_invalidates_repo_file_index(harness, tmp_path, cached_index):
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
-    r = harness._tool_edit_file({"path": "app.py", "operations": [
-        {"type": "replace", "anchor": "x = 1", "content": "x = 2"}]})
+    r = harness._tool_edit_file(
+        {"path": "app.py", "operations": [{"type": "replace", "anchor": "x = 1", "content": "x = 2"}]}
+    )
     assert r.ok, r.error
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 2\n"
     _assert_invalidated(cached_index)
@@ -106,16 +110,14 @@ def test_edit_file_rollback_write_is_atomic_and_invalidates(harness, tmp_path, c
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
 
     def bad_syntax(path):
-        return {"ok": False, "skipped": False,
-                "errors": [{"line": 1, "col": 1, "message": "boom"}]}
+        return {"ok": False, "skipped": False, "errors": [{"line": 1, "col": 1, "message": "boom"}]}
 
     monkeypatch.setattr(harness, "_run_syntax_check_for_file", bad_syntax)
-    r = harness._tool_edit_file({"path": "app.py", "operations": [
-        {"type": "replace", "anchor": "x = 1", "content": "x = 2"}]})
-    assert not r.ok and "Syntax error" in r.error
-    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n", (
-        "rollback must restore the original content"
+    r = harness._tool_edit_file(
+        {"path": "app.py", "operations": [{"type": "replace", "anchor": "x = 1", "content": "x = 2"}]}
     )
+    assert not r.ok and "Syntax error" in r.error
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n", "rollback must restore the original content"
     # The rollback write itself must also go through the atomic funnel (a
     # crash between restore-write and return must not leave a truncated file).
     _assert_invalidated(cached_index)
@@ -123,10 +125,10 @@ def test_edit_file_rollback_write_is_atomic_and_invalidates(harness, tmp_path, c
 
 # ── anchor_edit ─────────────────────────────────────────────────────────────
 
+
 def test_anchor_edit_delete_write_invalidates_repo_file_index(harness, tmp_path, cached_index):
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
-    r = harness._tool_anchor_edit(
-        {"file_path": "app.py", "edit_mode": "delete", "anchor_pattern": "x = 1"})
+    r = harness._tool_anchor_edit({"file_path": "app.py", "edit_mode": "delete", "anchor_pattern": "x = 1"})
     assert r.ok, r.error
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == ""
     _assert_invalidated(cached_index)
@@ -135,8 +137,8 @@ def test_anchor_edit_delete_write_invalidates_repo_file_index(harness, tmp_path,
 def test_anchor_edit_insert_write_invalidates_repo_file_index(harness, tmp_path, cached_index):
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     r = harness._tool_anchor_edit(
-        {"file_path": "app.py", "edit_mode": "insert_after",
-         "anchor_pattern": "x = 1", "code_snippet": "y = 2"})
+        {"file_path": "app.py", "edit_mode": "insert_after", "anchor_pattern": "x = 1", "code_snippet": "y = 2"}
+    )
     assert r.ok, r.error
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\ny = 2\n"
     _assert_invalidated(cached_index)

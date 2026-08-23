@@ -1,4 +1,5 @@
 """Tests for external_llm/analysis/contradictory_logic_scanner.py."""
+
 from __future__ import annotations
 
 import tempfile
@@ -302,6 +303,7 @@ def test_non_py_file_skipped():
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as tmp:
         tmp.write("if True: pass\n")
     from external_llm.agent.scanner_registry import get_registry
+
     reg = get_registry()
     result = reg.run("contradictory_logic_scanner", file_paths=[tmp.name])
     assert not result.candidates_raw, f"Expected 0 candidates, got {len(result.candidates_raw)}"
@@ -407,10 +409,7 @@ def test_all_patterns_in_one_file():
     }
     # Adjacent same-condition blocks may be flagged as mergeable_condition
     # or duplicate_condition depending on distance.
-    expected.add(
-        "mergeable_condition" if "mergeable_condition" in kinds
-        else "duplicate_condition"
-    )
+    expected.add("mergeable_condition" if "mergeable_condition" in kinds else "duplicate_condition")
     missing = expected - kinds
     assert not missing, f"Missing patterns: {missing}"
     Path(src).unlink()
@@ -422,6 +421,7 @@ def test_all_patterns_in_one_file():
 def test_is_constant_false():
     """_is_constant_false correctly identifies falsy constants."""
     import ast
+
     assert _is_constant_false(ast.Constant(value=False)) is True
     assert _is_constant_false(ast.Constant(value=True)) is False
     assert _is_constant_false(ast.Constant(value=0)) is True
@@ -435,6 +435,7 @@ def test_is_constant_false():
 def test_is_contradictory_and():
     """_check_boolop_tautology detects x and not x (And)."""
     import ast
+
     tree = ast.parse("x and not x")
     expr = tree.body[0].value  # type: ignore
     results = _check_boolop_tautology(expr)
@@ -446,6 +447,7 @@ def test_is_contradictory_and():
 def test_is_contradictory_and_negative():
     """_check_boolop_tautology returns empty for non-contradictory."""
     import ast
+
     tree = ast.parse("x and not y")
     expr = tree.body[0].value  # type: ignore
     assert _check_boolop_tautology(expr) == []
@@ -454,6 +456,7 @@ def test_is_contradictory_and_negative():
 def test_is_contradictory_and_not_x_and_compare():
     """not x and failed > 0 — only 'not x', no bare 'x' — must NOT be flagged."""
     import ast
+
     # Real-world pattern: `not _any_write_succeeded and failed > 0`
     tree = ast.parse("not x and failed > 0")
     expr = tree.body[0].value  # type: ignore
@@ -478,6 +481,7 @@ def test_contradictory_and_not_flagged_in_scan():
 def test_is_always_true_or():
     """_check_boolop_tautology detects x or not x (Or)."""
     import ast
+
     tree = ast.parse("x or not x")
     expr = tree.body[0].value  # type: ignore
     results = _check_boolop_tautology(expr)
@@ -489,6 +493,7 @@ def test_is_always_true_or():
 def test_is_always_true_or_negative():
     """_check_boolop_tautology returns empty for non-always-true."""
     import ast
+
     tree = ast.parse("x or not y")
     expr = tree.body[0].value  # type: ignore
     assert _check_boolop_tautology(expr) == []
@@ -500,6 +505,7 @@ def test_get_enclosing_symbol_name():
     Note: ast.walk is preorder, so the outermost match wins.
     """
     import ast
+
     tree = ast.parse("""\
 class MyClass:
     def method(self):
@@ -519,6 +525,7 @@ class MyClass:
 def test_collect_if_elif_chain_simple_if():
     """Single if with no else returns one-element chain and empty else_body."""
     import ast
+
     tree = ast.parse("if x > 0:\n    pass\n")
     if_node = tree.body[0]
     chain, else_body = _collect_if_elif_chain(if_node)
@@ -529,6 +536,7 @@ def test_collect_if_elif_chain_simple_if():
 def test_collect_if_elif_chain_if_else():
     """if/else returns one-element chain and non-empty else_body."""
     import ast
+
     tree = ast.parse("if x > 0:\n    pass\nelse:\n    pass\n")
     if_node = tree.body[0]
     chain, else_body = _collect_if_elif_chain(if_node)
@@ -539,6 +547,7 @@ def test_collect_if_elif_chain_if_else():
 def test_collect_if_elif_chain_elif():
     """if/elif/else flattens to two-element chain plus else_body."""
     import ast
+
     src = "if a:\n    pass\nelif b:\n    pass\nelse:\n    pass\n"
     tree = ast.parse(src)
     if_node = tree.body[0]
@@ -550,6 +559,7 @@ def test_collect_if_elif_chain_elif():
 def test_collect_if_elif_chain_triple_elif():
     """Three-branch if/elif/elif chain flattens correctly."""
     import ast
+
     src = "if a:\n    pass\nelif b:\n    pass\nelif c:\n    pass\n"
     tree = ast.parse(src)
     if_node = tree.body[0]
@@ -668,7 +678,7 @@ def test_duplicate_beyond_distance_not_flagged():
     lines.append("        pass")
     # add 200 filler lines
     lines.extend(f"    y = {i}" for i in range(200))
-    lines.append("    if x > 0:")   # same condition, 200+ lines later
+    lines.append("    if x > 0:")  # same condition, 200+ lines later
     lines.append("        pass")
     src = _make_py_file("\n".join(lines) + "\n")
     candidates = scan_contradictory_logic(repo_root="", file_paths=[src], max_dup_distance=100)
@@ -702,6 +712,7 @@ def test_nearest_prior_tracked_for_distance():
 def test_extract_condition_names_simple():
     """Simple Name in condition returns that name, no attr."""
     import ast
+
     cond = ast.parse("x > 0", mode="eval").body
     names, has_attr = _extract_condition_names(cond)
     assert "x" in names
@@ -711,6 +722,7 @@ def test_extract_condition_names_simple():
 def test_extract_condition_names_attr():
     """Attribute access sets has_attr_access flag."""
     import ast
+
     cond = ast.parse("self.config.enabled", mode="eval").body
     names, has_attr = _extract_condition_names(cond)
     assert "self" in names
@@ -720,6 +732,7 @@ def test_extract_condition_names_attr():
 def test_extract_condition_names_complex():
     """Complex expression with multiple names."""
     import ast
+
     cond = ast.parse("is_small and is_local and not self.is_subagent", mode="eval").body
     names, has_attr = _extract_condition_names(cond)
     assert {"is_small", "is_local", "self"} <= names
@@ -728,6 +741,7 @@ def test_extract_condition_names_complex():
 
 def test_assignment_target_overlaps_name():
     import ast
+
     target = ast.parse("x = 1").body[0].targets[0]
     assert _assignment_target_overlaps(target, {"x"})
     assert not _assignment_target_overlaps(target, {"y"})
@@ -735,6 +749,7 @@ def test_assignment_target_overlaps_name():
 
 def test_assignment_target_overlaps_tuple():
     import ast
+
     stmt = ast.parse("a, b = 1, 2").body[0]
     target = stmt.targets[0]
     assert _assignment_target_overlaps(target, {"a"})
@@ -745,6 +760,7 @@ def test_assignment_target_overlaps_tuple():
 def test_has_name_mutation_direct_assign():
     """Direct assignment to watched name is a barrier."""
     import ast
+
     stmts = ast.parse("x = 10").body
     assert _has_name_mutation(stmts, {"x"}, has_attr_access=False)
     assert not _has_name_mutation(stmts, {"y"}, has_attr_access=False)
@@ -753,6 +769,7 @@ def test_has_name_mutation_direct_assign():
 def test_has_name_mutation_aug_assign():
     """Augmented assignment (x += 1) is a barrier."""
     import ast
+
     stmts = ast.parse("x += 1").body
     assert _has_name_mutation(stmts, {"x"}, has_attr_access=False)
 
@@ -760,6 +777,7 @@ def test_has_name_mutation_aug_assign():
 def test_has_name_mutation_call_no_attr():
     """Function call is NOT a barrier when condition has no attribute access."""
     import ast
+
     stmts = ast.parse("some_func()").body
     assert not _has_name_mutation(stmts, {"x"}, has_attr_access=False)
 
@@ -767,6 +785,7 @@ def test_has_name_mutation_call_no_attr():
 def test_has_name_mutation_call_with_attr():
     """Function call IS a barrier when condition references an attribute."""
     import ast
+
     stmts = ast.parse("some_method()").body
     assert _has_name_mutation(stmts, {"self"}, has_attr_access=True)
 
@@ -774,6 +793,7 @@ def test_has_name_mutation_call_with_attr():
 def test_has_name_mutation_nested_assign():
     """Assignment inside nested if block is also detected."""
     import ast
+
     stmts = ast.parse("if cond:\n    x = 5").body
     assert _has_name_mutation(stmts, {"x"}, has_attr_access=False)
 
@@ -874,6 +894,7 @@ def test_branch_body_end_empty():
 
 def test_branch_body_end_with_stmts():
     import ast
+
     tree = ast.parse("if x:\n    a = 1\n    b = 2\n")
     body = tree.body[0].body
     assert _branch_body_end(1, body) == 3
@@ -922,8 +943,7 @@ def test_duplicate_node_kind_reflects_while_not_hardcoded_if():
                 v = 2
     """)
     candidates = scan_contradictory_logic(repo_root="", file_paths=[src], max_dup_distance=100)
-    dups = [c for c in candidates
-            if c.contradiction_kind in ("duplicate_condition", "mergeable_condition")]
+    dups = [c for c in candidates if c.contradiction_kind in ("duplicate_condition", "mergeable_condition")]
     assert dups, "Expected the repeated `x > 0` guard to be flagged"
     # The second (current) occurrence is the while loop.
     assert dups[0].node_kind == "While"
@@ -1050,9 +1070,9 @@ def test_disk_cache_invalidates_on_content_change(tmp_path):
     """,
     )
     kinds = {c.contradiction_kind for c in changed}
-    assert (
-        "constant_false_condition" in kinds or "constant_zero_condition" in kinds
-    ), f"expected changed verdicts, got {kinds}"
+    assert "constant_false_condition" in kinds or "constant_zero_condition" in kinds, (
+        f"expected changed verdicts, got {kinds}"
+    )
 
 
 def test_disk_cache_invalidates_on_dup_distance_change(tmp_path):
@@ -1076,9 +1096,7 @@ def test_disk_cache_invalidates_on_dup_distance_change(tmp_path):
 def test_disk_cache_corrupt_fails_open(tmp_path):
     """A corrupt cache file degrades to a full re-scan, never a wrong verdict."""
     (tmp_path / ".cache").mkdir(exist_ok=True)
-    (tmp_path / ".cache" / "contradictory_scan_v1.json").write_text(
-        "{not json", encoding="utf-8"
-    )
+    (tmp_path / ".cache" / "contradictory_scan_v1.json").write_text("{not json", encoding="utf-8")
     # Must still scan normally (no candidates for clean source)
     clean = _scan_cache_contract(tmp_path, "x = 1\n")
     assert not clean

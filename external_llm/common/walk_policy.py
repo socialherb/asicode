@@ -15,6 +15,7 @@ Names keep the historical underscore prefix: they are intra-package
 conventions, not a public API.  ``_shared_utils`` re-exports them for
 backward compatibility (same pattern as ``common/cache_utils``).
 """
+
 from __future__ import annotations
 
 # Basename suffixes every walker must skip -- minified bundles are parser
@@ -30,11 +31,26 @@ _WALK_SKIP_FILE_SUFFIXES: tuple = (".min.js", ".min.mjs", ".min.cjs", ".min.css"
 # the former call_graph / symbol_search / RepositoryGraph implementations --
 # the stricter of each -- so every consumer also excludes
 # venv/site-packages/*.egg-info/vendor dirs alike.
-_WALK_SKIP_DIRS: frozenset = frozenset({
-    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
-    "node_modules", ".venv", "venv", "env", ".tox", "dist", "build",
-    ".eggs", "worktrees", "vendor",
-})
+_WALK_SKIP_DIRS: frozenset = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        ".venv",
+        "venv",
+        "env",
+        ".tox",
+        "dist",
+        "build",
+        ".eggs",
+        "worktrees",
+        "vendor",
+    }
+)
 
 # Directories whose contents are least useful for code-navigation tools
 # (find_symbol / find_relevant_files / analyze_change_impact). The walker
@@ -43,12 +59,33 @@ _WALK_SKIP_DIRS: frozenset = frozenset({
 # policy), not a regex -- ``os.walk`` already prunes vendor dirs via
 # :data:`_WALK_SKIP_DIRS`; this set only reorders the survivors by relevance.
 # Case-insensitive match against the directory basename.
-_WALK_DEPRIORITIZED_DIRS: frozenset = frozenset({
-    "tests", "test", "__tests__", "tst", "spec", "specs", "__specs__",
-    "fixtures", "testdata", "test_data", "test-data", "mocks", "stubs",
-    "snapshots", "__snapshots__", "fakes", "examples", "samples",
-    "out", "target", "generated", "gen", "autogen",
-})
+_WALK_DEPRIORITIZED_DIRS: frozenset = frozenset(
+    {
+        "tests",
+        "test",
+        "__tests__",
+        "tst",
+        "spec",
+        "specs",
+        "__specs__",
+        "fixtures",
+        "testdata",
+        "test_data",
+        "test-data",
+        "mocks",
+        "stubs",
+        "snapshots",
+        "__snapshots__",
+        "fakes",
+        "examples",
+        "samples",
+        "out",
+        "target",
+        "generated",
+        "gen",
+        "autogen",
+    }
+)
 
 
 def _walk_dir_sort_key(d: str) -> tuple[int, str]:
@@ -75,9 +112,7 @@ def _walk_should_skip_dir(d: str) -> bool:
     JS/TS bundled inside a Python package pollute the index; RepositoryGraph
     had a private copy that drifted the other way (B2', 2026-08-11).
     """
-    return (
-        d.startswith((".", "venv")) or d in _WALK_SKIP_DIRS or d.endswith(".egg-info") or "site-packages" in d
-    )
+    return d.startswith((".", "venv")) or d in _WALK_SKIP_DIRS or d.endswith(".egg-info") or "site-packages" in d
 
 
 def _rel_under_skipped_dir(rel: str) -> bool:
@@ -90,9 +125,7 @@ def _rel_under_skipped_dir(rel: str) -> bool:
     (call_graph B1, 2026-08-11). The basename (``parts[-1]``) is never a
     directory and is not tested.
     """
-    return any(
-        _walk_should_skip_dir(part) for part in str(rel).replace("\\", "/").split("/")[:-1]
-    )
+    return any(_walk_should_skip_dir(part) for part in str(rel).replace("\\", "/").split("/")[:-1])
 
 
 def _path_is_walk_admissible(rel: str) -> bool:

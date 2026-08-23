@@ -9,6 +9,7 @@ Orchestrates the complete flow:
 5) Validate unified diff (git apply compatible)
 6) Return final patch + metadata
 """
+
 from __future__ import annotations
 
 import codecs
@@ -19,11 +20,10 @@ import os
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from common import normalize_rel_path_fast
 from context_collector import _SNIPPET_READ_MAX_BYTES
-from path_security import resolve_inside_repo
+from path_security import normalize_rel_path, resolve_inside_repo
 from utils.string_helper import utf8_trailing_incomplete_len
 
 from .agent.agent_context_manager import get_git_snapshot
@@ -41,6 +41,10 @@ from .context_builder import ContextBuilder, enhance_user_request
 from .output_parser import parse_file_blocks, parse_llm_output, validate_diff
 from .patch_engine import PatchEngine
 from .super_context_builder import SuperContextBuilder
+
+if TYPE_CHECKING:
+    from .agent.symbol_search import SymbolDef
+    from .ast_rewrite import ASTRewriter
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +92,6 @@ def _bounded_read_text(p: Path, max_bytes: int = _SNIPPET_READ_MAX_BYTES) -> tup
     return raw.decode("utf-8", errors="replace"), True
 
 
-
-
 # --- Typed context pack parser helpers (replaces ad-hoc regex patterns) ---
 
 
@@ -132,7 +134,7 @@ def _extract_failure_summary_block(txt: str) -> str:
             return ""
 
         picked: list[str] = []
-        for line in lines[header_idx + 1:]:
+        for line in lines[header_idx + 1 :]:
             if _is_section_boundary(line):
                 break
             if picked and not line.strip():
@@ -160,7 +162,7 @@ def _extract_failed_reason(txt: str) -> str:
                 continue
             if in_failed_block:
                 if stripped.startswith("reason:"):
-                    reason = line.strip()[len("reason:"):].strip()
+                    reason = line.strip()[len("reason:") :].strip()
                     if reason:
                         reason_lines.append(reason)
                     if len(reason_lines) >= 3:
@@ -181,16 +183,16 @@ def _extract_identifiers(text: str) -> list[str]:
     result: list[str] = []
     buf: list[str] = []
     for ch in text:
-        if ch.isalnum() or ch == '_':
+        if ch.isalnum() or ch == "_":
             buf.append(ch)
         elif buf:
-            word = ''.join(buf)
-            if len(word) >= 3 and (word[0].isalpha() or word[0] == '_'):
+            word = "".join(buf)
+            if len(word) >= 3 and (word[0].isalpha() or word[0] == "_"):
                 result.append(word)
             buf = []
     if buf:
-        word = ''.join(buf)
-        if len(word) >= 3 and (word[0].isalpha() or word[0] == '_'):
+        word = "".join(buf)
+        if len(word) >= 3 and (word[0].isalpha() or word[0] == "_"):
             result.append(word)
     return result
 
@@ -210,8 +212,7 @@ class ExternalLLMService:
     # P9-2: patch_engine is the single source of truth for FILE-size caps (_MAX_FILE_CHARS,
     # _MAX_PATCH_CHARS, _MAX_FILE_REWRITE_CHANGE_RATIO, _MAX_FILE_REWRITE_CHANGED_LINES).
     # Duplicated copies previously lived here and drifted (0.45/400 ghosts no longer in use).
-    _MAX_FILE_RETRY_FILE_CHARS = 60_000            # only allow FILE retry when the target file is small
-
+    _MAX_FILE_RETRY_FILE_CHARS = 60_000  # only allow FILE retry when the target file is small
 
     @staticmethod
     @contextlib.contextmanager
@@ -224,6 +225,7 @@ class ExternalLLMService:
     @staticmethod
     def _is_trivial_edit_request(user_request: str) -> bool:
         from .agent.agent_fast_path import _is_trivial_request
+
         return _is_trivial_request(user_request)
 
     @staticmethod
@@ -252,19 +254,20 @@ class ExternalLLMService:
                 j = text.find(quote, i + 1)
                 if j == -1:
                     break
-                content = text[i + 1:j]
-                if len(content) >= 6 and '\n' not in content and '\r' not in content:
+                content = text[i + 1 : j]
+                if len(content) >= 6 and "\n" not in content and "\r" not in content:
                     out.append(content.strip())
                 pos = j + 1
             return out
+
         needles.extend(_find_quoted(req, "'"))
         needles.extend(_find_quoted(req, '"'))
 
         # Bullet-like lines inside the request (common for prompt edits)
         # ex) - Do NOT echo...
-        for ln in req.split('\n'):
+        for ln in req.split("\n"):
             s = ln.strip()
-            if s.startswith('- ') and len(s) >= 8:  # "- " + at least 6 chars
+            if s.startswith("- ") and len(s) >= 8:  # "- " + at least 6 chars
                 needles.append(s)
 
         # Dedup while preserving order
@@ -282,13 +285,13 @@ class ExternalLLMService:
         return out
 
     @classmethod
-    def _noop_precheck_for_literal_add(cls, repo_root: str, target_file: Optional[str], user_request: str) -> bool:
+    def _noop_precheck_for_literal_add(cls, repo_root: str, target_file: str | None, user_request: str) -> bool:
         """
         If the request looks like an "add this literal text" request AND the literal text
         already exists in the target file, return True (NOOP).
         """
         rr = str(repo_root or "").strip()
-        tf = normalize_rel_path_fast(target_file)
+        tf = normalize_rel_path(target_file or "")
         if not rr or not tf:
             return False
 
@@ -320,11 +323,10 @@ class ExternalLLMService:
                     if any(n and n in buf for n in needles):
                         return True
                     if len(buf) > max_needle + 4096:
-                        buf = buf[-(max_needle + 4096):]
+                        buf = buf[-(max_needle + 4096) :]
         except (OSError, PermissionError):
             return False
         return False
-
 
     def _read_target_file_snippet_best_effort(
         self,
@@ -340,7 +342,7 @@ class ExternalLLMService:
         appends an explicit marker so the model knows it only sees the head.
         """
         rr = str(repo_root or "").strip()
-        tf = normalize_rel_path_fast(str(target_file))
+        tf = normalize_rel_path(str(target_file))
         if not rr or not tf:
             return ""
 
@@ -404,7 +406,7 @@ class ExternalLLMService:
     ) -> str:
         """Focused snippet around the first occurrence of any needle."""
         rr = str(repo_root or "").strip()
-        tf = normalize_rel_path_fast(str(target_file))
+        tf = normalize_rel_path(str(target_file))
         if not rr or not tf or not needles:
             return ""
 
@@ -424,7 +426,7 @@ class ExternalLLMService:
             return ""
 
         lines = txt.replace("\r\n", "\n").split("\n")
-        hit_idx: Optional[int] = None
+        hit_idx: int | None = None
         for i, line in enumerate(lines):
             for needle in needles:
                 if needle and (needle in line):
@@ -509,13 +511,23 @@ class ExternalLLMService:
             return "block_not_found"
         if ("ambig" in t) or ("needs_disambiguation" in t) or ("match_count" in t) or ("selected_indices_missing" in t):
             return "ambiguous"
-        if ("git apply" in t) or ("apply failed" in t) or ("patch failed" in t) or ("hunk" in t and ("failed" in t or "reject" in t)):
+        if (
+            ("git apply" in t)
+            or ("apply failed" in t)
+            or ("patch failed" in t)
+            or ("hunk" in t and ("failed" in t or "reject" in t))
+        ):
             return "apply_failed"
-        if ("no such file or directory" in t) or ("path" in t and ("mismatch" in t or "wrong" in t)) or ("diff --git" in t) or ("--- a/" in t and "+++ b/" in t):
+        if (
+            ("no such file or directory" in t)
+            or ("path" in t and ("mismatch" in t or "wrong" in t))
+            or ("diff --git" in t)
+            or ("--- a/" in t and "+++ b/" in t)
+        ):
             return "path_or_header"
         return ""
 
-    def _extract_previous_failure_hint_best_effort(self, extra_context: Optional[str]) -> str:
+    def _extract_previous_failure_hint_best_effort(self, extra_context: str | None) -> str:
         """
         Best-effort extraction of a small "previous failure" hint from UI-provided context (CLIP_SESSION/CTX_PACK).
         This is intentionally tiny to avoid token bloat and to prevent stale context from dominating.
@@ -546,18 +558,18 @@ class ExternalLLMService:
         self,
         *,
         repo_root: str,
-        target_file: Optional[str],
+        target_file: str | None,
         user_request: str,
         is_trivial: bool,
         previous_failure_hint: str = "",
-        output_mode: Optional[str] = None,
+        output_mode: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """
         Server-built, token-optimized LLM context (NOT the CLIP_SESSION).
         - Always includes authoritative full-file snippet
         """
         rr = str(repo_root or "").strip()
-        tgt = normalize_rel_path_fast(target_file) or ""
+        tgt = normalize_rel_path(target_file or "") or ""
         meta: dict[str, Any] = {"kind": "LLM_CONTEXT_V7", "source": "server"}
 
         git_info = self._get_git_identity_best_effort(rr)
@@ -653,9 +665,9 @@ class ExternalLLMService:
         self,
         *,
         repo_root: str,
-        target_file: Optional[str],
+        target_file: str | None,
         user_request: str,
-        output_mode: Optional[str] = None,
+        output_mode: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """
         Build a richer "super context" using SuperContextBuilder if available.
@@ -665,7 +677,7 @@ class ExternalLLMService:
           - Keep the output as plain text (LLM-friendly).
         """
         rr = str(repo_root or "").strip()
-        tgt = normalize_rel_path_fast(target_file) or None
+        tgt = normalize_rel_path(target_file or "") or None
         meta: dict[str, Any] = {"kind": "LLM_CONTEXT_SUPER", "source": "server", "target_file": tgt or ""}
 
         if not rr:
@@ -695,13 +707,12 @@ class ExternalLLMService:
         else:
             return (text, meta)
 
-
     def __init__(
         self,
         provider: str,
         api_key: str,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
+        model: str | None = None,
+        base_url: str | None = None,
         timeout: int = DEFAULT_LLM_TIMEOUT,
     ):
         # Special handling for Ollama: use longer default timeout for model loading.
@@ -750,9 +761,7 @@ class ExternalLLMService:
     @staticmethod
     def _get_default_model(provider: str) -> str:
         """Return the default model name for a provider, or '' if unknown."""
-        return ExternalLLMService._PROVIDER_DEFAULT_MODELS.get(
-            (provider or "").strip().lower(), ""
-        )
+        return ExternalLLMService._PROVIDER_DEFAULT_MODELS.get((provider or "").strip().lower(), "")
 
     # Public API
     # ---------------------------------------------------------------------
@@ -761,14 +770,14 @@ class ExternalLLMService:
         self,
         repo_root: str,
         user_request: str,
-        target_file: Optional[str] = None,
-        extra_context: Optional[str] = None,
+        target_file: str | None = None,
+        extra_context: str | None = None,
         temperature: float = 0.0,
-        system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
         output_mode: str = "diff",  # "diff" | "auto"
         max_tokens: int = _cfg.tokens.SERVICE_DEFAULT,
         context_variant: str = "v7",  # "v7" | "super" | "hybrid"
-        progress_callback: Optional[Callable[[str, str, Optional[int], Optional[int]], None]] = None,
+        progress_callback: Callable[[str, str, int | None, int | None], None] | None = None,
     ) -> dict[str, Any]:
         """
         Generate a patch using external LLM.
@@ -800,7 +809,7 @@ class ExternalLLMService:
         if mode not in {"diff", "auto", "full_file"}:
             mode = "diff"
 
-        tgt = normalize_rel_path_fast(target_file) or None
+        tgt = normalize_rel_path(target_file or "") or None
         is_trivial = self._is_trivial_edit_request(user_request)
 
         # Fast NOOP precheck (prevents "duplicate add" diffs like the one you saw):
@@ -813,18 +822,20 @@ class ExternalLLMService:
                 "provider": self.provider,
                 "model": self.model,
                 "tokens_used": None,
-                "meta": ({
-                    "reason": "noop",
-                    "mode": mode,
-                    "target_file": tgt,
-                    "context_meta": {"source": "noop_precheck"},
-                    "synth_reason": "noop_precheck",
-                    "explanation": "",
-                    "retry_used": False,
-                    "first_fail_reason": "",
-                    "second_fail_reason": "",
-                    "noop_trust_level": "high",
-                }),
+                "meta": (
+                    {
+                        "reason": "noop",
+                        "mode": mode,
+                        "target_file": tgt,
+                        "context_meta": {"source": "noop_precheck"},
+                        "synth_reason": "noop_precheck",
+                        "explanation": "",
+                        "retry_used": False,
+                        "first_fail_reason": "",
+                        "second_fail_reason": "",
+                        "noop_trust_level": "high",
+                    }
+                ),
             }
 
         try:
@@ -836,7 +847,7 @@ class ExternalLLMService:
             is_trivial = self._is_trivial_edit_request(user_request)
             if extra_context and str(extra_context).strip():
                 context_text = str(extra_context).strip()
-                context_meta = {"source": "provided", "length": len(context_text)}
+                context_meta: dict[str, Any] = {"source": "provided", "length": len(context_text)}
             elif is_trivial:
                 context_text = ""
                 context_meta = {"source": "built", "context_dropped": "trivial"}
@@ -862,7 +873,8 @@ class ExternalLLMService:
                     )
                     if not target_snippet:
                         target_snippet = self._read_target_file_snippet_best_effort(
-                            rr, tgt,
+                            rr,
+                            tgt,
                         )
                 else:
                     target_snippet = self._read_target_file_snippet_best_effort(rr, tgt)
@@ -963,6 +975,7 @@ class ExternalLLMService:
 
             # ---- E2E audit breadcrumbs (prove whether UI-provided context was injected) ----
             import hashlib
+
             _user_bytes = user_payload.encode("utf-8", errors="replace")
             _extra_bytes = extra_user_ctx.encode("utf-8", errors="replace") if extra_user_ctx else b""
             context_meta = dict(context_meta or {})
@@ -1002,7 +1015,7 @@ class ExternalLLMService:
             def _eval_patch_engine_fast_path(
                 llm_out: str,
                 force_file_block: bool,
-            ) -> Optional[tuple[bool, str, str, Optional[str], str]]:
+            ) -> tuple[bool, str, str, str | None, str] | None:
                 """Phase 1: PatchEngine direct synthesis.
 
                 Returns the full success tuple, or None when PatchEngine is
@@ -1033,16 +1046,19 @@ class ExternalLLMService:
                 return None
 
             def _eval_ast_rewrite_attempt(
-                rewriter: Optional[object],
+                rewriter: ASTRewriter | None,
                 llm_out: str,
-                synth0: Optional[str],
-            ) -> tuple[str, Optional[str]]:
+                synth0: str | None,
+            ) -> tuple[str, str | None]:
                 """Symbol-based AST rewrite (FUNCTION:/CLASS:/METHOD:/autodetect headers).
 
                 Returns (patch0, synth0); patch0 is empty when no rewrite applied,
                 in which case synth0 is passed through unchanged.
                 """
                 patch0 = ""
+                # Callers enter through ``if tgt:`` — capture the narrowed str
+                # so pyright doesn't see the closure's str | None at call sites.
+                _tgt = tgt or ""
                 try:
                     if rewriter:
                         # Attempt symbol-based rewrite first
@@ -1056,62 +1072,45 @@ class ExternalLLMService:
                             if llm_header.startswith("FUNCTION:"):
                                 func_name = llm_header.split("FUNCTION:")[1].strip()
 
-                                result = rewriter.replace_function(
-                                    tgt,
-                                    func_name,
-                                    new_code
-                                )
+                                result = rewriter.replace_function(_tgt, func_name, new_code)
 
-                                patch0 = rewriter.generate_patch(tgt, result)
+                                patch0 = rewriter.generate_patch(_tgt, result)
                                 synth0 = "ast_function"
 
                             elif llm_header.startswith("CLASS:"):
                                 class_name = llm_header.split("CLASS:")[1].strip()
 
-                                result = rewriter.replace_class(
-                                    tgt,
-                                    class_name,
-                                    new_code
-                                )
+                                result = rewriter.replace_class(_tgt, class_name, new_code)
 
-                                patch0 = rewriter.generate_patch(tgt, result)
+                                patch0 = rewriter.generate_patch(_tgt, result)
                                 synth0 = "ast_class"
 
                             elif llm_header.startswith("METHOD:"):
                                 path = llm_header.split("METHOD:")[1].strip()
                                 class_name, method_name = path.split(".")
 
-                                result = rewriter.replace_method(
-                                    tgt,
-                                    class_name,
-                                    method_name,
-                                    new_code
-                                )
+                                result = rewriter.replace_method(_tgt, class_name, method_name, new_code)
 
-                                patch0 = rewriter.generate_patch(tgt, result)
+                                patch0 = rewriter.generate_patch(_tgt, result)
                                 synth0 = "ast_method"
 
                             elif is_function_def(new_code):
                                 _fname, _ = extract_symbol_name(new_code.strip())
                                 if _fname:
-                                    result = rewriter.replace_function(
-                                        tgt,
-                                        _fname,
-                                        new_code
-                                    )
+                                    result = rewriter.replace_function(_tgt, _fname, new_code)
 
-                                    patch0 = rewriter.generate_patch(tgt, result)
+                                    patch0 = rewriter.generate_patch(_tgt, result)
                                     synth0 = "ast_autodetect"
                 except Exception as e:
                     logger.debug("AST rewrite attempt failed: %s", e)
                 return patch0, synth0
 
             def _eval_symbol_apply(
-                rewriter: Optional[object],
-                sym: object,
+                rewriter: ASTRewriter | None,
+                sym: SymbolDef,
                 new_code: str,
-                synth0: Optional[str],
-            ) -> tuple[str, Optional[str]]:
+                synth0: str | None,
+            ) -> tuple[str, str | None]:
                 """Apply the located symbol replacement; returns (patch0, synth0)."""
                 patch0 = ""
                 if sym.kind in ("function", "async_function", "method"):
@@ -1119,7 +1118,7 @@ class ExternalLLMService:
                         result = rewriter.replace_function(
                             sym.file,  # was sym.file_path
                             sym.name,
-                            new_code
+                            new_code,
                         )
                         patch0 = rewriter.generate_patch(sym.file, result)  # was sym.file_path
                         synth0 = "ast_symbol_function"
@@ -1134,10 +1133,10 @@ class ExternalLLMService:
                 return patch0, synth0
 
             def _eval_symbol_search_fallback(
-                rewriter: Optional[object],
+                rewriter: ASTRewriter | None,
                 llm_out: str,
-                synth0: Optional[str],
-            ) -> tuple[str, Optional[str]]:
+                synth0: str | None,
+            ) -> tuple[str, str | None]:
                 """Symbol search fallback: locate the target symbol across the repo.
 
                 Returns (patch0, synth0); patch0 is empty when nothing replaced.
@@ -1159,7 +1158,9 @@ class ExternalLLMService:
                         symbol_name, symbol_kind = extract_symbol_name(header)
 
                         if symbol_name:
-                            results = searcher.find_symbol(symbol_name, kind=symbol_kind if symbol_kind != "function" else "any")
+                            results = searcher.find_symbol(
+                                symbol_name, kind=symbol_kind if symbol_kind != "function" else "any"
+                            )
                         else:
                             results = searcher.find_symbol(header)  # Fallback to original behavior
 
@@ -1173,15 +1174,17 @@ class ExternalLLMService:
                 except Exception as e:
                     logger.debug("Symbol search fallback failed: %s", e)
                 return patch0, synth0
+
             def _eval_semantic_fallback(
                 llm_out: str,
-                synth0: Optional[str],
-            ) -> tuple[str, Optional[str]]:
+                synth0: str | None,
+            ) -> tuple[str, str | None]:
                 """Semantic patch fallback: whole-block rewrite via SemanticPatchEngine.
 
                 Returns (patch0, synth0); patch0 is empty when no patch produced.
                 """
                 patch0 = ""
+                _tgt = tgt or ""  # callers enter through ``if tgt:``
                 try:
                     from external_llm.semantic_patch import SemanticPatchEngine
 
@@ -1192,12 +1195,12 @@ class ExternalLLMService:
 
                         semantic_engine = SemanticPatchEngine(rr)
                         sem_result = semantic_engine.apply_semantic_patch(
-                            file_path=tgt,
+                            file_path=_tgt,
                             new_code=new_code,
                         )
 
                         if sem_result:
-                            patch0 = semantic_engine.generate_patch(tgt, sem_result)
+                            patch0 = semantic_engine.generate_patch(_tgt, sem_result)
                             synth0 = "semantic_class" if sem_result.kind == "class" else "semantic_function"
                 except Exception as e:
                     logger.debug("Semantic patch fallback failed: %s", e)
@@ -1205,8 +1208,8 @@ class ExternalLLMService:
 
             def _eval_file_block_diff_fallback(
                 llm_out: str,
-                synth0: Optional[str],
-            ) -> tuple[str, Optional[str]]:
+                synth0: str | None,
+            ) -> tuple[str, str | None]:
                 """Last-resort: synthesize a diff from file blocks server-side.
 
                 synth0 is set unconditionally (preserves the reason even when the
@@ -1215,7 +1218,7 @@ class ExternalLLMService:
                 engine = PatchEngine(rr)
                 p2, r2 = engine._try_synthesize_diff_from_file_blocks(
                     repo_root=rr,
-                    target_file=tgt,
+                    target_file=tgt or "",  # callers enter through ``if tgt:``
                     llm_text=llm_out,
                 )
                 synth0 = r2
@@ -1225,18 +1228,16 @@ class ExternalLLMService:
             def _eval_finalize_patch(
                 patch0: str,
                 expl0: str,
-                synth0: Optional[str],
+                synth0: str | None,
                 llm_out: str,
                 force_file_block: bool,
-            ) -> tuple[bool, str, str, Optional[str], str]:
+            ) -> tuple[bool, str, str, str | None, str]:
                 """Phase 4: central normalize/validate/apply-check + auto-repair.
 
                 Returns the final (ok, patch, explanation, synth_reason, fail_reason).
                 """
                 # Centralized patch normalization pipeline (shared by diff/auto/fast paths)
-                patch0, norm_error = self._normalize_candidate_patch(
-                    patch0, tgt if tgt else None, repo_root=rr
-                )
+                patch0, norm_error = self._normalize_candidate_patch(patch0, tgt if tgt else None, repo_root=rr)
 
                 if not patch0:
                     fr = "empty_patch"
@@ -1262,7 +1263,10 @@ class ExternalLLMService:
                 if not ok_g and tgt:
                     try:
                         repair_result = engine.repair_patch(patch0, tgt, "git_apply_failed", llm_out)
-                        repaired_patch = repair_result.patch if repair_result.success else None
+                        # PatchResult exposes the repaired diff as ``patch_applied``
+                        # (not ``patch``) — the old name made this Auto-Repair path
+                        # silently dead: AttributeError was swallowed by the except.
+                        repaired_patch = repair_result.patch_applied if repair_result.success else None
 
                         if repaired_patch:
                             ok2, _err2 = engine._git_apply_check_best_effort(repaired_patch)
@@ -1281,7 +1285,7 @@ class ExternalLLMService:
                 llm_out: str,
                 *,
                 force_file_block: bool = False,
-            ) -> tuple[bool, str, str, Optional[str], str]:
+            ) -> tuple[bool, str, str, str | None, str]:
                 """
                 Returns:
                   (ok, patch, explanation, synth_reason, fail_reason)
@@ -1295,7 +1299,7 @@ class ExternalLLMService:
                 if str(llm_out or "").strip().upper() == "NOOP":
                     return (True, "", "", "noop", "")
 
-                synth0: Optional[str] = None
+                synth0: str | None = None
 
                 # Phase 1: PatchEngine fast path (direct synthesis)
                 fast = _eval_patch_engine_fast_path(llm_out, force_file_block)
@@ -1328,6 +1332,7 @@ class ExternalLLMService:
                             # Import AST rewriter once for entire block
                             try:
                                 from external_llm.ast_rewrite import ASTRewriter
+
                                 rewriter = ASTRewriter(rr)
                             except Exception as e:
                                 logger.debug("AST rewriter import failed: %s", e)
@@ -1348,7 +1353,7 @@ class ExternalLLMService:
             if progress_callback:
                 progress_callback("parsing_response", "Parsing LLM response...", 3, 4)
             # For full_file mode, force FILE block only parsing
-            force_file = (mode == "full_file")
+            force_file = mode == "full_file"
             ok1, patch, explanation, synth_reason, fail_reason = _evaluate_llm_text(
                 llm_text,
                 force_file_block=force_file,
@@ -1365,7 +1370,12 @@ class ExternalLLMService:
             retry_used = False
             retry_fail_reason = ""
             retry_triggers = ("git_apply_check_failed:", "invalid_diff:")
-            if (not ok1) and tgt and any(str(fail_reason or "").startswith(trigger) for trigger in retry_triggers) and self._is_target_file_small_enough_for_file_retry(rr, tgt):
+            if (
+                (not ok1)
+                and tgt
+                and any(str(fail_reason or "").startswith(trigger) for trigger in retry_triggers)
+                and self._is_target_file_small_enough_for_file_retry(rr, tgt)
+            ):
                 retry_used = True
                 retry_system = self._build_file_block_only_system_prompt(tgt)
 
@@ -1455,21 +1465,23 @@ class ExternalLLMService:
                     "provider": self.provider,
                     "model": self.model,
                     "tokens_used": tokens_used_total,
-                    "meta": ({
-                        "reason": reason,
-                        "mode": mode,
-                        "target_file": tgt,
-                        "context_meta": context_meta,
-                        "synth_reason": synth_reason,
-                        "explanation": explanation,
-                        "retry_used": retry_used,
-                        "first_fail_reason": fail_reason,
-                        "second_fail_reason": retry_fail_reason,
-                        # token split (debuggable, stable fields)
-                        "tokens_used_first": tokens_used_first,
-                        "tokens_used_retry": tokens_used_retry,
-                        "tokens_used_total": tokens_used_total,
-                    }),
+                    "meta": (
+                        {
+                            "reason": reason,
+                            "mode": mode,
+                            "target_file": tgt,
+                            "context_meta": context_meta,
+                            "synth_reason": synth_reason,
+                            "explanation": explanation,
+                            "retry_used": retry_used,
+                            "first_fail_reason": fail_reason,
+                            "second_fail_reason": retry_fail_reason,
+                            # token split (debuggable, stable fields)
+                            "tokens_used_first": tokens_used_first,
+                            "tokens_used_retry": tokens_used_retry,
+                            "tokens_used_total": tokens_used_total,
+                        }
+                    ),
                 }
 
             reason = "ok"
@@ -1526,22 +1538,24 @@ class ExternalLLMService:
                 "provider": self.provider,
                 "model": self.model,
                 "tokens_used": tokens_used_total,
-                "meta": ({
-                    "reason": reason,
-                    "mode": mode,
-                    "target_file": tgt,
-                    "context_meta": context_meta,
-                    "synth_reason": synth_reason,
-                    "explanation": explanation,
-                    "retry_used": retry_used,
-                    "first_fail_reason": fail_reason,
-                    "second_fail_reason": retry_fail_reason,
-                    # token split (debuggable, stable fields)
-                    "tokens_used_first": tokens_used_first,
-                    "tokens_used_retry": tokens_used_retry,
-                    "tokens_used_total": tokens_used_total,
-                    "noop_trust_level": noop_trust_level,
-                }),
+                "meta": (
+                    {
+                        "reason": reason,
+                        "mode": mode,
+                        "target_file": tgt,
+                        "context_meta": context_meta,
+                        "synth_reason": synth_reason,
+                        "explanation": explanation,
+                        "retry_used": retry_used,
+                        "first_fail_reason": fail_reason,
+                        "second_fail_reason": retry_fail_reason,
+                        # token split (debuggable, stable fields)
+                        "tokens_used_first": tokens_used_first,
+                        "tokens_used_retry": tokens_used_retry,
+                        "tokens_used_total": tokens_used_total,
+                        "noop_trust_level": noop_trust_level,
+                    }
+                ),
             }
 
     # ---------------------------------------------------------------------
@@ -1551,7 +1565,7 @@ class ExternalLLMService:
     def _build_context_best_effort(
         self,
         repo_root: str,
-        target_file: Optional[str],
+        target_file: str | None,
         user_request: str,
     ) -> tuple[str, dict[str, Any]]:
         """
@@ -1605,8 +1619,8 @@ class ExternalLLMService:
 
     @staticmethod
     def _normalize_candidate_patch(
-        patch: str, target_file: Optional[str], repo_root: Optional[str] = None
-    ) -> tuple[str, Optional[str]]:
+        patch: str, target_file: str | None, repo_root: str | None = None
+    ) -> tuple[str, str | None]:
         """
         Centralized patch normalization pipeline.
         Apply the same sanitation/repair steps across diff/auto/fast paths.
@@ -1621,9 +1635,6 @@ class ExternalLLMService:
         # Use PatchEngine normalization
         engine = PatchEngine(repo_root or os.getcwd())
         return engine.normalize_and_validate(patch, target_file)
-
-
-
 
     @staticmethod
     def _compose_system_prompt(preamble: str, rules_block: str) -> str:
@@ -1661,7 +1672,7 @@ class ExternalLLMService:
         Strong fallback prompt: force Cursor-like single FILE block output for exactly the target file.
         The server will synthesize a unified diff from this.
         """
-        tf = normalize_rel_path_fast(target_file or "")
+        tf = normalize_rel_path(target_file or "")
         rules = (
             "\n\n"
             "CRITICAL OUTPUT RULES (FILE BLOCK ONLY):\n"
@@ -1719,12 +1730,12 @@ class ExternalLLMService:
         """
         try:
             rr = Path(str(repo_root or "")).resolve()
-            tgt_rel = normalize_rel_path_fast(str(target_file))
+            tgt_rel = normalize_rel_path(str(target_file))
             if not tgt_rel:
                 return False
             # P22-2: containment guard — prompt-derived paths must not escape the repo.
             try:
-                p = resolve_inside_repo(rr, tgt_rel)
+                p = resolve_inside_repo(str(rr), tgt_rel)
             except ValueError:
                 return False
             if not p.exists() or (not p.is_file()):
@@ -1738,11 +1749,12 @@ class ExternalLLMService:
         except (OSError, PermissionError):
             return False
 
+
 def create_service_from_env(
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Optional[ExternalLLMService]:
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> ExternalLLMService | None:
     """
     Create ExternalLLMService from environment variables.
 
@@ -1788,6 +1800,7 @@ def create_service_from_env(
     # Provider-scoped base_url: a foreign provider's global base_url must not
     # leak in (see resolve_provider_base_url).
     from .client import resolve_provider_base_url
+
     base_url = resolve_provider_base_url(prov)
 
     try:

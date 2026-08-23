@@ -9,6 +9,7 @@ key) therefore raised ``KeyError`` on the tool path while the plain ``chat``
 path degraded gracefully. B1 aligns the tool path to the same ``.get()``
 defaults so both paths agree.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -22,11 +23,7 @@ def _make_client() -> GoogleClient:
     client = GoogleClient(api_key="test-key")
     fake_response = MagicMock()
     fake_response.status_code = 200
-    fake_response.json.return_value = {
-        "candidates": [
-            {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
-        ]
-    }
+    fake_response.json.return_value = {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}
     client._session = MagicMock()
     client._session.post.return_value = fake_response
     return client

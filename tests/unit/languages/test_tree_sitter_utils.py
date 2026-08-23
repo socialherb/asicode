@@ -127,25 +127,15 @@ class TestExtractImports:
     def test_scala_import_module_path(self):
         # @source captures the whole import_declaration incl. the keyword;
         # extract_imports strips the keyword AND any namespace selectors/wildcards.
-        assert extract_imports("import scala.collection.mutable", "scala") == [
-            ("scala.collection.mutable", 1)
-        ]
+        assert extract_imports("import scala.collection.mutable", "scala") == [("scala.collection.mutable", 1)]
         # Multi-import: strip {c, d} selectors
-        assert extract_imports("import a.b.{c, d}", "scala") == [
-            ("a.b", 1)
-        ]
+        assert extract_imports("import a.b.{c, d}", "scala") == [("a.b", 1)]
         # Wildcard: strip ._ suffix
-        assert extract_imports("import a.b._", "scala") == [
-            ("a.b", 1)
-        ]
+        assert extract_imports("import a.b._", "scala") == [("a.b", 1)]
         # Nested multi-import: only strip the final selector block
-        assert extract_imports("import a.b.c.{d => e, f => g}", "scala") == [
-            ("a.b.c", 1)
-        ]
+        assert extract_imports("import a.b.c.{d => e, f => g}", "scala") == [("a.b.c", 1)]
         # Scala 3 wildcard: strip .* suffix
-        assert extract_imports("import a.b.*", "scala") == [
-            ("a.b", 1)
-        ]
+        assert extract_imports("import a.b.*", "scala") == [("a.b", 1)]
 
     def test_ruby_require_and_require_relative(self):
         src = 'require "json"\nrequire_relative "./helper"\n'
@@ -167,27 +157,19 @@ class TestExtractImports:
 
     def test_python_dotted_and_from(self):
         # Regression: @source is the dotted_name child, never includes keyword.
-        assert ("os.path", 1) in set(
-            extract_imports("import os.path", "python")
-        )
-        assert ("json", 1) in set(
-            extract_imports("from json import loads", "python")
-        )
+        assert ("os.path", 1) in set(extract_imports("import os.path", "python"))
+        assert ("json", 1) in set(extract_imports("from json import loads", "python"))
 
     def test_c_sharp_using_keyword_not_stripped(self):
         # The keyword strip is scoped to Scala only (`if language == "scala"`),
         # so C# never enters the strip path. This pins that C#'s @source
         # capture yields the bare dotted path without the `using` keyword.
-        assert extract_imports("using System.IO;", "c_sharp") == [
-            ("System.IO", 1)
-        ]
+        assert extract_imports("using System.IO;", "c_sharp") == [("System.IO", 1)]
 
     def test_lua_path_starting_with_import_keyword_is_preserved(self):
         # Pins the Scala-only scope fix: a pathological lua module path that
         # literally starts with "import " must NOT be sliced by the regex.
-        assert extract_imports('require("import foo")', "lua") == [
-            ("import foo", 1)
-        ]
+        assert extract_imports('require("import foo")', "lua") == [("import foo", 1)]
 
 
 class TestGrammarMapConsistency:
@@ -204,7 +186,13 @@ class TestGrammarMapConsistency:
         assert _GRAMMAR_KEY_OVERRIDES == {".tsx": "tsx"}
         # Parse-only languages (JSON/CSS/HTML) are excluded from the domain.
         assert not set(_EXT_TO_GRAMMAR_KEY) & {
-            ".json", ".jsonc", ".css", ".scss", ".less", ".html", ".htm",
+            ".json",
+            ".jsonc",
+            ".css",
+            ".scss",
+            ".less",
+            ".html",
+            ".htm",
         }
 
     def test_grammar_map_domain_is_full_ast_query_intersection(self):
@@ -238,9 +226,7 @@ class TestGrammarMapConsistency:
         extension-level equality below is a sanity consequence, not a pin.
         """
         family_names = {n for fam in _LANGUAGE_FAMILIES for n in fam}
-        full_ast_names = {
-            lang.name for lang in LanguageId if lang.value in _FULL_AST_GRAMMAR_KEYS
-        }
+        full_ast_names = {lang.name for lang in LanguageId if lang.value in _FULL_AST_GRAMMAR_KEYS}
         assert family_names == full_ast_names, (
             f"drift between _LANGUAGE_FAMILIES and the grammar-map domain: "
             f"families only: {sorted(family_names - full_ast_names)}, "
@@ -282,9 +268,7 @@ class TestGrammarMapConsistency:
         and the override set mirrors _GRAMMAR_KEY_OVERRIDES' single-entry shape.
         """
         assert _derive_lang_module_map() == _LANG_MODULE_MAP
-        assert frozenset(_LANG_MODULE_MAP) == (
-            _FULL_AST_GRAMMAR_KEYS | _PARSE_ONLY_GRAMMAR_KEYS
-        )
+        assert frozenset(_LANG_MODULE_MAP) == (_FULL_AST_GRAMMAR_KEYS | _PARSE_ONLY_GRAMMAR_KEYS)
         assert frozenset({"html", "css"}) == _PARSE_ONLY_GRAMMAR_KEYS
         assert _MODULE_NAME_OVERRIDES == {"tsx": "typescript"}
         for key, module in _LANG_MODULE_MAP.items():
@@ -342,12 +326,9 @@ class TestGrammarMapConsistency:
             # "*.py" → ".py"
             globbed = {glob[1:] for glob in provider.get_file_globs()}
             if mapped != globbed:
-                problems.append(
-                    f"  {lang}: _EXT_MAP={sorted(mapped)} globs={sorted(globbed)}"
-                )
-        assert not problems, (
-            "provider glob drift — get_file_globs() must match _EXT_MAP per "
-            "LanguageId:\n" + "\n".join(problems)
+                problems.append(f"  {lang}: _EXT_MAP={sorted(mapped)} globs={sorted(globbed)}")
+        assert not problems, "provider glob drift — get_file_globs() must match _EXT_MAP per LanguageId:\n" + "\n".join(
+            problems
         )
 
     def test_every_ext_map_language_has_provider(self):
@@ -366,10 +347,7 @@ class TestGrammarMapConsistency:
         """
         from external_llm.languages.registry import LanguageRegistry
 
-        registered = {
-            p.language_id().name
-            for p in LanguageRegistry.instance()._providers.values()
-        }
+        registered = {p.language_id().name for p in LanguageRegistry.instance()._providers.values()}
         mapped = set(_EXT_MAP.values())
         missing = mapped - registered
         assert not missing, (
@@ -394,14 +372,8 @@ class TestKindMapConsistency:
         """Every node type in both maps must map to the same kind."""
         base = _BASE_KIND_MAP
         walk = _WALK_KIND_MAP
-        disagreements = {
-            k: (walk[k], base[k])
-            for k in base.keys() & walk.keys()
-            if walk[k] != base[k]
-        }
-        assert not disagreements, (
-            f"kind-map drift (node_type: walk_kind != query_kind): {disagreements}"
-        )
+        disagreements = {k: (walk[k], base[k]) for k in base.keys() & walk.keys() if walk[k] != base[k]}
+        assert not disagreements, f"kind-map drift (node_type: walk_kind != query_kind): {disagreements}"
 
     def test_walk_map_is_base_plus_css(self):
         """Walk map is exactly the base SSOT overlaid with CSS-only entries."""
@@ -464,7 +436,9 @@ class TestIterativeWalkRecursionSafety:
 
     def test_extract_class_methods_no_recursion_error(self):
         methods = extract_class_methods(
-            self._deep_sibling_then_class(), "C", "javascript",
+            self._deep_sibling_then_class(),
+            "C",
+            "javascript",
         )
         assert methods == [("m", 1, 1)]
 
@@ -493,18 +467,12 @@ class TestQueryTableParity:
         }
         keysets = {name: set(t.keys()) for name, t in tables.items()}
         ref = keysets["symbol"]
-        drift = {
-            name: sorted(keys ^ ref)
-            for name, keys in keysets.items()
-            if keys != ref
-        }
-        assert not drift, (
-            "query-table parity drift (symmetric difference vs _SYMBOL_QUERIES): "
-            f"{drift}"
-        )
+        drift = {name: sorted(keys ^ ref) for name, keys in keysets.items() if keys != ref}
+        assert not drift, f"query-table parity drift (symmetric difference vs _SYMBOL_QUERIES): {drift}"
 
 
 # ── A cold resolve must not block unrelated cache hits ──────────────────────
+
 
 class TestLanguageResolveLockScope:
     """``_LANG_CACHE_LOCK`` must not be held across grammar resolution.
@@ -565,7 +533,7 @@ class TestLanguageResolveLockScope:
             t.join()
 
         assert blocked[0] < 0.1, (
-            f"cached lookup waited {blocked[0]*1000:.0f} ms behind an unrelated "
+            f"cached lookup waited {blocked[0] * 1000:.0f} ms behind an unrelated "
             f"cold resolve — the global lock is being held across resolution"
         )
 
@@ -605,9 +573,7 @@ class TestLanguageResolveLockScope:
         finally:
             sys.setswitchinterval(old)
 
-        assert seen == ["__once__"], (
-            f"resolved {len(seen)} times under 8 concurrent callers: {seen}"
-        )
+        assert seen == ["__once__"], f"resolved {len(seen)} times under 8 concurrent callers: {seen}"
 
     def test_invalidation_during_resolve_is_not_undone_by_the_store(self, monkeypatch):
         """A clear landing mid-resolve must not be resurrected by the store.
@@ -640,8 +606,7 @@ class TestLanguageResolveLockScope:
 
         assert result is not None, "the caller still gets its object"
         assert "__raced__" not in tsu._LANG_CACHE, (
-            "a resolve that straddled invalidate_caches() re-populated the "
-            "cache it just cleared"
+            "a resolve that straddled invalidate_caches() re-populated the cache it just cleared"
         )
 
 
@@ -669,15 +634,9 @@ class TestSharedTreeParam:
         tree = parse_to_tree(self._SRC, "typescript")
         if tree is None:
             pytest.skip("tree-sitter typescript grammar not installed")
-        assert find_all_symbols(self._SRC, "typescript", tree=tree) == find_all_symbols(
-            self._SRC, "typescript"
-        )
-        assert extract_calls(self._SRC, "typescript", tree=tree) == extract_calls(
-            self._SRC, "typescript"
-        )
-        assert extract_imports(self._SRC, "typescript", tree=tree) == extract_imports(
-            self._SRC, "typescript"
-        )
+        assert find_all_symbols(self._SRC, "typescript", tree=tree) == find_all_symbols(self._SRC, "typescript")
+        assert extract_calls(self._SRC, "typescript", tree=tree) == extract_calls(self._SRC, "typescript")
+        assert extract_imports(self._SRC, "typescript", tree=tree) == extract_imports(self._SRC, "typescript")
 
     def test_tree_param_results_are_nonempty(self):
         """Guard against the parity test passing vacuously (all empty)."""

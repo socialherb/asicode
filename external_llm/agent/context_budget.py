@@ -1,4 +1,5 @@
 """Context Budget Manager - token-aware message fitting (budget check only, no truncation)."""
+
 from __future__ import annotations
 
 import atexit
@@ -10,8 +11,7 @@ import os
 import threading
 import time
 from typing import (
-    TYPE_CHECKING,
-    Optional,  # f821-protected
+    TYPE_CHECKING,  # f821-protected
 )
 
 from external_llm.agent.config.thresholds import _env_int
@@ -39,14 +39,14 @@ logger = logging.getLogger(__name__)
 # are all 1M+ models — no explicit entry needed (use _DEFAULT_CONTEXT_LIMIT fallback).
 _CONTEXT_LIMITS: dict[str, int] = {
     # OpenAI
-    "gpt-4o":           128_000,
-    "gpt-4o-mini":      128_000,
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
     "gpt-4o-2024-08-06": 128_000,
-    "o3":               200_000,
-    "o3-mini":          200_000,
-    "o3-mini-high":     200_000,
-    "o4-mini":          200_000,
-    "o4-mini-high":     200_000,
+    "o3": 200_000,
+    "o3-mini": 200_000,
+    "o3-mini-high": 200_000,
+    "o4-mini": 200_000,
+    "o4-mini-high": 200_000,
     # Anthropic — all modern Claude models (Sonnet/Opus/Haiku generations 3-5)
     # share a 200K context window. Listed explicitly (no prefix matching) per the
     # table's design; new variants must be added here or they fall back to 1M.
@@ -54,64 +54,64 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # flagship ids the CLI was actively offering (claude-opus-5, claude-fable-5)
     # — see test_model_catalog_context_parity, which now fails when a catalog
     # model reaches this table without a decision.
-    "claude-fable-5":            200_000,
-    "claude-opus-5":             200_000,
-    "claude-sonnet-5":           200_000,
-    "claude-haiku-4-5":          200_000,
+    "claude-fable-5": 200_000,
+    "claude-opus-5": 200_000,
+    "claude-sonnet-5": 200_000,
+    "claude-haiku-4-5": 200_000,
     "claude-haiku-4-5-20251001": 200_000,
     # OpenRouter serves this model under the dot spelling ``claude-sonnet-4.6``
     # (same pinned snapshot as the hyphen form below); both resolve to 200K.
-    "claude-sonnet-4.6":         200_000,
-    "claude-sonnet-4-6":         200_000,
-    "claude-sonnet-4-5":         200_000,
-    "claude-opus-4-8":           200_000,
-    "claude-opus-4-7":           200_000,
-    "claude-opus-4-6":           200_000,
+    "claude-sonnet-4.6": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-opus-4-8": 200_000,
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-6": 200_000,
     "claude-3-5-sonnet-20241022": 200_000,
     "claude-3-5-haiku-20241022": 200_000,
-    "claude-3-sonnet":           200_000,
-    "claude-3-opus-20240229":    200_000,
-    "claude-3-sonnet-20240229":  200_000,
-    "claude-3-haiku-20240307":   200_000,
+    "claude-3-sonnet": 200_000,
+    "claude-3-opus-20240229": 200_000,
+    "claude-3-sonnet-20240229": 200_000,
+    "claude-3-haiku-20240307": 200_000,
     # DeepSeek — original deepseek-r1 (64K context); deepseek-chat/reasoner are
     # deprecated aliases for deepseek-v4-flash thinking/non-thinking → 1M fallback.
-    "deepseek-r1":       64_000,
+    "deepseek-r1": 64_000,
     # Zhipu GLM (zai + opencode). glm-5.3 is the DEFAULT_MODEL and 1M is verified
     # (Z.ai docs: "Context Length: 1M" — generational leap from the 200K family).
     # Listed EXPLICITLY (not via _DEFAULT fallback) so the default model's window
     # cannot silently drift if _DEFAULT_CONTEXT_LIMIT changes. glm-5/5.1/5-turbo 200K; glm-4.7 128K.
-    "glm-5.3":          1_000_000,
-    "glm-5.2":          1_000_000,
-    "glm-5.1":          200_000,
-    "glm-5-turbo":      200_000,
-    "glm-5":            200_000,
-    "glm-4.7":          128_000,
+    "glm-5.3": 1_000_000,
+    "glm-5.2": 1_000_000,
+    "glm-5.1": 200_000,
+    "glm-5-turbo": 200_000,
+    "glm-5": 200_000,
+    "glm-4.7": 128_000,
     # Qwen3 (opencode provider) — 3.8-max/3.7-max/plus, 3.6-plus, 3.5-plus are 1M (fallback)
     # qwen3.6 is the base model at 262_144 (= 2^18 = binary 256K). Source: openrouter.ai.
-    "qwen3.6":          262_144,
+    "qwen3.6": 262_144,
     # Xiaomi MiMo (opencode) — v2.5-pro/v2.5/v2-pro are 1M (fallback)
     # mimo-v2-omni has 256_000 (decimal 256K). Source: openrouter.ai.
-    "mimo-v2-omni":     256_000,
+    "mimo-v2-omni": 256_000,
     # Moonshot Kimi (opencode provider)
     # kimi-k3 is a 1M+ model (1,048,576 = 2^20) — uses _DEFAULT_CONTEXT_LIMIT fallback
     # (no explicit entry); variants like kimi-k3-0711/kimi-k3-turbo resolve uniformly to 1M.
     # kimi-k2.7-code uses binary 256K (262_144 = 2^18). kimi-k2.6/k2.5 use decimal 256K.
     # Source: platform.kimi.ai/docs/models.
-    "kimi-k2.7-code":   262_144,
-    "kimi-k2.6":        256_000,
-    "kimi-k2.5":        256_000,
+    "kimi-k2.7-code": 262_144,
+    "kimi-k2.6": 256_000,
+    "kimi-k2.5": 256_000,
     # MiniMax (opencode provider) — M3 is 1M (fallback)
     # minimax-m2.7/m2.5: 205_000 tokens — per OpenRouter model specs (non-standard size).
-    "minimax-m2.7":     205_000,
-    "minimax-m2.5":     205_000,
+    "minimax-m2.7": 205_000,
+    "minimax-m2.5": 205_000,
     # Tencent Hy3 (opencode provider) — GA as "hy3"; keep conservative 128K.
     # hy3-preview is aliased to hy3 in _MODEL_ALIASES (asi.py); both resolve here.
-    "hy3":              128_000,
-    "hy3-preview":      128_000,
+    "hy3": 128_000,
+    "hy3-preview": 128_000,
     # Grok 4.5 (opencode) — 500K context (xAI docs: a reduction from Grok 4.3's 1M).
     # MUST be explicit: the _DEFAULT_CONTEXT_LIMIT fallback is 1M, which would
     # over-allocate and risk HTTP errors on >500K-token requests.
-    "grok-4.5":         500_000,
+    "grok-4.5": 500_000,
 }
 
 
@@ -123,7 +123,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
 # until the provider 400'd. Values MUST be at or below the family's real
 # window (over-allocation risks HTTP errors; under-allocation only trims early).
 _FAMILY_PREFIX_LIMITS: tuple[tuple[str, int], ...] = (
-    ("claude-", 200_000),   # every claude-* entry above is 200K — shared by pinned dates
+    ("claude-", 200_000),  # every claude-* entry above is 200K — shared by pinned dates
     ("grok-4.5", 500_000),  # grok-4.5 variants share the 500K window
     # Qwen2.5-Coder series (local Ollama: qwen2.5-coder:0.5b/1.5b/3b/7b/14b/32b).
     # The MODEL supports 128K tokens (Qwen2.5-Coder technical report); Ollama
@@ -146,44 +146,60 @@ _DEFAULT_CONTEXT_LIMIT = 1_000_000
 # which is exactly how six Claude ids sat at 1M against a real 200K window.
 # test_model_catalog_context_parity requires every model_catalog id to appear in
 # _CONTEXT_LIMITS or here, so adding a model forces the question to be answered.
-_FALLBACK_IS_CORRECT: frozenset[str] = frozenset({
-    # ── Verified 1M+ (sources in the _CONTEXT_LIMITS header above) ──────────
-    "deepseek-v4-flash", "deepseek-v4-pro",
-    "deepseek-chat", "deepseek-reasoner",   # aliases of v4-flash thinking/non-thinking
-    "kimi-k3",                              # 1,048,576 = 2^20
-    # Meta Muse Spark 1.2 contributor — 1,048,576 = 2^20, carried over from
-    # 1.1 unchanged. The base muse-spark-1.2 was dropped by the opencode
-    # gateway on 2026-08-20 and left the catalog with it. Sources: OpenRouter
-    # model page (meta/muse-spark-1.2), Meta research blog 2026-08-05, eesel
-    # rate-card table (both variants 1M).
-    # Fallback (1M decimal) slightly under-allocates vs 2^20 — safe direction.
-    "muse-spark-1.2-contributor",
-    "minimax-m3",
-    "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro",
-    "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus",
-    # Gemini long-context line — 1M input across the 2.0/2.5 pro+flash tiers.
-    "gemini-2.5-pro", "gemini-2.5-flash",
-    "gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-2.0-flash-lite-001",
-
-    # ── UNVERIFIED: window not confirmed against a provider source ──────────
-    # These keep the 1M fallback, i.e. exactly the behaviour they had before
-    # this gate existed — listing them changes nothing at runtime, it only
-    # records that the number is unknown rather than agreed. If any is in fact
-    # smaller, the symptom is the pre-flight cap in agent_loop staying inert
-    # until the provider 400s, after which _record_context_overflow converges
-    # on the real size. Move an entry into _CONTEXT_LIMITS once its window is
-    # published.
-    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-    "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
-    "gemini-3.1-pro", "gemini-3-flash",
-    "qwen3.8-max",
-    # Ox Alpha Free (opencode stealth model, free tier, zero-retention). Window
-    # not published by opencode docs; live id ships as "ox-alpha-free" while
-    # the docs page calls the config id "x-preview-f-free".
-    "ox-alpha-free",
-    # DeepSeek v4 Flash vision variant — same 1M fallback as deepseek-v4-flash.
-    "deepseek-v4-flash-vision-exp",
-})
+_FALLBACK_IS_CORRECT: frozenset[str] = frozenset(
+    {
+        # ── Verified 1M+ (sources in the _CONTEXT_LIMITS header above) ──────────
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "deepseek-chat",
+        "deepseek-reasoner",  # aliases of v4-flash thinking/non-thinking
+        "kimi-k3",  # 1,048,576 = 2^20
+        # Meta Muse Spark 1.2 contributor — 1,048,576 = 2^20, carried over from
+        # 1.1 unchanged. The base muse-spark-1.2 was dropped by the opencode
+        # gateway on 2026-08-20 and left the catalog with it. Sources: OpenRouter
+        # model page (meta/muse-spark-1.2), Meta research blog 2026-08-05, eesel
+        # rate-card table (both variants 1M).
+        # Fallback (1M decimal) slightly under-allocates vs 2^20 — safe direction.
+        "muse-spark-1.2-contributor",
+        "minimax-m3",
+        "mimo-v2.5-pro",
+        "mimo-v2.5",
+        "mimo-v2-pro",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        # Gemini long-context line — 1M input across the 2.0/2.5 pro+flash tiers.
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+        "gemini-2.0-flash-lite-001",
+        # ── UNVERIFIED: window not confirmed against a provider source ──────────
+        # These keep the 1M fallback, i.e. exactly the behaviour they had before
+        # this gate existed — listing them changes nothing at runtime, it only
+        # records that the number is unknown rather than agreed. If any is in fact
+        # smaller, the symptom is the pre-flight cap in agent_loop staying inert
+        # until the provider 400s, after which _record_context_overflow converges
+        # on the real size. Move an entry into _CONTEXT_LIMITS once its window is
+        # published.
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro",
+        "gemini-3-flash",
+        "qwen3.8-max",
+        # Ox Alpha Free (opencode stealth model, free tier, zero-retention). Window
+        # not published by opencode docs; live id ships as "ox-alpha-free" while
+        # the docs page calls the config id "x-preview-f-free".
+        "ox-alpha-free",
+        # DeepSeek v4 Flash vision variant — same 1M fallback as deepseek-v4-flash.
+        "deepseek-v4-flash-vision-exp",
+    }
+)
 
 # Models already warned about the 1M fallback (once per model per process).
 _warned_unknown_models: set[str] = set()
@@ -195,8 +211,8 @@ _context_window_overrides: dict[str, int] = {}
 
 # ── Thread safety ──────────────────────────────────────────────────────────────
 _override_lock = threading.RLock()  # RLock allows nested acquire by same thread
-                                        # (_record_context_overflow locks then calls
-                                        # _save_override_cache which also locks).
+# (_record_context_overflow locks then calls
+# _save_override_cache which also locks).
 
 # ── TTL & reduction-capped overrides ───────────────────────────────────────────
 # Overrides self-expire after _OVERRIDE_TTL_SECONDS of inactivity, preventing a
@@ -213,7 +229,7 @@ _override_lock = threading.RLock()  # RLock allows nested acquire by same thread
 # recorded, so the overflow-recovery cache stops working with no error at all.
 # MAX_REDUCTIONS takes minimum=0 because 0 is a coherent setting there ("never
 # step a model's window down"), unlike a zero-second TTL.
-_OVERRIDE_TTL_SECONDS = _env_int("CONTEXT_OVERRIDE_TTL", 1800)              # 30 minutes
+_OVERRIDE_TTL_SECONDS = _env_int("CONTEXT_OVERRIDE_TTL", 1800)  # 30 minutes
 _MAX_OVERRIDE_REDUCTIONS = _env_int("CONTEXT_MAX_REDUCTIONS", 3, minimum=0)  # max step-downs per model
 
 # Model → {ts: float, reductions: int, limit: int}
@@ -233,7 +249,10 @@ _override_meta: dict[str, dict] = {}
 # external_llm.agent.context_budget"`` was enough to rewrite the real file to
 # ``{}`` at exit. Env vars are inherited, so this covers the children too.
 _OVERRIDE_CACHE_FILE = os.environ.get("ASICODE_CONTEXT_OVERRIDE_CACHE") or os.path.join(
-    os.path.expanduser("~"), ".cache", "asicode", "context_override_cache.json",
+    os.path.expanduser("~"),
+    ".cache",
+    "asicode",
+    "context_override_cache.json",
 )
 _last_cache_save: float = 0
 # True once THIS process has recorded an overflow of its own — i.e. its
@@ -264,7 +283,9 @@ def _read_override_cache() -> dict[str, dict]:
         with open(_OVERRIDE_CACHE_FILE, encoding="utf-8") as _f:
             _data = json.load(_f)
     except Exception:
-        logger.debug("context_budget: override cache load failed", exc_info=True)  # best-effort (file-level: missing, corrupt JSON, IO error)
+        logger.debug(
+            "context_budget: override cache load failed", exc_info=True
+        )  # best-effort (file-level: missing, corrupt JSON, IO error)
         return {}
     _now = time.time()
     _out: dict[str, dict] = {}
@@ -368,7 +389,7 @@ _ensure_override_cache_loaded()
 atexit.register(lambda: _save_override_cache(force=True))
 
 
-def _resolve_base_context_limit(model_name: str, base_url: Optional[str] = None) -> int:
+def _resolve_base_context_limit(model_name: str, base_url: str | None = None) -> int:
     """Compute the configured context limit WITHOUT runtime overrides.
 
     Like ``_resolve_context_limit`` but skips ``_context_window_overrides`` so
@@ -383,6 +404,7 @@ def _resolve_base_context_limit(model_name: str, base_url: Optional[str] = None)
     #    does not serve.
     if ":" in model_lower and "/" not in model_lower:
         from external_llm.ollama_api import query_ollama_num_ctx
+
         api_ctx = query_ollama_num_ctx(model_lower, base_url_hint=base_url)
         if api_ctx is not None:
             logger.debug("num_ctx=%d from Ollama API for model %s", api_ctx, model_lower)
@@ -395,6 +417,7 @@ def _resolve_base_context_limit(model_name: str, base_url: Optional[str] = None)
     #    (``claude-sonnet-5``) hits, and took the 1M fallback against a 200K
     #    window. Shares model_registry's normaliser rather than repeating it.
     from external_llm.model_registry import bare_model_name
+
     bare = bare_model_name(model_lower)
     if bare in _CONTEXT_LIMITS:
         return _CONTEXT_LIMITS[bare]
@@ -416,7 +439,8 @@ def _resolve_base_context_limit(model_name: str, base_url: Optional[str] = None)
             "No context-window entry for model %r — using %d fallback. "
             "If its real window is smaller, add it to _CONTEXT_LIMITS or "
             "_FAMILY_PREFIX_LIMITS in context_budget.py.",
-            model_name, _DEFAULT_CONTEXT_LIMIT,
+            model_name,
+            _DEFAULT_CONTEXT_LIMIT,
         )
     return _DEFAULT_CONTEXT_LIMIT
 
@@ -432,13 +456,14 @@ def _structural_window_floor() -> int:
     """
     from ._shared_utils import MIN_USABLE_MESSAGE_BUDGET, estimate_tokens_from_tool_schemas
     from .tool_schemas import TOOL_SCHEMA_VARIANTS
-    _max_tool_tokens = max(
-        estimate_tokens_from_tool_schemas(s) for s in TOOL_SCHEMA_VARIANTS.values()
-    )
+
+    _max_tool_tokens = max(estimate_tokens_from_tool_schemas(s) for s in TOOL_SCHEMA_VARIANTS.values())
     return _max_tool_tokens + 4096 + MIN_USABLE_MESSAGE_BUDGET
 
 
-def _record_context_overflow(model: str, estimated_prompt_tokens: int | None = None, base_url: Optional[str] = None) -> None:
+def _record_context_overflow(
+    model: str, estimated_prompt_tokens: int | None = None, base_url: str | None = None
+) -> None:
     """Record a context-length overflow for ``model``, reducing its effective limit.
 
     Called when a provider returns HTTP 400 with a "context length exceeded" or
@@ -495,7 +520,8 @@ def _record_context_overflow(model: str, estimated_prompt_tokens: int | None = N
             logger.warning(
                 "Context overflow for %s — reached max override reductions (%d), "
                 "cannot reduce further. If this persists, add it to _CONTEXT_LIMITS.",
-                model, _MAX_OVERRIDE_REDUCTIONS,
+                model,
+                _MAX_OVERRIDE_REDUCTIONS,
             )
             return
 
@@ -531,12 +557,16 @@ def _record_context_overflow(model: str, estimated_prompt_tokens: int | None = N
                 "the model may have a smaller actual context window. "
                 "Consider adding it to _CONTEXT_LIMITS in context_budget.py. "
                 "Reducing override: %d→%d",
-                model, current, reduced,
+                model,
+                current,
+                reduced,
             )
         else:
             logger.warning(
                 "Context overflow for %s: reducing limit %d→%d",
-                model, current, reduced,
+                model,
+                current,
+                reduced,
             )
 
         _save_override_cache()
@@ -563,8 +593,11 @@ def _is_context_length_error(exc: Exception) -> bool:
 
     # Narrow, provider-specific patterns (low false-positive risk).
     _narrow_patterns = (
-        "context length", "context window", "reduce length",
-        "reduce the length", "maximum context",
+        "context length",
+        "context window",
+        "reduce length",
+        "reduce the length",
+        "maximum context",
         "prompt length",
         # "too small" is intentionally absent — it's too broad (matches
         # "temperature too small", "image too small", etc.) and the only
@@ -597,7 +630,7 @@ def _is_context_length_error(exc: Exception) -> bool:
     return False
 
 
-def _resolve_context_limit(model_name: str, base_url: Optional[str] = None) -> int:
+def _resolve_context_limit(model_name: str, base_url: str | None = None) -> int:
     """Return the context window limit for a given model name.
 
     Priority:
@@ -643,6 +676,7 @@ def _resolve_context_limit(model_name: str, base_url: Optional[str] = None) -> i
     #      POST when the explicit base_url differs from OLLAMA_BASE_URL env.
     return _resolve_base_context_limit(model_lower, base_url)
 
+
 class ContextBudgetManager:
     """Manages token budget for LLM context windows.
 
@@ -652,8 +686,7 @@ class ContextBudgetManager:
       re-fetch, costing more tokens than it saves)
     """
 
-    def __init__(self, model_name: str, reserve_for_output: int=4096,
-                 tool_schemas: Optional[list] = None):
+    def __init__(self, model_name: str, reserve_for_output: int = 4096, tool_schemas: list | None = None):
         self.model_name = model_name
         _adaptive_max = max(512, self.context_limit // 5)
         self.reserve_for_output = min(reserve_for_output, _adaptive_max)
@@ -662,12 +695,16 @@ class ContextBudgetManager:
         self._tool_schema_tokens = 0
         if tool_schemas:
             from external_llm.agent._shared_utils import estimate_tokens_from_tool_schemas
+
             self._tool_schema_tokens = estimate_tokens_from_tool_schemas(tool_schemas)
         logger.info(
-            'ContextBudgetManager: model=%s limit=%d budget=%d (reserve=%d, tool_schemas=%d) '
-            '(no truncation — sliding window handles context management)',
-            model_name, self.context_limit, self.total_budget,
-            self.reserve_for_output, self._tool_schema_tokens,
+            "ContextBudgetManager: model=%s limit=%d budget=%d (reserve=%d, tool_schemas=%d) "
+            "(no truncation — sliding window handles context management)",
+            model_name,
+            self.context_limit,
+            self.total_budget,
+            self.reserve_for_output,
+            self._tool_schema_tokens,
         )
 
     @property
@@ -692,6 +729,7 @@ class ContextBudgetManager:
     def estimate_tokens(text: str) -> int:
         """CJK-aware token estimate via canonical _cjk_aware_tokens."""
         from external_llm.agent._shared_utils import _cjk_aware_tokens as _cat
+
         if not text:
             return 0
         return _cat(text)
@@ -705,10 +743,10 @@ class ContextBudgetManager:
         native tool_use/tool_result blocks + images).
         """
         from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
         return estimate_tokens_from_msgs(messages)
 
-    def fit_messages(self, messages: list,
-                     tool_schemas: Optional[list] = None) -> list:
+    def fit_messages(self, messages: list, tool_schemas: list | None = None) -> list:
         """Check message budget — no truncation.
 
         Truncating tool results or messages (head+tail) causes the LLM to lose
@@ -737,19 +775,22 @@ class ContextBudgetManager:
             _tool_tokens = self._tool_schema_tokens
             if not _tool_tokens:
                 from external_llm.agent._shared_utils import estimate_tokens_from_tool_schemas
+
                 _tool_tokens = estimate_tokens_from_tool_schemas(tool_schemas)
             from external_llm.agent._shared_utils import context_message_cap
-            _cap = context_message_cap(self.context_limit, self.reserve_for_output,
-                                       tool_tokens=_tool_tokens)
+
+            _cap = context_message_cap(self.context_limit, self.reserve_for_output, tool_tokens=_tool_tokens)
         else:
             _cap = self.total_budget
         if est > _cap:
             logger.info(
-                'fit_messages: estimated %d tokens > cap %d (not truncating — '
-                'sliding window handles context management)',
-                est, _cap,
+                "fit_messages: estimated %d tokens > cap %d (not truncating — "
+                "sliding window handles context management)",
+                est,
+                _cap,
             )
         return messages
+
 
 def repair_tool_message_sequence(messages: list) -> list:
     """Remove orphaned tool messages and assistant messages missing their tool responses.
@@ -777,25 +818,30 @@ def repair_tool_message_sequence(messages: list) -> list:
             if _is_anthropic_tool_result(msg):
                 _rc = getattr(msg, "raw_content", None)
                 if isinstance(_rc, list):
-                    _text_blocks = [
-                        b for b in _rc
-                        if isinstance(b, dict) and b.get("type") != "tool_result"
-                    ]
+                    _text_blocks = [b for b in _rc if isinstance(b, dict) and b.get("type") != "tool_result"]
                     if _text_blocks:
-                        logger.info('repair_tool_message_sequence: orphan tool_result at idx=%d had text blocks — preserving text', i)
-                        result.append(dataclasses.replace(msg, raw_content=_text_blocks, content="", tool_call_id=None, name=None))
+                        logger.info(
+                            "repair_tool_message_sequence: orphan tool_result at idx=%d had text blocks — preserving text",
+                            i,
+                        )
+                        result.append(
+                            dataclasses.replace(msg, raw_content=_text_blocks, content="", tool_call_id=None, name=None)
+                        )
                         i += 1
                         continue
-            logger.warning('repair_tool_message_sequence: dropping orphaned tool result at idx=%d', i)
+            logger.warning("repair_tool_message_sequence: dropping orphaned tool result at idx=%d", i)
             i += 1
             continue
         if is_tool_call(msg):
             j = i + 1
             while j < len(messages) and is_tool_result(messages[j]):
                 j += 1
-            tool_msgs = messages[i + 1:j]
+            tool_msgs = messages[i + 1 : j]
             if not tool_msgs:
-                logger.warning('repair_tool_message_sequence: dropping assistant(tool_call) with no following tool messages at idx=%d', i)
+                logger.warning(
+                    "repair_tool_message_sequence: dropping assistant(tool_call) with no following tool messages at idx=%d",
+                    i,
+                )
                 i = j
                 continue
             # Validate tool_call_id matching: every assistant tool_call id
@@ -809,8 +855,7 @@ def repair_tool_message_sequence(messages: list) -> list:
             _raw = getattr(msg, "raw_content", None)
             if isinstance(_raw, list):
                 _expected_ids |= {
-                    b.get("id") for b in _raw
-                    if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+                    b.get("id") for b in _raw if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
                 }
             # Collect actual tool result IDs from both standard and anthropic formats.
             _actual_ids = set()
@@ -822,16 +867,19 @@ def repair_tool_message_sequence(messages: list) -> list:
                 _mrc = getattr(m, "raw_content", None)
                 if isinstance(_mrc, list):
                     _actual_ids |= {
-                        b.get("tool_use_id") for b in _mrc
+                        b.get("tool_use_id")
+                        for b in _mrc
                         if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
                     }
             _expected_valid = bool(_expected_ids)
             _actual_valid = bool(_actual_ids)
             if _expected_valid and _actual_valid and _expected_ids != _actual_ids:
                 logger.warning(
-                    'repair_tool_message_sequence: tool_call_id mismatch at idx=%d '
-                    '(expected=%s, actual=%s) — dropping group',
-                    i, _expected_ids, _actual_ids,
+                    "repair_tool_message_sequence: tool_call_id mismatch at idx=%d "
+                    "(expected=%s, actual=%s) — dropping group",
+                    i,
+                    _expected_ids,
+                    _actual_ids,
                 )
                 i = j
                 continue

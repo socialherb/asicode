@@ -17,6 +17,7 @@ patch — see test_non_session_dirty_file_is_allowed for that friction win.
 These tests exercise both the real diff_apply main path and _tool_apply_patch
 (the LLM-facing entry) against a real git repo.
 """
+
 import subprocess
 
 from external_llm.agent.tool_handlers.write_tools import WriteToolsMixin
@@ -33,6 +34,7 @@ class _Stub(WriteToolsMixin):
 
     def _make_result(self, **kw):
         from external_llm.agent.tool_registry import ToolResult
+
         kw.setdefault("content", "")
         return ToolResult(**kw)
 
@@ -137,7 +139,7 @@ class TestApplyPatchSessionEditGuard:
         so the guard (which compares against patch-extracted relative paths) matches."""
         stub = _init_repo(tmp_path)
         stub._record_text_edit(str(tmp_path / "sample.py"))  # absolute
-        stub._record_text_edit("sample.py")                   # relative
+        stub._record_text_edit("sample.py")  # relative
         assert stub._text_edited_files == {"sample.py"}
 
     def test_refuse_session_edited_helper_contract(self, tmp_path):

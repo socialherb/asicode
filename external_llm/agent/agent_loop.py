@@ -17,9 +17,8 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any
 
-from common import normalize_rel_path_fast
 from external_llm.client import (
     ContextWindowCollapseError,
     LLMCancelled,
@@ -70,6 +69,7 @@ from .json_repair import repair_json_brackets, try_parse_json
 from .performance_metrics import PerformanceCollector, get_global_collector
 from .reasoning_utils import reasoning_ab_kwargs
 from .request_intent_classifier import (
+    RoutingIntent,
     intent_is_undetermined,
     is_non_edit_intent,
     routing_intent_from_intent_result,
@@ -227,7 +227,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 import os
                 import tempfile
 
-                temp_file: Optional[str] = None
+                temp_file: str | None = None
                 try:
                     with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as _tmp:
                         temp_file = _tmp.name
@@ -329,8 +329,8 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         config: AgentConfig,
         model: str = "",
         agent_id: str = "main",
-        run_store: Optional[InMemoryRunStore] = None,
-        session_id: Optional[str] = None,
+        run_store: InMemoryRunStore | None = None,
+        session_id: str | None = None,
     ):
         self.llm_client = llm_client
         self.registry = registry
@@ -395,11 +395,15 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         self._phase_target_symbol = ""
         self._phase_target_file = ""
 
+        # Optional per-run turn list (attach point for run_store); only read
+        # behind hasattr in telemetry, but declared so pyright sees the field.
+        self.turns: list[Any] = []
+
         # Hybrid architecture components (lazy-initialized). The PlannerAgent /
         # OperationExecutor half went with the PLANNER lane; these two survive
         # because MAIN_AGENT tooling reads them.
-        self._symbol_searcher: Optional[SymbolSearcher] = None
-        self._call_graph: Optional[RepositoryGraphFacade] = None
+        self._symbol_searcher: SymbolSearcher | None = None
+        self._call_graph: RepositoryGraphFacade | None = None
         self._shared_run_store: InMemoryRunStore = run_store if run_store is not None else InMemoryRunStore()
         _helper_enabled = config.helper_enabled
         _helper_model = config.helper_model
@@ -424,7 +428,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         else:
             self.registry.local_assistant = None
 
-        self._context_budget: Optional[ContextBudgetManager] = None
+        self._context_budget: ContextBudgetManager | None = None
         if config.context_budget_enabled:
             _budget_model = model or config.model_name or ""
             self._context_budget = ContextBudgetManager(
@@ -435,7 +439,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # Context manager (sliding window trim/compress/evict)
         self._init_context_manager()
 
-    def _resolve_routing_intent(self, route) -> str:
+    def _resolve_routing_intent(self, route) -> RoutingIntent:
         """Resolve routing intent from route / config in one place."""
         if getattr(self.config, "design_chat_mode", False):
             return "read_only"
@@ -503,7 +507,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 status="success",
                 turns=[],  # will be filled by caller
                 final_message=preview,
-                applied_patches=self.registry.applied_patches,
+                applied_patches=list(self.registry.applied_patches),
                 metadata={
                     "readonly_early_finish": True,
                     "tool": tool_name,
@@ -576,8 +580,10 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         repo_root = Path(str(self.registry.repo_root))
 
         for candidate in candidates:
-            path = normalize_rel_path_fast(str(candidate))
-            if not path:  # pragma: no cover — regex candidates are always non-empty, so normalize_rel_path_fast can never return "" here
+            path = normalize_rel_path(str(candidate))
+            if (
+                not path
+            ):  # pragma: no cover — regex candidates are always non-empty, so normalization can never return "" here
                 continue
             try:
                 full_path = repo_root / path
@@ -633,7 +639,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         known_target_file: str,
         target_keywords: list[str],
         tier: Any,
-        plan: Optional[dict[str, Any]],
+        plan: dict[str, Any] | None,
         plan_subtasks: list[dict[str, Any]],
         turns: list,
     ) -> TurnContext:
@@ -808,7 +814,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             error="No active lane handled this request. Ensure AgentConfig.route_decision is set.",
             turns=turns or [],
             final_message="No active lane handled this request.",
-            applied_patches=self.registry.applied_patches,
+            applied_patches=list(self.registry.applied_patches),
             metadata={
                 "session_id": _session_id,
                 "git_state": git_state,
@@ -837,7 +843,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         self,
         session_id: str,
         request: str,
-        result: "AgentResult",
+        result: AgentResult,
         prompt_tokens: int,
         completion_tokens: int,
         cache_read_tokens: int = 0,
@@ -906,13 +912,13 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
 
             from external_llm.common.file_lock import cross_process_flock
 
-            _SESSION_LOG_ROTATE_BYTES = 10 * 1024 * 1024
+            _session_log_rotate_bytes = 10 * 1024 * 1024
             with cross_process_flock(_Path(log_dir) / "sessions.lock"):
                 # Rotate when the log exceeds 10 MB (single generation, like
                 # worker.log rotation in orchestrator.py).  Best-effort: any
                 # OSError is silently ignored — the session log is advisory.
                 with contextlib.suppress(OSError):
-                    if os.path.isfile(log_path) and os.path.getsize(log_path) > _SESSION_LOG_ROTATE_BYTES:
+                    if os.path.isfile(log_path) and os.path.getsize(log_path) > _session_log_rotate_bytes:
                         os.replace(log_path, log_path + ".1")
                 with open(log_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -964,6 +970,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             # non-tag name / older Ollama) → assume supported (status quo);
             # only a definitive "no tools" downgrades to the text protocol.
             from external_llm.model_registry import ollama_supports_tools
+
             _base_url = getattr(self.llm_client, "base_url", None)
             if ollama_supports_tools(self.model, _base_url) is False:
                 logger.info(
@@ -976,8 +983,8 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
     def _llm_call_with_tools(
         self,
         messages: list[LLMMessage],
-        max_tokens: Optional[int] = None,
-        token_callback: Optional[Callable] = None,
+        max_tokens: int | None = None,
+        token_callback: Callable | None = None,
     ) -> dict[str, Any]:
         """Call LLM with native tool support."""
         # Check for cancellation before starting LLM call
@@ -1159,7 +1166,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         """Delegate to shared :func:`repair_json_brackets`."""
         return repair_json_brackets(text)
 
-    def _try_parse_json(self, text: str) -> "Optional[Any]":
+    def _try_parse_json(self, text: str) -> Any | None:
         """Try to parse JSON with 3-tier repair via shared :func:`try_parse_json`."""
         return try_parse_json(text)
 
@@ -1275,7 +1282,9 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                     "error_type": error_type,
                 }
                 if extra:
-                    payload.update(extra)  # pragma: no cover — loop_t0 is a named param, so **extra is always empty at the 3 internal call sites
+                    payload.update(
+                        extra
+                    )  # pragma: no cover — loop_t0 is a named param, so **extra is always empty at the 3 internal call sites
                 self._cb("error", payload)
                 # Record the final failure after all retries are exhausted —
                 # this is the single logical LLM call that ultimately failed.
@@ -1296,6 +1305,10 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # true wall-time (attempt calls + backoff waits) instead of 0 — keeps
         # avg_time_ms honest when failures occur.
         loop_t0 = time.monotonic()
+        # start_time is set inside the try on every iteration, but pre-binding
+        # it keeps the except's telemetry reference safe for type checkers
+        # (and makes the 0-iteration edge case defined, not just unreachable).
+        start_time = loop_t0
 
         for attempt in range(max_retries + 1):  # +1 for the initial attempt
             # Check for cancellation before each retry attempt
@@ -1346,7 +1359,6 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                         _rt,
                         max(0, completion_tokens - _rt),
                     )
-
 
             except LLMConnectionError as e:
                 # Clamp index: loop runs max_retries+1 times but retry_delays
@@ -1411,7 +1423,11 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 # record overflow override so subsequent calls pre-trim at the
                 # corrected limit instead of hitting the same error repeatedly.
                 if _is_context_length_error(e):
-                    _record_context_overflow(self.model, estimated_prompt_tokens=_estimated_prompt_tokens, base_url=getattr(self.llm_client, "base_url", None))
+                    _record_context_overflow(
+                        self.model,
+                        estimated_prompt_tokens=_estimated_prompt_tokens,
+                        base_url=getattr(self.llm_client, "base_url", None),
+                    )
                     logger.warning(
                         "[CONTEXT_OVERFLOW] %s — recorded overflow override (est=%s)",
                         self.model,
@@ -1458,7 +1474,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
     # Message management
     # ------------------------------------------------------------------
 
-    def _auto_repair_apply_patch_args(self, args: dict) -> Optional[dict]:
+    def _auto_repair_apply_patch_args(self, args: dict) -> dict | None:
         """Apply deterministic repair rules to apply_patch arguments.
 
         Rules (attempted in order, only one repair per failure):
@@ -1684,7 +1700,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         return content
 
     def _build_tool_result_message(
-        self, call_id: str, tool_name: str, result: ToolResult, tool_args: Optional[dict[str, Any]] = None
+        self, call_id: str, tool_name: str, result: ToolResult, tool_args: dict[str, Any] | None = None
     ) -> LLMMessage:
         """Build a message representing a tool result.
 
@@ -1802,7 +1818,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
 
         elif provider in ("anthropic", "zai"):
             # Anthropic: assistant content blocks + user tool_result blocks (keyed by tool_use_id).
-            raw_blocks: Optional[list[dict[str, Any]]] = None
+            raw_blocks: list[dict[str, Any]] | None = None
             if raw_response_data:
                 raw_blocks = raw_response_data.get("content")
 
@@ -1825,7 +1841,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
 
         elif provider == "google":
             # Gemini: model parts (with functionCall) + user functionResponse parts.
-            raw_parts: Optional[list[dict[str, Any]]] = None
+            raw_parts: list[dict[str, Any]] | None = None
             if raw_response_data:
                 candidates = raw_response_data.get("candidates", [])
                 if candidates:

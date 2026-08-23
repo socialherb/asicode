@@ -158,7 +158,9 @@ def test_wrapper_extracts_toolresult_fields(tmp_path, monkeypatch):
             metadata={"failure_class": "symbol_not_found", "file_path": "m.py"},
         )
         record_write_tool_failure_from_tr(
-            tool="modify_symbol", tr=tr, args={"file_path": "m.py", "symbol": "foo"},
+            tool="modify_symbol",
+            tr=tr,
+            args={"file_path": "m.py", "symbol": "foo"},
         )
         rows = rec.records()
         assert len(rows) == 1
@@ -186,7 +188,11 @@ def test_error_truncated_to_limit(tmp_path, monkeypatch):
     try:
         huge = "E" * 5000
         record_write_tool_failure(
-            tool="edit_text", ok=False, error=huge, metadata={}, args={},
+            tool="edit_text",
+            ok=False,
+            error=huge,
+            metadata={},
+            args={},
         )
         rows = rec.records()
         assert len(rows[0]["error"]) <= 1300  # _MAX_ERROR_CHARS + ellipsis
@@ -200,8 +206,12 @@ def test_partial_failure_recorded_even_when_ok(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     try:
         record_write_tool_failure(
-            tool="apply_patch", ok=True, error=None, metadata={"failure_class": "partial"},
-            args={}, partial_failure=True,
+            tool="apply_patch",
+            ok=True,
+            error=None,
+            metadata={"failure_class": "partial"},
+            args={},
+            partial_failure=True,
         )
         rows = rec.records()
         assert len(rows) == 1
@@ -218,20 +228,33 @@ def test_summarize_log_aggregates_by_tool_and_failure_class(tmp_path, monkeypatc
         # 3 anchor_edit failures (2 not_unique, 1 miss) + 1 apply_patch failure.
         for _ in range(2):
             record_write_tool_failure(
-                tool="anchor_edit", ok=False, error="e",
-                metadata={"failure_class": "anchor_not_unique"}, args={"file_path": "a.py"},
+                tool="anchor_edit",
+                ok=False,
+                error="e",
+                metadata={"failure_class": "anchor_not_unique"},
+                args={"file_path": "a.py"},
             )
         record_write_tool_failure(
-            tool="anchor_edit", ok=False, error="e",
-            metadata={"failure_class": "anchor_miss"}, args={"file_path": "b.py"},
+            tool="anchor_edit",
+            ok=False,
+            error="e",
+            metadata={"failure_class": "anchor_miss"},
+            args={"file_path": "b.py"},
         )
         record_write_tool_failure(
-            tool="apply_patch", ok=False, error="e",
-            metadata={"failure_class": "patch_apply_failed"}, args={"path": "c.py"},
+            tool="apply_patch",
+            ok=False,
+            error="e",
+            metadata={"failure_class": "patch_apply_failed"},
+            args={"path": "c.py"},
         )
         # success should NOT appear in summary.
         record_write_tool_failure(
-            tool="edit_text", ok=True, error=None, metadata={}, args={},
+            tool="edit_text",
+            ok=True,
+            error=None,
+            metadata={},
+            args={},
         )
         s = summarize_log(rec.path)
         assert s["total"] == 4
@@ -350,7 +373,6 @@ def test_git_sha_returns_unknown_on_subprocess_failure(monkeypatch, tmp_path):
     'unknown' rather than raising."""
     import subprocess
 
-
     def _boom(*a, **k):
         raise FileNotFoundError("git binary not on PATH")
 
@@ -373,82 +395,84 @@ def test_classify_handles_empty_error():
 
 
 def test_classify_old_string_not_found():
-    assert _classify_from_error(
-        "edit_text", "old_string not found in src/foo.py"
-    ) == "search_string_mismatch"
+    assert _classify_from_error("edit_text", "old_string not found in src/foo.py") == "search_string_mismatch"
 
 
 def test_classify_old_string_not_unique():
-    assert _classify_from_error(
-        "edit_text", "Found 3 occurrences of old_string in x.py"
-    ) == "search_string_mismatch"
+    assert _classify_from_error("edit_text", "Found 3 occurrences of old_string in x.py") == "search_string_mismatch"
 
 
 def test_classify_closest_match_hint():
-    assert _classify_from_error(
-        "edit_text", "... Closest match (~77% similar) near line 55:"
-    ) == "search_string_mismatch"
+    assert (
+        _classify_from_error("edit_text", "... Closest match (~77% similar) near line 55:") == "search_string_mismatch"
+    )
 
 
 def test_classify_edit_text_syntax_error():
-    assert _classify_from_error(
-        "edit_text",
-        "edit_text refused (file NOT modified): the replacement would "
-        "introduce a Python syntax error in foo.py",
-    ) == "syntax_invalid_after_edit"
+    assert (
+        _classify_from_error(
+            "edit_text",
+            "edit_text refused (file NOT modified): the replacement would introduce a Python syntax error in foo.py",
+        )
+        == "syntax_invalid_after_edit"
+    )
 
 
 def test_classify_anchor_edit_syntax_error():
-    assert _classify_from_error(
-        "anchor_edit",
-        "anchor_edit introduced syntax error (file unchanged)",
-    ) == "syntax_invalid_after_edit"
+    assert (
+        _classify_from_error(
+            "anchor_edit",
+            "anchor_edit introduced syntax error (file unchanged)",
+        )
+        == "syntax_invalid_after_edit"
+    )
 
 
 def test_classify_write_plan_syntax_error():
-    assert _classify_from_error(
-        "write_plan",
-        "Plan introduced syntax errors (rolled back): test_foo.py: invalid syntax",
-    ) == "syntax_invalid_after_edit"
+    assert (
+        _classify_from_error(
+            "write_plan",
+            "Plan introduced syntax errors (rolled back): test_foo.py: invalid syntax",
+        )
+        == "syntax_invalid_after_edit"
+    )
 
 
 def test_classify_apply_patch_3way_merge_blob_missing():
-    assert _classify_from_error(
-        "apply_patch",
-        "Patch application failed and repair attempts exhausted: error: "
-        "repository lacks the necessary blob to perform 3-way merge.",
-    ) == "patch_apply_failed"
+    assert (
+        _classify_from_error(
+            "apply_patch",
+            "Patch application failed and repair attempts exhausted: error: "
+            "repository lacks the necessary blob to perform 3-way merge.",
+        )
+        == "patch_apply_failed"
+    )
 
 
 def test_classify_apply_patch_does_not_apply():
-    assert _classify_from_error(
-        "apply_patch", "error: patch failed: foo.py:42"
-    ) == "patch_apply_failed"
+    assert _classify_from_error("apply_patch", "error: patch failed: foo.py:42") == "patch_apply_failed"
 
 
 def test_classify_anchor_multiline_pattern():
-    assert _classify_from_error(
-        "anchor_edit",
-        "anchor_pattern contains 2 lines (embedded '\\n').",
-    ) == "anchor_multiline_pattern"
+    assert (
+        _classify_from_error(
+            "anchor_edit",
+            "anchor_pattern contains 2 lines (embedded '\\n').",
+        )
+        == "anchor_multiline_pattern"
+    )
 
 
 def test_classify_anchor_not_unique():
-    assert _classify_from_error(
-        "anchor_edit", "anchor_not_unique: matched 3 times"
-    ) == "anchor_not_unique"
+    assert _classify_from_error("anchor_edit", "anchor_not_unique: matched 3 times") == "anchor_not_unique"
 
 
 def test_classify_missing_required_arg():
-    assert _classify_from_error(
-        "modify_symbol", "'code' is required"
-    ) == "invalid_args"
+    assert _classify_from_error("modify_symbol", "'code' is required") == "invalid_args"
 
 
 def test_classify_unknown_error_stays_unclassified():
-    assert _classify_from_error(
-        "edit_text", "something completely unexpected"
-    ) == "unclassified"
+    assert _classify_from_error("edit_text", "something completely unexpected") == "unclassified"
 
 
 # ── Regression: modify_symbol resolution failures. The handler wraps every
@@ -462,23 +486,28 @@ def test_classify_unknown_error_stays_unclassified():
 def test_classify_modify_symbol_failed_wrapper():
     """The handler's generic wrapper (catches symbol not found, syntax-blocked
     text splice, write-after-replace failure, etc.)."""
-    assert _classify_from_error(
-        "modify_symbol",
-        "modify_symbol failed for src/foo.py@bar: All strategies failed - "
-        "could not locate or replace symbol",
-    ) == "modify_failed"
+    assert (
+        _classify_from_error(
+            "modify_symbol",
+            "modify_symbol failed for src/foo.py@bar: All strategies failed - could not locate or replace symbol",
+        )
+        == "modify_failed"
+    )
 
 
 def test_classify_modify_symbol_syntax_blocked_detail():
     """The inner detail text for a re-indentation/splice that would break
     Python syntax is still a modify_failed tool-limitation, NOT a
     syntax_invalid_after_edit (the LLM's code was not applied at all)."""
-    assert _classify_from_error(
-        "modify_symbol",
-        "modify_symbol failed for src/foo.py@bar: modify_symbol could not "
-        "produce syntactically valid code for 'bar' (re-indentation/splice "
-        "would break Python syntax). Use apply_patch instead.",
-    ) == "modify_failed"
+    assert (
+        _classify_from_error(
+            "modify_symbol",
+            "modify_symbol failed for src/foo.py@bar: modify_symbol could not "
+            "produce syntactically valid code for 'bar' (re-indentation/splice "
+            "would break Python syntax). Use apply_patch instead.",
+        )
+        == "modify_failed"
+    )
 
 
 def test_classify_all_strategies_failed_unwrapped():
@@ -488,10 +517,13 @@ def test_classify_all_strategies_failed_unwrapped():
     Legacy wording (pre-2026-08-13). Kept because a persisted failure log can
     still hold it; the current wording is covered by the test below.
     """
-    assert _classify_from_error(
-        "modify_symbol",
-        "All strategies failed - could not locate or replace symbol",
-    ) == "modify_failed"
+    assert (
+        _classify_from_error(
+            "modify_symbol",
+            "All strategies failed - could not locate or replace symbol",
+        )
+        == "modify_failed"
+    )
 
 
 def test_classify_locate_failure_with_reason_unwrapped():
@@ -509,10 +541,13 @@ def test_classify_locate_failure_with_reason_unwrapped():
         "to fix it by exact string match",
         "no such symbol in this file",
     ):
-        assert _classify_from_error(
-            "modify_symbol",
-            f"modify_symbol could not locate symbol 'X.y' in src/foo.py: {detail}",
-        ) == "modify_failed", detail
+        assert (
+            _classify_from_error(
+                "modify_symbol",
+                f"modify_symbol could not locate symbol 'X.y' in src/foo.py: {detail}",
+            )
+            == "modify_failed"
+        ), detail
 
 
 def test_classify_modify_symbol_missing_arg_still_invalid_args():
@@ -520,9 +555,7 @@ def test_classify_modify_symbol_missing_arg_still_invalid_args():
     handler (write_tools.py:4245-4249), so they must still classify as
     invalid_args — NOT be stolen by the 'modify_symbol failed for' pattern,
     which only matches the wrapped outcome path."""
-    assert _classify_from_error(
-        "modify_symbol", "'code' is required"
-    ) == "invalid_args"
+    assert _classify_from_error("modify_symbol", "'code' is required") == "invalid_args"
 
 
 # ── Parity: every _ERROR_PATTERNS fallback value must be a canonical
@@ -546,6 +579,7 @@ class TestErrorPatternsParity:
             FailureClass,
             normalize_failure_class,
         )
+
         assert FailureClass.INVALID_ARGS.value == "invalid_args"
         assert normalize_failure_class("invalid_args") is FailureClass.INVALID_ARGS
 
@@ -559,13 +593,16 @@ def test_classify_batch_edit_text_occurrences_not_stolen_by_syntax_wrapper():
     # Verbatim wrapper from _tool_edit_text batch path: the match step runs and
     # fails with 2 occurrences BEFORE any syntax check, but the message carries
     # the generic "edit_text refused" token that the syntax patterns also match.
-    assert _classify_from_error(
-        "edit_text",
-        "edit_text refused (file NOT modified): edit #1 (edits[0]) failed to "
-        "match — no edits were applied (atomic batch).\n"
-        "Found 2 occurrences of old_string in asi.py. Make old_string more "
-        "unique (include 2-3 lines of surrounding context).",
-    ) == "search_string_mismatch"
+    assert (
+        _classify_from_error(
+            "edit_text",
+            "edit_text refused (file NOT modified): edit #1 (edits[0]) failed to "
+            "match — no edits were applied (atomic batch).\n"
+            "Found 2 occurrences of old_string in asi.py. Make old_string more "
+            "unique (include 2-3 lines of surrounding context).",
+        )
+        == "search_string_mismatch"
+    )
 
 
 def test_classify_edit_text_refused_pure_syntax_still_classes_as_syntax():
@@ -573,11 +610,14 @@ def test_classify_edit_text_refused_pure_syntax_still_classes_as_syntax():
     # must still classify as syntax, proving the reorder did not break syntax
     # classification — it only stopped the syntax wrapper from stealing match
     # failures that happen to carry "edit_text refused".
-    assert _classify_from_error(
-        "edit_text",
-        "edit_text refused (file NOT modified): the replacement would "
-        "introduce a Python syntax error in foo.py: invalid syntax at line 12.",
-    ) == "syntax_invalid_after_edit"
+    assert (
+        _classify_from_error(
+            "edit_text",
+            "edit_text refused (file NOT modified): the replacement would "
+            "introduce a Python syntax error in foo.py: invalid syntax at line 12.",
+        )
+        == "syntax_invalid_after_edit"
+    )
 
 
 # ── Regression: multiline anchor mismatches (pattern line N ≠ file line) were
@@ -585,21 +625,27 @@ def test_classify_edit_text_refused_pure_syntax_still_classes_as_syntax():
 #    emitted by anchor_shared.resolve_multiline_anchor but had no classifier
 #    pattern. Found in production write_tool_failures.jsonl. ─────────────────
 def test_classify_multiline_anchor_later_line_mismatch():
-    assert _classify_from_error(
-        "anchor_edit",
-        'multiline anchor: pattern line 2 "ok": True, does not match file '
-        "line 3242. The block starting at line 3241 does not fully match the "
-        "pattern. Read the file and provide the exact block.",
-    ) == "multiline_mismatch"
+    assert (
+        _classify_from_error(
+            "anchor_edit",
+            'multiline anchor: pattern line 2 "ok": True, does not match file '
+            "line 3242. The block starting at line 3241 does not fully match the "
+            "pattern. Read the file and provide the exact block.",
+        )
+        == "multiline_mismatch"
+    )
 
 
 def test_classify_multiline_anchor_extends_past_eof():
-    assert _classify_from_error(
-        "anchor_edit",
-        "multiline anchor: pattern has 3 lines but the file ends at line 100 "
-        "(pattern line 3 extends past end of file). Re-read the file and "
-        "provide the exact block.",
-    ) == "multiline_mismatch"
+    assert (
+        _classify_from_error(
+            "anchor_edit",
+            "multiline anchor: pattern has 3 lines but the file ends at line 100 "
+            "(pattern line 3 extends past end of file). Re-read the file and "
+            "provide the exact block.",
+        )
+        == "multiline_mismatch"
+    )
 
 
 def test_classify_multiline_anchor_distinguished_from_anchor_miss():
@@ -607,11 +653,13 @@ def test_classify_multiline_anchor_distinguished_from_anchor_miss():
     # multiline_mismatch — multiline_mismatch only fires when the first line
     # matched but a follow-on line did not. This guards against over-broad
     # "multiline anchor" matching stealing the anchor_miss case.
-    assert _classify_from_error(
-        "anchor_edit",
-        "multiline anchor: first line 'def foo' not found in file (searched "
-        "194 lines).",
-    ) == "anchor_miss"
+    assert (
+        _classify_from_error(
+            "anchor_edit",
+            "multiline anchor: first line 'def foo' not found in file (searched 194 lines).",
+        )
+        == "anchor_miss"
+    )
 
 
 # ── Regression: FailureClass enum must include MULTILINE_MISMATCH so the
@@ -632,11 +680,13 @@ def test_failure_class_enum_has_multiline_mismatch_member():
 def test_classify_anchor_edit_pattern_not_found_is_anchor_miss():
     """anchor_edit(delete): 'pattern ... not found in' must be anchor_miss,
     not search_string_mismatch (which is edit_text's failure mode)."""
-    assert _classify_from_error(
-        "anchor_edit",
-        "anchor_edit(delete): pattern 'def get_foo' not found in src/foo.py "
-        "(searched 758 lines)",
-    ) == "anchor_miss"
+    assert (
+        _classify_from_error(
+            "anchor_edit",
+            "anchor_edit(delete): pattern 'def get_foo' not found in src/foo.py (searched 758 lines)",
+        )
+        == "anchor_miss"
+    )
 
 
 def test_classify_pattern_not_found_requires_pattern_token():
@@ -644,21 +694,15 @@ def test_classify_pattern_not_found_requires_pattern_token():
     anchor_miss — it stays unclassified (or another class). This guards the
     co_substring disambiguation against false positives."""
     # edit_text's error is already caught by search_string_mismatch above.
-    assert _classify_from_error(
-        "edit_text", "old_string not found in foo.py"
-    ) == "search_string_mismatch"
+    assert _classify_from_error("edit_text", "old_string not found in foo.py") == "search_string_mismatch"
     # A bare "not found in" with no 'pattern' and no 'old_string' → unclassified.
-    assert _classify_from_error(
-        "edit_text", "the thing was not found in that place"
-    ) == "unclassified"
+    assert _classify_from_error("edit_text", "the thing was not found in that place") == "unclassified"
 
 
 def test_classify_empty_diff_is_no_diff_generated():
     """apply_patch salvage producing an empty diff is a no-op edit, not a
     patch failure."""
-    assert _classify_from_error(
-        "apply_patch", "empty diff after cleaning"
-    ) == "no_diff_generated"
+    assert _classify_from_error("apply_patch", "empty diff after cleaning") == "no_diff_generated"
 
 
 # ── Regression: _git_sha is cached within TTL but refreshed after ────────────
@@ -793,7 +837,7 @@ def test_compaction_drops_corrupt_lines(tmp_path):
         '{"tool":"a","failure_class":"x","i":2}',
         '{"tool":"a","failure_class":"x","i":3}',
         '{"tool":"a","failure_class":"x","i":4}',
-        'THIS IS NOT JSON — corrupt line',
+        "THIS IS NOT JSON — corrupt line",
         '{"tool":"a","failure_class":"x","i":5}',
         '{"tool":"a","failure_class":"x","i":6}',
         '{"tool":"a","failure_class":"x","i":7}',
@@ -842,14 +886,25 @@ def test_suggestion_fired_when_failure_carries_hint(tmp_path, monkeypatch):
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(metadata={
-            "failure_class": "search_string_mismatch", "near_match": True,
-        }), session_key="run-1")
-        record_write_tool_failure(**_suggestion_failure(metadata={
-            "failure_class": "search_string_mismatch", "reread_snippet": True,
-        }), session_key="run-2")
-        record_write_tool_failure(**_suggestion_failure(metadata={}),
-                                  session_key="run-3")
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={
+                    "failure_class": "search_string_mismatch",
+                    "near_match": True,
+                }
+            ),
+            session_key="run-1",
+        )
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={
+                    "failure_class": "search_string_mismatch",
+                    "reread_snippet": True,
+                }
+            ),
+            session_key="run-2",
+        )
+        record_write_tool_failure(**_suggestion_failure(metadata={}), session_key="run-3")
         counts = get_suggestion_counts()
         assert counts["fired"] == 2
         assert counts["helped"] == 0 and counts["ignored"] == 0
@@ -862,13 +917,19 @@ def test_suggestion_settles_helped_on_next_success(tmp_path, monkeypatch):
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "reread_snippet": True},
-        ), session_key="run-A")
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "reread_snippet": True},
+            ),
+            session_key="run-A",
+        )
         # The agent retries (same run) and succeeds → helped.
         tr = ToolResult(ok=True, content="done", metadata={})
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=tr, args={"file_path": "a.py"}, session_key="run-A",
+            tool="edit_text",
+            tr=tr,
+            args={"file_path": "a.py"},
+            session_key="run-A",
         )
         counts = get_suggestion_counts()
         assert counts["fired"] == 1
@@ -885,12 +946,18 @@ def test_suggestion_settles_ignored_and_rearms_on_next_failure(tmp_path, monkeyp
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "near_match": True},
-        ), session_key="run-B")
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "near_match": True},
-        ), session_key="run-B")
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "near_match": True},
+            ),
+            session_key="run-B",
+        )
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "near_match": True},
+            ),
+            session_key="run-B",
+        )
         counts = get_suggestion_counts()
         assert counts["fired"] == 2
         assert counts["ignored"] == 1
@@ -898,7 +965,10 @@ def test_suggestion_settles_ignored_and_rearms_on_next_failure(tmp_path, monkeyp
         # The second failure armed a fresh marker → a success now settles helped.
         tr = ToolResult(ok=True, content="ok", metadata={})
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=tr, args={}, session_key="run-B",
+            tool="edit_text",
+            tr=tr,
+            args={},
+            session_key="run-B",
         )
         counts = get_suggestion_counts()
         assert counts["helped"] == 1
@@ -914,7 +984,10 @@ def test_suggestion_settle_noop_without_marker(tmp_path, monkeypatch):
     try:
         tr = ToolResult(ok=True, content="done", metadata={})
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=tr, args={}, session_key="run-C",
+            tool="edit_text",
+            tr=tr,
+            args={},
+            session_key="run-C",
         )
         counts = get_suggestion_counts()
         assert counts["fired"] == 0
@@ -931,12 +1004,16 @@ def test_suggestion_empty_session_key_fires_but_never_settles(tmp_path, monkeypa
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "near_match": True},
-        ))
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "near_match": True},
+            )
+        )
         tr = ToolResult(ok=True, content="done", metadata={})
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=tr, args={},  # no session_key
+            tool="edit_text",
+            tr=tr,
+            args={},  # no session_key
         )
         counts = get_suggestion_counts()
         assert counts["fired"] == 1
@@ -952,18 +1029,28 @@ def test_suggestion_non_write_tool_result_does_not_settle(tmp_path, monkeypatch)
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "near_match": True},
-        ), session_key="run-D")
         record_write_tool_failure(
-            tool="run_tests", ok=True, error=None, metadata={}, args={},
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "near_match": True},
+            ),
+            session_key="run-D",
+        )
+        record_write_tool_failure(
+            tool="run_tests",
+            ok=True,
+            error=None,
+            metadata={},
+            args={},
             session_key="run-D",
         )
         counts = get_suggestion_counts()
         assert counts["helped"] == 0  # marker still pending
         tr = ToolResult(ok=True, content="done", metadata={})
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=tr, args={}, session_key="run-D",
+            tool="edit_text",
+            tr=tr,
+            args={},
+            session_key="run-D",
         )
         assert get_suggestion_counts()["helped"] == 1
     finally:
@@ -978,19 +1065,28 @@ def test_suggestion_auto_retry_counted_from_success_metadata(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
     try:
         ok_tr = ToolResult(
-            ok=True, content="done",
+            ok=True,
+            content="done",
             metadata={"reread_retried": True, "reread_retry_success": True},
         )
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=ok_tr, args={}, session_key="run-E",
+            tool="edit_text",
+            tr=ok_tr,
+            args={},
+            session_key="run-E",
         )
         # Retry failed: failure record carries reread_retried but no success flag.
         fail_tr = ToolResult(
-            ok=False, content="", error="old_string not found",
+            ok=False,
+            content="",
+            error="old_string not found",
             metadata={"failure_class": "search_string_mismatch", "reread_retried": True},
         )
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=fail_tr, args={}, session_key="run-E",
+            tool="edit_text",
+            tr=fail_tr,
+            args={},
+            session_key="run-E",
         )
         counts = get_suggestion_counts()
         assert counts["auto_retried"] == 2
@@ -1006,16 +1102,23 @@ def test_suggestion_partial_failure_settles_and_records(tmp_path, monkeypatch):
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "near_match": True},
-        ), session_key="run-F")
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "near_match": True},
+            ),
+            session_key="run-F",
+        )
         tr = ToolResult(
-            ok=True, partial_failure=True,
+            ok=True,
+            partial_failure=True,
             content="applied 2/3 edits",
             metadata={"failure_class": "search_string_mismatch"},
         )
         record_write_tool_failure_from_tr(
-            tool="edit_text", tr=tr, args={}, session_key="run-F",
+            tool="edit_text",
+            tr=tr,
+            args={},
+            session_key="run-F",
         )
         counts = get_suggestion_counts()
         assert counts["helped"] == 1
@@ -1029,19 +1132,22 @@ def test_reset_suggestion_counts_returns_snapshot(tmp_path, monkeypatch):
     rec = _Recorder(tmp_path)
     monkeypatch.chdir(tmp_path)
     try:
-        record_write_tool_failure(**_suggestion_failure(
-            metadata={"failure_class": "search_string_mismatch", "near_match": True},
-        ), session_key="run-G")
+        record_write_tool_failure(
+            **_suggestion_failure(
+                metadata={"failure_class": "search_string_mismatch", "near_match": True},
+            ),
+            session_key="run-G",
+        )
         snap = reset_suggestion_counts()
         assert snap["fired"] == 1
         counts = get_suggestion_counts()
-        assert counts == {"fired": 0, "helped": 0, "ignored": 0,
-                          "auto_retried": 0, "auto_retry_success": 0}
+        assert counts == {"fired": 0, "helped": 0, "ignored": 0, "auto_retried": 0, "auto_retry_success": 0}
     finally:
         rec.cleanup()
 
 
 # ── RED→GREEN gap coverage: remaining edge branches (round 32-7) ────────────
+
 
 class _BrokenStr:
     """An object whose str() raises — for the redaction fallbacks."""
@@ -1065,20 +1171,17 @@ def _boom(*a, **k):
 def test_log_path_defaults_to_home_when_env_unset(monkeypatch):
     """Without the env override the log lives under ~/.asicode/learning/."""
     monkeypatch.delenv("ASICODE_WRITE_TOOL_FAILURE_LOG", raising=False)
-    assert tfl._log_path() == os.path.join(
-        os.path.expanduser("~"), ".asicode", "learning", "write_tool_failures.jsonl"
-    )
+    assert tfl._log_path() == os.path.join(os.path.expanduser("~"), ".asicode", "learning", "write_tool_failures.jsonl")
 
 
 def test_git_sha_snapshot_raise_returns_unknown(monkeypatch, tmp_path):
     """get_git_snapshot raising must not block failure logging — _git_sha
     degrades to 'unknown' (transient repo-state failures are non-critical)."""
+
     def _snapshot_boom(*a, **k):
         raise RuntimeError("snapshot unavailable")
 
-    monkeypatch.setattr(
-        "external_llm.agent.agent_context_manager.get_git_snapshot", _snapshot_boom
-    )
+    monkeypatch.setattr("external_llm.agent.agent_context_manager.get_git_snapshot", _snapshot_boom)
     assert _git_sha(str(tmp_path)) == "unknown"
 
 
@@ -1139,8 +1242,12 @@ def test_append_record_failure_is_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(tfl, "_append_record", _boom)
     try:
         record_write_tool_failure(
-            tool="edit_text", ok=False, error="old_string not found",
-            metadata=None, args={}, repo_root=str(tmp_path),
+            tool="edit_text",
+            ok=False,
+            error="old_string not found",
+            metadata=None,
+            args={},
+            repo_root=str(tmp_path),
         )
         assert rec.records() == []
     finally:
@@ -1201,7 +1308,8 @@ def test_wrapper_auto_retry_count_failure_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(tfl, "_suggest_inc", _counter_boom)
     try:
         tr = ToolResult(
-            ok=False, error="x",
+            ok=False,
+            error="x",
             metadata={"reread_retried": True, "reread_retry_success": True},
         )
         record_write_tool_failure_from_tr(tool="edit_text", tr=tr, args={})

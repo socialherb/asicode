@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from .config.thresholds import config as _cfg
 from .enums import Complexity, Scope
@@ -41,10 +41,12 @@ class IntentResult:
     search_terms: list[str] = field(default_factory=list)
 
     # Intent classification
-    intent_type: str = "unknown"  # "bugfix", "feature", "refactor", "exploration", "question", "modify", "extend", "create"
+    intent_type: str = (
+        "unknown"  # "bugfix", "feature", "refactor", "exploration", "question", "modify", "extend", "create"
+    )
 
     # Target inference (LLM's best guess)
-    target_files: list[str] = field(default_factory=list)    # full relative paths
+    target_files: list[str] = field(default_factory=list)  # full relative paths
     target_symbols: list[str] = field(default_factory=list)  # function/class names
 
     # New symbols to be created (not yet in codebase)
@@ -70,12 +72,12 @@ class IntentResult:
     # guard_statement) and backfilled/canonicalized downstream.  Consumers
     # MUST prefer this over guard_statement string to avoid re-parsing.
     # [GUARD_SPEC] source: "intent_resolver" or "spec_resolver"
-    guard_spec: Optional["GuardIR"] = None
+    guard_spec: GuardIR | None = None
 
     # Legacy dict repr (compact + condition + control) — kept for backward compat.
     # New code should read guard_spec instead; this is only written for backward
     # compat (callers that still expect a dict, e.g. old tool_schemas telemetry paths).
-    guard_ir: Optional[dict[str, Any]] = None
+    guard_ir: dict[str, Any] | None = None
 
     # Lane suggestion
     lane_hint: str = ""  # "planner", "main_agent", "read_only", "clarify"
@@ -155,11 +157,13 @@ class IntentResult:
                 if not name or name in seen_names:
                     continue
                 seen_names.add(name)
-                valid.append({
-                    "name": name,
-                    "kind": entry.get("kind", "function"),
-                    "parent": entry.get("parent") or None,
-                })
+                valid.append(
+                    {
+                        "name": name,
+                        "kind": entry.get("kind", "function"),
+                        "parent": entry.get("parent") or None,
+                    }
+                )
             self.new_symbols = valid
 
         # Normalize lane_hint
@@ -183,13 +187,11 @@ class IntentResult:
             "guard_spec": (
                 {
                     "compact": self.guard_spec.compact,
-                    "condition": (
-                        self.guard_spec.condition.to_legacy_dict()
-                        if self.guard_spec.condition else None
-                    ),
+                    "condition": (self.guard_spec.condition.to_legacy_dict() if self.guard_spec.condition else None),
                     "control": self.guard_spec.control,
                 }
-                if self.guard_spec is not None else None
+                if self.guard_spec is not None
+                else None
             ),
             "guard_ir": self.guard_ir,
             "code_concepts": self.code_concepts,
@@ -207,13 +209,13 @@ class IntentResult:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "IntentResult":
+    def from_dict(cls, data: dict[str, Any]) -> IntentResult:
         """Create from dictionary."""
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        if 'scope_hint' in data:
-            data['scope_hint'] = Scope(data['scope_hint'])
-        if 'complexity_hint' in data:
-            data['complexity_hint'] = Complexity(data['complexity_hint'])
+        if "scope_hint" in data:
+            data["scope_hint"] = Scope(data["scope_hint"])
+        if "complexity_hint" in data:
+            data["complexity_hint"] = Complexity(data["complexity_hint"])
         # Rehydrate the typed GuardIR from its serialized form so consumers
         # can rely on guard_spec being a GuardIR (or None) after round-trips.
         if isinstance(data.get("guard_spec"), dict):
@@ -222,7 +224,7 @@ class IntentResult:
         return cls(**{k: v for k, v in data.items() if k in known})
 
     @staticmethod
-    def _guard_spec_from_dict(d: dict[str, Any]) -> Optional["GuardIR"]:
+    def _guard_spec_from_dict(d: dict[str, Any]) -> GuardIR | None:
         """Rehydrate a GuardIR from the serialized dict produced by to_dict()."""
         from .guard_ir import GuardCondition, GuardIR
 
@@ -243,14 +245,16 @@ class IntentResult:
                 condition=_condition,
                 control=d.get("control", ""),
             )
-        except (TypeError, ValueError) as exc:  # pragma: no cover — GuardIR은 plain dataclass라 생성이 던질 수 없음 (실측: compact=123/None/dict 모두 통과)
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:  # pragma: no cover — GuardIR은 plain dataclass라 생성이 던질 수 없음 (실측: compact=123/None/dict 모두 통과)
             _logger.debug("failed to rehydrate GuardIR from %r: %s", d, exc)
             return None
 
     def is_read_only(self) -> bool:
         """Check if this appears to be a read-only request."""
-        return (self.intent_type in ("exploration", "question") or
-                self.lane_hint == "read_only")
+        return self.intent_type in ("exploration", "question") or self.lane_hint == "read_only"
 
     def has_edit_intent(self) -> bool:
         """Check if this appears to be an edit request."""
@@ -291,5 +295,6 @@ class IntentResolutionConfig:
     def get_cache_key(self, request: str) -> str:
         """Generate cache key for request."""
         import hashlib
+
         # Simple hash of request (language + content)
-        return hashlib.md5(request.encode('utf-8'), usedforsecurity=False).hexdigest()[:16]
+        return hashlib.md5(request.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]

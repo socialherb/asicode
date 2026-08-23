@@ -34,14 +34,11 @@ def _run_placement_uncertain_check(
         and (op_metadata or {}).get("placement_uncertain")
         and not result.get("already_satisfied")
     ):
-        _pu_modified = bool(
-            result.get("modified_files") or result.get("patch_applied", "")
-        )
+        _pu_modified = bool(result.get("modified_files") or result.get("patch_applied", ""))
         if not _pu_modified:
             result["failure_class"] = result.get("failure_class") or "no_effect"
             result["error"] = (
-                "placement_uncertain: edit produced no change — "
-                "uncertain anchor may have missed intended location"
+                "placement_uncertain: edit produced no change — uncertain anchor may have missed intended location"
             )
             result_status = "error"
     return result_status, result
@@ -49,8 +46,8 @@ def _run_placement_uncertain_check(
 
 # ─── Positive case (uncertain flag + no change → escalation) ──────────────────
 
-class TestPlacementUncertainEscalation:
 
+class TestPlacementUncertainEscalation:
     def test_no_change_with_flag_escalates_to_error(self):
         """Part 4 positive: placement_uncertain + no diff → status=error."""
         status, result = _run_placement_uncertain_check(
@@ -83,8 +80,8 @@ class TestPlacementUncertainEscalation:
 
 # ─── Negative case (uncertain flag + real change → success preserved) ──────────
 
-class TestPlacementUncertainSuccessPreserved:
 
+class TestPlacementUncertainSuccessPreserved:
     def test_real_change_preserves_success(self):
         """Part 5 negative: placement_uncertain + actual diff → success NOT failed."""
         status, result = _run_placement_uncertain_check(
@@ -129,8 +126,8 @@ class TestPlacementUncertainSuccessPreserved:
 
 # ─── Guard: already-failed status is not double-processed ─────────────────────
 
-class TestPlacementUncertainGuardAlreadyFailed:
 
+class TestPlacementUncertainGuardAlreadyFailed:
     def test_already_error_not_touched(self):
         """If status is already error (e.g. intent assertion failed), skip the check."""
         status, result = _run_placement_uncertain_check(

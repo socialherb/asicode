@@ -272,8 +272,8 @@ def test_metrics_aggregate_multiple_registered_caches():
     c = PerformanceCollector()
     parent = ToolResultCache()
     clone = ToolResultCache()
-    parent._hits, parent._misses = 3, 1   # 75% hit
-    clone._hits, clone._misses = 0, 4     # 0% hit
+    parent._hits, parent._misses = 3, 1  # 75% hit
+    clone._hits, clone._misses = 0, 4  # 0% hit
     c.register_tool_result_cache(parent)
     c.register_tool_result_cache(clone)
 
@@ -387,8 +387,7 @@ class TestInvalidatePathsCountAccuracy:
     def test_empty_paths_count_matches_inserted(self):
         cache = ToolResultCache()
         for i in range(5):
-            cache.set("read_file", {"path": f"f{i}.py"}, {"content": str(i)},
-                      paths=frozenset({f"/repo/f{i}.py"}))
+            cache.set("read_file", {"path": f"f{i}.py"}, {"content": str(i)}, paths=frozenset({f"/repo/f{i}.py"}))
         removed = cache.invalidate_paths(frozenset())
         assert removed == 5
         assert len(cache._cache) == 0
@@ -487,7 +486,9 @@ class TestPathSignatureValidation:
         p2.write_text("2")
         args = {"paths": [str(p1), str(p2)]}
         cache.set(
-            "find_references", args, {"refs": []},
+            "find_references",
+            args,
+            {"refs": []},
             paths=frozenset({str(p1), str(p2)}),
         )
         assert cache.get("find_references", args) == {"refs": []}
@@ -507,8 +508,11 @@ class TestPathSignatureValidation:
         pre_sigs = {str(p): _path_sig(str(p))}  # captured BEFORE the handler read
         p.write_text("VERSION = 2  # rewritten by a parallel session\n")  # mid-read write
         cache.set(
-            "read_file", args, {"content": "VERSION = 1\n"},
-            paths=frozenset({str(p)}), file_sigs=pre_sigs,
+            "read_file",
+            args,
+            {"content": "VERSION = 1\n"},
+            paths=frozenset({str(p)}),
+            file_sigs=pre_sigs,
         )
         # Current signature (v2) != stored pre-read signature (v1) → stale.
         assert cache.get("read_file", args) is None
@@ -522,8 +526,11 @@ class TestPathSignatureValidation:
         args = {"path": str(p)}
         pre_sigs = {str(p): _path_sig(str(p))}
         cache.set(
-            "read_file", args, {"content": "VERSION = 1\n"},
-            paths=frozenset({str(p)}), file_sigs=pre_sigs,
+            "read_file",
+            args,
+            {"content": "VERSION = 1\n"},
+            paths=frozenset({str(p)}),
+            file_sigs=pre_sigs,
         )
         assert cache.get("read_file", args) == {"content": "VERSION = 1\n"}
         assert cache.get("read_file", args) == {"content": "VERSION = 1\n"}  # still fresh

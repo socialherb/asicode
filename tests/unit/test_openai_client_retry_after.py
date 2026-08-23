@@ -3,6 +3,7 @@ LLMRateLimitError it raises, so retry layers above it (agent_loop's
 _retry_on_rate_limit, design_chat's _call_llm_with_retry) can honor it instead
 of falling back to fixed backoff.
 """
+
 from __future__ import annotations
 
 import logging
@@ -82,11 +83,8 @@ def test_retry_after_clamped_at_construction():
 
 
 def test_short_error_reason_extracts_code_and_message():
-    body = ('{"error":{"code":"1305","message":"The service may be temporarily '
-            'overloaded, please try again later"}}')
-    assert _short_error_reason(body) == (
-        "1305 The service may be temporarily overloaded, please try again later"
-    )
+    body = '{"error":{"code":"1305","message":"The service may be temporarily overloaded, please try again later"}}'
+    assert _short_error_reason(body) == ("1305 The service may be temporarily overloaded, please try again later")
 
 
 def test_short_error_reason_flattens_and_truncates():
@@ -111,8 +109,7 @@ def test_transient_retry_logged_at_info_off_the_prompt_and_raise_is_clean(monkey
     # Transient auto-recovering retries log at INFO, not WARNING, so asi's
     # _TerminalInfoFilter (which suppresses INFO from asicode.*/external_llm.*)
     # keeps them off the interactive prompt while the file handler still records.
-    assert all(r.levelno == logging.INFO for r in rate_records), \
-        [(r.levelname, r.getMessage()) for r in rate_records]
+    assert all(r.levelno == logging.INFO for r in rate_records), [(r.levelname, r.getMessage()) for r in rate_records]
     # And they're terse — no raw JSON envelope.
     assert all("{" not in r.getMessage() for r in rate_records)
 
@@ -154,7 +151,6 @@ def test_parse_error_code_extracts_glm_error_codes():
     assert oc._parse_error_code(r) is None
 
 
-
 # ── _request_with_retry backoff semantics (#1 bug fix) ─────────────────────
 # Regression: ``_skipped_backoff`` used to be a STICKY flag — once a 429 with
 # Retry-After set it True, exponential backoff was disabled for ALL subsequent
@@ -172,6 +168,7 @@ class _Resp:
 
     def json(self):
         import json as _json
+
         return _json.loads(self.text)
 
 
@@ -196,27 +193,33 @@ def test_backoff_resumes_after_retry_after_then_5xx(monkeypatch):
     """429(Retry-After=1) -> 500 must apply exponential backoff on the 3rd
     attempt. The legacy sticky ``_skipped_backoff`` would skip it entirely
     (sleeps == [1.0] only); the one-shot fix yields [retry_after, backoff]."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(429, {"Retry-After": "1"}),   # attempt 0 -> retry_after sleep
-        _Resp(500),                          # attempt 1 -> backoff skipped (just slept)
-        _Resp(500),                          # attempt 2 -> MUST backoff, then give up
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(429, {"Retry-After": "1"}),  # attempt 0 -> retry_after sleep
+            _Resp(500),  # attempt 1 -> backoff skipped (just slept)
+            _Resp(500),  # attempt 2 -> MUST backoff, then give up
+        ],
+    )
     with pytest.raises(LLMServerUnavailableError):
         client._request_with_retry("http://x", {}, {}, tag="chat")
     # sleeps[0] == 1.0 (Retry-After honored), sleeps[1] == exponential backoff
     # resumed on the 3rd attempt. The bug produced sleeps == [1.0] only.
     assert len(sleeps) >= 2, f"backoff was permanently disabled: {sleeps}"
     assert sleeps[0] == 1.0  # Retry-After
-    assert sleeps[1] > 1.0   # resumed exponential backoff (4s base + jitter)
+    assert sleeps[1] > 1.0  # resumed exponential backoff (4s base + jitter)
 
 
 def test_retry_after_skips_only_the_next_backoff(monkeypatch):
     """429(Retry-After=1) -> 200: the second attempt runs immediately (no
     backoff), because we just slept for Retry-After. sleep list == [1.0]."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(429, {"Retry-After": "1"}),
-        _Resp(200, text='{"choices":[]}'),
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(429, {"Retry-After": "1"}),
+            _Resp(200, text='{"choices":[]}'),
+        ],
+    )
     resp = client._request_with_retry("http://x", {}, {}, tag="chat")
     assert resp.status_code == 200
     assert sleeps == [1.0], f"expected only the Retry-After sleep: {sleeps}"
@@ -225,11 +228,14 @@ def test_retry_after_skips_only_the_next_backoff(monkeypatch):
 def test_plain_5xx_uses_exponential_backoff(monkeypatch):
     """5xx with no preceding Retry-After uses normal exponential backoff on
     every retry (no skip semantics involved)."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(503),
-        _Resp(503),
-        _Resp(503),
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(503),
+            _Resp(503),
+            _Resp(503),
+        ],
+    )
     with pytest.raises(LLMServerUnavailableError):
         client._request_with_retry("http://x", {}, {}, tag="chat")
     # Two backoff sleeps (retry 1: ~4s, retry 2: ~8s), no Retry-After.
@@ -241,9 +247,12 @@ def test_plain_5xx_uses_exponential_backoff(monkeypatch):
 
 def test_helper_returns_response_on_success(monkeypatch):
     """A 200 response is returned immediately with no retries/sleeps."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(200, text='{"choices":[]}'),
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(200, text='{"choices":[]}'),
+        ],
+    )
     resp = client._request_with_retry("http://x", {}, {}, tag="chat")
     assert resp.status_code == 200
     assert sleeps == []
@@ -257,7 +266,8 @@ def test_connection_error_retries_with_backoff(monkeypatch):
     client, sleeps = _tracking_client(monkeypatch, [])
     # Override post to always raise ConnectionError.
     monkeypatch.setattr(
-        client._session, "post",
+        client._session,
+        "post",
         lambda *a, **k: (_ for _ in ()).throw(_requests.ConnectionError("boom")),
     )
     with pytest.raises(LLMServerUnavailableError):
@@ -269,10 +279,13 @@ def test_connection_error_retries_with_backoff(monkeypatch):
 def test_chat_uses_unified_retry_helper(monkeypatch):
     """chat() must route through _request_with_retry (dedup regression):
     a 429-then-success sequence yields exactly one Retry-After sleep."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(429, {"Retry-After": "2"}),
-        _Resp(200, text='{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}'),
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(429, {"Retry-After": "2"}),
+            _Resp(200, text='{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}'),
+        ],
+    )
     resp = client.chat([LLMMessage(role="user", content="hi")], model="gpt-4")
     assert resp.content == "hi"
     assert sleeps == [2.0]
@@ -290,8 +303,7 @@ def test_chat_uses_unified_retry_helper(monkeypatch):
 from external_llm.client import LLMQuotaExceededError
 
 _ZAI_BALANCE_BODY = (
-    '{"error":{"code":"1113","message":"Insufficient balance or no resource '
-    'package. Please recharge."}}'
+    '{"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}'
 )
 
 
@@ -317,9 +329,12 @@ def test_is_balance_quota_response_false_for_genuine_rate_limit():
 def test_balance_429_raises_quota_error_not_rate_limit(monkeypatch):
     """A 429 carrying a balance signal must raise LLMQuotaExceededError
     immediately, WITHOUT consuming the retry budget (no sleeps)."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(429, text=_ZAI_BALANCE_BODY),
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(429, text=_ZAI_BALANCE_BODY),
+        ],
+    )
     with pytest.raises(LLMQuotaExceededError):
         client._request_with_retry("http://x", {}, {}, tag="chat")
     # No backoff/Retry-After sleep — raised on the first attempt.
@@ -330,9 +345,12 @@ def test_balance_429_via_chat_raises_quota_error(monkeypatch):
     """End-to-end: chat() path surfaces the balance failure as a quota error,
     not a rate-limit error — so design_chat's error_type stays non-auth and the
     REPL never offers the misleading "re-enter your API key" prompt."""
-    client, sleeps = _tracking_client(monkeypatch, [
-        _Resp(429, text=_ZAI_BALANCE_BODY),
-    ])
+    client, sleeps = _tracking_client(
+        monkeypatch,
+        [
+            _Resp(429, text=_ZAI_BALANCE_BODY),
+        ],
+    )
     with pytest.raises(LLMQuotaExceededError):
         client.chat([LLMMessage(role="user", content="hi")], model="glm-4.6")
     assert sleeps == []
@@ -428,7 +446,8 @@ def test_no_cancel_event_unchanged_behavior(monkeypatch):
     assert client.cancel_event is None
     calls = []
     monkeypatch.setattr(
-        oc, "interruptible_sleep",
+        oc,
+        "interruptible_sleep",
         lambda d, ce=None: calls.append((d, ce)) or False,
     )
 

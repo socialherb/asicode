@@ -5,9 +5,8 @@ since no bundled Swift toolchain is assumed. Symbols are served via the
 provider index (_nonpy_index_for), removing the need for the legacy
 hardcoded rg fallback.
 """
-from __future__ import annotations
 
-from typing import Optional
+from __future__ import annotations
 
 from .base import SyntaxProvider, tree_sitter_syntax_fallback
 from .models import (
@@ -45,32 +44,42 @@ class SwiftSyntaxProvider(SyntaxProvider):
         patterns: list[SymbolPattern] = []
         if kind in ("function", "method", "any"):
             # func name(  or  func name<T>(  (generic parameter clause).
-            patterns.append(SymbolPattern(
-                kind="function",
-                regex=r"\bfunc\s+{name}\s*[<(]",
-                description="Swift function declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="function",
+                    regex=r"\bfunc\s+{name}\s*[<(]",
+                    description="Swift function declaration",
+                )
+            )
         if kind in ("class", "any"):
-            patterns.append(SymbolPattern(
-                kind="class",
-                regex=r"\bclass\s+{name}\s*[:(<{]",
-                description="Swift class declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="struct",
-                regex=r"\bstruct\s+{name}\s*[:(<{]",
-                description="Swift struct declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="protocol",
-                regex=r"\bprotocol\s+{name}\s*[:(<{]",
-                description="Swift protocol declaration",
-            ))
-            patterns.append(SymbolPattern(
-                kind="enum",
-                regex=r"\benum\s+{name}\s*[:(<{]",
-                description="Swift enum declaration",
-            ))
+            patterns.append(
+                SymbolPattern(
+                    kind="class",
+                    regex=r"\bclass\s+{name}\s*[:(<{]",
+                    description="Swift class declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="struct",
+                    regex=r"\bstruct\s+{name}\s*[:(<{]",
+                    description="Swift struct declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="protocol",
+                    regex=r"\bprotocol\s+{name}\s*[:(<{]",
+                    description="Swift protocol declaration",
+                )
+            )
+            patterns.append(
+                SymbolPattern(
+                    kind="enum",
+                    regex=r"\benum\s+{name}\s*[:(<{]",
+                    description="Swift enum declaration",
+                )
+            )
         return patterns
 
     # ── File globs ────────────────────────────────────────────────────────
@@ -78,17 +87,13 @@ class SwiftSyntaxProvider(SyntaxProvider):
     def get_file_globs(self) -> list[str]:
         return ["*.swift"]
 
-    def get_lint_command(self, file_path: str) -> Optional[list[str]]:
+    def get_lint_command(self, file_path: str) -> list[str] | None:
         return None
 
-    def get_test_command(
-        self, repo_root: str, test_args: Optional[list[str]] = None
-    ) -> Optional[list[str]]:
+    def get_test_command(self, repo_root: str, test_args: list[str] | None = None) -> list[str] | None:
         return None
 
-    def find_symbol_in_file(
-        self, file_path: str, symbol_name: str, content: str
-    ) -> Optional[tuple[int, int]]:
+    def find_symbol_in_file(self, file_path: str, symbol_name: str, content: str) -> tuple[int, int] | None:
         return None
 
     def get_definition_keywords(self) -> list[str]:

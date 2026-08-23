@@ -79,6 +79,14 @@ debug_dump/
 debug_*.py
 keyword_reality_*.txt
 
+# Scratch probe files (keep out of structural scan / release verify)
+# NOTE: the structural gate's per-file union (_untracked_scan_files) and
+# full-scan mode (check_structural_scanners.py) ALSO exclude *_probe.py /
+# _f1_* — .gitignore alone is NOT sufficient because the full-scan os.walk
+# does not read .gitignore.  Keep these in sync with that exclusion.
+_f1_*.py
+*_probe.py
+
 # Temporary plan/test artifacts
 plan.json
 node_modules/

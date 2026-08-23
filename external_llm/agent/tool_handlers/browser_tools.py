@@ -37,13 +37,18 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as _FutureTimeout
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from external_llm.pip_env import ensure_user_site_importable, pip_install_flags
 
 from ...client import interruptible_sleep
 from ..agent_loop_types import AgentCancelled
-from ..cancel_scope import call_cancel_scope, current_cancel_event, effective_cancel
+from ..cancel_scope import (
+    _CompositeCancel,
+    call_cancel_scope,
+    current_cancel_event,
+    effective_cancel,
+)
 
 if TYPE_CHECKING:
     from ..tool_registry import ToolResult
@@ -85,8 +90,8 @@ PLAYWRIGHT_BROWSER_AVAILABLE = _playwright_browser_installed()
 
 # Bound on first use by _ensure_playwright_imported(); _reload_playwright_module()
 # rebinds the same three names after a late install.
-sync_playwright = None
-_PlaywrightTimeout = Exception
+sync_playwright: Any = None  # callable once imported: sync_playwright().start()
+_PlaywrightTimeout: Any = Exception
 
 
 def _ensure_playwright_imported() -> bool:
@@ -105,6 +110,7 @@ def _ensure_playwright_imported() -> bool:
     sync_playwright = _sync_pw
     _PlaywrightTimeout = _PwTimeout
     return True
+
 
 # ── Dedicated single-thread executor for all Playwright work ─────────── #
 # Playwright's sync API binds its greenlet driver to the thread that called
@@ -240,9 +246,17 @@ class BrowserActionToolsMixin:
     _user_agent = None  # de-headlessed UA, derived once per browser (see _browser_user_agent)
     _pw_install_lock = threading.Lock()  # serialise Playwright install across threads
 
+    # ── Host contract (provided by ToolRegistry / AgentToolsMixin) ───── #
+    # These names are supplied by the host classes this mixin is mounted
+    # onto; class-level annotations keep pyright from flagging the calls
+    # below (P29 pattern — same as web_search_tools / read_tools).
+    _make_result: Any
+    _tool_ask_user: Any
+    repo_root: str
+
     # ── Public dispatch entry point ───────────────────────────────────── #
 
-    def _live_cancel_event(self) -> Optional[threading.Event]:
+    def _live_cancel_event(self) -> threading.Event | _CompositeCancel | None:
         """The registry's current cancel events as a cooperative-channel source.
 
         Merges the agent-loop ``config.cancel_event`` (whole-turn ESC) with any
@@ -255,11 +269,9 @@ class BrowserActionToolsMixin:
         Defensive ``getattr``: the mixin is also mounted on duck-typed test
         hosts that carry no ``config`` attribute.
         """
-        return effective_cancel(
-            getattr(getattr(self, "config", None), "cancel_event", None)
-        )
+        return effective_cancel(getattr(getattr(self, "config", None), "cancel_event", None))
 
-    def _tool_browser_action(self, args: dict[str, Any]) -> "ToolResult":
+    def _tool_browser_action(self, args: dict[str, Any]) -> ToolResult:
         """Browser automation: navigate, click, type, extract, screenshot, evaluate, wait, close."""
         action = str(args.get("action", "")).strip().lower()
 
@@ -285,7 +297,7 @@ class BrowserActionToolsMixin:
                     )
             # Module-level names updated by _reload_playwright_module; proceed.
 
-        _ACTIONS = {
+        _actions = {
             "navigate": self._browser_navigate,
             "click": self._browser_click,
             "type": self._browser_type,
@@ -296,12 +308,12 @@ class BrowserActionToolsMixin:
             "close": self._browser_close,
         }
 
-        handler = _ACTIONS.get(action)
+        handler = _actions.get(action)
         if handler is None:
             return self._make_result(
                 ok=False,
                 content="",
-                error=f"Unknown action: '{action}'. Available: {', '.join(sorted(_ACTIONS))}",
+                error=f"Unknown action: '{action}'. Available: {', '.join(sorted(_actions))}",
             )
 
         # Per-call cancel scope capture: this method runs on the calling
@@ -313,10 +325,12 @@ class BrowserActionToolsMixin:
         # a whole-turn ESC. None when no scope (serial dispatch) → no-op.
         _caller_scope = current_cancel_event()
 
-        def _run() -> "ToolResult":
+        def _run() -> ToolResult:
             try:
-                with call_cancel_scope(_caller_scope):
-                    return handler(args)
+                if _caller_scope is not None:
+                    with call_cancel_scope(_caller_scope):
+                        return handler(args)
+                return handler(args)
             except AgentCancelled:
                 # ESC mid-action must abort the turn, not become a generic
                 # "Browser action failed" ToolResult (B904).
@@ -467,6 +481,7 @@ class BrowserActionToolsMixin:
         code paths (guard, ``_get_browser``, ``_run`` exception handler) pick
         up the new values without requiring a process restart.
         """
+        global sync_playwright, _PlaywrightTimeout, HAS_PLAYWRIGHT
         try:
             # A just-completed ``--user`` install may land in a user-site dir
             # that was absent (hence not on sys.path) at interpreter startup;
@@ -475,10 +490,9 @@ class BrowserActionToolsMixin:
             ensure_user_site_importable()
             importlib.invalidate_caches()
             sync_mod = importlib.import_module("playwright.sync_api")
-            mod = sys.modules[__name__]
-            mod.sync_playwright = sync_mod.sync_playwright
-            mod._PlaywrightTimeout = sync_mod.TimeoutError
-            mod.HAS_PLAYWRIGHT = True
+            sync_playwright = sync_mod.sync_playwright
+            _PlaywrightTimeout = sync_mod.TimeoutError
+            HAS_PLAYWRIGHT = True
         except ImportError as e:
             logger.exception("Failed to import Playwright after installation: %s", e)
             return False
@@ -487,7 +501,7 @@ class BrowserActionToolsMixin:
 
     # ── Browser lifecycle helpers ─────────────────────────────────────── #
 
-    def _get_browser(self):
+    def _get_browser(self) -> Any:
         """Lazy-init and return the shared Playwright browser instance."""
         if BrowserActionToolsMixin._browser is None:
             # Callers reach here only past a HAS_PLAYWRIGHT guard, but bind
@@ -541,7 +555,7 @@ class BrowserActionToolsMixin:
                 return None
         return BrowserActionToolsMixin._user_agent
 
-    def _get_page(self):
+    def _get_page(self) -> Any:
         """Get or create a page in the shared browser.
 
         Recreates the page if the existing one was closed (crash / user close).
@@ -615,9 +629,7 @@ class BrowserActionToolsMixin:
         if not HAS_PLAYWRIGHT or not _ensure_playwright_imported():
             with BrowserActionToolsMixin._pw_install_lock:
                 if not self._ensure_playwright_installed():
-                    raise RuntimeError(
-                        "Playwright is not available (automatic install declined or failed)"
-                    )
+                    raise RuntimeError("Playwright is not available (automatic install declined or failed)")
 
         per_call = _clamp_per_call_timeout_ms(timeout_ms)
         if wait_until not in ("load", "domcontentloaded", "networkidle", "commit"):
@@ -647,8 +659,7 @@ class BrowserActionToolsMixin:
         except _FutureTimeout:
             _reset_browser_on_wedge()
             raise RuntimeError(
-                f"browser render did not complete within {_BROWSER_HARD_TIMEOUT_SEC}s; "
-                "the browser session was reset"
+                f"browser render did not complete within {_BROWSER_HARD_TIMEOUT_SEC}s; the browser session was reset"
             ) from None
 
     def _screenshot_dir(self) -> str:
@@ -664,7 +675,7 @@ class BrowserActionToolsMixin:
 
     # ── Action handlers ───────────────────────────────────────────────── #
 
-    def _browser_navigate(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_navigate(self, args: dict[str, Any]) -> ToolResult:
         url = str(args.get("url", "")).strip()
         timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
         max_chars = int(args.get("max_chars", 15000))
@@ -703,7 +714,7 @@ class BrowserActionToolsMixin:
             metadata={"title": title, "url": final_url, "length": reported_len, "total_length": total_len},
         )
 
-    def _browser_click(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_click(self, args: dict[str, Any]) -> ToolResult:
         selector = str(args.get("selector", "")).strip()
         timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
 
@@ -720,7 +731,7 @@ class BrowserActionToolsMixin:
             metadata={"selector": selector},
         )
 
-    def _browser_type(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_type(self, args: dict[str, Any]) -> ToolResult:
         selector = str(args.get("selector", "")).strip()
         text = args.get("text", "")
         timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
@@ -738,7 +749,7 @@ class BrowserActionToolsMixin:
             metadata={"selector": selector, "text_length": len(text)},
         )
 
-    def _browser_extract(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_extract(self, args: dict[str, Any]) -> ToolResult:
         page = self._get_page()
         text = page.inner_text("body")
         title = page.title()
@@ -760,7 +771,7 @@ class BrowserActionToolsMixin:
             metadata={"title": title, "url": url, "length": reported_len, "total_length": total_len},
         )
 
-    def _browser_screenshot(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_screenshot(self, args: dict[str, Any]) -> ToolResult:
         page = self._get_page()
         filename = f"browser_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
         filepath = os.path.join(self._screenshot_dir(), filename)
@@ -773,7 +784,7 @@ class BrowserActionToolsMixin:
             metadata={"filepath": filepath, "url": page.url},
         )
 
-    def _browser_evaluate(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_evaluate(self, args: dict[str, Any]) -> ToolResult:
         js = str(args.get("js", "")).strip()
 
         if not js:
@@ -788,7 +799,7 @@ class BrowserActionToolsMixin:
             metadata={"result_type": type(result).__name__},
         )
 
-    def _browser_wait(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_wait(self, args: dict[str, Any]) -> ToolResult:
         selector = args.get("selector")
         timeout = _clamp_per_call_timeout_ms(args.get("timeout", 30000))
 
@@ -810,6 +821,6 @@ class BrowserActionToolsMixin:
             content=f"Waited {wait_ms / 1000:.1f}s (no selector given).",
         )
 
-    def _browser_close(self, args: dict[str, Any]) -> "ToolResult":
+    def _browser_close(self, args: dict[str, Any]) -> ToolResult:
         self._close_shared_browser()
         return self._make_result(ok=True, content="Browser closed and resources released.")

@@ -8,6 +8,7 @@ images entirely: only ``role`` + ``content`` were sent, so a local vision model
 placeholder. The agent loop always uses ``chat_with_tools`` for Ollama
 (``_NATIVE_TOOL_PROVIDERS``), so ``chat`` alone was never enough.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -59,12 +60,8 @@ IMAGE = {"media_type": "image/png", "data": "AAAA"}
 
 def _client(monkeypatch) -> OllamaClient:
     """OllamaClient with the network stubbed and num_ctx/capability queries inert."""
-    monkeypatch.setattr(
-        "external_llm.ollama_api.query_ollama_num_ctx", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        "external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None
-    )
+    monkeypatch.setattr("external_llm.ollama_api.query_ollama_num_ctx", lambda *a, **k: None)
+    monkeypatch.setattr("external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None)
     client = OllamaClient(base_url="http://ollama.test")
     client._session = _FakeSession()  # type: ignore[assignment]
     return client
@@ -92,9 +89,7 @@ def test_chat_with_tools_vision_model_sends_native_images(monkeypatch):
 
 def test_chat_with_tools_non_vision_model_gets_ocr_text(monkeypatch):
     client = _client(monkeypatch)
-    client.chat_with_tools(
-        _user_messages([IMAGE]), tools=[], model="qwen2.5-coder:3b"
-    )
+    client.chat_with_tools(_user_messages([IMAGE]), tools=[], model="qwen2.5-coder:3b")
     _, payload = client._session.calls[-1]  # type: ignore[attr-defined]
     user_msg = payload["messages"][1]
     assert "images" not in user_msg
@@ -105,9 +100,7 @@ def test_chat_with_tools_non_vision_model_gets_ocr_text(monkeypatch):
 def test_chat_with_tools_system_message_keeps_images_out(monkeypatch):
     """Images only ride on the user turn — the system turn stays clean."""
     client = _client(monkeypatch)
-    client.chat_with_tools(
-        _user_messages([IMAGE]), tools=[], model="llava:13b"
-    )
+    client.chat_with_tools(_user_messages([IMAGE]), tools=[], model="llava:13b")
     _, payload = client._session.calls[-1]  # type: ignore[attr-defined]
     sys_msg = payload["messages"][0]
     assert sys_msg["role"] == "system"
@@ -162,9 +155,7 @@ def test_chat_and_chat_with_tools_image_parity_non_vision(monkeypatch):
 def test_ollama_vision_keyword_detection(monkeypatch, model, expected):
     from external_llm.model_registry import ollama_vision
 
-    monkeypatch.setattr(
-        "external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None
-    )
+    monkeypatch.setattr("external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None)
     assert ollama_vision(model) is expected
 
 
@@ -186,9 +177,7 @@ def test_ollama_vision_slow_path_uses_capabilities(monkeypatch):
 def test_ollama_vision_slow_path_unknown_is_false(monkeypatch):
     from external_llm.model_registry import ollama_vision
 
-    monkeypatch.setattr(
-        "external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None
-    )
+    monkeypatch.setattr("external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None)
     assert ollama_vision("gemma3:27b") is False
 
 
@@ -207,7 +196,5 @@ def test_ollama_supports_tools_wired_to_capabilities(monkeypatch):
     )
     assert ollama_supports_tools("gemma3:27b") is False
 
-    monkeypatch.setattr(
-        "external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None
-    )
+    monkeypatch.setattr("external_llm.model_registry.query_ollama_capabilities", lambda *a, **k: None)
     assert ollama_supports_tools("gemma3:27b") is None

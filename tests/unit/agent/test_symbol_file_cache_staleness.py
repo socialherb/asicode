@@ -18,6 +18,7 @@ Two independent layers, tested separately because they fail differently:
 * :meth:`SymbolSearcher.invalidate_file_caches` — catches the rest, including a
   same-size edit, and needs no filesystem assumptions.
 """
+
 from __future__ import annotations
 
 import os
@@ -33,8 +34,7 @@ PINNED = 1_700_000_000
 
 # Size-CHANGING edit: `target` moves 5 -> 9 and `inserted` appears.
 V1 = 'def alpha():\n    return 1\n\n\ndef target():\n    return "ORIGINAL"\n'
-V2 = ('def alpha():\n    return 1\n\n\ndef inserted():\n    return 0\n\n\n'
-      'def target():\n    return "EDITED"\n')
+V2 = 'def alpha():\n    return 1\n\n\ndef inserted():\n    return 0\n\n\ndef target():\n    return "EDITED"\n'
 
 # Same-SIZE edit: byte-identical length, `target` moves 1 -> 5. The signature
 # cannot see this one at all; only explicit invalidation can.
@@ -75,8 +75,7 @@ class TestSignatureLayer:
         assert f.stat().st_mtime == PINNED
 
         assert _line_of(s, f) == 9, "stale line number served from cache"
-        assert s._find_in_python_cached(f, "inserted", "function"), \
-            "symbol added by the edit is invisible"
+        assert s._find_in_python_cached(f, "inserted", "function"), "symbol added by the edit is invisible"
 
     def test_same_size_edit_defeats_the_signature(self, repo: Path):
         """Pins WHY invalidate_file_caches has to exist."""
@@ -147,9 +146,7 @@ class TestPostWriteWiring:
     def test_invalidate_cache_after_write_drops_per_file_maps(self, repo: Path):
         f = repo / "m.py"
         _write_pinned(f, S1)
-        reg = ToolRegistry(
-            str(repo), AgentConfig(rag_enabled=False)
-        )
+        reg = ToolRegistry(str(repo), AgentConfig(rag_enabled=False))
         s = reg._symbol_searcher
         assert _line_of(s, f) == 1
         assert s._py_file_cache, "precondition: cache warmed"
@@ -163,9 +160,7 @@ class TestPostWriteWiring:
         """bash can write anything — the wholesale path must cover these too."""
         f = repo / "m.py"
         _write_pinned(f, S1)
-        reg = ToolRegistry(
-            str(repo), AgentConfig(rag_enabled=False)
-        )
+        reg = ToolRegistry(str(repo), AgentConfig(rag_enabled=False))
         s = reg._symbol_searcher
         assert _line_of(s, f) == 1
 
@@ -173,4 +168,3 @@ class TestPostWriteWiring:
         reg._invalidate_caches_unknown_scope()
 
         assert _line_of(s, f) == 5
-

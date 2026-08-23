@@ -4,6 +4,7 @@ Covers the graceful-degrade contract: when ``tsc`` is not on ``$PATH``
 the provider must fall back to tree-sitter syntax checking rather than
 silently returning ``ok=True``.
 """
+
 from unittest.mock import patch
 
 from external_llm.languages.models import LanguageId
@@ -22,17 +23,13 @@ class TestTscAbsentDegrade:
 
     def test_valid_passes_tree_sitter_fallback(self):
         with self._tool_absent():
-            r = TypeScriptSyntaxProvider().validate_syntax(
-                "app.ts", "const x: number = 1;"
-            )
+            r = TypeScriptSyntaxProvider().validate_syntax("app.ts", "const x: number = 1;")
         assert r.ok is True
         assert r.language is LanguageId.TYPESCRIPT
 
     def test_syntax_error_caught_by_tree_sitter(self):
         with self._tool_absent():
-            r = TypeScriptSyntaxProvider().validate_syntax(
-                "app.ts", "const x: number = ;"
-            )
+            r = TypeScriptSyntaxProvider().validate_syntax("app.ts", "const x: number = ;")
         assert r.ok is False
         assert r.language is LanguageId.TYPESCRIPT
         assert len(r.errors) >= 1
@@ -57,18 +54,14 @@ class TestTsxFallback:
     def test_valid_tsx_with_jsx_passes(self):
         """Valid JSX in a .tsx file must not be rolled back."""
         with self._tool_absent():
-            r = TypeScriptSyntaxProvider().validate_syntax(
-                "component.tsx", "const A = () => <div>hello</div>;"
-            )
+            r = TypeScriptSyntaxProvider().validate_syntax("component.tsx", "const A = () => <div>hello</div>;")
         assert r.ok is True
         assert r.language is LanguageId.TYPESCRIPT
 
     def test_syntax_error_tsx_caught(self):
         """Genuine syntax error in a .tsx file must still be caught."""
         with self._tool_absent():
-            r = TypeScriptSyntaxProvider().validate_syntax(
-                "broken.tsx", "const A = () => <div>hello</div"
-            )
+            r = TypeScriptSyntaxProvider().validate_syntax("broken.tsx", "const A = () => <div>hello</div")
         assert r.ok is False
         assert r.language is LanguageId.TYPESCRIPT
         assert len(r.errors) >= 1
@@ -78,6 +71,7 @@ class TestTsxFallback:
 class TestTsRegistryWiring:
     def test_ts_provider_registered(self):
         from external_llm.languages.registry import LanguageRegistry
+
         r = LanguageRegistry.instance()
         prov = r.get("app.ts")
         assert prov.__class__.__name__ == "TypeScriptSyntaxProvider"

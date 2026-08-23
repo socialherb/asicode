@@ -18,7 +18,7 @@ import threading
 import weakref
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy
@@ -65,6 +65,7 @@ def _suppress_hf_progress():
             except Exception:
                 logger.debug("_suppress_hf_progress: _restore() failed", exc_info=True)
 
+
 # Embedding model. Default to the multilingual MiniLM so non-English requests
 # (this project's prompts are often Korean) embed well; it is the same 384-dim
 # space as the previous English-only all-MiniLM-L6-v2, so FAISS index structure
@@ -95,6 +96,7 @@ def _embedding_model_candidates() -> list:
             candidates.append(name)
     return candidates
 
+
 # Detect availability WITHOUT loading the full numpy/faiss modules (~100ms combined, +175 imported modules).
 # Actual imports are deferred to _ensure_np_imported() / _ensure_faiss_imported().
 
@@ -119,6 +121,8 @@ if not HAS_SENTENCE_TRANSFORMERS:
 # Module-level attribute kept for patch() compatibility in tests.
 # Replaced with the real class on first lazy import via _ensure_st_imported().
 SentenceTransformer = None
+
+
 def _ensure_np_imported() -> None:
     """Lazy import of numpy (first call ~40ms, subsequent calls no-op)."""
     global _np
@@ -128,6 +132,7 @@ def _ensure_np_imported() -> None:
         return
     try:
         import numpy as _n
+
         _np = _n
     except ImportError:
         logger.debug("numpy import failed (HAS_NUMPY was stale)")
@@ -142,6 +147,7 @@ def _ensure_faiss_imported() -> None:
         return
     try:
         import faiss as _f
+
         _faiss = _f
     except ImportError:
         logger.debug("faiss import failed (HAS_FAISS was stale)")
@@ -160,19 +166,21 @@ def _ensure_st_imported() -> None:
         return
     try:
         from sentence_transformers import SentenceTransformer as _ST  # noqa: N814 — private lazy-import alias
+
         SentenceTransformer = _ST
     except ImportError:
         HAS_SENTENCE_TRANSFORMERS = False
         logger.warning("SentenceTransformers not installed, vector cache disabled")
 
+
 # Global embedding model singleton
-_global_embedding_model: "Optional[SentenceTransformer]" = None
+_global_embedding_model: Any | None = None
 _embedding_model_lock = threading.Lock()
 _embedding_model_dimension: int = 384  # Multilingual MiniLM-L12-v2 is also 384-d
-_loaded_embedding_model_name: "Optional[str]" = None
+_loaded_embedding_model_name: str | None = None
 
 
-def _read_embedding_dimension(model: "SentenceTransformer", fallback: int = 384) -> int:
+def _read_embedding_dimension(model: Any, fallback: int = 384) -> int:
     """Best-effort embedding dimension, tolerant of SentenceTransformer API drift.
 
     Prefer the current ``get_embedding_dimension`` name; ``get_sentence_embedding_dimension``
@@ -184,15 +192,13 @@ def _read_embedding_dimension(model: "SentenceTransformer", fallback: int = 384)
             try:
                 dim = getter()
                 if dim:
-                    return int(dim)
+                    return int(dim)  # type: ignore[arg-type]  # getattr result is object; API returns int/float
             except Exception:
-                logger.debug(
-                    "_read_embedding_dimension: %s() failed", attr, exc_info=True
-                )
+                logger.debug("_read_embedding_dimension: %s() failed", attr, exc_info=True)
     return fallback
 
 
-def get_global_embedding_model() -> "Optional[SentenceTransformer]":
+def get_global_embedding_model() -> Any | None:
     """Get or create global SentenceTransformer instance."""
     global _global_embedding_model, _embedding_model_dimension, _loaded_embedding_model_name
 
@@ -208,6 +214,7 @@ def get_global_embedding_model() -> "Optional[SentenceTransformer]":
             return _global_embedding_model
 
         _ensure_st_imported()
+        assert SentenceTransformer is not None  # HAS_SENTENCE_TRANSFORMERS gate guarantees import succeeded
         candidates = _embedding_model_candidates()
         for i, model_name in enumerate(candidates):
             try:
@@ -221,7 +228,8 @@ def get_global_embedding_model() -> "Optional[SentenceTransformer]":
                     logger.warning(
                         "Embedding model %r unavailable; fell back to %r. "
                         "Run online once to fetch the preferred model.",
-                        candidates[0], model_name,
+                        candidates[0],
+                        model_name,
                     )
                 logger.info("Model loaded with dimension %s", _embedding_model_dimension)
             except Exception as e:
@@ -235,7 +243,7 @@ def get_global_embedding_model() -> "Optional[SentenceTransformer]":
         return None
 
 
-def set_active_embedding_model(model_name: str) -> "Optional[SentenceTransformer]":
+def set_active_embedding_model(model_name: str) -> Any | None:
     """Force-load a specific model and install it as the global singleton.
 
     Bypasses the preferred→fallback candidate order of ``get_global_embedding_model``.
@@ -251,6 +259,7 @@ def set_active_embedding_model(model_name: str) -> "Optional[SentenceTransformer
 
     with _embedding_model_lock:
         _ensure_st_imported()
+        assert SentenceTransformer is not None  # HAS_SENTENCE_TRANSFORMERS gate guarantees import succeeded
         try:
             logger.info("Loading SentenceTransformer model %r...", model_name)
             with _suppress_hf_progress():
@@ -269,7 +278,7 @@ def get_global_embedding_dimension() -> int:
     return _embedding_model_dimension
 
 
-def get_loaded_embedding_model_name() -> Optional[str]:
+def get_loaded_embedding_model_name() -> str | None:
     """Name of the model actually loaded, or None if not yet loaded."""
     return _loaded_embedding_model_name
 
@@ -351,7 +360,7 @@ def warmup_embedding_model() -> None:
 # atexit hook; both are already gone by the time __del__ runs at shutdown).
 # __del__ keeps handling only the live-interpreter case (manager dropped
 # mid-session).
-_live_managers: "weakref.WeakSet[VectorCacheManager]" = weakref.WeakSet()
+_live_managers: weakref.WeakSet[VectorCacheManager] = weakref.WeakSet()
 _atexit_registered = False
 _atexit_guard = threading.Lock()
 
@@ -463,9 +472,7 @@ class VectorCacheManager:
         self.index, self.id_to_doc = self._load_or_create_index()
         # Rebuild reverse-lookup from loaded metadata.
         self._doc_id_to_idx = {
-            doc["doc_id"]: idx
-            for idx, doc in self.id_to_doc.items()
-            if isinstance(doc, dict) and "doc_id" in doc
+            doc["doc_id"]: idx for idx, doc in self.id_to_doc.items() if isinstance(doc, dict) and "doc_id" in doc
         }
 
     def _cached_model_matches(self) -> bool:
@@ -481,7 +488,7 @@ class VectorCacheManager:
             return False
         return stored == self.model_name
 
-    def _load_or_create_index(self) -> tuple[Optional[Any], dict[int, dict]]:
+    def _load_or_create_index(self) -> tuple[Any | None, dict[int, dict]]:
         """Load existing FAISS index and metadata, or create new ones.
 
         Existing vectors are reused only when they were produced by the current
@@ -494,11 +501,12 @@ class VectorCacheManager:
         if self.index_path.exists() and self.metadata_path.exists():
             if not self._cached_model_matches():
                 logger.info(
-                    "Vector cache was built with a different embedding model; "
-                    "rebuilding for %s", self.model_name,
+                    "Vector cache was built with a different embedding model; rebuilding for %s",
+                    self.model_name,
                 )
             else:
                 try:
+                    assert _faiss is not None  # HAS_FAISS gate guarantees import succeeded
                     index = _faiss.read_index(str(self.index_path))
                     if index.d != self.dimension:
                         # The marker can match by name while the persisted
@@ -510,7 +518,8 @@ class VectorCacheManager:
                         # is built at the current model's width.
                         logger.warning(
                             "Vector cache dimension %d != model dimension %d; rebuilding",
-                            index.d, self.dimension,
+                            index.d,
+                            self.dimension,
                         )
                         raise ValueError("dimension mismatch")
                     with open(self.metadata_path, encoding="utf-8") as f:
@@ -533,14 +542,11 @@ class VectorCacheManager:
                     # 7700 re-embeddings). The lost tail is bounded by the
                     # checkpoint cadence, same as any crash.
                     _recovered = False
-                    if (
-                        index.ntotal > len(id_to_doc)
-                        and id_to_doc
-                        and set(id_to_doc) == set(range(len(id_to_doc)))
-                    ):
+                    if index.ntotal > len(id_to_doc) and id_to_doc and set(id_to_doc) == set(range(len(id_to_doc))):
                         _ensure_np_imported()
                         _before = index.ntotal
                         _orphan = _before - len(id_to_doc)
+                        assert _np is not None  # HAS_NUMPY gate guarantees import succeeded
                         index.remove_ids(_np.arange(len(id_to_doc), _before))
                         # Persist the trimmed state on the next save.
                         self._dirty = True
@@ -548,13 +554,15 @@ class VectorCacheManager:
                         logger.warning(
                             "Vector cache: dropped %d orphan tail rows "
                             "(index=%d, metadata=%d); recovered without re-embedding",
-                            _orphan, _before, len(id_to_doc),
+                            _orphan,
+                            _before,
+                            len(id_to_doc),
                         )
                     if not _recovered and index.ntotal != len(id_to_doc):
                         logger.warning(
-                            "Vector cache index/metadata mismatch "
-                            "(index=%d rows, metadata=%d entries); rebuilding",
-                            index.ntotal, len(id_to_doc),
+                            "Vector cache index/metadata mismatch (index=%d rows, metadata=%d entries); rebuilding",
+                            index.ntotal,
+                            len(id_to_doc),
                         )
                     else:
                         # ── Legacy-entry migration: drop persisted 'content' ──
@@ -592,6 +600,7 @@ class VectorCacheManager:
                             _p.unlink(missing_ok=True)
 
         # Create new index
+        assert _faiss is not None  # HAS_FAISS gate guarantees import succeeded
         index = _faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
         id_to_doc = {}
         return index, id_to_doc
@@ -633,6 +642,7 @@ class VectorCacheManager:
         try:
             with self._io_lock:
                 _ensure_faiss_imported()
+                assert _faiss is not None  # HAS_FAISS gate guarantees import succeeded
                 _blob = _faiss.serialize_index(self.index)
                 _meta = dict(self.id_to_doc)
                 _gen = self._generation
@@ -640,9 +650,7 @@ class VectorCacheManager:
             logger.warning("Failed to serialize vector cache: %s", e)
             return
         try:
-            _fd, _tmp = tempfile.mkstemp(
-                dir=str(self.index_path.parent), prefix=".atomic_", suffix=".tmp"
-            )
+            _fd, _tmp = tempfile.mkstemp(dir=str(self.index_path.parent), prefix=".atomic_", suffix=".tmp")
             os.close(_fd)
         except OSError as e:
             # The cache dir vanished (rm -rf .asicode, pytest tmp teardown):
@@ -689,7 +697,7 @@ class VectorCacheManager:
             self.dimension = get_global_embedding_dimension()
             self.model_name = get_loaded_embedding_model_name() or self.model_name
 
-    def _compute_embedding(self, text: str) -> "numpy.ndarray":
+    def _compute_embedding(self, text: str) -> numpy.ndarray:
         """Compute embedding for text."""
         self._ensure_model_loaded()
         if self.embedding_model is None:
@@ -724,7 +732,7 @@ class VectorCacheManager:
         # must not block concurrent searches.
         try:
             embedding = self._compute_embedding(content)
-            embedding = embedding.reshape(1, -1).astype('float32')
+            embedding = embedding.reshape(1, -1).astype("float32")
 
             with self._io_lock:
                 # Re-check under the lock: a concurrent add may have inserted
@@ -736,8 +744,9 @@ class VectorCacheManager:
                 # (e.g. np.linalg.norm) cannot leave the FAISS index with a row that
                 # has no id_to_doc entry — an index/metadata desync that breaks every
                 # subsequent search with a KeyError on the orphaned row.
+                assert _np is not None  # HAS_NUMPY gate guarantees import succeeded
                 metadata = {
-                    'file_path': file_path,
+                    "file_path": file_path,
                     # Intentionally NOT storing full content: content is the ~96%
                     # of metadata.json size (35 KB per entry x 3359 files ≈ 117 MB),
                     # and snippets are extracted from the BM25 _doc_texts in the
@@ -746,16 +755,17 @@ class VectorCacheManager:
                     # populated; vector cache search falls back to "" for the rare
                     # desync case, which _vector_search handles gracefully (empty
                     # snippet, re-read from disk).
-                    'doc_id': doc_id,
+                    "doc_id": doc_id,
                     # Coerce numpy float32 scalar → Python float so the metadata
                     # dict is JSON-serializable (metadata is persisted as JSON, not
                     # pickle). Note: embedding_norm is not read back by any caller.
-                    'embedding_norm': float(_np.linalg.norm(embedding)),
+                    "embedding_norm": float(_np.linalg.norm(embedding)),
                 }
 
                 # Normalize so FAISS IndexFlatIP inner product = cosine similarity.
                 # search() already normalizes the query vector; the indexed
                 # vectors must also be normalized for the math to work correctly.
+                assert _faiss is not None  # HAS_FAISS gate guarantees import succeeded
                 _faiss.normalize_L2(embedding)
 
                 # Add to index, then record metadata. If the index mutated but the
@@ -835,7 +845,8 @@ class VectorCacheManager:
         try:
             contents = [c for (_did, _fp, c) in new_items]
             embeddings = self.embedding_model.encode(contents, convert_to_numpy=True, show_progress_bar=False)
-            embeddings = _np.asarray(embeddings, dtype='float32')
+            assert _np is not None  # HAS_NUMPY gate guarantees import succeeded
+            embeddings = _np.asarray(embeddings, dtype="float32")
             # encode() may return 1-D for a single-item list; normalise to 2-D.
             if embeddings.ndim == 1:
                 embeddings = embeddings.reshape(1, -1)
@@ -844,11 +855,7 @@ class VectorCacheManager:
                 # Re-filter under the lock: a concurrent add may have inserted
                 # some of these docs while we were embedding.  Drop them now
                 # (their embeddings were wasted, but dedup stays strict).
-                kept = [
-                    i
-                    for i, (doc_id, _fp, _c) in enumerate(new_items)
-                    if doc_id not in self._doc_id_to_idx
-                ]
+                kept = [i for i, (doc_id, _fp, _c) in enumerate(new_items) if doc_id not in self._doc_id_to_idx]
                 if not kept:
                     return
                 kept_items = [new_items[i] for i in kept]
@@ -857,7 +864,9 @@ class VectorCacheManager:
                 # Capture pre-normalization norms (matches add_document: the norm is
                 # read before normalize_L2). embedding_norm is not read back by any
                 # caller, but we keep the value consistent to avoid silent drift.
+                assert _np is not None  # HAS_NUMPY gate guarantees import succeeded
                 norms = _np.linalg.norm(kept_embeddings, axis=1)
+                assert _faiss is not None  # HAS_FAISS gate guarantees import succeeded
                 _faiss.normalize_L2(kept_embeddings)
 
                 # Build ALL metadata BEFORE touching the index so a failure here
@@ -865,11 +874,13 @@ class VectorCacheManager:
                 # index/metadata desync that breaks every subsequent search).
                 metadatas = []
                 for (doc_id, file_path, _content), pre_norm in zip(kept_items, norms, strict=True):
-                    metadatas.append({
-                        'file_path': file_path,
-                        'doc_id': doc_id,
-                        'embedding_norm': float(pre_norm),
-                    })
+                    metadatas.append(
+                        {
+                            "file_path": file_path,
+                            "doc_id": doc_id,
+                            "embedding_norm": float(pre_norm),
+                        }
+                    )
 
                 # Add the whole batch in one FAISS call (cheaper than N single-row
                 # adds), then record metadata + reverse lookups in lockstep.
@@ -906,12 +917,19 @@ class VectorCacheManager:
             logger.debug("Batch-added %s documents to vector cache (ntotal=%s)", len(kept_items), self.index.ntotal)
         except Exception as e:
             logger.warning("Failed to batch-add documents to vector cache: %s", e)
+
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         """Search for documents similar to query."""
         with self._io_lock:
             self._ensure_index_loaded()
             self._ensure_model_loaded()
-            if not HAS_NUMPY or not HAS_FAISS or self.index is None or self.index.ntotal == 0 or self.embedding_model is None:
+            if (
+                not HAS_NUMPY
+                or not HAS_FAISS
+                or self.index is None
+                or self.index.ntotal == 0
+                or self.embedding_model is None
+            ):
                 return []
             # Every other _faiss user guards itself; search() reaches _faiss only
             # when self.index is already set, which today only _load_or_create_index
@@ -923,11 +941,12 @@ class VectorCacheManager:
             # Compute query embedding (outside the lock: model inference must
             # not block concurrent adds).
             query_embedding = self._compute_embedding(query)
-            query_embedding = query_embedding.reshape(1, -1).astype('float32')
+            query_embedding = query_embedding.reshape(1, -1).astype("float32")
 
             with self._io_lock:
                 # Normalize for cosine similarity (FAISS inner product expects normalized vectors)
                 # We'll normalize both query and indexed vectors
+                assert _faiss is not None  # HAS_FAISS gate guarantees import succeeded
                 _faiss.normalize_L2(query_embedding)
 
                 # Search
@@ -942,17 +961,20 @@ class VectorCacheManager:
                         doc = self.id_to_doc.get(int(idx))
                         if doc is None:
                             logger.warning(
-                                "Vector cache row %s has no metadata; skipping", int(idx),
+                                "Vector cache row %s has no metadata; skipping",
+                                int(idx),
                             )
                             continue
                         # Convert inner product to cosine similarity (since vectors are normalized)
                         cosine_sim = max(0.0, min(1.0, float(dist)))
-                        results.append({
-                            "file_path": doc["file_path"],
-                            "content": "",  # content stored in BM25 _doc_texts, not here
-                            "score": cosine_sim,
-                            "from_cache": True
-                        })
+                        results.append(
+                            {
+                                "file_path": doc["file_path"],
+                                "content": "",  # content stored in BM25 _doc_texts, not here
+                                "score": cosine_sim,
+                                "from_cache": True,
+                            }
+                        )
                 return results
         except Exception as e:
             logger.warning("Vector cache search failed: %s", e)

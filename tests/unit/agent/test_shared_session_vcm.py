@@ -16,6 +16,7 @@ pool (multi-tool batches run read-tools in parallel threads).  These tests
 pin both properties WITHOUT requiring the faiss / sentence-transformers
 stack (they monkeypatch a fake VCM or a probe index).
 """
+
 from __future__ import annotations
 
 import threading
@@ -116,10 +117,10 @@ class TestSharedSessionVCM:
         monkeypatch.setattr(_dcl, "_HAS_VECTOR_CACHE", True)
         monkeypatch.setattr(_dcl, "VectorCacheManager", _flaky)
 
-        assert _get_session_vcm() is None      # first call: construction raises → None
-        vcm = _get_session_vcm()                # second call: succeeds
+        assert _get_session_vcm() is None  # first call: construction raises → None
+        vcm = _get_session_vcm()  # second call: succeeds
         assert vcm is not None
-        assert _get_session_vcm() is vcm        # memoised thereafter
+        assert _get_session_vcm() is vcm  # memoised thereafter
 
     def test_io_lock_serialises_concurrent_vcm_access(self, monkeypatch, tmp_path):
         """Concurrent ``index_docs()`` (FAISS mutate via ``add_document``) and

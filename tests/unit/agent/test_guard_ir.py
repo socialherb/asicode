@@ -21,17 +21,16 @@ from external_llm.agent.guard_ir import (
 # GuardCondition
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestGuardCondition:
     def test_to_legacy_dict_basic(self):
-        gc = GuardCondition(op_class="NotEq", operands=["x", "0"],
-                            attribute_pairs=[])
+        gc = GuardCondition(op_class="NotEq", operands=["x", "0"], attribute_pairs=[])
         d = gc.to_legacy_dict()
         assert d["op"] == "NotEq"
         assert d["operands"] == ["x", "0"]
 
     def test_to_legacy_dict_with_attribute_pairs(self):
-        gc = GuardCondition(op_class="Is", operands=["x"],
-                            attribute_pairs=[("obj", "attr")])
+        gc = GuardCondition(op_class="Is", operands=["x"], attribute_pairs=[("obj", "attr")])
         d = gc.to_legacy_dict()
         assert "attribute_pairs" in d
         assert d["attribute_pairs"] == [("obj", "attr")]
@@ -41,38 +40,41 @@ class TestGuardCondition:
 # GuardIR
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestGuardIR:
     def test_to_legacy_tuple_with_condition(self):
-        gc = GuardCondition(op_class="Gt", operands=["x", "0"],
-                            attribute_pairs=[])
-        ir = GuardIR(raw="if x > 0: return", canonical="if x > 0: return",
-                     compact="if x > 0: return", condition=gc, control="return")
+        gc = GuardCondition(op_class="Gt", operands=["x", "0"], attribute_pairs=[])
+        ir = GuardIR(
+            raw="if x > 0: return",
+            canonical="if x > 0: return",
+            compact="if x > 0: return",
+            condition=gc,
+            control="return",
+        )
         cond, ctrl = ir.to_legacy_tuple()
         assert cond is not None
         assert cond["op"] == "Gt"
         assert ctrl == "return"
 
     def test_to_legacy_tuple_no_condition(self):
-        ir = GuardIR(raw="invalid", canonical="", compact="",
-                     condition=None, control="")
+        ir = GuardIR(raw="invalid", canonical="", compact="", condition=None, control="")
         cond, ctrl = ir.to_legacy_tuple()
         assert cond is None
         assert ctrl is None
 
     def test_is_parsed_true(self):
-        ir = GuardIR(raw="if x: break", canonical="if x: break",
-                     compact="if x: break", condition=None, control="break")
+        ir = GuardIR(raw="if x: break", canonical="if x: break", compact="if x: break", condition=None, control="break")
         assert ir.is_parsed is True
 
     def test_is_parsed_false(self):
-        ir = GuardIR(raw="", canonical="", compact="",
-                     condition=None, control="")
+        ir = GuardIR(raw="", canonical="", compact="", condition=None, control="")
         assert ir.is_parsed is False
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # GuardIR.parse_guard
 # ══════════════════════════════════════════════════════════════════════════
+
 
 class TestParseGuard:
     def test_parse_guard_empty(self):
@@ -134,6 +136,7 @@ if x > 0 return
 # _compute_op_class
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestComputeOpClass:
     def test_unary_op(self):
         expr = ast.parse("not x", mode="eval").body
@@ -159,6 +162,7 @@ class TestComputeOpClass:
 # ══════════════════════════════════════════════════════════════════════════
 # _extract_control
 # ══════════════════════════════════════════════════════════════════════════
+
 
 class TestExtractControl:
     def test_continue(self):
@@ -186,6 +190,7 @@ class TestExtractControl:
 # _extract_condition
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestExtractCondition:
     def test_simple_compare(self):
         tree = ast.parse("if x > 0: break")
@@ -208,6 +213,7 @@ class TestExtractCondition:
 # _make_compact
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestMakeCompact:
     def test_single_line(self):
         assert _make_compact("if x: return") == "if x: return"
@@ -227,6 +233,7 @@ class TestMakeCompact:
 # ══════════════════════════════════════════════════════════════════════════
 # _expand_condensed_guard_src
 # ══════════════════════════════════════════════════════════════════════════
+
 
 class TestExpandCondensedGuardSrc:
     def test_normal_expansion(self):
@@ -279,6 +286,7 @@ class TestExpandCondensedGuardSrc:
 # parse_guard — condensed-form / edge cases
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestParseGuardAdditional:
     def test_expanded_condensed_form(self):
         """Condensed form that requires expansion (multi-stmt on one line)."""
@@ -322,6 +330,7 @@ class TestParseGuardAdditional:
 # Condensed-expansion single-parse pin
 # ══════════════════════════════════════════════════════════════════════════
 
+
 class TestExpandCondensedSingleParse:
     """The condensed-expansion path must parse the candidate exactly once."""
 
@@ -345,15 +354,11 @@ class TestExpandCondensedSingleParse:
         assert calls.count(candidate) == 1
 
     def test_expand_condensed_return_tree(self):
-        res = _expand_condensed_guard_src(
-            "if error: continue break", _return_tree=True
-        )
+        res = _expand_condensed_guard_src("if error: continue break", _return_tree=True)
         assert res is not None
         src, tree = res
         assert src == "if error:\n    continue\n    break"
         assert isinstance(tree, ast.Module)
         # Legacy signature is unchanged.
-        assert _expand_condensed_guard_src("if error: continue break") == (
-            "if error:\n    continue\n    break"
-        )
+        assert _expand_condensed_guard_src("if error: continue break") == ("if error:\n    continue\n    break")
         assert _expand_condensed_guard_src("x = 1", _return_tree=True) is None

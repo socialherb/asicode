@@ -25,6 +25,7 @@ dead code.
 These tests pin the *contract* the inline helper must satisfy for both dict
 shapes so the bug cannot silently return.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -35,8 +36,8 @@ import pytest
 # implementation diverges, these tests fail.
 def _pair_bare(p: dict) -> set:
     _syms = p.get("symbols") or []
-    _a = (p.get("symbol_a") or (_syms[0] if len(_syms) > 0 else "") or "")
-    _b = (p.get("symbol_b") or (_syms[1] if len(_syms) > 1 else "") or "")
+    _a = p.get("symbol_a") or (_syms[0] if len(_syms) > 0 else "") or ""
+    _b = p.get("symbol_b") or (_syms[1] if len(_syms) > 1 else "") or ""
     return {_a.split(".")[-1], _b.split(".")[-1]}
 
 
@@ -44,12 +45,7 @@ def _pair_bare(p: dict) -> set:
 def _buggy_pair_bare(p: dict) -> set:
     return {
         (p.get("symbol_a") or p.get("symbols", ["", ""])[0] or "").split(".")[-1],
-        (
-            p.get("symbol_b")
-            or p.get("symbols", ["", ""])[1]
-            if len(p.get("symbols", [])) > 1
-            else ""
-        ).split(".")[-1],
+        (p.get("symbol_b") or p.get("symbols", ["", ""])[1] if len(p.get("symbols", [])) > 1 else "").split(".")[-1],
     }
 
 

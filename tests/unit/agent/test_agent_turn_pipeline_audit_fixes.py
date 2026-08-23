@@ -15,6 +15,7 @@ P2/P3 — dead params removed from ``_process_tool_results``;
 ``metadata["tokens"]`` unified behind ``_token_metadata`` (single 11-key set
 on every exit path).
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -74,20 +75,32 @@ def test_none_token_fields_do_not_crash_turn_loop():
     """
     loop = _make_loop()
     loop._build_initial_messages = mock.MagicMock(return_value=[])
-    loop._prepare_turn_messages = mock.MagicMock(return_value=SimpleNamespace(
-        messages=[], budget_warned=False, goal_reminder_injected=0,
-        search_first_hint_done=False, reads_since_last_edit=0,
-    ))
-    final_out = SimpleNamespace(
-        result=SimpleNamespace(status="text_reply"), nudge_message=None)
+    loop._prepare_turn_messages = mock.MagicMock(
+        return_value=SimpleNamespace(
+            messages=[],
+            budget_warned=False,
+            goal_reminder_injected=0,
+            search_first_hint_done=False,
+            reads_since_last_edit=0,
+        )
+    )
+    final_out = SimpleNamespace(result=SimpleNamespace(status="text_reply"), nudge_message=None)
     loop._handle_final_answer_turn = mock.MagicMock(return_value=final_out)
     loop._handle_loop_error = mock.MagicMock(
-        side_effect=AssertionError("_handle_loop_error must not run for None tokens"))
-    loop._llm_call_with_tools = mock.MagicMock(return_value={
-        "prompt_tokens": None, "completion_tokens": None, "tokens_used": None,
-        "cache_read_input_tokens": None, "cache_creation_input_tokens": None,
-        "content": "done", "tool_calls": [], "finish_reason": "stop",
-    })
+        side_effect=AssertionError("_handle_loop_error must not run for None tokens")
+    )
+    loop._llm_call_with_tools = mock.MagicMock(
+        return_value={
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "tokens_used": None,
+            "cache_read_input_tokens": None,
+            "cache_creation_input_tokens": None,
+            "content": "done",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+    )
 
     ctx = _make_ctx()
     result = loop._run_llm_loop(ctx)
@@ -136,28 +149,40 @@ def test_parallel_branch_wires_accounting_and_recovery():
     loop._record_tool_success = mock.MagicMock()
     loop._record_tool_failure = mock.MagicMock()
     loop._auto_repair_apply_patch_args = mock.MagicMock(return_value=None)
-    loop._process_tool_results = mock.MagicMock(return_value=_ResultsProcessingOutcome(
-        new_messages=[], write_tool_used=False, reads_since_last_edit=0,
-        noop_confirmed=False, fail_streak={},
-    ))
+    loop._process_tool_results = mock.MagicMock(
+        return_value=_ResultsProcessingOutcome(
+            new_messages=[],
+            write_tool_used=False,
+            reads_since_last_edit=0,
+            noop_confirmed=False,
+            fail_streak={},
+        )
+    )
     loop._settle_deferred_semantics = mock.MagicMock()
 
     calls = [
         {"tool": "read_file", "args": {"path": "a.txt"}, "call_id": "c1"},
         {"tool": "apply_patch", "args": {"patch": "x"}, "call_id": "c2"},
     ]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0,
-    ))
-    loop.registry.dispatch_parallel = mock.MagicMock(return_value=[
-        ToolResult(ok=True, content="file content"),
-        ToolResult(ok=False, content="", error="patch failed"),
-    ])
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(
+            prepared_calls=calls,
+            phase_rule_messages=[],
+            plan_current_index=0,
+        )
+    )
+    loop.registry.dispatch_parallel = mock.MagicMock(
+        return_value=[
+            ToolResult(ok=True, content="file content"),
+            ToolResult(ok=False, content="", error="patch failed"),
+        ]
+    )
 
     ctx = _exec_ctx()
     with mock.patch.object(atp, "_log_parallel_write_failures") as _log_pwf:
         outcome = loop._execute_and_process_tool_calls(
-            ctx, tool_calls=calls,
+            ctx,
+            tool_calls=calls,
         )
 
     assert outcome.any_tool_called is True
@@ -177,22 +202,31 @@ def test_serial_branch_uses_same_recovery_helper():
     loop.config.tolerant_patch_mode = False
     loop._record_tool_success = mock.MagicMock()
     loop._record_tool_failure = mock.MagicMock()
-    loop._process_tool_results = mock.MagicMock(return_value=_ResultsProcessingOutcome(
-        new_messages=[], write_tool_used=False, reads_since_last_edit=0,
-        noop_confirmed=False, fail_streak={},
-    ))
+    loop._process_tool_results = mock.MagicMock(
+        return_value=_ResultsProcessingOutcome(
+            new_messages=[],
+            write_tool_used=False,
+            reads_since_last_edit=0,
+            noop_confirmed=False,
+            fail_streak={},
+        )
+    )
     loop._settle_deferred_semantics = mock.MagicMock()
     calls = [{"tool": "apply_patch", "args": {"patch": "x"}, "call_id": "c1"}]
-    loop._build_and_filter_prepared_calls = mock.MagicMock(return_value=_PreparedCallsResult(
-        prepared_calls=calls, phase_rule_messages=[], plan_current_index=0,
-    ))
-    loop.registry.dispatch = mock.MagicMock(
-        return_value=ToolResult(ok=False, content="", error="boom"))
+    loop._build_and_filter_prepared_calls = mock.MagicMock(
+        return_value=_PreparedCallsResult(
+            prepared_calls=calls,
+            phase_rule_messages=[],
+            plan_current_index=0,
+        )
+    )
+    loop.registry.dispatch = mock.MagicMock(return_value=ToolResult(ok=False, content="", error="boom"))
     loop._auto_repair_apply_patch_args = mock.MagicMock(return_value=None)
 
     ctx = _exec_ctx()
     outcome = loop._execute_and_process_tool_calls(
-        ctx, tool_calls=calls,
+        ctx,
+        tool_calls=calls,
     )
 
     assert outcome.any_tool_called is True
@@ -204,18 +238,21 @@ def test_post_dispatch_patch_recovery_auto_repair():
     """P1: failed apply_patch with repair args retries once and records metadata."""
     loop = _make_loop()
     ok_result = ToolResult(ok=True, content="applied")
-    loop._auto_repair_apply_patch_args = mock.MagicMock(
-        return_value={"patch": "fixed", "path": "a.txt"})
+    loop._auto_repair_apply_patch_args = mock.MagicMock(return_value={"patch": "fixed", "path": "a.txt"})
     loop.registry.dispatch = mock.MagicMock(return_value=ok_result)
 
     out = loop._post_dispatch_patch_recovery(
-        "apply_patch", {"patch": "broken"}, ToolResult(ok=False, error="orig", content=""),
+        "apply_patch",
+        {"patch": "broken"},
+        ToolResult(ok=False, error="orig", content=""),
     )
 
     assert out is ok_result
     assert out.metadata["auto_repair"] == {
-        "attempted": True, "kind": "patch_format_fix",
-        "original_error": "orig", "success": True,
+        "attempted": True,
+        "kind": "patch_format_fix",
+        "original_error": "orig",
+        "success": True,
     }
     assert loop._patch_fail_count == 0
 
@@ -255,9 +292,17 @@ def test_token_metadata_uniform_field_set():
     """P2: every exit path now emits the SAME 11-key token field set."""
     m = _token_metadata(_token_ctx())
     assert set(m) == {
-        "prompt", "completion", "total", "cost_usd", "cache_adjusted_cost_usd",
-        "cache_read_tokens", "cache_creation_tokens", "cache_hit_ratio",
-        "last_call_prompt", "last_call_completion", "provider",
+        "prompt",
+        "completion",
+        "total",
+        "cost_usd",
+        "cache_adjusted_cost_usd",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "cache_hit_ratio",
+        "last_call_prompt",
+        "last_call_completion",
+        "provider",
     }
     assert m["total"] == 150
     assert m["provider"] == "anthropic"
@@ -267,11 +312,16 @@ def test_token_metadata_uniform_field_set():
 
 def test_token_metadata_zero_tokens_ratio_zero():
     """P2: empty-run ctx (all zeros) yields ratio 0.0 without crashing."""
-    m = _token_metadata(_token_ctx(
-        total_prompt_tokens=0, total_completion_tokens=0,
-        total_cache_read_tokens=0, total_cache_creation_tokens=0,
-        last_call_prompt_tokens=0, last_call_completion_tokens=0,
-    ))
+    m = _token_metadata(
+        _token_ctx(
+            total_prompt_tokens=0,
+            total_completion_tokens=0,
+            total_cache_read_tokens=0,
+            total_cache_creation_tokens=0,
+            last_call_prompt_tokens=0,
+            last_call_completion_tokens=0,
+        )
+    )
     assert m["total"] == 0
     assert m["cache_hit_ratio"] == 0.0
 
@@ -285,7 +335,8 @@ def test_build_tool_name_map_skips_gemini_self_reference():
     """P3: Gemini functionCall parts have no id — a name->name entry would
     only pollute the id->name map, so it must not appear."""
     m = LLMMessage(
-        role="assistant", content="",
+        role="assistant",
+        content="",
         raw_content=[
             {"text": "hi"},
             {"functionCall": {"name": "read_file", "args": {}}},

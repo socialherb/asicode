@@ -4,6 +4,7 @@ Output Mode Enumeration for asicode
 Defines the different output formats that LLMs can produce.
 Used by hybrid_parser, patch_synthesizer, and intelligent routing.
 """
+
 from enum import Enum
 
 

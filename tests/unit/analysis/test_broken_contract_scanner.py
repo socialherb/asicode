@@ -5,6 +5,7 @@ the end-to-end ``scan_broken_contracts`` against an in-memory temp file with a
 fake repo graph (caller-asymmetry is what distinguishes a broken contract from
 a healthy writer/reader pair).
 """
+
 from __future__ import annotations
 
 import ast
@@ -31,6 +32,7 @@ from external_llm.analysis.broken_contract_scanner import (
 )
 
 # ── helpers ─────────────────────────────────────────────────────────────────
+
 
 def _expr(src: str) -> ast.expr:
     """Parse a single expression and return its AST node."""
@@ -65,6 +67,7 @@ class _FakeGraph:
 
 # ── _strip_access_verb ──────────────────────────────────────────────────────
 
+
 class TestStripAccessVerb:
     def test_set_prefix(self):
         assert _strip_access_verb("set_pending_impl_spec") == "pending_impl_spec"
@@ -92,6 +95,7 @@ class TestStripAccessVerb:
 
 # ── _dotted_target ──────────────────────────────────────────────────────────
 
+
 class TestDottedTarget:
     def test_attribute_chain(self):
         assert _dotted_target(_expr("self.a.b")) == "self.a.b"
@@ -107,6 +111,7 @@ class TestDottedTarget:
 
 
 # ── _literal_str / _literal_path ────────────────────────────────────────────
+
 
 class TestLiteralAccessors:
     def test_literal_str_string(self):
@@ -126,6 +131,7 @@ class TestLiteralAccessors:
 
 
 # ── _classify_*_call ────────────────────────────────────────────────────────
+
 
 class TestClassifyMutatorCall:
     def test_append_writes_base(self):
@@ -201,6 +207,7 @@ class TestClassifyOpenCall:
 
 # ── _state_accesses ─────────────────────────────────────────────────────────
 
+
 class TestStateAccesses:
     def _accesses(self, src):
         return _state_accesses(_stmts(src))
@@ -232,6 +239,7 @@ class TestStateAccesses:
 
 
 # ── _shared_state / _loc_overlaps ───────────────────────────────────────────
+
 
 class TestLocOverlaps:
     def test_equal(self):
@@ -271,6 +279,7 @@ class TestSharedState:
 
 # ── _role_of / _member_summary ──────────────────────────────────────────────
 
+
 class TestRoleOf:
     def test_writer(self):
         assert _role_of({"writes": {"x"}}) == "writer"
@@ -281,11 +290,13 @@ class TestRoleOf:
 
 class TestMemberSummary:
     def test_summary_shape(self):
-        m = {"name": "foo", "lineno": 1, "end_lineno": 3,
-             "writes": {"x"}, "reads": set(), "caller_count": 2}
+        m = {"name": "foo", "lineno": 1, "end_lineno": 3, "writes": {"x"}, "reads": set(), "caller_count": 2}
         assert _member_summary(m) == {
-            "name": "foo", "lineno": 1, "end_lineno": 3,
-            "role": "writer", "caller_count": 2,
+            "name": "foo",
+            "lineno": 1,
+            "end_lineno": 3,
+            "role": "writer",
+            "caller_count": 2,
         }
 
 
@@ -313,10 +324,13 @@ def _scan(src, callers, fname="c.py"):
 class TestScanBrokenContracts:
     def test_orphan_reader_detected(self):
         # set_ has callers (live), pop_ has none (orphan) → broken contract.
-        cands = _scan(CONTRACT_SRC, {
-            "set_pending_impl_spec": ["main"],
-            "pop_pending_impl_spec": [],
-        })
+        cands = _scan(
+            CONTRACT_SRC,
+            {
+                "set_pending_impl_spec": ["main"],
+                "pop_pending_impl_spec": [],
+            },
+        )
         assert len(cands) == 1
         c = cands[0]
         assert c.core_name == "pending_impl_spec"
@@ -326,24 +340,35 @@ class TestScanBrokenContracts:
 
     def test_orphan_writer_detected(self):
         # Inverted: pop_ live, set_ orphan.
-        cands = _scan(CONTRACT_SRC, {
-            "set_pending_impl_spec": [],
-            "pop_pending_impl_spec": ["main"],
-        })
+        cands = _scan(
+            CONTRACT_SRC,
+            {
+                "set_pending_impl_spec": [],
+                "pop_pending_impl_spec": ["main"],
+            },
+        )
         assert len(cands) == 1
         assert cands[0].orphan_role == "writer"
         assert cands[0].orphan_name == "set_pending_impl_spec"
 
     def test_both_live_no_candidate(self):
-        cands = _scan(CONTRACT_SRC, {
-            "set_pending_impl_spec": ["a"], "pop_pending_impl_spec": ["b"],
-        })
+        cands = _scan(
+            CONTRACT_SRC,
+            {
+                "set_pending_impl_spec": ["a"],
+                "pop_pending_impl_spec": ["b"],
+            },
+        )
         assert cands == []
 
     def test_both_dead_defers_to_public_dead_code(self):
-        cands = _scan(CONTRACT_SRC, {
-            "set_pending_impl_spec": [], "pop_pending_impl_spec": [],
-        })
+        cands = _scan(
+            CONTRACT_SRC,
+            {
+                "set_pending_impl_spec": [],
+                "pop_pending_impl_spec": [],
+            },
+        )
         assert cands == []
 
     def test_no_graph_returns_empty(self):
@@ -365,24 +390,26 @@ class TestScanBrokenContracts:
             with open(p, "w") as f:
                 f.write("package main\n")
             cands = scan_broken_contracts(
-                repo_root=d, file_paths=[p],
+                repo_root=d,
+                file_paths=[p],
                 repo_graph=_FakeGraph({}),
             )
         assert cands == []
 
     def test_no_shared_state_no_candidate(self):
         # Two methods with the same core name but disjoint state → no contract.
-        src = (
-            "def set_alpha_beta(self):\n    self._alpha = 1\n"
-            "def pop_alpha_beta(self):\n    return self._beta\n"
-        )
+        src = "def set_alpha_beta(self):\n    self._alpha = 1\ndef pop_alpha_beta(self):\n    return self._beta\n"
         cands = _scan(src, {"set_alpha_beta": ["x"], "pop_alpha_beta": []})
         assert cands == []
 
     def test_candidate_to_dict_roundtrip(self):
-        cands = _scan(CONTRACT_SRC, {
-            "set_pending_impl_spec": ["main"], "pop_pending_impl_spec": [],
-        })
+        cands = _scan(
+            CONTRACT_SRC,
+            {
+                "set_pending_impl_spec": ["main"],
+                "pop_pending_impl_spec": [],
+            },
+        )
         d = cands[0].to_dict()
         assert d["core_name"] == "pending_impl_spec"
         assert d["orphan_role"] == "reader"
@@ -391,6 +418,7 @@ class TestScanBrokenContracts:
 
 
 # ── _member_caller_count: suffix-fallback + fail-fast contract ────────────────
+
 
 class _Sym:
     def __init__(self, name):
