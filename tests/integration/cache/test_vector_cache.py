@@ -13,6 +13,7 @@ import pytest
 try:
     import numpy as np
 
+    import external_llm.agent.vector_cache as vc
     from external_llm.agent.vector_cache import (
         HAS_FAISS,
         HAS_NUMPY,
@@ -27,6 +28,28 @@ except ImportError:
     VECTOR_CACHE_AVAILABLE = False
 
 
+class _StubST:
+    """384-dim deterministic model; the configured name loads fine.
+
+    Mirrors tests/unit/agent/test_vector_cache_checkpoint_failure.py::_StubST.
+    Lets logic tests exercise add/search/persistence WITHOUT paying the real
+    SentenceTransformer download+load (~7s per process; ~35s per test when a
+    prior test's ``reset_global_embedding_model()`` dropped the global cache).
+    The real-load contract is covered by the two ``@pytest.mark.slow`` tests
+    (singleton + embedding_generation), which intentionally do NOT use this.
+    """
+
+    def __init__(self, name: str):
+        pass
+
+    def get_embedding_dimension(self) -> int:
+        return 384
+
+    def encode(self, texts, convert_to_numpy=True, show_progress_bar=False):
+        n = len(texts) if isinstance(texts, list) else 1
+        return np.ones((n, 384), dtype="float32")
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(not VECTOR_CACHE_AVAILABLE, reason="Vector cache module not available")
 class TestVectorCache:
@@ -38,6 +61,22 @@ class TestVectorCache:
         cache_dir = tempfile.mkdtemp(prefix="vector-cache-test-")
         yield cache_dir
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+    @pytest.fixture
+    def stub_model(self, monkeypatch):
+        """Replace the real SentenceTransformer with a deterministic stub.
+
+        Opt-in (NOT autouse): the two ``@pytest.mark.slow`` tests exercise the
+        REAL model load and must keep it. Logic tests that route through
+        ``_ensure_model_loaded`` (add/search/persistence/RAG) take this fixture
+        so the ~7s real load (and the ~35s reload after a prior test's reset)
+        is never paid in the gate suite.
+        """
+        vc.reset_global_embedding_model()
+        monkeypatch.setattr(vc, "SentenceTransformer", _StubST)
+        monkeypatch.setattr(vc, "HAS_SENTENCE_TRANSFORMERS", True)
+        yield
+        vc.reset_global_embedding_model()
 
     @pytest.mark.slow
     def test_global_embedding_model_singleton(self):
@@ -66,6 +105,7 @@ class TestVectorCache:
         assert manager.dimension > 0
         assert manager.cache_dir.exists()
 
+    @pytest.mark.slow
     def test_vector_cache_embedding_generation(self, temp_cache_dir):
         """Test embedding generation for text."""
         if not HAS_NUMPY or not HAS_SENTENCE_TRANSFORMERS:
@@ -80,7 +120,7 @@ class TestVectorCache:
             assert isinstance(embedding, np.ndarray)
             assert embedding.shape == (manager.dimension,)
 
-    def test_vector_cache_add_and_search(self, temp_cache_dir):
+    def test_vector_cache_add_and_search(self, temp_cache_dir, stub_model):
         """Test adding documents and searching the vector cache."""
         if not HAS_NUMPY or not HAS_SENTENCE_TRANSFORMERS:
             pytest.skip("NumPy or SentenceTransformers not available")
@@ -145,7 +185,7 @@ class TestVectorCache:
         assert indices.shape == (1, k)
         assert all(0 <= idx < 10 for idx in indices[0])
 
-    def test_vector_cache_integration_with_rag(self, temp_cache_dir):
+    def test_vector_cache_integration_with_rag(self, temp_cache_dir, stub_model):
         """Test vector cache integration with RAG searcher."""
         if not HAS_NUMPY or not HAS_SENTENCE_TRANSFORMERS:
             pytest.skip("NumPy or SentenceTransformers not available")
@@ -187,7 +227,7 @@ class TestVectorCache:
             assert vector_stats.get("hits", vector_stats.get("hit_count", 0)) == 2
             assert vector_stats.get("misses", vector_stats.get("miss_count", 0)) == 1
 
-    def test_vector_cache_persistence(self, temp_cache_dir):
+    def test_vector_cache_persistence(self, temp_cache_dir, stub_model):
         """Test that vector cache persists across instances."""
         if not HAS_NUMPY or not HAS_FAISS:
             pytest.skip("NumPy or FAISS not available")
@@ -208,8 +248,18 @@ class TestVectorCache:
             assert manager2.index.ntotal >= 1
 
     def test_vector_cache_fallback_on_failure(self, temp_cache_dir):
-        """Test fallback behavior when vector cache (FAISS) is not available."""
-        with patch("external_llm.agent.vector_cache.HAS_FAISS", False):
+        """Test fallback behavior when vector cache (FAISS) is not available.
+
+        Also patches HAS_SENTENCE_TRANSFORMERS False: the "no FAISS" scenario
+        is the degraded environment, and leaving the model path live would pull
+        the real transformers/torch import (~2-10s cold) through
+        ``_ensure_model_loaded`` for zero coverage — add/search must degrade to
+        empty results when the INDEX is unavailable, independently of the model.
+        """
+        with (
+            patch("external_llm.agent.vector_cache.HAS_FAISS", False),
+            patch("external_llm.agent.vector_cache.HAS_SENTENCE_TRANSFORMERS", False),
+        ):
             manager = VectorCacheManager(temp_cache_dir)
 
             # Should gracefully handle missing FAISS
@@ -222,7 +272,7 @@ class TestVectorCache:
             results = manager.search("test query", top_k=3)
             assert results == []
 
-    def test_vector_cache_thread_safety(self, temp_cache_dir):
+    def test_vector_cache_thread_safety(self, temp_cache_dir, stub_model):
         """Test vector cache thread safety for concurrent add_document."""
         if not HAS_NUMPY or not HAS_FAISS:
             pytest.skip("NumPy or FAISS not available")

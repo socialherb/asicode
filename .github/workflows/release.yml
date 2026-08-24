@@ -81,6 +81,13 @@ jobs:
           python -m pip install ruff==0.15.21
           python -m pip install -e '.[dev]'
 
+          # tree-sitter core env guard: the exported-tree test job is the
+          # clean-install surface closest to what ships — the core must be
+          # below the segfault bound AND satisfy the declared constraint even
+          # where pytest is absent (the 2026-08-24 incident). Mirrors
+          # lint.yml's structural-scan step.
+          python scripts/check_tree_sitter_core.py
+
       - name: Unit tests
         # Hung-test protection comes from the pyproject.toml pytest-timeout ini
         # default (`timeout = 300`) — no CLI flag, same source of truth as

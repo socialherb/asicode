@@ -274,7 +274,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(symbol_name, content)
+        return self._find_symbol_regex(symbol_name, content, js_lexing=True)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -331,7 +331,7 @@ class JavaScriptSyntaxProvider(SyntaxProvider):
         result = extract_symbol_body(content, symbol_name, "javascript") if is_available() else None
         if result:
             return result
-        return self._find_symbol_body_range_regex(content, symbol_name)
+        return self._find_symbol_body_range_regex(content, symbol_name, js_lexing=True)
 
     def get_definition_keywords(self) -> list[str]:
         return [

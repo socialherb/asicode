@@ -650,23 +650,25 @@ def _iter_brace_tokens(content: str, offset: int = 0, *, js_lexing: bool = False
         i += 1
 
 
-def _find_closing_brace(content: str, offset: int) -> int:
+def _find_closing_brace(content: str, offset: int, *, js_lexing: bool = False) -> int:
     """Core brace scanner — returns offset of matching ``}`` or -1.
 
     Thin consumer of :func:`_iter_brace_tokens` (the SSOT literal/comment/
     char-vs-lifetime scanner). Tracks depth and returns the offset of the
     first ``}`` that returns depth to zero after an opening ``{``.
 
+    Set *js_lexing* for JavaScript/TypeScript: enables ``\\``` escape
+    handling inside template literals (the SSOT otherwise treats backtick as
+    ``escapes=False`` for Go raw-string compat). Pass it from JS/TS callers
+    only — Go/Java/Kotlin/C keep the default and are unaffected.
+
     Returns -1 when no matching brace is found (unterminated block), letting
     each twin (:func:`find_brace_block_end` /
     :func:`find_brace_block_end_offset`) apply its own conservative fallback.
-
-    Known limitation: backtick (`` ` ``) is always ``escapes=False`` for Go
-    raw-string compat — see :func:`_iter_brace_tokens`.
     """
     depth = 0
     started = False
-    for ch, idx in _iter_brace_tokens(content, offset):
+    for ch, idx in _iter_brace_tokens(content, offset, js_lexing=js_lexing):
         if ch == "{":
             depth += 1
             started = True
@@ -737,13 +739,18 @@ def line_at_offset(nl: list[int], offset: int) -> int:
     return line_index_at_offset(nl, offset) + 1
 
 
-def find_brace_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
+def find_brace_block_end(content: str, offset: int, nl: list[int] | None = None, *, js_lexing: bool = False) -> int:
     """Heuristic: 1-based line of the matching ``}`` starting from *offset*.
 
     Derives from the core :func:`_find_closing_brace` scanner — every newline
     in the scanned region (including those inside skipped literals) is
     accurately counted via ``content[:end].count("\\n")``, fixing the
     multi-line literal under-count regression (bug #1).
+
+    Set *js_lexing* for JavaScript/TypeScript source: enables ``\\```
+    escape handling inside template literals (see
+    :func:`_find_closing_brace`); Go raw strings keep the default and are
+    unaffected.
 
     Shared by all brace-delimited C-family languages (C/C++/Go/Java/Kotlin/
     TypeScript/JavaScript).  Conservative fallback is the start line when
@@ -753,7 +760,7 @@ def find_brace_block_end(content: str, offset: int, nl: list[int] | None = None)
     calling in a loop to keep the two line queries O(log n) instead of O(n).
     """
     start_line = content[:offset].count("\n") + 1 if nl is None else line_at_offset(nl, offset)
-    end = _find_closing_brace(content, offset)
+    end = _find_closing_brace(content, offset, js_lexing=js_lexing)
     if end == -1:
         return start_line
     if nl is None:
@@ -761,7 +768,7 @@ def find_brace_block_end(content: str, offset: int, nl: list[int] | None = None)
     return line_at_offset(nl, end)
 
 
-def find_brace_block_end_offset(content: str, offset: int) -> int:
+def find_brace_block_end_offset(content: str, offset: int, *, js_lexing: bool = False) -> int:
     """Offset-returning twin of :func:`find_brace_block_end`.
 
     Returns the *offset* (exclusive) of the matching ``}`` — i.e. one past the
@@ -769,10 +776,15 @@ def find_brace_block_end_offset(content: str, offset: int) -> int:
     exactly the brace-delimited block. Derives from the same core
     :func:`_find_closing_brace` scanner as its line-based twin.
 
+    Set *js_lexing* for JavaScript/TypeScript source: enables ``\\```
+    escape handling inside template literals (see
+    :func:`_find_closing_brace`); Go raw strings keep the default and are
+    unaffected.
+
     Used by the regex-fallback *class-body* range computation in Java/Kotlin/
     TypeScript providers. Conservative fallback is ``len(content)``.
     """
-    end = _find_closing_brace(content, offset)
+    end = _find_closing_brace(content, offset, js_lexing=js_lexing)
     if end == -1:
         return len(content)
     return end + 1
@@ -921,12 +933,18 @@ class SyntaxProvider(ABC):
         self,
         symbol_name: str,
         content: str,
+        *,
+        js_lexing: bool = False,
     ) -> tuple[int, int] | None:
         """Fallback: regex match + brace counting for block end.
 
         Pattern kinds listed in :attr:`_LINE_BASED_KINDS` (C ``macro``/
         ``typedef``, Go ``variable``/``constant``) end at the first newline
         instead of a matching brace.
+
+        *js_lexing* is forwarded to :func:`find_brace_block_end` — enable it
+        from JS/TS providers so ``\\``` escapes inside template literals are
+        honoured instead of closing the literal early.
         """
         for sp, m in self._iter_symbol_matches(content, symbol_name):
             start_offset = m.start()
@@ -935,7 +953,7 @@ class SyntaxProvider(ABC):
                 end_pos = content.find("\n", m.end())
                 end_line = (content[:end_pos].count("\n") + 1) if end_pos != -1 else start_line
             else:
-                end_line = find_brace_block_end(content, start_offset)
+                end_line = find_brace_block_end(content, start_offset, js_lexing=js_lexing)
             return (start_line, end_line)
         return None
 
@@ -943,14 +961,21 @@ class SyntaxProvider(ABC):
         self,
         content: str,
         symbol_name: str,
+        *,
+        js_lexing: bool = False,
     ) -> tuple[int, int] | None:
-        """Regex fallback: find function body via first { after definition."""
+        """Regex fallback: find function body via first { after definition.
+
+        *js_lexing* is forwarded to :func:`find_brace_block_end` — enable it
+        from JS/TS providers so ``\\``` escapes inside template literals are
+        honoured instead of closing the literal early.
+        """
         for _, m in self._iter_symbol_matches(content, symbol_name):
             body_start = content.find("{", m.end())
             if body_start == -1:
                 continue
             body_start_line = content[:body_start].count("\n") + 1
-            body_end_line = find_brace_block_end(content, body_start)
+            body_end_line = find_brace_block_end(content, body_start, js_lexing=js_lexing)
             return (body_start_line, body_end_line)
         return None
 

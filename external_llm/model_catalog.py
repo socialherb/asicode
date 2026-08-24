@@ -130,6 +130,13 @@ KNOWN_MODELS: dict[str, list[str]] = {
         # same v4-flash core). 1M window like deepseek-v4-flash →
         # _FALLBACK_IS_CORRECT (UNVERIFIED).
         "deepseek-v4-flash-vision-exp",
+        # LongCat-2.0 (Meituan, open-sourced 2026-07-05; served by the opencode
+        # gateway since 2026-08-24). 1.6T-param MoE, native 1M context (trained
+        # on 1M-context data — longcat.chat/blog/longcat-2.0, github.com/
+        # meituan-longcat/LongCat-2.0). Context decision in _FALLBACK_IS_CORRECT
+        # (UNVERIFIED against an opencode-docs provider page; 1M fallback is the
+        # correct window here).
+        "longcat-2.0",
     ],
 }
 

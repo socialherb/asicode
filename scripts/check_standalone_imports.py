@@ -90,13 +90,19 @@ def _iter_modules_under(root: Path) -> list[str]:
     mods: list[str] = []
     for scan in _SCAN_ROOTS:
         d = root / scan
-        if d.is_dir():
-            for p in d.rglob("*.py"):
-                if _should_skip(p):
+        if not d.is_dir():
+            continue
+        # os.walk with in-place dir prune: _SKIP_DIRS subtrees are never
+        # descended into (rglob would materialize unrelated paths — F-4).
+        for dirpath, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x not in _SKIP_DIRS and not x.endswith(".egg-info")]
+            for name in files:
+                if not name.endswith(".py"):
                     continue
-                name = _module_name(str(p.relative_to(root)))
-                if name:
-                    mods.append(name)
+                p = Path(dirpath) / name
+                name_ = _module_name(str(p.relative_to(root)))
+                if name_:
+                    mods.append(name_)
     if (root / "asi.py").exists():
         mods.append("asi")
     return sorted(set(mods))

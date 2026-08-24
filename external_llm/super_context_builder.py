@@ -352,8 +352,10 @@ class SuperContextBuilder:
         """Build enhanced file context with AST analysis"""
         lines = []
 
-        # Analyze code structure
-        analysis = self.code_analyzer.analyze_file(file_path)
+        # Analyze code structure — route through DependencyGraphBuilder's
+        # single per-file cache so _build_dependency_context reuses this
+        # analysis instead of re-reading/re-parsing the file.
+        analysis = self.dependency_builder.get_analysis(file_path)
 
         if analysis:
             # === FILE SUMMARY ===
@@ -464,7 +466,7 @@ class SuperContextBuilder:
 
             # Call relationships
             # Find functions defined in this file
-            analysis = self.code_analyzer.analyze_file(file_path)
+            analysis = self.dependency_builder.get_analysis(file_path)
             if analysis and analysis.functions:
                 for func in analysis.functions[:3]:  # Top 3 functions
                     func_key = f"{rel_path}:{func.name}"

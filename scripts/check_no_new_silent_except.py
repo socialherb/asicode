@@ -405,8 +405,15 @@ def _iter_repo_py(paths: list[str] | None = None) -> list[Path]:
     full: list[Path] = []
     for root in _SCAN_ROOTS:
         d = REPO / root
-        if d.is_dir():
-            full.extend(p for p in d.rglob("*.py") if not _should_skip(p))
+        if not d.is_dir():
+            continue
+        # os.walk with in-place dir prune: _SKIP_DIRS subtrees are never
+        # descended into (rglob would materialize unrelated paths — F-4).
+        for dirpath, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x not in _SKIP_DIRS and not x.endswith(".egg-info")]
+            for name in files:
+                if name.endswith(".py"):
+                    full.append(Path(dirpath) / name)
     for root in _ROOT_FILES:
         f = REPO / root
         if f.exists():

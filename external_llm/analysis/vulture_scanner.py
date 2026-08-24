@@ -478,8 +478,19 @@ def _serialize_vulture_item(item) -> dict:
 
 
 def _restore_vulture_entry(v: Any, entry: dict) -> None:
-    """Rehydrate one cached per-file scan into *v* (defined items + used names)."""
-    from pathlib import Path
+    """Rehydrate one cached per-file scan into *v* (defined items + used names).
+
+    The restored items carry a ``str`` filename (the cached absolute path),
+    NOT a ``pathlib.Path``.  vulture's ``get_unused_code()`` builds a
+    ``set(defined_*)`` whose ``Item.__hash__`` hashes ``(filename, lineno,
+    name)`` and sorts by ``str(filename).lower()`` — Path hashing is
+    measurably expensive on 111K-item corpora (gate profile: 0.37s in
+    ``get_unused_code`` alone).  ``Item`` accepts any filename type (the
+    ``__init__`` does no coercion; ``size``/``get_report``/``_tuple`` all use
+    ``str()`` on it), and a cold-``scan`` file's Path filename never co-occurs
+    with a restored file's str filename for the SAME file in one run, so the
+    hash/eq surfaces never mix.
+    """
 
     import vulture.core
 
@@ -487,7 +498,7 @@ def _restore_vulture_entry(v: Any, entry: dict) -> None:
         item = vulture.core.Item(
             name=d["name"],
             typ=d["typ"],
-            filename=Path(entry.get("fn") or ""),
+            filename=entry.get("fn") or "",
             first_lineno=d["first_lineno"],
             last_lineno=d["last_lineno"],
             message=d.get("message", ""),
@@ -1394,11 +1405,11 @@ def scan_vulture_dead_code(
                         name = sym.name if hasattr(sym, "name") else ""
                         if name and repo_graph.get_callers(name):
                             _caller_live.add(name)
-                try:
-                    with open(abs_p, "rb") as fh:
-                        _tree = ast.parse(fh.read(), filename=abs_p)
-                except (OSError, SyntaxError, ValueError):
-                    _tree = None
+                # Fused single-stat cached read+parse — the same path vulture's
+                # own scan uses (see _scan_vulture_files_with_cache), so each
+                # target file is parsed exactly once instead of re-reading it
+                # here with a bare open()+ast.parse().
+                _, _tree = parse_cache.read_and_parse(abs_p)
                 if _tree is not None:
                     for node in ast.walk(_tree):
                         if isinstance(node, ast.Import):

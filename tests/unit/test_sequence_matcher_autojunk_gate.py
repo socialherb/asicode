@@ -19,6 +19,17 @@ import ast
 import os
 import pathlib
 
+import pytest
+
+# repo_scan group — DO NOT REMOVE (P3 re-verify 2026-08-24): contents-unchanged
+# A/B (group renamed away) measured ZERO wall-time gain — gate-level
+# (-m "not slow") INTACT 13.4/14.2s vs DISABLED 13.9/14.1s, slow-inclusive
+# 25.2/25.4 vs 23.2/29.7 (jitter). Each worker's @cache (tracked_files /
+# _first_party_imports) is process-wide: keeping these tests on one worker
+# reuses one full-repo AST scan; scattering them repeats it per worker and
+# re-introduces the .cache/structural_graph_v1.json storm 64a0917e6 fixed.
+pytestmark = pytest.mark.xdist_group("repo_scan")
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SKIP_DIRS = {"tests", ".venv", ".asicode", "node_modules", "__pycache__", ".git"}
 

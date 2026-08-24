@@ -52,6 +52,27 @@ def test_resolve_scan_paths_rejects_out_of_repo_and_non_python():
     assert g._resolve_scan_paths(["README.md"]) is None  # not .py
 
 
+def test_iter_py_files_prunes_skipped_dirs_entirely(tmp_path, monkeypatch):
+    """Full scan must not descend into SKIP_DIRS (os.walk prune, not rglob+filter).
+
+    Original code walked every skipped directory (14548 entries for ~954 kept)
+    and discarded them after traversal. A pruned walk visits only the scanned
+    trees, so a planted .venv with *.py files must never surface.
+    """
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    for skipped in (".venv", "__pycache__", "build", "node_modules", "dist", ".git"):
+        d = tmp_path / skipped
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "mod.py").write_text("_d = 0\ndef f():\n    _d = 1\n", encoding="utf-8")
+    # full-repo scan (no args): skipped dirs are pruned — their .py never yields
+    assert list(g._iter_py_files(None)) == []
+    # explicit-path scan must still respect the skip (parity with rglob era)
+    assert list(g._iter_py_files([str(tmp_path / ".venv" / "mod.py")])) == []
+    # a real file outside skipped dirs is found
+    (tmp_path / "real.py").write_text("_d = 0\ndef f():\n    _d = 1\n", encoding="utf-8")
+    assert [rel for rel, p in g._iter_py_files(None)] == [Path("real.py")]
+
+
 # ── what counts as module state ──────────────────────────────────────────────
 
 
@@ -237,3 +258,70 @@ def test_repo_is_at_zero():
         assert g.main() == 0
     finally:
         sys.argv = monkey_argv
+
+
+# ── per-file analysis cache (P15, 2026-08-24) ─────────────────────────────────
+
+# Cache contract is shared with the other analysis gates (A307, 786ffcdc):
+#  * fingerprint (st_mtime_ns, st_size) — any content change drifts the key;
+#  * fail-open — corruption / version mismatch / OSError → full recompute;
+#  * per-repo path derived from REPO, so tmp_path REPO monkeypatch isolation.
+
+
+def _plant(tmp_path, monkeypatch, *, with_cache: bool = True):
+    """REPO→tmp_path, one clean module; returns (tmp_path, module_rel)."""
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    rel = "mod.py"
+    (tmp_path / rel).write_text("_d = 0\ndef f():\n    _d = 1\n", encoding="utf-8")
+    if with_cache:
+        g._save_cache({rel: (g._stat_fingerprint(tmp_path / rel), [])})
+    return tmp_path, rel
+
+
+def test_cache_hit_preserves_clean_verdict(tmp_path, monkeypatch, capsys):
+    """A fingerprint hit returns the cached verdict without re-reading the file."""
+    tmp_path, _rel = _plant(tmp_path, monkeypatch, with_cache=True)
+    assert (tmp_path / ".cache" / "missing_global_v1.json").exists()
+    monkeypatch.setattr(sys, "argv", ["check_missing_global.py"])
+    assert g.main() == 0
+    assert "✅" in capsys.readouterr().out
+    # the file was never re-read: a fictional planted violation in the cache
+    # still surfaces (fail-open only on mismatch, not on hit)
+
+
+def test_cache_miss_after_content_change_restores_recomputed_verdict(tmp_path, monkeypatch, capsys):
+    """Changing the file (mtime+size drift) must invalidate and recompute."""
+    tmp_path, rel = _plant(tmp_path, monkeypatch, with_cache=True)
+    # drift: add a second planted violation (valid indentation) → size+mtime change
+    (tmp_path / rel).write_text("_d = 0\ndef f():\n    _d = 1\ndef h():\n    _d = 2\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["check_missing_global.py"])
+    assert g.main() == 1  # recomputed from the drifted file
+    assert "mod.py:3" in capsys.readouterr().out
+
+
+def test_cache_ignored_under_no_cache_flag(tmp_path, monkeypatch, capsys):
+    """--no-cache forces a re-read even when the fingerprint matches."""
+    tmp_path, rel = _plant(tmp_path, monkeypatch, with_cache=True)
+    (tmp_path / rel).write_text("_d = 0\ndef f():\n    _d = 1\ndef h():\n    _d = 2\n", encoding="utf-8")
+    # the cache entry now holds the CLEAN fingerprint for the drifted file —
+    # only --no-cache can force the re-read that surfaces the violation
+    g._save_cache({rel: (g._stat_fingerprint(tmp_path / rel), [])})
+    monkeypatch.setattr(sys, "argv", ["check_missing_global.py", "--no-cache"])
+    assert g.main() == 1
+    assert "mod.py:3" in capsys.readouterr().out
+
+
+def test_corrupt_cache_fails_open(tmp_path, monkeypatch, capsys):
+    """Garbage / version-mismatch / schema-broken cache must full-recompute."""
+    tmp_path, _rel = _plant(tmp_path, monkeypatch, with_cache=True)
+    cache = tmp_path / ".cache" / "missing_global_v1.json"
+    cache.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["check_missing_global.py"])
+    assert g.main() == 1  # recomputed the planted violation
+    assert "mod.py:3" in capsys.readouterr().out
+
+    # and version mismatch also fails open
+    _plant(tmp_path, monkeypatch, with_cache=True)
+    cache.write_text('{"version": 999, "files": {}}', encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["check_missing_global.py"])
+    assert g.main() == 1

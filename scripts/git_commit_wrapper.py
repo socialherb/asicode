@@ -236,7 +236,10 @@ def _wait_for_settle(
     deadline = time.monotonic() + timeout
     prev: tuple[int, bytes] | None = None
     stable = 0
-    while time.monotonic() < deadline:
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            return False
         cur = _snapshot(cwd, runner, exclude)
         if cur == prev:
             stable += 1
@@ -245,8 +248,13 @@ def _wait_for_settle(
         else:
             stable = 0
         prev = cur
-        time.sleep(interval)
-    return False
+        # Sleep at most ``interval`` AND only until the deadline: a slow
+        # snapshot (git diff on a large tree) already consumed part of the
+        # budget, and ``interval > timeout`` must not extend the wait past the
+        # caller's deadline (the retry is bounded by design).
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(interval, remaining))
 
 
 def _module_available(name: str) -> bool:

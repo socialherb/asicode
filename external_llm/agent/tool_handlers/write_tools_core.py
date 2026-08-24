@@ -137,7 +137,10 @@ def _find_block_end_line(
         line_start = sum(len(_l) for _l in lines[:anchor_lineno])
         line_end = line_start + len(anchor_line)
         first_open = None
-        for _ch, _idx in _iter_brace_tokens(content, line_start):
+        # js_lexing matches the find_brace_block_end call below: a template-
+        # literal ``{`` (``const x = `{t}`; function f() {``) must not be
+        # picked as the body opener for TS/JS (Go raw backticks keep False).
+        for _ch, _idx in _iter_brace_tokens(content, line_start, js_lexing=lang_str in ("typescript", "javascript")):
             if _idx >= line_end:
                 break
             if _ch == "{":
@@ -145,7 +148,7 @@ def _find_block_end_line(
                 break
         if first_open is None:
             return None
-        end_0based = find_brace_block_end(content, first_open) - 1
+        end_0based = find_brace_block_end(content, first_open, js_lexing=lang_str in ("typescript", "javascript")) - 1
         if end_0based <= anchor_lineno:
             return None
         return min(end_0based, len(lines) - 1)

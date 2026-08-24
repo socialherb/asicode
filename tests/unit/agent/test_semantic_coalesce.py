@@ -78,6 +78,17 @@ def _edit(reg, old, new):
     return reg.dispatch("edit_text", {"file_path": "sample.py", "old_string": old, "new_string": new})
 
 
+def _clean_syntax(self, file_path, content):
+    """Stub for validate_syntax: always a clean verdict, never a false one.
+
+    The drain-concurrency tests exercise the semantic batching/overlap path,
+    not the syntax toolchain — without this the dispatch path would spawn a
+    real tsc per edit and the gate would pay its contention for a property the
+    test does not measure.
+    """
+    return type("R", (), {"ok": True, "errors": [], "language": None})()
+
+
 def _syntax_check(result) -> dict:
     return (result.metadata or {}).get("syntax_check") or {}
 
@@ -369,6 +380,15 @@ def test_provider_groups_run_concurrently(tool_registry, temp_repo_root, monkeyp
     monkeypatch.setattr(pp.PythonSyntaxProvider, "validate_semantics_batch", _make("py"))
     monkeypatch.setattr(tp.TypeScriptSyntaxProvider, "validate_semantics_batch", _make("ts"))
 
+    # The dispatch path also runs an immediate SYNTAX check (validate_syntax),
+    # which would spawn a real tsc per edit. This test is about the drain
+    # overlapping its semantic groups, not about the syntax toolchain, so stub
+    # that too — otherwise the gate pays a real tsc spawn (and its contention)
+    # for a property this test does not exercise. Same shape as the `reg`
+    # fixture's stub: never a false verdict.
+    monkeypatch.setattr(pp.PythonSyntaxProvider, "validate_syntax", _clean_syntax)
+    monkeypatch.setattr(tp.TypeScriptSyntaxProvider, "validate_syntax", _clean_syntax)
+
     Path(temp_repo_root, "app.ts").write_text("export const a = 1;\n", encoding="utf-8")
     tool_registry.begin_semantic_turn()
     _edit(tool_registry, '    return "world"', '    return "world"  # a')
@@ -438,6 +458,12 @@ def test_one_group_failing_does_not_cost_the_other_its_diagnostics(
 
     monkeypatch.setattr(pp.PythonSyntaxProvider, "validate_semantics_batch", _ok)
     monkeypatch.setattr(tp.TypeScriptSyntaxProvider, "validate_semantics_batch", _raises)
+
+    # Same as test_provider_groups_run_concurrently: the dispatch path's
+    # immediate syntax check would spawn a real tsc per edit. This test is
+    # about per-group failure isolation in the drain, not the syntax toolchain.
+    monkeypatch.setattr(pp.PythonSyntaxProvider, "validate_syntax", _clean_syntax)
+    monkeypatch.setattr(tp.TypeScriptSyntaxProvider, "validate_syntax", _clean_syntax)
 
     Path(temp_repo_root, "app.ts").write_text("export const a = 1;\n", encoding="utf-8")
     tool_registry.begin_semantic_turn()

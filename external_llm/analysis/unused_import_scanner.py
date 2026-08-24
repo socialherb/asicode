@@ -455,10 +455,13 @@ def _uic_extract_file(abs_path: str, rel_path: str):
     mirroring the scan loop's skip conditions.  Pure function of file
     content; cached by ``scan_unused_imports``.
     """
-    source = parse_cache.read_source(abs_path)
+    # Fused read+parse: one stat, so source and tree are guaranteed to be the
+    # SAME file version (read_source+parse_ast would stat twice and could pair
+    # a pre-write source with a post-write tree — the multi-line noqa(F401)
+    # check below splits THIS source, so a mismatched tree would misjudge it).
+    source, tree = parse_cache.read_and_parse(abs_path)
     if source is None:
         return None
-    tree = parse_cache.parse_ast(abs_path)
     if tree is None:
         logger.debug("[UNUSED_IMPORT] SyntaxError in %s — skipping", rel_path)
         return None

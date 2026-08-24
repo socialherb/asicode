@@ -306,7 +306,7 @@ def _ts_symbol_defined(content: str, symbol: str, lang_id: _LanguageId | None = 
         # Delegated to the literal/comment-aware base scanner: the old
         # hand-rolled depth loop miscounted braces inside strings/comments
         # (e.g. `s = "}"`) and truncated the body, losing methods after it.
-        _body_end_abs = find_brace_block_end_offset(content, _match.end())
+        _body_end_abs = find_brace_block_end_offset(content, _match.end(), js_lexing=True)
         _class_body = content[_match.end() : _body_end_abs]
         _method_re = re.compile(
             rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(member_name)}\s*[\(=:<]"
@@ -327,7 +327,7 @@ def _ts_symbol_defined(content: str, symbol: str, lang_id: _LanguageId | None = 
     _method_re = re.compile(rf"(?:public|private|protected|static|readonly|async|\s)*\b{re.escape(symbol)}\s*[\(=:<]")
     for _cm in _RE_TS_CLASS_BODY.finditer(content):
         _body_start = _cm.end()
-        _body_end_abs = find_brace_block_end_offset(content, _body_start)
+        _body_end_abs = find_brace_block_end_offset(content, _body_start, js_lexing=True)
         _class_body = content[_body_start:_body_end_abs]
         if _method_re.search(_class_body):
             return True

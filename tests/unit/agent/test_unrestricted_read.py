@@ -270,6 +270,45 @@ class TestSecurePathRootResolveCache:
             str(repo2),
         }
 
+    def test_override_cycles_keep_cache_bounded_by_distinct_roots(self, tmp_path):
+        # Regression seal: _secure_root_resolve_cache must stay bounded by the
+        # number of DISTINCT effective roots ever used — never by the number of
+        # override assignments or by per-path lookups (the key is the root
+        # string, so re-assigning an override only ever ADDS a key for a root
+        # not seen before; a second assignment of the same root reuses the
+        # existing entry).
+        repo_a = tmp_path / "a"
+        repo_b = tmp_path / "b"
+        repo_c = tmp_path / "c"
+        for r in (repo_a, repo_b, repo_c):
+            r.mkdir()
+            (r / "f.py").write_text("x = 1\n", encoding="utf-8")
+        reg = ToolRegistry(str(repo_a), AgentConfig())
+        # Seed the cache under the initial root so repo_a's key exists BEFORE
+        # the cycle (the invariant below counts 3 distinct roots, and counting
+        # the seed would otherwise mask a growing-cache regression).
+        assert reg._secure_path("f.py") is not None
+
+        def cycle_roots() -> None:
+            roots = [str(repo_b), str(repo_c), str(repo_b), str(repo_a)]
+            for r in roots:
+                reg._repo_root_override = r
+                # Resolve a relative path that only exists inside the current
+                # effective root, forcing root resolution under that override.
+                assert reg._secure_path("f.py") is not None
+
+        cycle_roots()
+        # The cycle touched b, c, b, a — only 3 DISTINCT roots (a was already
+        # seeded), so the cache must hold exactly one entry per distinct root.
+        assert len(reg._secure_root_resolve_cache) == 3, (
+            f"cache must hold one entry per DISTINCT root, got {len(reg._secure_root_resolve_cache)}"
+            f" keys: {sorted(reg._secure_root_resolve_cache)}"
+        )
+        # Re-running the same cycle must NOT grow the cache further (same keys
+        # hit again — no new entries).
+        cycle_roots()
+        assert len(reg._secure_root_resolve_cache) == 3
+
     def test_clone_for_subagent_gets_own_cache(self, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()

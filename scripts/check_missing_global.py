@@ -86,6 +86,7 @@ CI) scans the whole repo.
 """
 
 import ast
+import json
 import os
 import symtable
 import sys
@@ -110,6 +111,75 @@ SKIP_DIRS = {
     ".asicode",
 }
 
+# Per-file analysis disk cache (P15, 2026-08-24): the full-repo scan re-parses
+# every scoped .py on every run (ast.parse + symtable), but _violations_in is a
+# pure function of file content, so a (st_mtime_ns, st_size) fingerprint cache
+# reuses prior results — same invalidation contract as the other analysis gates
+# (A307, 786ffcdc).  Fail-open: corruption/version-mismatch → full recompute.
+# `--no-cache` bypasses the cache entirely (pre-commit per-file runs where the
+# file set and content are mid-edit).
+_CACHE_VERSION = 1
+
+
+def _cache_path() -> Path:
+    """Per-repo cache file (REPO is monkeypatch-able in tests, so derived dynamically)."""
+    return REPO / ".cache" / f"missing_global_v{_CACHE_VERSION}.json"
+
+
+def _stat_fingerprint(path: Path) -> tuple[int, int] | None:
+    """(st_mtime_ns, st_size) for *path*, or None when it cannot be stat'd."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _load_cache() -> dict[str, tuple[tuple[int, int], list[tuple[int, str, str, str]]]]:
+    """Load the violations cache; ``{rel: (fingerprint, violations)}``, empty on any fault."""
+    try:
+        with open(_cache_path(), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if payload.get("version") != _CACHE_VERSION:
+        return {}
+    out: dict[str, tuple[tuple[int, int], list[tuple[int, str, str, str]]]] = {}
+    for rel, entry in (payload.get("files") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        fp = entry.get("fp")
+        vio = entry.get("violations")
+        if (
+            isinstance(fp, list)
+            and len(fp) == 2
+            and all(isinstance(x, int) for x in fp)
+            and isinstance(vio, list)
+            and all(
+                isinstance(v, list) and len(v) == 4 and isinstance(v[0], int) and all(isinstance(x, str) for x in v[1:])
+                for v in vio
+            )
+        ):
+            out[rel] = (tuple(fp), [tuple(v) for v in vio])
+    return out
+
+
+def _save_cache(cache: dict[str, tuple[tuple[int, int], list[tuple[int, str, str, str]]]]) -> None:
+    """Persist *cache* to disk (best-effort; failure costs a re-analysis)."""
+    try:
+        target = _cache_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        files = {rel: {"fp": list(fp), "violations": [list(v) for v in vio]} for rel, (fp, vio) in cache.items()}
+        payload = {"version": _CACHE_VERSION, "files": files}
+        tmp = target.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except (OSError, ValueError, TypeError):
+        pass
+
 
 def _resolve_scan_paths(args: list[str]) -> list[str] | None:
     """Normalize explicit file args to repo-relative ``*.py`` paths.
@@ -128,11 +198,13 @@ def _resolve_scan_paths(args: list[str]) -> list[str] | None:
 
 def _iter_py_files(paths=None):
     if paths is None:
-        for path in REPO.rglob("*.py"):
-            rel = path.relative_to(REPO)
-            if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel.parts):
-                continue
-            yield rel, path
+        for root, dirs, files in os.walk(REPO):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.endswith(".egg-info")]
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                rel = os.path.relpath(os.path.join(root, name), REPO)
+                yield Path(rel), Path(root) / name
         return
     for rel in paths:
         p = REPO / rel
@@ -229,12 +301,16 @@ def _violations_in(source: str, filename: str) -> list[tuple[int, str, str, str]
     """``(lineno, func, name, shape)`` for each undeclared module-global write."""
     try:
         tree = ast.parse(source)
-        table = symtable.symtable(source, filename, "exec")
     except (SyntaxError, ValueError):
         return []  # the syntax gates own that
 
     module_names = _module_assigned_names(tree)
     if not module_names:
+        return []  # nothing can be shadowed; skip the symtable build (488/954 files)
+
+    try:
+        table = symtable.symtable(source, filename, "exec")
+    except (SyntaxError, ValueError):
         return []
 
     scopes: dict[tuple[str, int], symtable.SymbolTable] = {}
@@ -276,13 +352,27 @@ def _violations_in(source: str, filename: str) -> list[tuple[int, str, str, str]
 def main() -> int:
     findings: list[str] = []
     paths = _resolve_scan_paths([a for a in sys.argv[1:] if not a.startswith("--")])
+    cache = {} if "--no-cache" in sys.argv else _load_cache()
+    dirty = False
     for rel, path in sorted(_iter_py_files(paths)):
-        try:
-            source = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for lineno, func, name, shape in _violations_in(source, str(rel)):
+        rel = str(rel)  # cache keys / findings are repo-relative str (Path != str)
+        fp = _stat_fingerprint(path)
+        if fp is not None and rel in cache and cache[rel][0] == fp:
+            violations = cache[rel][1]
+        else:
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            violations = _violations_in(source, rel)
+            if fp is not None:
+                cache[rel] = (fp, violations)
+                dirty = True
+        for lineno, func, name, shape in violations:
             findings.append(f"  {rel}:{lineno}  in {func}()  assigns {name!r}\n      {shape}")
+
+    if dirty:
+        _save_cache(cache)
 
     if not findings:
         print(

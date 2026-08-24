@@ -1082,6 +1082,40 @@ def test_scan_cache_hot_run_matches_cold_and_reuses_all_entries(tmp_path):
     assert _unused_names(hot) == cold_results, "cache-rehydrated run must match the full scan"
 
 
+def test_scan_cache_restore_str_filename_matches_cold_path_filename(tmp_path):
+    """A cache-hot (restored) run's get_unused_code() must be identical to the
+    cold (scanned) run in ORDER as well as content — the restore path stores
+    Item filenames as ``str`` while a real ``v.scan`` uses ``pathlib.Path``.
+    ``get_unused_code()`` sorts by ``str(filename).lower()`` and hashes
+    ``(filename, lineno, name)``, so the two surfaces must agree bit-for-bit
+    on every output tuple (name, typ, lineno) in raw sorted order."""
+    from pathlib import Path
+
+    import vulture.core
+
+    from external_llm.analysis.vulture_scanner import (
+        _load_vulture_scan_cache,
+        _restore_vulture_entry,
+    )
+
+    paths = _vulture_files(tmp_path)
+
+    cold = _scan_unused(tmp_path, paths)
+    cold_raw = [(i.name, i.typ, i.first_lineno) for i in cold.get_unused_code(min_confidence=0)]
+
+    # Rehydrate the same cache into a fresh Vulture with the str-filename path.
+    files = _load_vulture_scan_cache(str(tmp_path), vulture.__version__)
+    v = vulture.core.Vulture(verbose=False)
+    for _rel, entry in files.items():
+        _restore_vulture_entry(v, entry)
+    hot_raw = [(i.name, i.typ, i.first_lineno) for i in v.get_unused_code(min_confidence=0)]
+    assert hot_raw == cold_raw, "restored (str filename) get_unused_code order must match cold (Path filename)"
+    # The restored items must actually carry a plain str filename.
+    assert all(
+        isinstance(i.filename, str) and not isinstance(i.filename, Path) for i in v.get_unused_code(min_confidence=0)
+    )
+
+
 def test_scan_cache_reparses_only_edited_file(tmp_path):
     """Editing one file invalidates exactly that file's entry — the other
     entries are rehydrated and the edit's new dead code is detected."""

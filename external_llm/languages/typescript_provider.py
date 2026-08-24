@@ -638,7 +638,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
             if result:
                 return result
 
-        return self._find_symbol_regex(symbol_name, content)
+        return self._find_symbol_regex(symbol_name, content, js_lexing=True)
 
     @staticmethod
     def _find_block_end(content: str, offset: int, nl: list[int] | None = None) -> int:
@@ -649,8 +649,11 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         comments so braces inside them do not corrupt the depth counter.
         *nl* is an optional precomputed line index (see ``base.build_line_index``)
         that keeps the internal line queries O(log n) in hot loops.
+
+        TS/JS passes ``js_lexing=True`` so ``\\``` escapes inside template
+        literals are honoured (the SSOT default treats backtick as Go-raw).
         """
-        return find_brace_block_end(content, offset, nl)
+        return find_brace_block_end(content, offset, nl, js_lexing=True)
 
     # ── Definition keywords ───────────────────────────────────────────────
 
@@ -706,8 +709,11 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         Delegates to :func:`base.find_brace_block_end_offset` (the shared SSOT) so
         braces inside string/char/template literals or comments cannot corrupt the
         depth counter. See base.py for the full contract.
+
+        TS/JS passes ``js_lexing=True`` so ``\\``` escapes inside template
+        literals are honoured (the SSOT default treats backtick as Go-raw).
         """
-        return find_brace_block_end_offset(content, offset)
+        return find_brace_block_end_offset(content, offset, js_lexing=True)
 
     def _find_class_methods_regex(
         self,
@@ -776,7 +782,7 @@ class TypeScriptSyntaxProvider(SyntaxProvider):
         result = extract_symbol_body(content, symbol_name, "typescript") if is_available() else None
         if result:
             return result
-        return self._find_symbol_body_range_regex(content, symbol_name)
+        return self._find_symbol_body_range_regex(content, symbol_name, js_lexing=True)
 
     def get_definition_keywords(self) -> list[str]:
         return [

@@ -97,7 +97,7 @@ class DependencyGraphBuilder:
         visited.add(file_path)
 
         # Analyze file
-        analysis = self._get_analysis(file_path)
+        analysis = self.get_analysis(file_path)
         if not analysis:
             return
 
@@ -115,7 +115,7 @@ class DependencyGraphBuilder:
             if imported_file.exists() and imported_file.suffix == ".py":
                 self._build_recursive(imported_file, graph, visited, depth + 1, max_depth)
 
-    def _get_analysis(self, file_path: Path) -> CodeAnalysis | None:
+    def get_analysis(self, file_path: Path) -> CodeAnalysis | None:
         """Get or cache code analysis.
 
         Returns a SHARED cached object: every caller for a given file_path
@@ -126,6 +126,21 @@ class DependencyGraphBuilder:
         rich per-file AST metadata whose reuse is the entire point of the cache,
         so the copy cost would negate the benefit. The read-only contract is
         enforced by convention (all current callers iterate only).
+
+        Public so external consumers (e.g. SuperContextBuilder) share the same
+        single per-file analysis cache instead of re-analyzing via their own
+        CodeAnalyzer instance.
+
+        Deliberately does NOT route file reads through analysis.parse_cache
+        (F-3): parse_cache decodes with ``errors="replace"`` (best-effort
+        U+FFFD) while analyze_file requires STRICT utf-8 so an undecodable
+        file is reported unreadable (None → the file is skipped by graph
+        building) rather than half-analyzed with replacement characters.
+        Reusing the cache here would change that decode contract for zero
+        gain: each DependencyGraphBuilder lives for a single request (created
+        per SuperContextBuilder in service.py), so cross-request reuse is
+        already impossible and within one request get_analysis is the sole
+        read path.
         """
         if file_path not in self._analysis_cache:
             analysis = self.analyzer.analyze_file(file_path)

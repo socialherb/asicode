@@ -34,7 +34,7 @@ class _Harness(WriteToolsMixin):
         kwargs.setdefault("content", "")
         return ToolResult(**kwargs)
 
-    def _run_syntax_check_for_file(self, path):
+    def _run_syntax_check_for_file(self, path, **kwargs):
         return {"ok": True, "skipped": True, "reason": "test"}
 
     def _secure_path(self, path, *, confine=False):
@@ -193,7 +193,6 @@ class TestNearMatchHint:
         out = harness._near_match_hint(content, "a = code")
         assert "Markdown decoration differs" in out
 
-    @pytest.mark.slow
     def test_multiline_content_change_ratio_survives_autojunk(self, harness):
         """P24-1: char-level autojunk collapse on multi-line old_strings.
 
@@ -213,6 +212,28 @@ class TestNearMatchHint:
         content = "\n".join(lines)
         old = content.replace("compute_value_10", "compute_value_1X")  # 1-char content edit
         out = harness._near_match_hint(content, old)
+        assert "~9" in out or "~100%" in out, f"ratio collapsed (autojunk): {out[:200]}"
+
+    def test_window_scan_bounded_not_full_blob_per_candidate(self, harness):
+        """Performance contract for the hint window scan.
+
+        The scorer used to iterate EVERY start in [ci-window+1, ci] for each
+        candidate line — a 60-line old_string with 5 candidates scored up to
+        300 full-blob SequenceMatcher comparisons (~19s for one hint). The
+        scan is now bounded to at most 3 starts per candidate, so the same
+        pathological input must stay well under a second. This pins the
+        bound: if the window scan regresses to unbounded, this test's
+        2s ceiling fails.
+        """
+        import time
+
+        lines = [f"    self.attr_{i} = compute_value_{i}(input_{i}, options_{i}, flags[{i}])" for i in range(60)]
+        content = "\n".join(lines)
+        old = content.replace("compute_value_10", "compute_value_1X")
+        t0 = time.monotonic()
+        out = harness._near_match_hint(content, old)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 2.0, f"window scan unbounded again: {elapsed:.2f}s"
         assert "~9" in out or "~100%" in out, f"ratio collapsed (autojunk): {out[:200]}"
 
     def test_no_match_returns_empty(self, harness):

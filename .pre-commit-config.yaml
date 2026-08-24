@@ -183,3 +183,17 @@ repos:
         language: system
         entry: python3 scripts/check_structural_scanners.py
         types_or: [python, ts, tsx, javascript, go, java, kotlin]
+      - id: core-tree-sitter
+        # Env-WIDE check (not incremental): the installed tree-sitter core must
+        # stay below the measured segfault bound (0.26) AND satisfy the declared
+        # pyproject constraint. This must run even where pytest is absent — the
+        # 2026-08-24 incident: the dev venv had no pytest (so the
+        # test_tree_sitter_core_version.py guard never executed) while holding
+        # core 0.26.0, and the whole gate segfaulted. language: system uses the
+        # host python3 (the same interpreter that runs the other hook scripts),
+        # so pytest presence is irrelevant. Mirrors lint.yml's
+        # check_tree_sitter_core.py step — keep both in sync.
+        name: tree-sitter core version guard (env-wide)
+        language: system
+        entry: python3 scripts/check_tree_sitter_core.py
+        pass_filenames: false

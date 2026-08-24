@@ -159,6 +159,48 @@ def test_wait_for_settle_times_out_while_tree_keeps_changing(repo):
         t.join()
 
 
+def test_wait_for_settle_no_overshoot_when_interval_exceeds_timeout(repo):
+    """interval > timeout must not extend the wait past the deadline.
+
+    Old code slept the full interval after the deadline check, so a
+    timeout=0.05 / interval=0.5 call blocked ~0.5s (10x the budget) when the
+    tree kept changing. The sleep is now capped by the remaining budget.
+    """
+    start = time.monotonic()
+    assert not w._wait_for_settle(str(repo), w._default_runner, timeout=0.05, interval=0.5, stable_samples=1)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.3, f"overshot the deadline: waited {elapsed:.2f}s for a 0.05s timeout"
+
+
+def test_wait_for_settle_no_overshoot_with_slow_snapshot(repo):
+    """A slow snapshot must not push past the deadline while the tree churns."""
+    stop = threading.Event()
+
+    def churn():
+        i = 0
+        while not stop.is_set():
+            (repo / "a.txt").write_text(f"churn{i}\n")
+            i += 1
+            time.sleep(0.01)
+
+    def slow_runner(args, cwd):
+        time.sleep(0.1)  # snapshot cost, larger than the remaining budget
+        return w._default_runner(args, cwd)
+
+    t = threading.Thread(target=churn)
+    t.start()
+    try:
+        start = time.monotonic()
+        assert not w._wait_for_settle(str(repo), slow_runner, timeout=0.25, interval=0.05, stable_samples=1)
+        elapsed = time.monotonic() - start
+        # Budget 0.25s: at most one 0.1s snapshot + capped sleeps. Without the
+        # cap, the last `time.sleep(0.05)` would run after the deadline passed.
+        assert elapsed < 0.5, f"overshot the deadline: waited {elapsed:.2f}s for a 0.25s timeout"
+    finally:
+        stop.set()
+        t.join()
+
+
 # --- run_hooks(): success passthrough ----------------------------------------
 def test_run_hooks_success_passthrough_no_retry(tmp_path, capsys):
     top = str(tmp_path / "repo")

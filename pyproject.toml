@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.29"
+version = "0.2.30"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -242,6 +242,18 @@ markers = [
     "unit: unit tests (isolated, fast)",
     "slow: slow tests (deselected by default; PR/lint jobs skip, release runs them)",
     "network: tests that require network access",
+    # repo_scan group (P3, 2026-08-24 re-verify): serializes 5 whole-REPO
+    # scan files so 8 xdist workers never run them concurrently. Re-verified
+    # by A/B (marker renamed to disable the group, file contents unchanged):
+    # gate-level (-m "not slow") INTACT 13.4/14.2s vs DISABLED 13.9/14.1s,
+    # slow-inclusive 25.2/25.4 vs 23.2/29.7 (jitter only) — group removal buys
+    # ZERO wall-time. Each worker's @cache (export_public._first_party_imports /
+    # tracked_files) is process-wide, so a worker that runs several of these
+    # tests sequentially reuses one full-repo AST scan; scattering them across
+    # workers repeats that scan per worker and re-introduces the 8-way
+    # .cache/structural_graph_v1.json read+rewrite storm 64a0917e6 measured
+    # (dump_candidates 9.13s -> 5.87s). Keep the group; do not "parallelize".
+    "xdist_group: tests that must not run concurrently with other xdist_group tests (serialized full-repo scans)",
 ]
 addopts = [
     "-v",
@@ -257,15 +269,20 @@ addopts = [
     # the flag and its value must be separate elements.
     "-n",
     "auto",
-    # --dist=worksteal: idle workers steal pending tests from busy workers'
-    # queues (pytest-xdist >= 3.5). The unit suite is top-heavy — stage3
-    # spawned-REPL cluster (~19 tests x 2-5s) plus 13.8s/12.6s/8.5s
-    # heavyweights (verify-durations 20260820-204549) — so round-robin
-    # ``load`` left stragglers. Measured 2026-08-20 (8 workers, full unit
-    # suite, interleaved A/B x2): load 199.1/202.1s vs worksteal
-    # 156.1/167.1s = 1.24x median. Pinned by test_pytest_dist_contract.py.
+    # --dist=loadgroup: xdist_group markers serialize whole-repo scan files
+    # (repo_scan) onto ONE worker — the ONLY distribution mode that honors
+    # xdist_group when those files are present (P5 re-verify 2026-08-24:
+    # worksteal STEALS group tests onto other workers → the 8-way
+    # .cache/structural_graph_v1.json read+rewrite storm 64a0917e6 fixed —
+    # repo_scan tests measured 17-18s apiece vs 4.5-6.4s under loadgroup).
+    # P10 (2026-08-20) measured worksteal 1.24x faster than ``load`` — but
+    # that A/B ran BEFORE repo_scan's xdist_group existed; a fair re-A/B
+    # (2026-08-24, identical tree/command, Chrome closed, x2): worksteal
+    # 293.8/302.4s vs loadgroup 276.7/313.7s — NO total-time difference
+    # (medians 298.1 vs 295.2, <1%) while loadgroup restores group
+    # serialization. Pinned by test_pytest_dist_contract.py.
     "--dist",
-    "worksteal",
+    "loadgroup",
 ]
 # Coverage measurement: `coverage run -m pytest` is WRONG under -n auto —
 # xdist workers are separate interpreters, so it records only the main

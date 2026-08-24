@@ -1205,8 +1205,12 @@ def _extract_dead_block_file(abs_path: str, rel_path: str):
         # ── Fallback: AST (Python only) ──
         if _lang != "python":
             return None
-        tree = _pc.parse_ast(abs_path)
-        if tree is None:
+        # Parse from the SAME src read above — no second stat, so the tree
+        # cannot be a different file version from the source being analysed.
+        try:
+            tree = ast.parse(src, filename=abs_path)
+        except SyntaxError:
+            logger.debug("[DEAD_BLOCK] SyntaxError in %s — skipping", rel_path)
             return None
         all_names = _extract_all_list(tree)
         if "*__dynamic__*" in all_names:

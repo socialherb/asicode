@@ -1346,8 +1346,13 @@ class TestHandleTerminalResize:
         def _boom(*a, **k):
             raise OSError("bad tty")
 
-        monkeypatch.setattr(shutil, "get_terminal_size", _boom)
-        asi._handle_terminal_resize()  # must not raise
+        # Scope the patch to the call under test: a module-level (test-wide)
+        # patch would leak into pytest's own progress rendering, which calls
+        # shutil.get_terminal_size() after this test finishes -> OSError ->
+        # worker crash (INTERNALERROR) under xdist.
+        with monkeypatch.context() as m:
+            m.setattr(shutil, "get_terminal_size", _boom)
+            asi._handle_terminal_resize()  # must not raise
 
 
 # ─── embedding cache helpers ───────────────────────────────────────────────────

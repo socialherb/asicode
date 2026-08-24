@@ -2614,7 +2614,12 @@ class WriteToolsPatchMixin:
     def _analyze_patch_failure(self, patch_text: str, git_error: str) -> dict[str, Any]:
         import re
 
+        # Lazy import: analysis.parse_cache is a heavy module (tree-sitter
+        # grammars); only failure paths pay the cost.
+        from ...analysis import parse_cache
         from ..failure_context import analyze_failure
+
+        read_source = parse_cache.read_source
 
         failure_ctx = analyze_failure(
             stage="git_apply_check",
@@ -2623,6 +2628,10 @@ class WriteToolsPatchMixin:
 
         file_path = None
         hunks = []
+        # Reused across the two context-mismatch analysis branches below; the
+        # process-wide parse_cache makes the second branch a cache hit instead
+        # of a second disk read.
+        file_source: str | None = None
 
         lines = patch_text.split("\n")
         for i, line in enumerate(lines):
@@ -2703,60 +2712,62 @@ class WriteToolsPatchMixin:
                 conflicting_lines.append(conflicting_line)
 
                 if file_path:
-                    try:
-                        file_full_path = Path(self.repo_root) / file_path
-                        if file_full_path.exists():
-                            with open(file_full_path, encoding="utf-8") as f:
-                                file_content = f.read()
-                                file_lines_list = file_content.split("\n")
+                    # Reuse the process-wide parse_cache (single-stat, cached
+                    # read) instead of re-reading the target file from disk.
+                    # read_source() decodes UTF-8 with errors="replace" — for
+                    # well-formed UTF-8 files this is identical to the old
+                    # strict-utf8 read, and for undecodable files it surfaces
+                    # U+FFFD markers in the hint instead of failing silently.
+                    file_source = read_source(str(Path(self.repo_root) / file_path))
+                    if file_source is not None:
+                        file_lines_list = file_source.split("\n")
 
-                                if 0 <= conflicting_line - 1 < len(file_lines_list):
-                                    actual_line = file_lines_list[conflicting_line - 1]
+                        if 0 <= conflicting_line - 1 < len(file_lines_list):
+                            actual_line = file_lines_list[conflicting_line - 1]
 
-                                    expected_line = None
-                                    for hunk in hunks:
-                                        if (
-                                            hunk["old_start"]
-                                            <= conflicting_line
-                                            <= hunk["old_start"] + hunk["old_lines"]
-                                        ):
-                                            offset = conflicting_line - hunk["old_start"]
-                                            context_counter = 0
-                                            for line_type, content in hunk["original_lines"]:
-                                                if line_type == "context":
-                                                    if context_counter == offset:
-                                                        expected_line = content
-                                                        break
-                                                    context_counter += 1
-                                                elif line_type == "remove":
-                                                    context_counter += 1
-                                            break
+                            expected_line = None
+                            for hunk in hunks:
+                                if hunk["old_start"] <= conflicting_line <= hunk["old_start"] + hunk["old_lines"]:
+                                    offset = conflicting_line - hunk["old_start"]
+                                    context_counter = 0
+                                    for line_type, content in hunk["original_lines"]:
+                                        if line_type == "context":
+                                            if context_counter == offset:
+                                                expected_line = content
+                                                break
+                                            context_counter += 1
+                                        elif line_type == "remove":
+                                            context_counter += 1
+                                    break
 
-                                    if expected_line:
-                                        if len(expected_line) > 100:
-                                            expected_line = expected_line[:97] + "..."
-                                        if len(actual_line) > 100:
-                                            actual_line = actual_line[:97] + "..."
-                                        hint = f"Context mismatch at line ~{conflicting_line}. Expected: '{expected_line}' but found: '{actual_line}'"
-                                    else:
-                                        start = max(0, conflicting_line - 3)
-                                        end = min(len(file_lines_list), conflicting_line + 2)
-                                        ctx = "\n".join(f"{i + 1}: {file_lines_list[i]}" for i in range(start, end))
-                                        hint = (
-                                            f"Patch failed at line {conflicting_line}. File context around line:\n{ctx}"
-                                        )
-                    except Exception as e:
-                        logger.debug("Failed to read file %s for patch analysis: %s", file_path, e)
+                            if expected_line:
+                                if len(expected_line) > 100:
+                                    expected_line = expected_line[:97] + "..."
+                                if len(actual_line) > 100:
+                                    actual_line = actual_line[:97] + "..."
+                                hint = f"Context mismatch at line ~{conflicting_line}. Expected: '{expected_line}' but found: '{actual_line}'"
+                            else:
+                                ctx_start = max(0, conflicting_line - 3)
+                                ctx_end = min(len(file_lines_list), conflicting_line + 2)
+                                ctx = "\n".join(f"{i + 1}: {file_lines_list[i]}" for i in range(ctx_start, ctx_end))
+                                hint = f"Patch failed at line {conflicting_line}. File context around line:\n{ctx}"
+                else:
+                    file_source = None
         elif "no such file" in error_lower or "cannot stat" in error_lower:
             reason = "file_not_found"
             hint = f"Target file not found: {file_path or 'unknown'}{self._suggest_missing_paths(file_path or '')}"
 
         file_context_snippet: str | None = None
         if reason == "context_mismatch" and file_path and hunks:
-            try:
-                file_full_path = Path(self.repo_root) / file_path
-                if file_full_path.exists():
-                    file_lines_list = file_full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            # The line_match branch above populated file_source; without a
+            # line number the read is done here (single parse_cache lookup).
+            if file_source is None:
+                file_source = read_source(str(Path(self.repo_root) / file_path))
+            if file_source is not None:
+                try:
+                    # Reuse the source read in the line_match branch above (parse_cache
+                    # guarantees both reads observe the same file version).
+                    file_lines_list = file_source.splitlines()
                     hunk_start = hunks[0]["old_start"]
                     ctx_start = max(0, hunk_start - 5)
                     ctx_end = min(len(file_lines_list), hunk_start + hunks[0].get("old_lines", 10) + 5)
@@ -2764,11 +2775,11 @@ class WriteToolsPatchMixin:
                         f"{ctx_start + j + 1:4d}: {file_lines_list[ctx_start + j]}" for j in range(ctx_end - ctx_start)
                     ]
                     file_context_snippet = "\n".join(ctx_lines)
-            except (IndexError, TypeError):
-                logger.debug(
-                    "<module>::WriteToolsPatchMixin::_analyze_patch_failure:2 suppressed (IndexError, TypeError)",
-                    exc_info=True,
-                )
+                except (IndexError, TypeError):
+                    logger.debug(
+                        "<module>::WriteToolsPatchMixin::_analyze_patch_failure:2 suppressed (IndexError, TypeError)",
+                        exc_info=True,
+                    )
 
         parts = [f"Patch failed ({reason}): {hint or git_error.strip()[:200]}"]
 

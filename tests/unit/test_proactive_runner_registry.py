@@ -181,6 +181,17 @@ def test_get_or_create_updates_llm_invoke_fn():
 
 def test_evicted_runner_stop_failure_logged(monkeypatch, caplog):
     """A stop() failure while evicting is logged, not fatal (L113-114)."""
+    # This is a module-level test (no class setup/teardown isolation): clear
+    # any runner state left by earlier tests in the same worker. Otherwise the
+    # LRU eviction below may evict a *leftover* repo instead of /repo-0, and
+    # the injected stop() failure never fires (flaky under xdist). Must stop()
+    # each leftover so its drain daemon thread does not leak.
+    with _runners_lock:
+        leftovers = list(_runners.values())
+        _runners.clear()
+    for r in leftovers:
+        with contextlib.suppress(Exception):
+            r.stop()
     cap = 2
     monkeypatch.setattr(pr_mod, "_cfg", _StubCfg(cap))
     get_or_create_runner("/repo-0")

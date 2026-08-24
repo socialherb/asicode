@@ -254,6 +254,17 @@ class TestTypeScriptProvider:
         assert body[0] >= 1, f"body start invalid: {body}"
         assert body[1] >= body[0], f"body end < start: {body}"
 
+    def test_ts_template_literal_escaped_backtick_symbol_range(self, provider):
+        # Regression for the fixed limitation: a \` inside a TS template
+        # literal must NOT close the literal early when locating a symbol.
+        # Without js_lexing=True the scan would end at line 2 (the `hello\`
+        # backtick) instead of line 4 (the real closing brace).
+        content = "function make(): void {\n    const s = `hello\\` world`;\n    return s;\n}\n"
+        result = provider.find_symbol_in_file("sym.ts", "make", content)
+        assert result is not None, "symbol not found"
+        _, end = result
+        assert end == 4, f"expected end line 4 (real closing brace), got {end}"
+
 
 # ── JavaScriptSyntaxProvider ──────────────────────────────────────────────────
 
@@ -295,6 +306,15 @@ class TestJavaScriptProvider:
         content = "function hello() {\n    return 1;\n}\n"
         body = provider.find_symbol_body_range(content, "hello")
         assert isinstance(body, tuple) if body is not None else True
+
+    def test_js_template_literal_escaped_backtick_symbol_range(self, provider):
+        # Regression for the fixed limitation: a \` inside a JS template
+        # literal must NOT close the literal early when locating a symbol.
+        content = "function make() {\n    const s = `hello\\` world`;\n    return s;\n}\n"
+        result = provider.find_symbol_in_file("sym.js", "make", content)
+        assert result is not None, "symbol not found"
+        _, end = result
+        assert end == 4, f"expected end line 4 (real closing brace), got {end}"
 
 
 # ── KotlinSyntaxProvider ──────────────────────────────────────────────────────
@@ -667,17 +687,19 @@ class TestFindBlockEndSharedSSOT:
     def test_go_raw_string_backslash_does_not_escape_backtick(self, provider_cls):
         # Bug #2 regression: Go raw strings have NO escape sequences. A backslash
         # before the closing backtick (e.g. `C:\`) must NOT swallow the backtick.
-        # Only GoSyntaxProvider actually uses raw strings, but the shared scanner
-        # must handle it correctly for all.
+        # Go/Java/Kotlin keep js_lexing=False (shared-scanner default). TS passes
+        # js_lexing=True, where `\`` IS an escaped backtick inside a template
+        # literal — so `C:\` stays unterminated and the conservative fallback
+        # (start line) applies instead.
         src = "package main\nfunc f() {\n    s := `C:\\`\n}\n"
         end = provider_cls._find_block_end(src, src.index("{"))
-        assert end == 4, f"{provider_cls.__name__}: expected 4, got {end}"
+        if provider_cls is TypeScriptSyntaxProvider:
+            # js_lexing=True: `\` escapes the backtick → template unterminated →
+            # fallback to start line (2).
+            assert end == 2, f"{provider_cls.__name__}: expected 2 (unterminated fallback), got {end}"
+        else:
+            assert end == 4, f"{provider_cls.__name__}: expected 4, got {end}"
 
-    @pytest.mark.xfail(
-        reason="Known limitation: backtick always escapes=False "
-        "(Go compat) — TS escaped backtick inside template "
-        "literal may close prematurely. See _find_closing_brace docstring."
-    )
     @pytest.mark.parametrize(
         "provider_cls",
         [
@@ -688,15 +710,20 @@ class TestFindBlockEndSharedSSOT:
         ],
     )
     def test_ts_escaped_backtick_premature_close(self, provider_cls):
-        # TS template literal with escaped backtick (\`) — the shared scanner
-        # treats backtick as escapes=False (Go raw string compat), so the \`
-        # is not recognised as an escaped backtick and the literal closes early.
-        # Ideal end_line is 4; current behaviour (premature close) is 2.
+        # TS/JS template literals honour \` escapes: the \` inside
+        # `hello\` world` is escaped, so the literal does NOT close there and
+        # the matching } is on line 4. The TS provider passes js_lexing=True.
+        # Go/Java/Kotlin keep js_lexing=False (backtick = raw for Go compat):
+        # there the escaped backtick closes the literal early, the trailing
+        # ` world`; opens an unterminated literal that swallows the real },
+        # and the conservative fallback (start line) applies — that is the
+        # documented Go-raw behaviour and must stay unchanged.
         src = "void f() {\n    x = `hello\\` world`;\n}\n"
         end = provider_cls._find_block_end(src, src.index("{"))
-        # Known xfail: current result is ~2 (premature close on the \`).
-        # Update this assertion when the limitation is fixed.
-        assert end == 4, f"{provider_cls.__name__}: expected 4, got {end}"
+        if provider_cls is TypeScriptSyntaxProvider:
+            assert end == 3, f"{provider_cls.__name__}: expected 3, got {end}"
+        else:
+            assert end == 1, f"{provider_cls.__name__}: expected 1 (Go-raw fallback), got {end}"
 
 
 # ── find_brace_block_end_offset: SSOT for class-body ranges (java/kotlin/ts) ──
@@ -770,11 +797,35 @@ class TestFindBlockEndOffsetSharedSSOT:
     @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
     def test_raw_string_backslash_backtick_offset(self, provider_cls):
         # Bug #2: raw string backslash before backtick must not break the scanner.
+        # For Go/Java/Kotlin (js_lexing=False) `\` is literal and the backtick
+        # closes the raw string normally. For TS (js_lexing=True) `\`` is an
+        # escaped backtick → the template literal never closes → conservative
+        # len(content) fallback (which is also what real TS would do: the code
+        # is a syntax error there).
         src = "class A {\n    String s = `C:\\`;\n    void real() {}\n}\n"
         start = src.index("{")
         end = provider_cls._find_block_end_offset(src, start)
-        body = src[start:end]
-        assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+        if provider_cls is TypeScriptSyntaxProvider:
+            assert end == len(src), f"{provider_cls.__name__}: expected len(content) fallback, got {end}"
+        else:
+            body = src[start:end]
+            assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+
+    @pytest.mark.parametrize("provider_cls", OFFSET_PROVIDERS)
+    def test_ts_escaped_backtick_offset(self, provider_cls):
+        # Regression: a TS/JS template literal with an escaped backtick (\`)
+        # must not close the literal early. TS passes js_lexing=True so the
+        # class body extends to the real closing brace. For Go/Java/Kotlin the
+        # backtick is Go-raw (not escapable) — the scan is different but must
+        # still produce a sane (non-degenerate) range.
+        src = "class A {\n    const s = `a\\`b`;\n    void real() {}\n}\n"
+        start = src.index("{")
+        end = provider_cls._find_block_end_offset(src, start)
+        if provider_cls is TypeScriptSyntaxProvider:
+            body = src[start:end]
+            assert "void real()" in body, f"{provider_cls.__name__}: method lost, body={body!r}"
+        else:
+            assert end > start, f"{provider_cls.__name__}: degenerate range"
 
 
 def test_no_naive_brace_counting_in_block_extent_consumers():

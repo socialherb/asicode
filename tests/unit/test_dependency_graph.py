@@ -348,3 +348,32 @@ def test_relative_import_not_misresolved_as_absolute(tmp_path):
     graph = b.build_graph(mod, max_depth=2)
     imports = dict(graph.file_imports)
     assert imports.get("pkg/mod.py") == ["pkg/sibling.py"], imports
+
+
+# --- F-3: decode contract guard (strict utf-8, NOT parse_cache replace) ---
+
+
+def test_undecodable_file_returns_none_skips_analysis(tmp_path):
+    """Analysis must use STRICT utf-8: an undecodable file is reported
+    unreadable (skipped by graph building), never half-analyzed with U+FFFD
+    replacement characters.
+
+    This seals the F-3 decision: get_analysis deliberately does NOT route
+    through analysis.parse_cache, which decodes with errors='replace'. If
+    someone switches it to parse_cache, this test fails because the file
+    would decode (with replacement chars) instead of returning None.
+    """
+    (tmp_path / "pkg").mkdir(exist_ok=True)
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    mod = tmp_path / "pkg" / "mod.py"
+    mod.write_bytes(b"# \xff\xfe invalid utf-8\n" + b"def f():\n    pass\n")
+
+    b = DependencyGraphBuilder(tmp_path)
+    analysis = b.get_analysis(mod)
+    assert analysis is None  # strict decode failed -> unreadable -> skipped
+
+    # Graph building must skip the file entirely (no partial analysis).
+    graph = b.build_graph(mod, max_depth=2)
+    # calls is {caller: [callees]} — no 'f' anywhere means the file was skipped.
+    assert not any("f" in k or "f" in v for k, v in graph.calls.items()), graph.calls
+    assert graph.file_imports == {}, graph.file_imports

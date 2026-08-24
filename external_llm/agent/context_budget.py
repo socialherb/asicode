@@ -198,6 +198,12 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset(
         "ox-alpha-free",
         # DeepSeek v4 Flash vision variant — same 1M fallback as deepseek-v4-flash.
         "deepseek-v4-flash-vision-exp",
+        # LongCat-2.0 (Meituan 1.6T MoE, open-sourced 2026-07-05; on the opencode
+        # gateway since 2026-08-24). Native 1M context per the release blog
+        # (longcat.chat/blog/longcat-2.0) and github.com/meituan-longcat/
+        # LongCat-2.0 — UNVERIFIED against an opencode-docs provider page, but
+        # 1M fallback matches the model's real window, so safe.
+        "longcat-2.0",
     }
 )
 

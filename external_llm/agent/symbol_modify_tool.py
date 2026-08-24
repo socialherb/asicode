@@ -1438,7 +1438,10 @@ def _find_symbol_line_range(source: str, symbol: str, file_path: str) -> tuple[i
         # `line_start + find('{')` could land mid-string, truncate the range,
         # and orphan the body on edit). Returns a 1-based inclusive line;
         # conservative fallback is the start line when no match is found.
-        close_off = _find_closing_brace(source, line_start)
+        # TS/JS: js_lexing=True so a \` escape inside a template literal does
+        # not close the literal early (SSOT default is Go-raw backtick).
+        _is_js = LanguageId.from_path(file_path) in (LanguageId.TYPESCRIPT, LanguageId.JAVASCRIPT)
+        close_off = _find_closing_brace(source, line_start, js_lexing=_is_js)
         if close_off == -1:
             # No matching ``}`` (genuinely unbalanced/malformed input). Return
             # the def line alone: the brace-balance gate in _post_edit_syntax_ok

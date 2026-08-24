@@ -225,6 +225,7 @@ jobs:
         # optional [vulture] extra).
         run: |
           python -m pip install -e ".[vulture]" --quiet
+          python scripts/check_tree_sitter_core.py
           python scripts/check_structural_scanners.py --gate-only
 
       - name: PLR2004 magic-value drift observation (report-only, never gates)
@@ -271,15 +272,20 @@ jobs:
   #
   # The job mirrors release.yml's test job — same command, same Python
   # version, no deselections — so a PR faces the same gate a release faces.
-  # ONE deliberate difference: this job checks out the FULL private tree
-  # (release.yml checks out the exported tag, where lane/, webapp/, tools/
-  # and their coupled tests are absent), so the install below adds the
-  # webapp extra — 83 tests/unit files import webapp at module level
-  # (test_ui_tools_*, test_llm_execution_*, ...) and collection would fail
-  # with ImportError without fastapi. Locally fastapi is always present in
-  # dev installs, which is why this gap only manifests in CI.
+  # TREE REALITY (re-verified 2026-08-24, P28): this job does NOT check out the
+  # full private tree. actions/checkout@v4 with no `repository:` override checks
+  # out `github.repository` = the PUBLIC repo `socialherb/asicode`, whose main
+  # branch is the EXPORTED public snapshot (lane/, webapp/, tools/ and their
+  # coupled tests are absent — measured: public tree has 493 tests/unit files,
+  # private tree has 577; CI collects 13424 items vs 16067 locally). The CI head
+  # SHA (e.g. 480ca0d5c) does not exist in the private repo — the two repos have
+  # divergent commit histories, the public one being rebuilt from releases.
+  # The install below adds the webapp extra for historical reasons (the comment
+  # block this replaces claimed 83 files import webapp); on the public tree no
+  # webapp-coupled test exists, so the extra is inert-but-harmless. It is kept to
+  # match release.yml's identical install command (SSOT for the gate surface).
   unit-tests:
-    name: Unit tests (full tree, clean install)
+    name: Unit tests (public exported tree, clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -354,7 +360,7 @@ jobs:
   # (marker doc: deselected by default) and optional-dependency tests (numpy/faiss
   # vector cache) self-skip. Measured locally: 358 passed in ~3 min.
   integration-tests:
-    name: Integration tests (full tree, clean install)
+    name: Integration tests (public exported tree, clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

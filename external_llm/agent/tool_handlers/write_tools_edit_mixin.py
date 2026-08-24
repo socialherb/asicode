@@ -624,8 +624,17 @@ class WriteToolsEditMixin:
                 # hint below the 0.88 note threshold.
                 _sm = difflib.SequenceMatcher(autojunk=False)
                 _sm.set_seq2(old_blob)
+                # Window scan bounded: score at most 3 starts per candidate
+                # line (ci-2..ci, clamped) instead of every start in the full
+                # window. old_string matches at or near its first-line anchor,
+                # so starts further than 2 lines from the anchor add nothing
+                # but O(window·n·m) SequenceMatcher work (a 60-line old_string
+                # with 5 candidates used to score up to 300 full-blob
+                # comparisons — ~19s for one hint on the P24-1 regression).
                 for ci in cand_idxs:
-                    for start in range(max(0, ci - window + 1), ci + 1):
+                    lo = max(0, ci - 2)
+                    hi = min(len(file_lines) - window + 1, ci + 1)
+                    for start in range(lo, hi):
                         region = file_lines[start : start + window]
                         # start <= ci < len(file_lines) and window >= 1, so the
                         # slice is never empty.
@@ -1912,6 +1921,14 @@ class WriteToolsEditMixin:
         # than apply_patch/edit_file for the same file+edit. Skip when the
         # ORIGINAL already failed parsing (we never block an edit fixing a
         # pre-existing error), matching the Python branch above.
+        # P1: whether the non-Python gate below produced a CLEAN verdict on
+        # new_content. The success return used to re-run validate_syntax via
+        # _run_syntax_check_for_file (post-apply), spawning the backing tool
+        # (npx tsc / go build / ...) a second time on every successful non-
+        # Python edit. When this flag is set and the bytes on disk still match
+        # what the gate validated, the post-check reuses the gate's verdict and
+        # only runs the (separate) semantic check.
+        _et_gate_ok = False
         _et_lang = LanguageId.from_path(file_path)
         if _et_lang is not LanguageId.PYTHON and _et_lang is not LanguageId.UNKNOWN:
             try:
@@ -1930,7 +1947,11 @@ class WriteToolsEditMixin:
                         _et_new_val = _et_provider.validate_syntax(file_path, new_content)
                     except Exception:
                         _et_new_val = None
-                    if _et_new_val is not None and not _et_new_val.ok:
+                    if _et_new_val is not None and _et_new_val.ok:
+                        # Clean gate verdict on new_content — the post-check
+                        # can reuse it after verifying disk bytes.
+                        _et_gate_ok = True
+                    elif _et_new_val is not None and not _et_new_val.ok:
                         _et_errs = _et_new_val.errors or []
                         if _et_errs:
                             _e0 = _et_errs[0]
@@ -2026,7 +2047,13 @@ class WriteToolsEditMixin:
             _meta["matched_indent"] = _first_match_indent
             if _first_reindent_applied:
                 _meta["reindent_applied"] = True
-        _syn = self._run_syntax_check_for_file(str(_norm))
+        # P1: reuse the non-Python syntax gate's clean verdict (when it ran and the
+        # disk bytes still match) instead of re-spawning the backing tool. The
+        # semantic check below is never skipped — it is the part the gate did
+        # not run and the reason this post-apply call still exists.
+        _syn = self._run_syntax_check_for_file(
+            str(_norm), reuse_gate_syntax=_et_gate_ok, gate_content=new_content if _et_gate_ok else None
+        )
         if not _syn.get("skipped"):
             _meta["syntax_check"] = _syn
         return self._make_result(
@@ -2289,8 +2316,17 @@ class WriteToolsEditMixin:
         """
         return _try_repair_truncated_json(raw)
 
-    def _run_syntax_check_for_file(self, rel_or_abs_path: str) -> dict:
+    def _run_syntax_check_for_file(
+        self, rel_or_abs_path: str, *, reuse_gate_syntax: bool = False, gate_content: str | None = None
+    ) -> dict:
         """Run post-apply syntax validation for *rel_or_abs_path* if a provider exists.
+
+        ``reuse_gate_syntax`` lets a caller (edit_text's non-Python success
+        path) skip the post-apply syntax re-spawn when it already validated the
+        written content in-memory via the same provider: pass
+        ``gate_content=`` the validated content and this method compares disk
+        bytes against it, reusing the clean verdict on match and falling back
+        to a full ``validate_syntax`` run on mismatch.
 
         Always returns a dict.  ``skipped=True`` means no provider is registered
         for this file type — callers should omit the result from metadata rather
@@ -2341,7 +2377,17 @@ class WriteToolsEditMixin:
                 )
                 return {"ok": True, "skipped": True, "reason": "decode_error"}
 
-            result = provider.validate_syntax(abs_path, content)
+            # P1: when the caller already ran a clean non-Python syntax gate on
+            # gate_content (the exact new_content that was about to be written),
+            # and the bytes that actually landed on disk are identical to that
+            # content, reuse the gate's verdict instead of re-spawning the
+            # backing tool (npx tsc / go build / javac ...) a second time. The
+            # disk comparison is the safety net: any drift (concurrent writer,
+            # encoding round-trip mismatch) falls back to a fresh full run.
+            if reuse_gate_syntax and gate_content is not None and gate_content == content:
+                result = type("ReusedGateVerdict", (), {"ok": True, "language": provider.language_id(), "errors": []})()
+            else:
+                result = provider.validate_syntax(abs_path, content)
             out = {
                 "ok": result.ok,
                 "language": result.language.value if result.language else None,

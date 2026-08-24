@@ -107,3 +107,23 @@ def test_nested_function_own_unused_param_found():
 
 def test_syntax_error_returns_empty():
     assert g._scan_source("def f(:\n", "m.py") == []
+
+
+# ── scan pruning: os.walk must not descend into skipped dirs (F-4) ──────────
+def test_iter_repo_py_prunes_skipped_dirs_entirely(tmp_path, monkeypatch):
+    """Full scan must skip SKIP_DIRS subtrees before traversal (rglob era
+    walked everything and discarded afterwards; os.walk prunes in place).
+
+    A planted skip dir with *.py files must never surface in the scan.
+    """
+    monkeypatch.setattr(g, "REPO", tmp_path)
+    monkeypatch.setattr(g, "_SCAN_ROOTS", ("ext",))
+    prod = tmp_path / "ext"
+    prod.mkdir()
+    (prod / "real.py").write_text("_d = 0\ndef f():\n    _d = 1\n", encoding="utf-8")
+    for skipped in (".venv", "__pycache__", "build", "node_modules", ".git"):
+        d = tmp_path / "ext" / skipped
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "mod.py").write_text("_d = 0\ndef f():\n    _d = 1\n", encoding="utf-8")
+    scanned = g._iter_repo_py()
+    assert scanned == [tmp_path / "ext" / "real.py"], scanned

@@ -600,17 +600,22 @@ class TestProgressPrinterStatics:
         assert p._spinner_indent() == " " * (2 + (repl_impl._SEQ_W + 2))
 
     def test_fit_row_flattens_and_truncates(self, monkeypatch):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((30, 24)))
-        p = repl_impl._ProgressPrinter
-        assert p._fit_row("a\rb\nc\td") == "a b c d"
-        out = p._fit_row("x" * 100)
-        assert out.endswith("…") and len(out) <= 30  # max_cols 29 + …
+        # Scope the patch: a test-wide shutil.get_terminal_size patch leaks
+        # into pytest's progress rendering (it calls get_terminal_size with a
+        # `fallback` kwarg) -> TypeError -> xdist worker crash.
+        with monkeypatch.context() as m:
+            m.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((30, 24)))
+            p = repl_impl._ProgressPrinter
+            assert p._fit_row("a\rb\nc\td") == "a b c d"
+            out = p._fit_row("x" * 100)
+            assert out.endswith("…") and len(out) <= 30  # max_cols 29 + …
 
     def test_fit_row_cjk_wide(self, monkeypatch):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((30, 24)))
-        p = repl_impl._ProgressPrinter
-        out = p._fit_row("가" * 20)  # 40 cols > 29 → truncated
-        assert out.endswith("…")
+        with monkeypatch.context() as m:
+            m.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((30, 24)))
+            p = repl_impl._ProgressPrinter
+            out = p._fit_row("가" * 20)  # 40 cols > 29 → truncated
+            assert out.endswith("…")
 
     def test_style_row_no_brackets_unchanged(self):
         p = repl_impl._ProgressPrinter
@@ -668,7 +673,7 @@ class TestRenderLiveLine:
         assert printer._render_live_line("○") == ""
 
     def _term(self, cols):
-        return lambda *a: os.terminal_size((cols, 24))
+        return lambda *a, **kw: os.terminal_size((cols, 24))
 
     def test_single_tool_recent(self, printer, monkeypatch):
         monkeypatch.setattr(shutil, "get_terminal_size", self._term(80))
@@ -753,7 +758,7 @@ class TestRenderPlanUpdate:
     @pytest.fixture(autouse=True)
     def _plain_mode(self, monkeypatch):
         monkeypatch.setattr(repl_impl, "_RICH", False)
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((100, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((100, 24)))
 
     def test_no_items_returns(self, printer, capsys):
         printer._render_plan_update({"items": []}, None)
@@ -869,7 +874,7 @@ class TestRenderPlanUpdate:
         assert len(bar_chars) == 10
 
     def test_narrow_terminal_stat_clipped(self, printer, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((40, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((40, 24)))
         plan = {
             "items": [{"title": f"item {i}", "status": "done"} for i in range(3)]
             + [{"title": f"s{i}", "status": "skipped"} for i in range(3)]
@@ -1317,7 +1322,7 @@ class TestProgressPrinterEvent:
     def test_render_plan_update_rich(self, printer, monkeypatch):
         fake = self._rich(monkeypatch)
         fake.width = 60
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((100, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((100, 24)))
         printer._render_plan_update({"items": [{"title": "t", "status": "done"}]}, None)
         assert any("╭─ Plan" in ln for ln in fake.lines)
         assert any("✓ t" in ln for ln in fake.lines)
@@ -1330,13 +1335,13 @@ class TestProgressPrinterEvent:
 
 class TestRefreshLiveLine:
     def test_empty_inflight_clears_filter(self, printer, monkeypatch):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         printer._refresh_live_line()
         assert printer._live_drawn is False
         assert repl_impl._tool_running_filter.active is False
 
     def test_inflight_draws_live_line(self, printer, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         printer._inflight = {"a": {"tool": "bash", "hint": "", "t0": time.perf_counter()}}
         try:
             printer._refresh_live_line()
@@ -1372,7 +1377,7 @@ class TestToolTicker:
             printer._ticker_stop = None
 
     def test_worker_renders_when_conditions_met(self, printer, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         printer._inflight = {"a": {"tool": "bash", "hint": "", "t0": time.perf_counter() - 5}}
         printer._live_drawn = True
         calls = {"n": 0}
@@ -1481,7 +1486,7 @@ class TestProgressPrinterCall:
         monkeypatch.setattr(repl_impl, "_RICH", False)
         monkeypatch.setattr(repl_impl, "_ensure_out_console_imported", lambda: None)
         monkeypatch.setattr(repl_impl, "_print", lambda t, c="": prints.append((t, c)))
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((100, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((100, 24)))
         return prints
 
     def test_route_applied(self, printer, plain, capsys):
@@ -1834,7 +1839,7 @@ class TestProgressPrinterCall:
 
 class TestTickerRemainingBranches:
     def test_worker_skips_when_stop_set(self, printer, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         printer._inflight = {"a": {"tool": "bash", "hint": "", "t0": time.perf_counter() - 5}}
         printer._live_drawn = True
         stop = threading.Event()
@@ -1856,7 +1861,7 @@ class TestTickerRemainingBranches:
             printer._live_drawn = False
 
     def test_worker_skips_pause_and_sub_second(self, printer, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         repl_impl._esc_watcher_pause.set()
         printer._inflight = {"a": {"tool": "bash", "hint": "", "t0": time.perf_counter()}}
         printer._live_drawn = True
@@ -1888,7 +1893,7 @@ class TestTickerRemainingBranches:
         assert calls["n"] == 1
 
     def test_spinner_worker_renders_loop(self, printer, monkeypatch, capsys):
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         monkeypatch.setattr(repl_impl, "_RICH", False)
         printer._spinner_running = True
         printer._spinner_msg = "hello world"
@@ -2351,7 +2356,7 @@ class TestProgressPrinterRichSpinner:
         console = Console(file=buf, width=80, force_terminal=False)
         monkeypatch.setattr(repl_impl, "_RICH", True)
         monkeypatch.setattr(repl_impl.asi, "_console", console)
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((100, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((100, 24)))
         margin = SimpleNamespace(called=False)
         margin.reset_bol = lambda: setattr(margin, "called", True)
         monkeypatch.setattr(repl_impl.asi, "_margin_stderr", margin)
@@ -2450,7 +2455,7 @@ class TestProgressPrinterCallExtra:
         monkeypatch.setattr(repl_impl, "_RICH", False)
         monkeypatch.setattr(repl_impl, "_ensure_out_console_imported", lambda: None)
         monkeypatch.setattr(repl_impl, "_print", lambda t, c="": prints.append((t, c)))
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((100, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((100, 24)))
         return prints
 
     def test_routing_intent_starts_spinner(self, printer, plain):
@@ -2685,7 +2690,7 @@ class TestRetryAndPathExtras:
 class TestTickerPauseOrder:
     def test_worker_pause_then_sub_second(self, printer, monkeypatch, capsys):
         """pause continue(1st) → pause cleared → <1s continue(2nd) → exit(3rd)."""
-        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
         repl_impl._esc_watcher_pause.set()
         printer._inflight = {"a": {"tool": "bash", "hint": "", "t0": time.perf_counter()}}
         printer._live_drawn = True

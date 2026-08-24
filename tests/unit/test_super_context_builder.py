@@ -294,6 +294,45 @@ def test_dependency_context_no_call_info_filtered(builder, tmp_path):
     assert "f()" not in out  # filtered out
 
 
+def test_dependency_context_reuses_builder_analysis_cache(builder, tmp_path):
+    """_build_dependency_context must NOT re-analyze the target: it reads the
+    analysis from DependencyGraphBuilder.get_analysis (the single per-file
+    cache that build_graph already populated). Counts analyze_file calls."""
+    f = tmp_path / "m.py"
+    f.write_text("def f():\n    g()\n")
+
+    calls: list[str] = []
+    orig = builder.dependency_builder.analyzer.analyze_file
+    builder.dependency_builder.analyzer.analyze_file = lambda p: calls.append(str(p)) or orig(p)
+
+    # build_graph analyzes the file once and caches it.
+    builder.dependency_builder.build_graph(f, max_depth=1)
+    assert len(calls) == 1
+
+    # _build_dependency_context now serves from the cache — no second call.
+    builder._build_dependency_context(f)
+    assert len(calls) == 1  # still 1: no re-analysis
+
+
+def test_build_context_analyzes_target_file_once(builder, tmp_path):
+    """Full build_context path: _build_enhanced_file_context + _build_dependency_context
+    must share the single _analysis_cache — analyze_file fires exactly once."""
+    f = tmp_path / "app.py"
+    f.write_text("def f():\n    g()\n")
+
+    calls: list[str] = []
+    orig = builder.dependency_builder.analyzer.analyze_file
+    builder.dependency_builder.analyzer.analyze_file = lambda p: calls.append(str(p)) or orig(p)
+
+    # Note: format_function_signature/format_class_signature on code_analyzer
+    # do not call analyze_file, so the only analyze_file invocations are
+    # through dependency_builder.get_analysis.
+    builder._build_enhanced_file_context(f, max_lines=500)
+    builder._build_dependency_context(f)
+
+    assert calls.count(str(f)) == 1
+
+
 def test_dependency_context_non_repo_file_caught(builder, tmp_path):
     foreign = Path("/__scb_foreign__/m.py")  # not under repo_root
     builder.dependency_builder.build_graph = lambda target_file, max_depth=1: _stub_graph()

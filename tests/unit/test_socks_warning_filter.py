@@ -35,22 +35,38 @@ pytestmark = pytest.mark.skipif(
 )
 
 _CHURN = """
-    import threading, time, warnings
+    import threading, time, warnings, builtins
 
-    stop = threading.Event()
+    # Hook requests' import chain at the exact spot where the SOCKS warning
+    # would be emitted (urllib3.contrib.socks, imported from
+    # requests.adapters). Firing the event there, then sleeping, makes the
+    # churn thread's catch_warnings EXIT land deterministically BETWEEN
+    # requests installing its DependencyWarning filter (requests/__init__.py)
+    # and the warning being emitted — the race window the module docstring
+    # documents. The original design slept 0.05s and hoped for a collision;
+    # this is race-free by construction.
+    real_import = builtins.__import__
+    fired = threading.Event()
+
+    def hooked(name, *a, **kw):
+        if name == "urllib3.contrib.socks":
+            fired.set()
+            time.sleep(0.005)  # widen the window: hold the import open
+        return real_import(name, *a, **kw)
+
+    builtins.__import__ = hooked
 
     def churn():
-        # Mimics sentence_transformers/torch: repeatedly enter and leave a
-        # catch_warnings block, each exit restoring an older filter snapshot.
-        while not stop.is_set():
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                time.sleep(0)
+        # Mimics sentence_transformers/torch: sit inside a catch_warnings
+        # block until the SOCKS import begins, then exit — restoring the
+        # pre-requests filter snapshot at the worst possible moment.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            fired.wait(10)
 
     threading.Thread(target=churn, daemon=True).start()
-    time.sleep(0.05)
     import requests  # noqa: F401  — the import that triggers the SOCKS warning
-    stop.set()
+    time.sleep(0.01)
 """
 
 

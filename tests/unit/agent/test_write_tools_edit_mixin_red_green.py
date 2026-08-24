@@ -657,3 +657,104 @@ def test_modify_symbol_dry_run_restore_failure(tool_registry, monkeypatch):
     assert not res.ok
     assert "restoring" in res.error
     assert res.metadata.get("restore_failed") is True
+
+
+# ── P1: edit_text non-Python syntax-gate reuse ──────────────────────────────
+
+
+def test_edit_text_non_python_gate_reuse_skips_post_spawn(tool_registry, monkeypatch):
+    """A successful non-Python edit must NOT re-spawn validate_syntax after apply.
+
+    The blocking gate runs validate_syntax TWICE in-memory: once on the
+    ORIGINAL content (origin guard) and once on new_content. The pre-change
+    code then ran a THIRD time via the post-apply check; now the post-check
+    compares disk bytes against the gate-validated content and reuses the
+    clean verdict, so validate_syntax runs exactly TWICE (gate only). The
+    semantic check is a separate call and still runs.
+    """
+    from external_llm.languages import LanguageRegistry
+
+    p = Path(tool_registry.repo_root) / "reuse.ts"
+    p.write_text("let x = 1;\n")
+
+    calls = {"syntax": 0, "semantic": 0}
+
+    class _Prov:
+        def capabilities(self):
+            return types.SimpleNamespace(has_syntax_validator=True, has_semantic_validator=True)
+
+        def language_id(self):
+            return types.SimpleNamespace(value="typescript")
+
+        def validate_syntax(self, path, content):
+            calls["syntax"] += 1
+            return types.SimpleNamespace(ok=True, errors=[], language=types.SimpleNamespace(value="typescript"))
+
+        def validate_semantics(self, path):
+            calls["semantic"] += 1
+            return types.SimpleNamespace(ok=True, errors=[], checked=True)
+
+    real_get = LanguageRegistry.instance().get
+    monkeypatch.setattr(LanguageRegistry.instance(), "get", lambda path: _Prov())
+    try:
+        res = tool_registry.dispatch(
+            "edit_text",
+            {"file_path": "reuse.ts", "old_string": "let x = 1;", "new_string": "let y = 2;"},
+        )
+    finally:
+        monkeypatch.setattr(LanguageRegistry.instance(), "get", real_get)
+
+    assert res.ok, res.error
+    assert calls["syntax"] == 2, f"validate_syntax should run twice (gate orig+new), got {calls['syntax']}"
+    assert calls["semantic"] == 1, f"semantic check must still run, got {calls['semantic']}"
+    assert res.metadata["syntax_check"]["ok"] is True
+    assert (Path(tool_registry.repo_root) / "reuse.ts").read_text() == "let y = 2;\n"
+
+
+def test_edit_text_non_python_gate_reuse_falls_back_on_disk_drift(tool_registry, monkeypatch):
+    """When disk bytes drift from the gate-validated content, the post-apply
+    check must NOT reuse the verdict — it re-runs validate_syntax (3 total:
+    gate orig + gate new + post-apply).
+    """
+    from external_llm.languages import LanguageRegistry
+
+    p = Path(tool_registry.repo_root) / "drift.ts"
+    p.write_text("let x = 1;\n")
+
+    calls = {"syntax": 0}
+
+    class _Prov:
+        def capabilities(self):
+            return types.SimpleNamespace(has_syntax_validator=True, has_semantic_validator=False)
+
+        def language_id(self):
+            return types.SimpleNamespace(value="typescript")
+
+        def validate_syntax(self, path, content):
+            calls["syntax"] += 1
+            return types.SimpleNamespace(ok=True, errors=[], language=types.SimpleNamespace(value="typescript"))
+
+    real_get = LanguageRegistry.instance().get
+    monkeypatch.setattr(LanguageRegistry.instance(), "get", lambda path: _Prov())
+    import external_llm.agent.tool_handlers.write_tools_edit_mixin as m
+
+    # Interpose after the gate validates but before the post-check reads disk:
+    # make the on-disk content differ from new_content so the reuse condition
+    # (gate_content == content) fails and a fresh syntax run is forced.
+    orig_atomic = m.atomic_write_bytes
+
+    def _write_with_drift(path, data):
+        orig_atomic(path, data + b"\n// drift\n")
+
+    monkeypatch.setattr(m, "atomic_write_bytes", _write_with_drift)
+    try:
+        res = tool_registry.dispatch(
+            "edit_text",
+            {"file_path": "drift.ts", "old_string": "let x = 1;", "new_string": "let y = 2;"},
+        )
+    finally:
+        monkeypatch.setattr(m, "atomic_write_bytes", orig_atomic)
+        monkeypatch.setattr(LanguageRegistry.instance(), "get", real_get)
+
+    assert res.ok, res.error
+    assert calls["syntax"] == 3, f"drift must force a fresh syntax run, got {calls['syntax']}"

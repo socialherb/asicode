@@ -627,11 +627,14 @@ class ToolRegistry(
         self.repo_root = str(Path(repo_root).resolve())
         self._repo_root_override: str | None = None
         # Resolved-root memo for _secure_path. The effective root is a session
-        # constant (repo_root frozen above; override set at most once), so
-        # re-resolving it on every read/write tool call was pure filesystem I/O
-        # on the hottest tool path. Keyed by the effective-root STRING so an
-        # override change simply misses and re-resolves. Clones get their own
-        # dict (clone_for_subagent bypasses __init__ via object.__new__).
+        # constant on the hot path (repo_root frozen above; an override is
+        # copied to subagent clones, and a re-assigned override only ADDS a key
+        # for the new root while the old entry stays — bounded by the number of
+        # distinct roots ever used, never per-path), so re-resolving it on every
+        # read/write tool call was pure filesystem I/O on the hottest tool path.
+        # Keyed by the effective-root STRING so an override change simply misses
+        # and re-resolves. Clones get their own dict (clone_for_subagent
+        # bypasses __init__ via object.__new__).
         self._secure_root_resolve_cache: dict[str, Path] = {}
         # Detect dominant code language by counting source files
         # (_LANGUAGE_EXTENSION_GROUPS — single source of truth). Used by
@@ -713,8 +716,6 @@ class ToolRegistry(
                 config.tool_result_cache_max_entries,
                 config.tool_result_cache_ttl,
             )
-        self._search_cache: dict[str, ToolResult] = {}
-
         # Local Assistant instance for delegating tasks to local LLMs
         self.local_assistant = local_assistant
         # Agent profile: explicit param takes precedence over config field
@@ -1040,8 +1041,8 @@ class ToolRegistry(
 
         Shared (immutable/thread-safe): SymbolSearcher, RAGSearcher,
         CallGraphIndexer, LintRunner.
-        Fresh (per-subagent mutable state): _applied_patches,
-        _search_cache, config, async/watcher (disabled for subagents).
+        Fresh (per-subagent mutable state): _applied_patches, config,
+        async/watcher (disabled for subagents).
         """
         clone = object.__new__(ToolRegistry)
         clone.repo_root = self.repo_root
@@ -1058,7 +1059,6 @@ class ToolRegistry(
 
         # Fresh mutable state per subagent
         clone._applied_patches = []
-        clone._search_cache = {}
 
         # Fresh, ISOLATED cache (NOT shared with the parent, NOT None). A null
         # cache threw away the most common subagent win — repeated read_file of

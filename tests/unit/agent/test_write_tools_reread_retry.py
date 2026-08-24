@@ -47,7 +47,7 @@ class _Harness(WriteToolsMixin):
         kwargs.setdefault("content", "")
         return ToolResult(**kwargs)
 
-    def _run_syntax_check_for_file(self, path):
+    def _run_syntax_check_for_file(self, path, **kwargs):
         return {"ok": True, "skipped": True, "reason": "test"}
 
     def _secure_path(self, path, *, confine=False):

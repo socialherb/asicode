@@ -453,19 +453,23 @@ def scan_duplicate_definitions(
     _cache, _dirty = _load_dup_def_cache(repo_root or "")
     for rel_path in file_paths or []:
         abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(repo_root or "", rel_path)
-        src = parse_cache.read_source(abs_path)
-        if src is None:
+        # Fused read+fingerprint under ONE stat (B1 order contract, 2026-08-16):
+        # the fingerprint may only key content read at or after this stat, so a
+        # torn entry is unreachable instead of silently stale.  The previous
+        # read_source-then-stat_fingerprint pair stat-ed twice and could pair a
+        # post-write stamp with pre-write analysis.
+        _fused = parse_cache.read_with_fingerprint(abs_path)
+        if _fused is None:
             continue
+        src, _fp = _fused
 
         # ── Determine language ──
         _lang_id = _LanguageId.from_path(rel_path)
         _lang = _lang_id.value if _lang_id is not None else "python"
 
         # ── Fingerprint cache: skip the tree-sitter/AST collection entirely on
-        # a (mtime_ns, size) hit (the scanner's dominant cost, P14-5).  The
-        # stat is taken BEFORE the read above served the source (B1 order
-        # contract — read_with_fingerprint) so a torn entry is unreachable.
-        _fp = parse_cache.stat_fingerprint(abs_path)
+        # a (mtime_ns, size) hit (the scanner's dominant cost, P14-5).  ``_fp``
+        # came from the fused read above (B1 order — stamp precedes content).
         _cached = _cache.get(abs_path)
         if _cached is not None and _cached[0] == _fp:
             defs = _cached[1]
@@ -477,8 +481,12 @@ def scan_duplicate_definitions(
                 # ── Fallback: AST (Python only) ──
                 if _lang != "python":
                     continue
-                tree = parse_cache.parse_ast(abs_path)
-                if tree is None:
+                # Parse from the SAME src the fingerprint describes — no second
+                # stat, so fp/src/defs are one consistent file version.
+                try:
+                    tree = ast.parse(src, filename=abs_path)
+                except SyntaxError:
+                    logger.debug("[DUPLICATE_DEF] SyntaxError in %s — skipping", rel_path)
                     continue
                 defs = _collect_top_level_definitions(tree)
             if _fp is not None:

@@ -262,13 +262,31 @@ def test_find_block_end_line_brace_fallback_delegates_to_base_ssot(monkeypatch):
     monkeypatch.setattr(
         core,
         "find_brace_block_end",
-        lambda c, o: (calls.append(o), real(c, o))[1],
+        lambda c, o, **kw: (calls.append(o), real(c, o, **kw))[1],
     )
     content = 'fun a(): String {\n    val s = "}"\n    return s\n}\nval t = 1\n'
     lines = content.splitlines(True)
     end = core._find_block_end_line(content, "kotlin", 0, lines)
     assert end == 3
     assert calls, "brace fallback did not delegate to find_brace_block_end"
+
+
+def test_find_block_end_line_ts_template_escaped_backtick_first_open(monkeypatch):
+    """TS template-literal `\\` {` on the anchor line must NOT be picked as
+    the body opener — the SSOT brace scan needs js_lexing=True for the
+    first-open search, not just the matching find_brace_block_end call
+    (the write_tools_core pre-fix returned None for this shape)."""
+    monkeypatch.setattr(core, "_HAS_TS", False)
+    content = "function f(x = `a\\` { b }`) {\n    return x;\n}\nusing();\n"
+    lines = content.splitlines(True)
+    end = core._find_block_end_line(content, "typescript", 0, lines)
+    assert end == 2, f"TS escaped-backtick template: got {end}, want 2"
+
+    # Go raw-string contract: `\\` does NOT escape the backtick, so the
+    # first `{` after it IS real code — the brace fallback must NOT treat
+    # the template as a literal (js_lexing stays False for Go).
+    end_go = core._find_block_end_line(content, "go", 0, lines)
+    assert end_go is None, f"Go raw-string must keep the Go-raw contract: got {end_go}"
 
 
 # ── RED→GREEN gap coverage: edge branches not hit by the above ──────────────

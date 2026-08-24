@@ -58,7 +58,7 @@ class _Harness(WriteToolsMixin):
         kwargs.setdefault("content", "")
         return ToolResult(**kwargs)
 
-    def _run_syntax_check_for_file(self, path):
+    def _run_syntax_check_for_file(self, path, **kwargs):
         return {"ok": True, "skipped": True, "reason": "test"}
 
     def _secure_path(self, path, *, confine=False):
@@ -1310,6 +1310,63 @@ class TestAnalyzePatchFailure:
         out = harness._analyze_patch_failure(patch, "does not apply")
         assert out["hunk_count"] == 1
         assert out["file_path"] == "t.py"
+
+    def test_context_mismatch_reads_through_parse_cache_single_stat(self, harness, tmp_path, monkeypatch):
+        """The failure-analysis file read goes through parse_cache.read_source,
+        and a line-hinted mismatch reads the file exactly once for both the
+        conflicting-line hint and the file-context snippet."""
+        (tmp_path / "t.py").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+        from external_llm.analysis import parse_cache
+
+        calls: list[str] = []
+
+        def _spy_read_source(path):
+            calls.append(path)
+            return _orig_read_source(path)
+
+        _orig_read_source = parse_cache.read_source
+        monkeypatch.setattr(parse_cache, "read_source", _spy_read_source)
+
+        out = harness._analyze_patch_failure(
+            "--- a/t.py\n+++ b/t.py\n@@ -1,3 +1,3 @@\n alpha\n-betax\n+beta\n gamma\n",
+            "error: patch failed: t.py:1: hunk failed, does not apply at line 1",
+        )
+        assert out["reason"] == "context_mismatch"
+        assert out["conflicting_lines"] == [1]
+        assert "Context mismatch" in out["hint"]
+        assert "Actual file content" in out["error_message"]
+        # Single stat + read via the cache; both branches reuse the same source.
+        assert len(calls) == 1, calls
+        assert calls[0].endswith("t.py")
+
+    def test_context_mismatch_without_line_hint_reads_fallback(self, harness, tmp_path, monkeypatch):
+        """When git's error carries no line number, the snippet branch performs
+        its own (single) cache read — behavior preserved from the pre-cache
+        independent second read."""
+        (tmp_path / "t.py").write_text("alpha\nbeta\ngamma\ndelta\n", encoding="utf-8")
+
+        from external_llm.analysis import parse_cache
+
+        calls: list[str] = []
+
+        def _spy_read_source(path):
+            calls.append(path)
+            return _orig_read_source(path)
+
+        _orig_read_source = parse_cache.read_source
+        monkeypatch.setattr(parse_cache, "read_source", _spy_read_source)
+
+        out = harness._analyze_patch_failure(
+            "--- a/t.py\n+++ b/t.py\n@@ -1,4 +1,4 @@\n alpha\n-beta\n+beta2\n gamma\n delta\n",
+            "error: patch failed: does not apply",
+        )
+        assert out["reason"] == "context_mismatch"
+        assert out["conflicting_lines"] == []
+        # No line number → no conflicting-line hint, but the context snippet
+        # still appears (fallback read).
+        assert "Actual file content" in out["error_message"]
+        assert len(calls) == 1, calls
 
 
 # ── _tool_anchor_edit deeper paths ──────────────────────────────────────────

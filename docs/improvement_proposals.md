@@ -771,3 +771,90 @@ for f in ['change_spec_assertions.py', 'symbol_handlers.py', 'intent_verifier.py
 - **테스트**: `test_context_builder_unit._norm` → SSOT + SSOT 계약 추가 4건 (따옴표/a·b 접두사/traversal/드라이브). **의도된 동작 변화 2건 갱신**: `test_context_collector_bounds`의 traitversal 기대가 `path_outside_repo`(fast가 통과→resolve가 거부) → `empty_target`/`missing_args`(SSOT가 normalize에서 조기 거부) — 목표인 fail-closed 조기 차단.
 - **잔존 fast**: `common.py` 정의 자체 + 테스트 5곳 (test_common 직접 테스트, 과거형 기록). 프로덕션 fast 사용 **0건 달성**.
 - **검증**: 관련 643 passed, 풀 스위트 전체 실행 (백그라운드), ruff 0건, compileall clean.
+
+## 2026-08-24 | P26 — 게이트 상위 40 재프로파일: 잔여 병목 전부 "본질 + 간헐적 경합" 확인 (최적화 여지 0)
+
+- **방법**: 풀 게이트 (`tests/unit -m "not slow" --durations=40`, `--dist loadgroup`) 재실행 183.34s (16067 passed). 상위 40의 각 항목을 **단독/파일 단독 병렬**로 재측정해 "진짜 비용" vs "간헐적 경합"을 분리.
+- **판정표**:
+
+| 게이트 상위 항목 | 게이트서 관측 | 파일 단독 | 판정 |
+|---|---|---|---|
+| `test_dump_candidates_writes_raw_json_and_exits_zero@repo_scan` | 14.94s | 콜드 5.15s / 웜 2.58s | **본질** — repo_scan 그룹이 콜드 rebuild 전체를 지불 (그래프 1.5s + 스캐너 2.7s + JSON dump 2.3s) |
+| context_manager setup/teardown ×10건 (3.2~4.5s) | ~30-60s 누적 | 전부 0.05-0.12s (파일 병렬 77 tests = 2.40s) | **간헐적 경합** — 순수 메모리 연산 |
+| `test_vector_cache_checkpoint_failure` 10.2s | 10.2s | 파일 병렬 5 tests = 3.23s (고정 ~1.65s/test = faiss/numpy 임포트) | **간헐적 경합** |
+| `test_release_untracked_import_gate` / `test_release_ignored_py_gate` etc. | 3.8-8.2s | 웜에서 2.26-2.58s | warm 캐시 정상 |
+
+- **콜드 비용 분해 (cProfile, 단독)**: JSON encode 2.31s (6회 atomic_write_json, `_iterencode_dict` 0.97s + `_iterencode` 1.86s) + JSON decode 0.57s + gc.collect 0.43s + tree-sitter 0.07s×55. **JSON I/O가 콜드 5.26s의 ~55%**.
+- **최적화 후보 전부 닫힘**:
+  - JSON encode 최적화 → 이미 **entry-wise streaming** (P0-2, 2026-08-12, 335MB→7.3MB peak, compact separators). 여지 0.
+  - 콜드 rebuild → **repo_scan xdist_group 직렬화가 이미 1워커로 집중** (P3/P5). 콜드 병렬 12-15s는 8워커 CPU 경합 분, 단독 5.15s가 본질 하한.
+  - 캐시 재사용 → 게이트 순서상 첫 repo_scan만 12-15s, 이후 웜 2.58s. 이미 최선.
+  - `test_dump_candidates`가 스캐너 8개 전부 + 그래프 + JSON dump를 실제로 실행 — 테스트가 하는 일 자체가 비싸고, 그 일이 게이트 계약 (후보 dump 정확성).
+- **결론**: P1-P6로 병목 후보 (edit_text tsc 스폰 / 캐시 / repo_scan 그룹 / AST 스캔 / xdist dist 모드 / 콜드 rebuild)가 전부 닫힘. 남은 게이트 비용은 "8개 워커가 각자 1회 지불하는 본질 비용 + 부하 지터" — 게이트 총시간이 183-445s 사이로 출렁이는 건 지터 (Variance는 워커 수·머신 부하 의존), 최적화 여지 0.
+- **권장**: 추가 병목 헌팅 중단. 게이트 시간 안정화는 `-n auto` 워커 수 조정 등 인프라 영역 (코드 아님).
+
+## 2026-08-24 | P27 — 게이트 워커 수 A/B: `-n auto`(=8) 유지 확정 (n=4/n=2는 확실히 열등)
+
+- **동기**: P26 결론 "게이트 183-445s 출렁임은 부하 지터"에 대한 후속 — M1 8코어(4P+4E) 8GB에서 swap 4.86GB 사용 중이라 "워커를 줄이면 메모리 압박/스왑이 줄어 오히려 빨라질 것"이라는 가설을 실험 (머신: Apple M1, 8GB, swap used 4.86GB).
+- **방법**: 동일 트리 (f375e070a), warm 캐시, Chrome 열려 있던 상태 (측정 전), 게이트 그대로 `tests/unit -m "not slow" --durations=15`, `--dist loadgroup` 고정, `-n 8/4/2`만 변화, 런 사이 20s 안정화.
+- **결과**:
+
+| n (워커) | 총시간 | 최대 개별 | 비고 |
+|---|---|---|---|
+| **8 (auto)** | **177.19s** | 12.93s | 정상 (P26의 183s와 동일 범위 → auto=8 확인) |
+| 4 | 309.49s (1.75x) | **77.32s** | `test_vector_cache_model_order` 스톨 — faiss/vector-cache가 워커에 직렬 누적 |
+| 2 | 701.26s (3.96x) | **112.15s** | `test_save_fsyncs_staged_index_before_rename` 스톨 + Thread warning |
+
+- **가설 기각**: 워커 감소 → 스왑 감소 → 빨라짐. **정반대**. 스왑 used는 실험 전 4.86GB → 후 4.93GB (불변, 스왑은 원인이 아님). 느려진 이유는 **무거운 테스트 클러스터 (vector-cache faiss/numpy, REPL pty spawn)가 소수 워커에 직렬로 몰리는 것** — n=4에서 77s, n=2에서 112s 스톨은 병렬 분산 효용의 역전증거.
+- **결론**: `-n auto`(8 workers) 유지가 실측상 최속 & 재현성 최고. 워커 수 조정으로 얻을 시간 없음. 게이트 변동성은 머신 부하 (다른 사용자 프로세스, Chrome 등)가 지배 — 코드/설정으로 해결 불가.
+- **자산**: 세 런 로그 `/tmp/wn_8.log`, `/tmp/wn_4.log`, `/tmp/wn_2.log` (duration 상세 포함).
+
+## 2026-08-24 | P28 — CI 워커 유형 검토: ubuntu-latest(4 vCPU)가 이 계정의 유일+최적 옵션 (larger runner 불가)
+
+- **동기**: P26/P27이 "게이트 변동성은 머신 부하 지배, 코드/설정으로 해결 불가"로 닫은 후, 유일하게 남은 조정 축은 CI 러너 하드웨어. "CI 워커 유형을 올리면 (8/16 vCPU larger runner) 게이트가 빨라지는가"를 실측으로 검토.
+- **방법**: (1) GitHub 공식 문서로 러너 스펙 확정 (2) 최근 CI 성공 5건의 job 로그로 실측 수집 (3) 로컬 8코어에서 동일 게이트를 `-n 2/4/8`으로 돌려 CI 4-vCPU 조건 시뮬레이션.
+- **실측 (러너 스펙)**:
+  - `ubuntu-latest` = **4 vCPU / 16 GB RAM** (GitHub-hosted runners 공식 문서; 2026-08-24 확인). CI 로그도 정확히 `4 workers [13424 items]` — `-n auto`가 4로 해석됨.
+  - **larger runner (8/16/32 vCPU)는 Team/Enterprise 플랜 전용 + 유료** (Actions runner pricing). 이 계정은 개인 Free (`type: User`, org 없음) → **선택 자체가 불가능**.
+- **실측 (CI job)**: 최근 성공 5건 (2026-08-18~23) unit-tests job:
+  - 총 소요: 288 / 333 / 331 / 334 / 343s (mean ~326s) — 매우 일관적 (4-vCPU 수렴값).
+  - 순수 pytest: **236s** (14:41:35→14:45:31). 나머지 ~107s는 checkout/setup-python/apt/pip install/coverage combine.
+- **실측 (로컬 시뮬레이션, 동일 트리 0829be2c1, warm 캐시)**:
+
+| 시나리오 | 총시간 | vs CI |
+|---|---|---|
+| CI 4-vCPU `-n auto`(4) | 304-343s (mean ~326s) | 기준 |
+| 로컬 8코어 `-n 8` | 177-203s | 0.6x |
+| 로컬 8코어 `-n 4` | 255-309s | 0.8-1.0x |
+| 로컬 8코어 `-n 2` | 630-701s | 2.0x |
+
+- **결론 1 (워커 유형)**: 4-vCPU ubuntu-latest는 (a) 이 계정에서 유일하게 선택 가능한 호스팅 러너, (b) 이미 그 하드웨어의 수렴값(304s, 4 workers, 실패 0)에서 동작. **8-vCPU larger runner로 가면 pytest가 8 workers가 되어 ~203s (1.5-1.7x) 단축 가능하지만 플랜 제약으로 실행 불가능.** 현행 CI 워커 구성은 이 계정에서 최적 — 변경할 코드/설정 없음.
+- **결론 2 (발견된 주석 불일치)**: lint.yml `unit-tests` job 주석은 "checks out the FULL private tree"라 하지만, **실제 CI는 public repo `socialherb/asicode`의 main을 체크아웃** (확정: CI head `480ca0d5c`는 로컬에 없는 커밋; public repo tree에 lane//webapp//tools/ 0개). 그 결과:
+  - CI 수집 13424 items vs 로컬 16067 — 차이 2645개 = **private 전용 테스트 84개 파일** (lane/, webapp/, tools/ coupled).
+  - **webapp extra 설치의 주석 근거("83 files import webapp")는 public 트리에는 해당 없음** — public 트리에 webapp-coupled tests 부재. 설치는 무해하지만 주석이 실제와 다름.
+  - lint.yml과 release.yml이 사실상 **같은(exported) 트리**를 검사 — PR 게이트와 릴리스 게이트가 같은 커버리지. private 전용 테스트는 어느 CI job도 안 돎 (의도된 단일-트리 정책으로 보이나, 명시된 적 없음).
+- **권장**: 워커 유형 변경 액션 없음. lint.yml 주석 "FULL private tree" → "public exported tree"로 정정 필요. private 전용 테스트를 CI에서도 돌리려면 별도 private-트리 job이 필요 (그 경우 webapp extra 주석이 비로소 의미를 가짐) — 별도 작업으로 분리.
+
+## 2026-08-24 | P29 — private 전용 테스트 CI job 구성: private-tests.yml 구현 (webapp/tools coupled 103개)
+
+- **동기**: P28 결론 2가 남긴 "private 전용 테스트(webapp/, tools/, export-infra coupled)를 CI에서도 돌리려면 별도 private-트리 job 필요"를 실제 구현. public exported 트리(CI)는 webapp/tools가 없어 이 파일들을 원천 실행 불가 — **단일-트리 정책이 설계상 의도**이므로, "public에 없음"을 바로잡는 대신 private 전체 트리를 도는 전용 job을 추가.
+- **실측 (후보 정리, P28 이어서)**:
+  - 실제 private-only 테스트 파일: **103개** (P28의 "84개"는 import 기반만; 실제로는 excluded conftest fixture를 request하는 테스트까지 재귀 제외되어 +19개 — `is_excluded()`가 SSOT로 정확히 재현, `/tmp/private_only.txt`).
+  - private 트리에서 전부 green: **2441 passed in 34.53s** (단일 프로세스, slow 제외) — 완전 실행 가능.
+  - structural gate(private 트리)는 baseline 없이도 0 candidates (private은 baseline이 없어도 green).
+  - GitHub에 private mirror repo **없음** (계정 `socialherb`: public asicode + AsRecord(private)만) — 로컬 remote 0개 전용.
+- **설계 (구현됨)**:
+  - `.github/workflows/private-tests.yml` — 독립 워크플로, **private mirror에서만 실행**:
+    - 파일 목록을 `scripts/export_public.py --list`로 **동적 생성** (SSOT: export 규칙이 바뀌면 자동 반영 — hardcoded 목록 결함 방지). `comm -23`으로 shipped 제외.
+    - `-m "not slow"` (private-only slow 2개 제외) + `-n auto` 단일 프로세스 (10초대).
+    - 빈 목록 guard: public 트리에서 실수 실행 시 pytest가 testpaths로 폴백해 전체를 도는 것을 방지 (exit 1).
+    - `on: push(main) / pull_request / workflow_dispatch` — 리소스 절약.
+  - `scripts/export_public.py` `EXCLUDE_FILES`에 `.github/workflows/private-tests.yml` 추가 — **public export에서 제외** (public 트리에 존재하면 pytest 0개 선택 → fail; 존재를 원천 차단).
+  - lint.yml/release.yml과 동일한 install (`. [dev,webapp]`), 동일 Python 3.12.
+- **검증 (모두 통과)**:
+  - 워크플로 YAML 파싱 OK (주석의 `SSOT:` 콜론이 YAML 스칼라를 깨는 문제 수정).
+  - SSOT 목록: shipped 496 / all 599 / private-only 103 (정확).
+  - `python -m pytest $(private-only) -q -m "not slow"` → **2441 passed in 34.53s** (+ 무해한 atexit 서브프로세스 종료 워닝).
+  - export dry-run: `.github/workflows/`에 lint.yml/release.yml만 존재, private-tests.yml **없음** (제외 확인).
+  - export 기반 테스트 3종 (test_export_structural_baseline / test_release_ignored_py_gate / test_precommit_config) 20 passed.
+- **결론**: private 전용 103개 테스트가 이제 private mirror push 시 CI에서 실행됨. public 트리는 이 워크플로 자체가 없어 no-op (설계상). private mirror 생성·push는 사용자 승인 후 `gh repo create asicode-private --private --source=. --push` (선택).

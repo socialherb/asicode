@@ -89,11 +89,16 @@ def _resolve_scan_paths(args: list[str]) -> list[str] | None:
 
 def _iter_py_files(paths=None):
     if paths is None:
-        for path in REPO.rglob("*.py"):
-            rel = path.relative_to(REPO)
-            if any(part in SKIP_DIRS or part.endswith(".egg-info") for part in rel.parts):
-                continue
-            yield rel, path
+        # os.walk with in-place dir prune: SKIP_DIRS subtrees are never
+        # descended into (rglob would materialize ~15k paths and discard
+        # most of them — F-4 pattern).
+        for root, dirs, files in os.walk(REPO):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.endswith(".egg-info")]
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                p = Path(root) / name
+                yield p.relative_to(REPO), p
         return
     for rel in paths:
         p = REPO / rel
