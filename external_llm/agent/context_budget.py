@@ -10,12 +10,14 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,  # f821-protected
+    Any,  # f821-protected
 )
 
 from external_llm.agent.config.thresholds import _env_int
-from external_llm.agent.message_shapes import _is_anthropic_tool_result, is_tool_call, is_tool_result
+from external_llm.agent.message_shapes import _is_anthropic_tool_result, is_tool_call
 
 if TYPE_CHECKING:
     pass
@@ -415,6 +417,19 @@ def _resolve_base_context_limit(model_name: str, base_url: str | None = None) ->
         if api_ctx is not None:
             logger.debug("num_ctx=%d from Ollama API for model %s", api_ctx, model_lower)
             return api_ctx
+        # No explicit Modelfile num_ctx: fall back to the model's REAL context
+        # length (model_info context_length, capped at 32768) or the 8192
+        # default — NOT the 1M _DEFAULT_CONTEXT_LIMIT.  A local Ollama tag like
+        # ``qwen3:8b`` misses _CONTEXT_LIMITS entirely (the bare name "qwen3"
+        # is an OPENAI-catalog id), so without this it would receive the 1M
+        # fallback against a real 32K window — over-allocating ~31x and making
+        # the pre-flight budget cap inert until the provider 400s.
+        from external_llm.ollama_api import query_ollama_effective_num_ctx
+
+        effective = query_ollama_effective_num_ctx(model_lower, base_url_hint=base_url)
+        if effective is not None:
+            logger.debug("effective context=%d from Ollama model_info for %s", effective, model_lower)
+            return effective
 
     # 1. Exact match in _CONTEXT_LIMITS, on the BARE catalog id.
     #    The table is keyed on bare ids but a model arrives spelled however its
@@ -683,13 +698,26 @@ def _resolve_context_limit(model_name: str, base_url: str | None = None) -> int:
     return _resolve_base_context_limit(model_lower, base_url)
 
 
+# Warn/act thresholds for the pre-flight budget check (consumption = estimated
+# prompt tokens / prompt-allowable cap). Below the WARN threshold the agent
+# proceeds silently; at WARN it emits an ``agent_working`` event + warning log;
+# at CRITICAL (when a trim callback is wired) the caller force-trims the window
+# so the request still fits instead of 400-ing after 3 wasted retries.
+BUDGET_WARN_RATIO: float = 0.90
+BUDGET_CRITICAL_RATIO: float = 0.95
+# One warning per sign-off session (process lifetime); keeps long-running agents
+# from spamming the same warning every turn while the session stays hot.
+_BUDGET_WARN_EMITTED: set = set()
+
+
 class ContextBudgetManager:
     """Manages token budget for LLM context windows.
 
     Provides:
     - Fast token estimation (no external dependencies)
     - Pre-flight budget check (no truncation — truncated info forces LLM to
-      re-fetch, costing more tokens than it saves)
+      re-fetch, costing more tokens than it saves; above the CRITICAL ratio the
+      caller may pass a ``trim_cb`` to force-compress via the sliding window)
     """
 
     def __init__(self, model_name: str, reserve_for_output: int = 4096, tool_schemas: list | None = None):
@@ -752,8 +780,14 @@ class ContextBudgetManager:
 
         return estimate_tokens_from_msgs(messages)
 
-    def fit_messages(self, messages: list, tool_schemas: list | None = None) -> list:
-        """Check message budget — no truncation.
+    def fit_messages(
+        self,
+        messages: list,
+        tool_schemas: list | None = None,
+        warn_cb: Callable[[str, dict], None] | None = None,
+        trim_cb: Callable[[list], list] | None = None,
+    ) -> list:
+        """Check message budget — no truncation, but warn (and optionally force-trim).
 
         Truncating tool results or messages (head+tail) causes the LLM to lose
         intermediate context and re-issue the same tool calls, wasting more
@@ -763,16 +797,29 @@ class ContextBudgetManager:
         SlidingWindowContext in context_manager.py handles context management
         by summarising older messages rather than silently dropping content.
 
+        Warning contract: when the estimate exceeds ``BUDGET_WARN_RATIO`` of
+        the prompt-allowable cap, ``warn_cb("agent_working", {...})`` is invoked
+        (once per process, keyed by model + signature) so the UI can surface an
+        explicit "context budget nearly exhausted" chip instead of the silent
+        "success" that previously hid a 99.6% hot session.  When the estimate
+        exceeds ``BUDGET_CRITICAL_RATIO`` and ``trim_cb`` is provided, the
+        callback force-trims the window (token-based sliding-window
+        compression) and the trimmed estimate is returned as ``critical``.
+
         Args:
             messages: List of LLMMessage objects.
             tool_schemas: Optional tool schemas to account for in the budget.
                           When provided, uses ``context_message_cap`` logic
                           (matching the pre-trim guard) instead of the
                           construction-time budget.
+            warn_cb: Optional ``(event, data)`` callback for the warning event.
+            trim_cb: Optional ``(messages) -> messages`` callback invoked at
+                     CRITICAL ratio to force-compress the window.
 
-        Returns the **original** message list (never a copy). Callers may mutate
-        freely. The list may exceed budget — the API model's own context window
-        handles overflow gracefully.
+        Returns the **original** message list (never a copy) unless ``trim_cb``
+        actually trimmed (then it returns the trimmed list). Callers may mutate
+        freely. The list may exceed budget when below CRITICAL — the API model's
+        own context window handles overflow gracefully.
         """
         est = self.estimate_messages_tokens(messages)
         if tool_schemas:
@@ -795,7 +842,64 @@ class ContextBudgetManager:
                 est,
                 _cap,
             )
+
+        # ── Consumption-ratio warning / trim (R3) ───────────────────────────
+        if est > 0 and _cap > 0:
+            _ratio = est / _cap
+            _critical = _ratio >= BUDGET_CRITICAL_RATIO
+            if _ratio >= BUDGET_WARN_RATIO:
+                _sig = (self.model_name, "warn" if not _critical else "critical")
+                if _sig not in _BUDGET_WARN_EMITTED:
+                    _BUDGET_WARN_EMITTED.add(_sig)
+                    _evt: dict[str, Any] = {
+                        "reason": "context_budget_warning" if not _critical else "context_budget_critical",
+                        "estimated_tokens": est,
+                        "cap": _cap,
+                        "ratio": round(_ratio, 3),
+                        "model": self.model_name,
+                    }
+                    if warn_cb is not None:
+                        try:
+                            warn_cb("agent_working", _evt)
+                        except Exception as _cb_exc:
+                            logger.debug("fit_messages warn_cb failed: %s", _cb_exc)
+                    _log_f = logger.critical if _critical else logger.warning
+                    _log_f(
+                        "fit_messages: context budget %.1f%% exhausted (est=%d/cap=%d) for %s%s",
+                        _ratio * 100,
+                        est,
+                        _cap,
+                        self.model_name,
+                        " — CRITICAL, force-trimming window" if _critical and trim_cb else "",
+                    )
+            if _critical and trim_cb is not None:
+                try:
+                    trimmed = trim_cb(messages)
+                    if trimmed is not None and len(trimmed) != len(messages):
+                        _t_est = self.estimate_messages_tokens(trimmed)
+                        logger.warning(
+                            "fit_messages: CRITICAL budget → force-trimmed %d msgs (est %d→%d, ratio %.1f%%→%.1f%%)",
+                            len(messages) - len(trimmed),
+                            est,
+                            _t_est,
+                            _ratio * 100,
+                            (_t_est / _cap * 100) if _cap else 0.0,
+                        )
+                        return trimmed
+                except Exception as _trim_exc:
+                    logger.warning("fit_messages: force-trim failed: %s", _trim_exc)
         return messages
+
+
+def _is_tool_call_shape(msg) -> bool:
+    """True if *msg* is a tool-calling assistant message.
+
+    Delegates to :func:`external_llm.agent.message_shapes.is_tool_call` (single
+    source of truth for standard ``tool_calls`` + Anthropic ``tool_use`` +
+    Gemini ``functionCall`` blocks).  The caller has already read ``role``, so
+    this only runs for ``role="assistant"`` candidates.
+    """
+    return is_tool_call(msg)
 
 
 def repair_tool_message_sequence(messages: list) -> list:
@@ -808,40 +912,66 @@ def repair_tool_message_sequence(messages: list) -> list:
 
     Any group that violates these rules is dropped entirely, preserving the
     integrity of the surrounding history.
+
+    Perf note: this runs before EVERY LLM call, so it must stay cheap on long
+    histories (sliding-window floor ~300 messages). On the hot path it reads
+    each message's ``role`` exactly once and dispatches on it: roles are
+    mutually exclusive for shape detection (``role="tool"`` is always a
+    standard result, only ``role="user"`` can carry native tool_result blocks,
+    only ``role="assistant"`` can be a tool_call), so a single role read plus
+    the native-format probes replace the full ``is_tool_result`` +
+    ``is_tool_call`` chains (which internally re-check the role). Fallback
+    keep-alive: messages whose role is None/unset are treated as plain content
+    (matching ``is_tool_result``/``is_tool_call`` empty-role semantics) — they
+    are preserved as-is and never block the scan.
     """
     result: list = []
     i = 0
     while i < len(messages):
         msg = messages[i]
-        if is_tool_result(msg) and not is_tool_call(msg):
-            # NOTE: tool messages that legitimately follow an assistant with tool_calls
-            # are consumed by the assistant handler below (which collects ALL consecutive
-            # tool responses). Any tool message arriving here is an orphan.
-            # Anthropic-native user message may mix text + tool_result blocks: drop only
-            # the tool_result blocks and keep any text (strategy warnings, user input)
-            # so it isn't lost along with the orphan result.  Standard role="tool"
-            # messages are still dropped whole (they carry only tool payload).
-            if _is_anthropic_tool_result(msg):
-                _rc = getattr(msg, "raw_content", None)
-                if isinstance(_rc, list):
-                    _text_blocks = [b for b in _rc if isinstance(b, dict) and b.get("type") != "tool_result"]
-                    if _text_blocks:
-                        logger.info(
-                            "repair_tool_message_sequence: orphan tool_result at idx=%d had text blocks — preserving text",
-                            i,
-                        )
-                        result.append(
-                            dataclasses.replace(msg, raw_content=_text_blocks, content="", tool_call_id=None, name=None)
-                        )
-                        i += 1
-                        continue
+        role = getattr(msg, "role", None)
+        # ── Standard tool-result (role="tool") — always a result ──────────────
+        # Consumed by the assistant handler below when it directly follows an
+        # assistant with tool_calls (it collects ALL consecutive tool responses);
+        # any role="tool" arriving here is an orphan.
+        if role == "tool":
             logger.warning("repair_tool_message_sequence: dropping orphaned tool result at idx=%d", i)
             i += 1
             continue
-        if is_tool_call(msg):
+        # ── Anthropic-native user message: may mix text + tool_result blocks ──
+        # Drop only the tool_result blocks and keep any text (strategy warnings,
+        # user input) so it isn't lost along with the orphan result.
+        if role == "user" and _is_anthropic_tool_result(msg):
+            _rc = getattr(msg, "raw_content", None)
+            if isinstance(_rc, list):
+                _text_blocks = [b for b in _rc if isinstance(b, dict) and b.get("type") != "tool_result"]
+                if _text_blocks:
+                    logger.info(
+                        "repair_tool_message_sequence: orphan tool_result at idx=%d had text blocks — preserving text",
+                        i,
+                    )
+                    result.append(
+                        dataclasses.replace(msg, raw_content=_text_blocks, content="", tool_call_id=None, name=None)
+                    )
+                    i += 1
+                    continue
+            logger.warning("repair_tool_message_sequence: dropping orphaned tool result at idx=%d", i)
+            i += 1
+            continue
+        # ── Assistant tool-call — must be followed by matching tool results ──
+        # (also covers Gemini functionCall parts via native-format probe)
+        if role == "assistant" and _is_tool_call_shape(msg):
             j = i + 1
-            while j < len(messages) and is_tool_result(messages[j]):
-                j += 1
+            while j < len(messages):
+                _nj = messages[j]
+                _nr = getattr(_nj, "role", None)
+                if _nr == "tool":
+                    j += 1
+                    continue
+                if _nr == "user" and _is_anthropic_tool_result(_nj):
+                    j += 1
+                    continue
+                break
             tool_msgs = messages[i + 1 : j]
             if not tool_msgs:
                 logger.warning(

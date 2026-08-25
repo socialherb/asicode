@@ -515,3 +515,31 @@ def test_plan_to_dict():
     assert out["operations"][0]["file"] == "a.py"
     assert out["operations"][0]["dependencies"] == ["b.py"]
     assert out["success_criteria"] == ["ok"]
+
+
+# ── shared format_project_structure (delegation parity) ──────────────────────
+
+
+def test_project_context_summary_delegates_to_shared_format():
+    """Both _build_project_context_summary copies delegate to the SSOT.
+
+    Pins the shared renderer so a future edit to one caller (or the shared
+    function) cannot silently diverge from the other.  The two callers must
+    produce byte-identical output for the same structure, and the shared
+    function must be the implementation behind both.
+    """
+    from external_llm.multi_planner import LLMEnhancedMultiFilePlanner
+    from external_llm.project_analyzer import format_project_structure
+
+    structure = _structure()
+    via_service = _make_service()._build_project_context_summary(structure)
+    planner = object.__new__(LLMEnhancedMultiFilePlanner)
+    via_planner = planner._build_project_context_summary(structure)
+    direct = format_project_structure(structure)
+
+    assert via_service == via_planner == direct
+    # Spot-check the pinned format survives (full sections incl. 'other' exclusion)
+    assert "- **Directory Structure**:" in direct
+    assert "  - app: app/" in direct
+    assert "misc" not in direct
+    assert direct.endswith("- x: `x.py`")

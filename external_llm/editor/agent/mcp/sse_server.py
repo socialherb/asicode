@@ -30,17 +30,20 @@ state is a per-session bounded ``queue.Queue`` guarded by the server's lock;
 the plumbing (registration, teardown, idle sweep, shutdown) is shared with the
 Streamable-HTTP transport via ``_SessionQueueMixin`` (``_session_queue``).
 
-Limitation: a client that disconnects silently while no event is in flight is
-only detected on the next write (BrokenPipe), so its reader thread stays
-blocked in ``queue.get()`` until the background idle sweep closes the
-session (default TTL 30 min — see ``session_idle_ttl``).  Acceptable for a
-local dev server; the daemon-thread model keeps process teardown clean.
+Liveness: the stream loop polls the queue with a heartbeat timeout (default
+30 s — ``_SSE_HEARTBEAT_INTERVAL_SECONDS``) instead of blocking forever, so a
+client that disconnects silently turns the next heartbeat write into a
+BrokenPipe and the session is reclaimed within one interval — not stranded
+until the 30-min idle sweep.  (Shared with the Streamable-HTTP transport.)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -50,6 +53,7 @@ from external_llm.editor.agent.mcp._session_queue import (
     _MAX_MESSAGE_BODY_BYTES,
     _SESSION_IDLE_TTL_SECONDS,
     _SESSION_SWEEP_INTERVAL_SECONDS,
+    _SSE_HEARTBEAT_INTERVAL_SECONDS,
     JsonRpcHandler,
     QuietHttpHandler,
     _SessionQueueMixin,
@@ -60,6 +64,12 @@ logger = logging.getLogger(__name__)
 # Shared session-queue plumbing (registration, teardown, enqueue-under-race,
 # idle sweep, shutdown) lives in _SessionQueueMixin; constants and the
 # JsonRpcHandler type live in _session_queue.
+
+# Global cap on concurrent id'd JSON-RPC requests (tool calls) — mirrors the
+# stdio transport's BoundedSemaphore(8) and the Streamable-HTTP transport's
+# _MAX_CONCURRENT_REQUESTS.  Without it, a pipelining/parallel client posting
+# many call_tools at once would spawn unbounded handler threads.
+_MAX_CONCURRENT_REQUESTS = 8
 
 
 class SSEMcpServer(_SessionQueueMixin):
@@ -77,14 +87,18 @@ class SSEMcpServer(_SessionQueueMixin):
         port: int = 8765,
         *,
         handle: JsonRpcHandler | None = None,
+        max_concurrent: int = _MAX_CONCURRENT_REQUESTS,
         session_idle_ttl: float = _SESSION_IDLE_TTL_SECONDS,
         sweep_interval: float = _SESSION_SWEEP_INTERVAL_SECONDS,
+        heartbeat_interval: float = _SSE_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self.registry = registry
         # JSON-RPC handler — injected by server.py's _run_sse_server so the
         # stdio and SSE transports share ONE implementation; tests inject
         # fakes.  None (direct construction) degrades to an explicit error.
         self._handle = handle
+        self._heartbeat_interval = heartbeat_interval
+        self._concurrency_semaphore = threading.BoundedSemaphore(max_concurrent)
         self.httpd = ThreadingHTTPServer((host, port), _make_handler(self))
         self.host, self.port = self.httpd.server_address[:2]
         logger.info("MCP SSE server bound to %s:%s", self.host, self.port)
@@ -95,6 +109,27 @@ class SSEMcpServer(_SessionQueueMixin):
             session_idle_ttl=session_idle_ttl,
             sweep_interval=sweep_interval,
         )
+
+    def _handle_request_capped(self, request: dict) -> tuple[bool, str | None]:
+        """Handle an id'd request under the global concurrency cap.
+
+        Returns ``(True, payload)`` on success (``payload`` is None for
+        notifications, which bypass the cap) and ``(False, None)`` when the
+        cap is reached — the caller answers 503.
+        """
+        if request.get("id") is None:
+            return True, None
+        if not self._concurrency_semaphore.acquire(blocking=False):
+            return False, None
+        try:
+            return True, self._handle_request(request)
+        finally:
+            self._concurrency_semaphore.release()
+
+    def _touch(self, session_id: str) -> None:
+        """Refresh a session's idle timestamp (shared with Streamable-HTTP)."""
+        with self._lock:
+            self._last_active[session_id] = time.monotonic()
 
 
 def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
@@ -185,7 +220,16 @@ def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
                 )
             else:
                 # None for notifications (no id) — the 202 ack is their only reply.
-                payload = server._handle_request(request)
+                # id'd requests run under the global concurrency cap (mirrors the
+                # stdio/Streamable-HTTP transports): over the cap we answer 503
+                # instead of spawning unbounded dispatch threads.
+                ok, payload = server._handle_request_capped(request)
+                if not ok:
+                    self._json_error(
+                        503,
+                        "Server busy — concurrency limit reached (retry later)",
+                    )
+                    return
             if payload is not None:
                 outcome = server._enqueue_if_current(session_id, session, payload)
                 if outcome == "gone":
@@ -239,11 +283,22 @@ def _make_handler(server: SSEMcpServer) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(f"event: endpoint\ndata: {endpoint}\n\n".encode())
                 self.wfile.flush()
                 while True:
-                    data = messages.get()
+                    try:
+                        data = messages.get(timeout=server._heartbeat_interval)
+                    except queue.Empty:
+                        # Keep-alive: SSE comment (no-op event).  Fails fast
+                        # (BrokenPipeError) if the client has vanished, and
+                        # touches the session so an active stream is never
+                        # idle-swept.
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        server._touch(session_id)
+                        continue
                     if data is None:
                         break
                     self.wfile.write(f"event: message\ndata: {data}\n\n".encode())
                     self.wfile.flush()
+                    server._touch(session_id)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # Client went away — nothing to clean up beyond the session.
                 logger.debug("MCP SSE client disconnected (session %s)", session_id[:8])

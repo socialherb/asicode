@@ -693,11 +693,11 @@ def create_llm_client(
         return OpenRouterClient(api_key, base_url, timeout)
 
     if provider_lower == "opencode":
-        from .openai_client import OpenAIClient
+        from .openai_client import OpenCodeClient
 
         if not base_url:
             base_url = "https://opencode.ai/zen/go/v1"  # default for OpenCode Go
-        return OpenAIClient(api_key, base_url, timeout)
+        return OpenCodeClient(api_key, base_url, timeout)
 
     raise ValueError(
         f"Unknown LLM provider: {provider}. "

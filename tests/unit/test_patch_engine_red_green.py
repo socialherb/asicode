@@ -809,7 +809,9 @@ class TestRollbackHelpers:
         snapshot = {"app.py": ("100644", "sha1"), "other.py": ("100644", "sha9")}
         engine._restore_index_entries(snapshot)
         assert len(updates) == 1
-        assert "other.py" in updates[0][2]
+        assert updates[0][1] == "add"
+        assert updates[0][2] == "--"
+        assert "other.py" in updates[0][3]
 
     def test_snapshot_index_entries(self, engine, git_repo):
         snap = engine._snapshot_index_entries("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n")
@@ -1034,27 +1036,23 @@ class TestAddDiffHeaders:
 
 
 class TestTolerantApplyEdges:
-    def test_check_ok_apply_fails_rolls_back(self, engine, git_repo, monkeypatch):
+    def test_apply_failure_rolls_back_3way(self, engine, git_repo, monkeypatch):
+        """A failed apply must roll back the tree. The --check pre-spawn is gone
+        (the apply itself is the decider); only the --3way CONFLICT path mutates
+        (markers + staging), so that is the path that rolls back."""
         import external_llm.patch_engine as pe
 
-        seq = {"n": 0}
-
-        class _Check:
-            returncode = 0
-            stderr = b""
+        restores = []
 
         class _Apply:
             returncode = 1
             stderr = b"apply exploded"
 
         def _fake_run(cmd, *a, **k):
-            seq["n"] += 1
-            # 1st call per variant is --check, 2nd is the apply
-            if "--check" in cmd:
-                return _Check()
+            # No --check calls anymore: every run is a real apply
+            assert "--check" not in cmd, f"--check pre-spawn must be gone, got {cmd}"
             return _Apply()
 
-        restores = []
         monkeypatch.setattr(pe.subprocess, "run", _fake_run)
         monkeypatch.setattr(engine, "_snapshot_patch_targets", lambda p: {"k": "v"})
         monkeypatch.setattr(engine, "_snapshot_index_entries", lambda p: {})
@@ -1066,9 +1064,9 @@ class TestTolerantApplyEdges:
             "app.py",
         )
         assert ok is False
-        assert "check OK but apply failed" in (err or "")
+        assert "3way apply failed" in (err or "")
         assert restores  # rollback ran
-        assert mode != "none"
+        assert mode == "3way_merge"
 
     def test_subprocess_exception_continues_to_next_variant(self, engine, monkeypatch):
         import external_llm.patch_engine as pe
@@ -1088,20 +1086,23 @@ class TestTolerantApplyEdges:
     def test_3way_only_when_allowed(self, engine, git_repo, monkeypatch):
         import external_llm.patch_engine as pe
 
-        seen_flags = []
+        seen_cmds = []
 
         class _R:
             returncode = 1
             stderr = b"nope"
 
         def _fake_run(cmd, *a, **k):
-            if "--check" in cmd:
-                seen_flags.append(tuple(cmd[2:-1]))
+            seen_cmds.append(tuple(cmd))
             return _R()
 
         monkeypatch.setattr(pe.subprocess, "run", _fake_run)
         engine._tolerant_git_apply("junk patch", "app.py", allow_3way=False)
-        joined = [f for t in seen_flags for f in t]
+        # PERF contract: no `--check` pre-spawn at all — each variant is a
+        # single real apply. Regression guard for the spawn-halving change.
+        assert seen_cmds, "expected at least one apply attempt"
+        assert all("--check" not in c for c in seen_cmds), f"--check pre-spawn must be gone, got {seen_cmds}"
+        joined = [f for c in seen_cmds for f in c]
         assert "--3way" not in joined
 
 

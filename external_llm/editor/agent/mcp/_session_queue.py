@@ -46,6 +46,15 @@ _MAX_QUEUED_EVENTS = 1024
 _SESSION_IDLE_TTL_SECONDS = 30 * 60
 _SESSION_SWEEP_INTERVAL_SECONDS = 60
 
+# SSE keep-alive heartbeat interval for both HTTP transports (SSE +
+# Streamable-HTTP).  The stream loop blocks on the session queue; without
+# periodic writes it can never detect a vanished client (a RST only fails the
+# *next* write), so a dead client's session would linger until the idle sweep
+# (30 min).  Writing an SSE comment (a no-op event) on a timer turns a
+# vanished client into a BrokenPipeError within one interval, and touches the
+# session so an *active* client is never swept.
+_SSE_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
 # Type of the injected JSON-RPC handler: (registry, request) -> response dict.
 JsonRpcHandler = Callable[[ToolRegistry, dict[str, Any]], dict[str, Any]]
 

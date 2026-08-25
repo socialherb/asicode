@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .agent.config.thresholds import config as _cfg
 from .client import effective_content
-from .project_analyzer import ProjectAnalyzer, ProjectStructure
+from .project_analyzer import ProjectAnalyzer, ProjectStructure, format_project_structure
 from .smart_analyzer import RequestAnalysis, SmartRequestAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -427,35 +427,12 @@ class LLMEnhancedMultiFilePlanner(MultiFilePlanner):
             return None
 
     def _build_project_context_summary(self, structure: ProjectStructure) -> str:
-        """Build concise project context summary for LLM planning"""
-        lines = []
+        """Build concise project context summary for LLM planning.
 
-        if structure.frameworks:
-            lines.append(f"- **Frameworks**: {', '.join(structure.frameworks)}")
-        elif structure.framework:
-            lines.append(f"- **Framework**: {structure.framework}")
-
-        if structure.project_types:
-            lines.append(f"- **Project Type**: {', '.join(structure.project_types)}")
-
-        if structure.directories:
-            lines.append("- **Directory Structure**:")
-            for purpose, dirs in structure.directories.items():
-                if purpose != "other" and dirs:
-                    lines.append(f"  - {purpose}: {', '.join(dirs)}")
-
-        if structure.naming_style:
-            lines.append(f"- **Naming Convention**: {structure.naming_style}")
-
-        if structure.common_imports:
-            lines.append(f"- **Common Imports**: {', '.join(structure.common_imports[:5])}")
-
-        if structure.example_files:
-            lines.append("- **Example Files**:")
-            for file_type, path in list(structure.example_files.items())[:3]:
-                lines.append(f"  - {file_type}: `{path}`")
-
-        return "\n".join(lines) if lines else "No project context available."
+        Delegates to ``format_project_structure`` (project_analyzer.py) — the
+        single source of truth shared with IntelligentLLMService.
+        """
+        return format_project_structure(structure)
 
     def _build_llm_planning_prompt(
         self, user_request: str, analysis: RequestAnalysis, structure: ProjectStructure, project_context: str

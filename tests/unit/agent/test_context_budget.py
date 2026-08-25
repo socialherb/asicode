@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 
@@ -60,6 +61,17 @@ def _clear_overrides() -> None:
     """Clear all runtime override state between tests."""
     _context_window_overrides.clear()
     _override_meta.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_budget_warn_emitted():
+    """The one-shot budget-warn latch (_BUDGET_WARN_EMITTED) is module-global;
+    reset it before each test so test isolation is not affected by run order."""
+    from external_llm.agent.context_budget import _BUDGET_WARN_EMITTED
+
+    _BUDGET_WARN_EMITTED.clear()
+    yield
+    _BUDGET_WARN_EMITTED.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -585,6 +597,105 @@ class TestNoTruncation:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 5.5 Budget warning / critical trim (R3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestBudgetWarning:
+    """fit_messages emits a one-shot warn_cb event at >=90% consumption and
+    force-trims via trim_cb at >=95%."""
+
+    def _mgr_and_msgs(self) -> tuple[ContextBudgetManager, list]:
+        mgr = _bare_manager()
+        msgs = [make_msg("system", "SYS")]
+        for _i in range(50):
+            msgs.append(make_msg("user", "u" * 1000))
+            msgs.append(make_msg("assistant", "a" * 1000))
+        return mgr, msgs
+
+    def test_warn_cb_fires_above_90_percent(self):
+        mgr, msgs = self._mgr_and_msgs()
+        events: list = []
+        with _tiny_limit(100_000):  # est ~50k → ~50% ratio (no warn)
+            mgr.fit_messages(msgs, warn_cb=lambda ev, d: events.append((ev, d)))
+        assert events == []
+
+        with _tiny_limit(53_000):  # est ~50k → ~95%, but under 90% of 53k cap
+            mgr.fit_messages(msgs, warn_cb=lambda ev, d: events.append((ev, d)))
+        assert len(events) == 1
+        ev, data = events[0]
+        assert ev == "agent_working"
+        assert data["reason"] == "context_budget_warning"
+        assert data["estimated_tokens"] > 0
+        assert data["cap"] > 0
+        assert data["ratio"] >= 0.9
+        assert data["model"] == "test"
+
+    def test_warn_fires_once_per_signature(self):
+        """A second fit_messages call with the same signature does NOT re-emit."""
+        mgr, msgs = self._mgr_and_msgs()
+        events: list = []
+        with _tiny_limit(53_000):
+            mgr.fit_messages(msgs, warn_cb=lambda ev, d: events.append((ev, d)))
+            mgr.fit_messages(msgs, warn_cb=lambda ev, d: events.append((ev, d)))
+        assert len(events) == 1
+
+    def test_critical_prefers_noop_trim_over_original(self):
+        """At 94.5% (warn, not critical) trim_cb is NOT invoked — original kept."""
+        mgr, msgs = self._mgr_and_msgs()
+        trimmed_output = msgs[:3]
+        events: list = []
+        with _tiny_limit(53_000):  # est 50k / cap 53k = 94.5% — warn, no critical
+            result = mgr.fit_messages(
+                msgs,
+                warn_cb=lambda ev, d: events.append((ev, d)),
+                trim_cb=lambda m: trimmed_output,
+            )
+        # ratios below 95% do not invoke trim_cb → original unchanged
+        assert result is msgs or result == msgs
+        assert all(d["reason"] != "context_budget_critical" for _ev, d in events)
+
+    def test_critical_fires_at_95_percent_and_trims(self):
+        mgr, msgs = self._mgr_and_msgs()
+        trimmed_output = msgs[:3]
+        events: list = []
+        with _tiny_limit(52_000):  # est 50k / cap 52k = 96.2% — critical
+            result = mgr.fit_messages(
+                msgs,
+                warn_cb=lambda ev, d: events.append((ev, d)),
+                trim_cb=lambda m: trimmed_output,
+            )
+        assert result is trimmed_output
+        assert any(d["reason"] == "context_budget_critical" for _ev, d in events)
+
+    def test_trim_cb_returning_same_list_keeps_original(self):
+        """When trim_cb is a no-op (same len), fit_messages returns the original."""
+        mgr, msgs = self._mgr_and_msgs()
+        with _tiny_limit(52_000):
+            result = mgr.fit_messages(msgs, trim_cb=lambda m: m)
+        assert result is msgs or result == msgs
+
+    def test_below_warn_no_events(self):
+        mgr = _bare_manager()
+        msgs = [make_msg("system", "SYS"), make_msg("user", "hi"), make_msg("assistant", "yo")]
+        events: list = []
+        with _tiny_limit(100_000):  # est tiny vs cap → well below 90%
+            mgr.fit_messages(msgs, warn_cb=lambda ev, d: events.append((ev, d)))
+        assert events == []
+
+    def test_tool_schemas_path_caps_warning(self):
+        """The tool-schemas path (context_message_cap) also emits the warning."""
+        mgr = _bare_manager()
+        mgr._tool_schema_tokens = 5_000  # pretend schemas cost tokens
+        msgs = [make_msg("system", "SYS"), make_msg("user", "u" * 200_000)]
+        events: list = []
+        with _tiny_limit(60_000):  # cap = 60k - 5k schema - reserve(0) = 55k; est≈100k → critical
+            mgr.fit_messages(msgs, tool_schemas=[{"name": "t"}], warn_cb=lambda ev, d: events.append((ev, d)))
+        assert len(events) == 1
+        assert events[0][1]["reason"] in ("context_budget_warning", "context_budget_critical")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 7. ContextBudgetManager initialisation
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -629,6 +740,197 @@ class TestRepairToolMessageSequence:
         result = repair_tool_message_sequence(msgs)
         assert len(result) == 3
         assert [m.content for m in result] == ["sys", "hello", "world"]
+
+    def test_plain_user_with_tool_result_blocks_dropped_via_role_dispatch(self):
+        """role='user' with tool_result blocks is dropped WITHOUT calling is_tool_result
+        — the role-dispatch fast path must behave identically to the old
+        is_tool_result/is_tool_call gate."""
+        msgs = [
+            make_msg("user", "task"),
+            # Anthropic-native orphan: role="user" + tool_result block, no text
+            make_msg(
+                "user",
+                "",
+                raw_content=[{"type": "tool_result", "tool_use_id": "tu1", "content": "out"}],
+            ),
+            make_msg("assistant", "done"),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 2
+        assert result[0].content == "task"
+        assert result[1].content == "done"
+
+    def test_plain_user_without_tool_blocks_preserved_without_probes(self):
+        """Every non-tool role must fall through to the identity path unchanged."""
+        for role in ("user", "system", "assistant"):
+            msg = make_msg(role, "plain")
+            result = repair_tool_message_sequence([msg])
+            assert len(result) == 1
+            assert result[0] is msg
+
+    def test_plain_user_with_tool_use_in_raw_preserved(self):
+        """role='user' carrying tool_use blocks (not tool_result) is NOT a tool result —
+        the role-dispatch branch must not drop it."""
+        msgs = [
+            make_msg("user", "task"),
+            make_msg(
+                "user",
+                "ctx",
+                raw_content=[{"type": "tool_use", "id": "tu1", "name": "read_file"}],
+            ),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 2
+
+    def test_native_gemini_function_call_still_repairs(self):
+        """Assistant with Gemini functionCall part must be detected via is_tool_call
+        delegation even when role='assistant' has no standard tool_calls attr."""
+        msgs = [
+            make_msg(
+                "assistant",
+                "",
+                raw_content=[{"functionCall": {"name": "read_file", "args": {}, "id": "fc1"}}],
+            ),
+            make_msg("tool", "r1", tool_call_id="fc1"),
+            make_msg("user", "done"),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 3
+        assert [m.role for m in result] == ["assistant", "tool", "user"]
+
+    def test_gemini_orphan_function_call_dropped(self):
+        """Gemini functionCall without following functionResponse part is dropped."""
+        msgs = [
+            make_msg(
+                "assistant",
+                "",
+                raw_content=[{"functionCall": {"name": "read_file", "args": {}, "id": "fc1"}}],
+            ),
+            make_msg("user", "done"),
+        ]
+        result = repair_tool_message_sequence(msgs)
+        assert len(result) == 1
+        assert result[0].content == "done"
+
+    def test_role_none_message_passthrough_not_probed(self):
+        """result-no-role / tool-no-role behave exactly like the old empty-role path."""
+        bare = object()
+        result = repair_tool_message_sequence([bare, make_msg("user", "x")])
+        assert len(result) == 2
+        assert result[0] is bare
+
+    def test_consistent_with_old_impl_on_corpus(self):
+        """Deterministic corpus: the role-dispatch fast path must produce
+        byte-identical results to the original is_tool_result/is_tool_call gate."""
+        import random
+
+        rng = random.Random(42)
+        corpus = []
+        for i in range(200):
+            r = rng.random()
+            if r < 0.18:
+                corpus.append(make_msg("assistant", "", tool_calls=[{"id": f"tc{i}"}]))
+                corpus.append(make_msg("tool", "r", tool_call_id=f"tc{i}"))
+            elif r < 0.26:
+                corpus.append(
+                    make_msg("user", "", raw_content=[{"type": "tool_result", "tool_use_id": f"tu{i}", "content": "x"}])
+                )
+            elif r < 0.34:
+                corpus.append(
+                    make_msg(
+                        "user",
+                        "",
+                        raw_content=[
+                            {"type": "tool_result", "tool_use_id": f"tu{i}", "content": "x"},
+                            {"type": "text", "text": "keep"},
+                        ],
+                    )
+                )
+            elif r < 0.50:
+                corpus.append(
+                    make_msg("assistant", "", raw_content=[{"type": "tool_use", "id": f"tu{i}", "name": "bash"}])
+                )
+            else:
+                corpus.append(make_msg(rng.choice(["user", "assistant", "system"]), f"msg {i}"))
+
+        def old_impl(msgs):
+            from external_llm.agent.message_shapes import is_tool_call as _itc
+            from external_llm.agent.message_shapes import is_tool_result as _itr
+
+            result = []
+            i = 0
+            while i < len(msgs):
+                msg = msgs[i]
+                if _itr(msg) and not _itc(msg):
+                    if _is_anthropic_tool_result_local(msg):
+                        _rc = getattr(msg, "raw_content", None)
+                        if isinstance(_rc, list):
+                            _text_blocks = [b for b in _rc if isinstance(b, dict) and b.get("type") != "tool_result"]
+                            if _text_blocks:
+                                result.append(
+                                    dataclasses.replace(
+                                        msg, raw_content=_text_blocks, content="", tool_call_id=None, name=None
+                                    )
+                                )
+                                i += 1
+                                continue
+                    i += 1
+                    continue
+                if _itc(msg):
+                    j = i + 1
+                    while j < len(msgs) and _itr(msgs[j]):
+                        j += 1
+                    tool_msgs = msgs[i + 1 : j]
+                    if not tool_msgs:
+                        i = j
+                        continue
+                    _tool_calls = getattr(msg, "tool_calls", None) or []
+                    _expected_ids = {tc.get("id") for tc in _tool_calls if isinstance(tc, dict) and tc.get("id")}
+                    _raw = getattr(msg, "raw_content", None)
+                    if isinstance(_raw, list):
+                        _expected_ids |= {
+                            b.get("id")
+                            for b in _raw
+                            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+                        }
+                    _actual_ids = set()
+                    for m in tool_msgs:
+                        _tid = getattr(m, "tool_call_id", None)
+                        if _tid:
+                            _actual_ids.add(_tid)
+                        _mrc = getattr(m, "raw_content", None)
+                        if isinstance(_mrc, list):
+                            _actual_ids |= {
+                                b.get("tool_use_id")
+                                for b in _mrc
+                                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
+                            }
+                    if _expected_ids and _actual_ids and _expected_ids != _actual_ids:
+                        i = j
+                        continue
+                    i = j
+                    result.append(msg)
+                    result.extend(tool_msgs)
+                    continue
+                result.append(msg)
+                i += 1
+            return result
+
+        def _is_anthropic_tool_result_local(m):
+            from external_llm.agent.message_shapes import _has_raw_blocks
+
+            return _has_raw_blocks(m, "user", "tool_result")
+
+        fast = repair_tool_message_sequence(corpus)
+        slow = old_impl(corpus)
+        assert len(fast) == len(slow)
+        for a, b in zip(fast, slow, strict=False):
+            assert a.role == b.role
+            assert a.content == b.content
+            assert a.tool_call_id == b.tool_call_id
+            assert a.name == b.name
+            assert (a.tool_calls or []) == (b.tool_calls or [])
+            assert (a.raw_content or []) == (b.raw_content or [])
 
     def test_valid_tool_call_sequence_preserved(self):
         msgs = [
@@ -2419,6 +2721,38 @@ class TestOllamaNumCtxPath:
         monkeypatch.setattr("external_llm.ollama_api.query_ollama_num_ctx", fake_query)
         assert cb._resolve_base_context_limit("llama3:8b", base_url="http://localhost:11434") == 8192
         assert calls == [("llama3:8b", "http://localhost:11434")]
+
+    def test_ollama_tag_without_explicit_num_ctx_uses_effective_not_1m(self, monkeypatch):
+        """A local Ollama tag whose Modelfile lacks num_ctx must NOT receive the
+        1M _DEFAULT_CONTEXT_LIMIT fallback: it resolves via
+        query_ollama_effective_num_ctx (model_info context_length / 8192)."""
+        import external_llm.agent.context_budget as cb
+
+        calls = []
+
+        def fake_num_ctx(model, base_url_hint=None):
+            calls.append(("num_ctx", model, base_url_hint))
+            # no explicit Modelfile num_ctx → implicit None
+
+        def fake_effective(model, base_url_hint=None):
+            calls.append(("effective", model, base_url_hint))
+            return 32768  # server-reported context_length
+
+        monkeypatch.setattr("external_llm.ollama_api.query_ollama_num_ctx", fake_num_ctx)
+        monkeypatch.setattr("external_llm.ollama_api.query_ollama_effective_num_ctx", fake_effective)
+        assert cb._resolve_base_context_limit("qwen3:8b", base_url="http://localhost:11434") == 32768
+        assert calls == [
+            ("num_ctx", "qwen3:8b", "http://localhost:11434"),
+            ("effective", "qwen3:8b", "http://localhost:11434"),
+        ]
+
+    def test_ollama_tag_effective_default_8192(self, monkeypatch):
+        """No explicit num_ctx AND no model_info → 8192 (not 1M, not 2048)."""
+        import external_llm.agent.context_budget as cb
+
+        monkeypatch.setattr("external_llm.ollama_api.query_ollama_num_ctx", lambda *a, **k: None)
+        monkeypatch.setattr("external_llm.ollama_api.query_ollama_effective_num_ctx", lambda *a, **k: 8192)
+        assert cb._resolve_base_context_limit("deepseek-r1:8b", base_url="http://localhost:11434") == 8192
 
 
 class TestIsContextLengthErrorCodePath:

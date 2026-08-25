@@ -228,6 +228,67 @@ class TestSlidingWindowPrepare:
         assert _roles(out) == ["system", "user", "assistant", "tool", "user"]
 
 
+# ── SlidingWindowContext: token-budget force trim (R3) ─────────────────────
+
+
+class TestSlidingWindowTokenBudget:
+    """prepare_before_call(budget=N) force-compresses the OLDEST messages and
+    keeps the NEWEST suffix that fits the token budget."""
+
+    def _heavy(self, n_pairs: int, content: str = "x" * 300):
+        msgs = [_sys("SYS")]
+        for i in range(n_pairs):
+            msgs.append(_user(f"q{i} " + content))
+            msgs.append(_asst(f"a{i} " + content))
+        return msgs
+
+    def test_budget_trims_to_fit_and_keeps_newest(self):
+        from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
+        msgs = self._heavy(40)
+        est_all = estimate_tokens_from_msgs(msgs)
+        cfg = SlidingWindowConfig(context_window_size=300)
+        swc = SlidingWindowContext(cfg)
+        out = swc.prepare_before_call(msgs, budget=est_all // 2)
+        est_out = estimate_tokens_from_msgs(out)
+        assert est_out <= est_all // 2
+        # The newest exchange survives
+        assert out[-1].content.startswith("a39")
+        # A compact summary block exists
+        assert any(getattr(m, "role", "") == "user" and m.content.startswith("[COMPRESSED CONTEXT]") for m in out)
+
+    def test_budget_noop_when_already_fits(self):
+        from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
+        msgs = self._heavy(3)
+        est = estimate_tokens_from_msgs(msgs)
+        out = SlidingWindowContext(SlidingWindowConfig(context_window_size=300)).prepare_before_call(
+            msgs, budget=est + 10_000
+        )
+        assert len(out) == len(msgs)  # no trim when comfortably under budget
+
+    def test_budget_impossible_returns_none_falls_back_to_count(self):
+        msgs = self._heavy(5)
+        # Budget far below a single message + summary reserve → impossible.
+        swc = SlidingWindowContext(SlidingWindowConfig(context_window_size=2))
+        out = swc.prepare_before_call(msgs, budget=10)
+        # falls back to count window (window=2 → trim)
+        assert len(out) < len(msgs)
+
+    def test_emits_context_trimmed_event(self):
+        from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
+        msgs = self._heavy(40)
+        est = estimate_tokens_from_msgs(msgs)
+        events: list = []
+        swc = SlidingWindowContext(
+            SlidingWindowConfig(context_window_size=300), stream_callback=lambda ev, d: events.append(ev)
+        )
+        swc.prepare_before_call(msgs, budget=est // 2)
+        assert "context_trimmed" in events
+        assert "agent_working" in events
+
+
 # ── trajectory_summary ─────────────────────────────────────────────────────
 
 

@@ -419,6 +419,64 @@ def test_sse_post_session_queue_full_returns_503(sse_server, monkeypatch):
     assert b"queue full" in body.lower()
 
 
+def test_sse_concurrency_cap_returns_503():
+    """R2 parity: over the global cap, id'd POSTs answer 503; notifications
+    bypass the cap (mirrors the stdio/Streamable-HTTP transports)."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_handle(registry, request):
+        entered.set()
+        release.wait(timeout=5)
+        return {"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}
+
+    server, thread = _start_server(handle=slow_handle, max_concurrent=1)
+    session_id, _ = server._new_session()
+    endpoint = f"/message?session_id={session_id}"
+    try:
+        results = {}
+
+        def first_post():
+            results["first"] = _post(
+                server.host,
+                server.port,
+                endpoint,
+                {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping", "params": {}},
+            )
+
+        t1 = threading.Thread(target=first_post)
+        t1.start()
+        assert entered.wait(timeout=5), "first request should occupy the cap slot"
+
+        # Second id'd request over the cap → 503.
+        status, body = _post(
+            server.host,
+            server.port,
+            endpoint,
+            {"jsonrpc": "2.0", "id": 2, "method": "mcp.ping", "params": {}},
+        )
+        assert status == 503, f"expected 503, got {status}: {body!r}"
+        assert b"concurrency" in body.lower()
+
+        # Notifications bypass the cap (no id) — still 202.
+        status2, _ = _post(
+            server.host,
+            server.port,
+            endpoint,
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        )
+        assert status2 == 202
+
+        release.set()
+        t1.join(timeout=5)
+        assert results["first"][0] == 202
+    finally:
+        release.set()
+        server._close_session(session_id)
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_sse_delete_full_session_drops_without_blocking(sse_server, monkeypatch):
     """DELETE against a full session must not block the handler thread
     (put_nowait, not put); the session is dropped so later POSTs 404."""
@@ -812,3 +870,60 @@ def test_sse_stream_client_disconnect_logged(sse_server, caplog):
             {"jsonrpc": "2.0", "id": 1, "method": "mcp.ping"},
         )
         assert _wait_until(lambda: any("client disconnected" in r.message for r in caplog.records))
+
+
+def test_sse_heartbeat_ping_on_idle_stream():
+    """An idle SSE stream receives periodic heartbeat comments (no-op events),
+    so a vanished client is detected within one interval (was: blocked forever
+    on messages.get() until the 30-min idle sweep)."""
+    server, thread = _start_server(heartbeat_interval=0.1)
+    try:
+        sock, rest = _open_sse(server.host, server.port)
+        reader = _SseReader(sock, rest)
+        event, _endpoint = reader.read_event()
+        assert event == "endpoint"
+        # No POSTs — only heartbeats flow.  A heartbeat is an SSE comment
+        # line starting with ':'; _SseReader reports it as a message event
+        # with empty data (the parser only handles event:/data: lines).
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            event, data = reader.read_event()
+            # First real write may be a heartbeat (no data) — assert that
+            # SOMETHING arrived within the interval (proves liveness).
+            if event == "message" and data == "":
+                break
+        else:
+            raise AssertionError("no heartbeat arrive on idle stream")
+        sock.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_sse_vanish_after_stream_open_dropped_by_heartbeat():
+    """A client that vanishes AFTER the stream opened (endpoint write already
+    succeeded) still has its session dropped — the heartbeat write fails fast
+    on the dead connection.  Previously the loop blocked on messages.get()
+    with nothing to write, so the session lingered until the 30-min idle
+    sweep."""
+    import struct
+
+    server, thread = _start_server(heartbeat_interval=0.1)
+    try:
+        sock, rest = _open_sse(server.host, server.port)
+        reader = _SseReader(sock, rest)
+        event, _endpoint = reader.read_event()
+        assert event == "endpoint"
+        # Let the stream open and the first write succeed (endpoint event).
+        time.sleep(0.3)  # > heartbeat: the loop is definitely in its idle poll
+        # Now vanish without DELETE — RST kills the connection.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+        # The heartbeat write on the dead socket fails → session dropped well
+        # before the 30-min idle TTL.
+        assert _wait_until(lambda: len(server._sessions) == 0, timeout=3), (
+            "vanished client's session not reclaimed by heartbeat"
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)

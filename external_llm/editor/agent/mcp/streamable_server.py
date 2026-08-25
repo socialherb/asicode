@@ -56,6 +56,7 @@ from external_llm.editor.agent.mcp._session_queue import (
     _MAX_MESSAGE_BODY_BYTES,
     _SESSION_IDLE_TTL_SECONDS,
     _SESSION_SWEEP_INTERVAL_SECONDS,
+    _SSE_HEARTBEAT_INTERVAL_SECONDS,
     JsonRpcHandler,
     QuietHttpHandler,
     _SessionQueueMixin,
@@ -64,20 +65,12 @@ from external_llm.editor.agent.mcp._session_queue import (
 logger = logging.getLogger(__name__)
 
 # Transport-wide constants shared with the SSE transport (body-size limit,
-# queue cap, idle TTL, JsonRpcHandler type) live in _session_queue; the
-# Streamable-HTTP-only limits below stay here.
+# queue cap, idle TTL, heartbeat, JsonRpcHandler type) live in _session_queue;
+# the Streamable-HTTP-only limits below stay here.
 
 # Socket timeout for client connections — a stalled client must not pin a
 # worker thread forever (ThreadingHTTPServer spawns one thread per connection).
 _SOCKET_TIMEOUT_SECONDS = 30
-
-# SSE keep-alive heartbeat interval.  The stream loop blocks on the session
-# queue; without periodic writes it can never detect a vanished client (a RST
-# only fails the *next* write), so a dead client's session would linger until
-# the idle sweep (30 min).  Writing an SSE comment (a no-op event) on a timer
-# turns a vanished client into a BrokenPipeError within one interval, and
-# touches the session so an *active* client is never swept.
-_SSE_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 # Global cap on concurrent id'd JSON-RPC requests (tool calls) — mirrors the
 # stdio transport's BoundedSemaphore(8).  Overflow is answered 503.

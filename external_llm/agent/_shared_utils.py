@@ -750,6 +750,12 @@ _COST_PER_M: dict[str, tuple[float, float]] = {
     # a low DeepSeek-tier rate since the common OpenRouter workloads (DeepSeek
     # Flash/Pro) are cheap — model-specific entries in _MODEL_COST_PER_M win.
     "openrouter": (0.27, 1.10),
+    # OpenCode gateway (opencode.ai/zen) — go subscription and zen pay-as-you-go
+    # share the same token prices (source: opencode.ai/docs/go, /docs/zen,
+    # verified 2026-08-25). Fallback for unknown OpenCode models: the most-used
+    # coding model tier (DeepSeek V4 Flash off-peak). Model-specific entries in
+    # _OPENCODE_COST_PER_M win when the id is known.
+    "opencode": (0.22, 0.66),
 }
 
 # Model-specific pricing (prefix-matched, checked before provider fallback).
@@ -800,6 +806,18 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
     "deepseek/deepseek-v4-flash": (0.09, 0.18),  # 35% cheaper than native
     "deepseek/deepseek-v4-pro": (0.435, 0.87),  # same as native
     "qwen/qwen3.6": (0.289, 2.40),
+    # OpenRouter vendor-prefixed slugs from the catalog (KNOWN_MODELS
+    # "openrouter") — verified 2026-08-25 against the live
+    # https://openrouter.ai/api/v1/models pricing field (per-1M, exact).
+    "anthropic/claude-fable-5": (10.00, 50.00),
+    "anthropic/claude-sonnet-5": (2.00, 10.00),
+    "anthropic/claude-sonnet-4.6": (3.00, 15.00),
+    "google/gemini-3.6-flash": (0.75, 3.75),
+    "google/gemini-2.5-pro": (1.25, 10.00),
+    "moonshotai/kimi-k3": (3.00, 15.00),
+    "minimax/minimax-m3": (0.30, 1.20),
+    "z-ai/glm-5.2": (0.966, 3.036),
+    "qwen/qwen3.7-max": (1.475, 4.425),
     # Z.AI — source: https://docs.z.ai/guides/overview/pricing (verified 2026-06)
     "glm-5.2": (1.40, 4.40),
     "glm-5.1": (1.40, 4.40),
@@ -809,6 +827,78 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
     "glm-4.6": (0.60, 2.20),
     "glm-4.5": (0.60, 2.20),
 }
+
+# OpenCode gateway model pricing — $/1M (input, output) per token.
+# Source: https://opencode.ai/docs/go/ + https://opencode.ai/docs/zen/
+# (both price sheets verified 2026-08-25; Go and Zen share these token prices).
+# Keyed by BARE model id (the catalog ids — the gateway serves them without a
+# vendor prefix), and consulted ONLY when provider == "opencode" (see
+# ``_get_rates``), so these never collide with the native-provider entries in
+# ``_MODEL_COST_PER_M`` (e.g. ``deepseek-v4-flash`` costs 0.14/0.28 natively
+# but 0.22/0.66 on the OpenCode gateway).
+#
+# DeepSeek peak/off-peak split (Go/Zen docs): peak 01:00-04:00 & 06:00-10:00
+# UTC weekdays; off-peak otherwise. We price off-peak (the common case); peak
+# runs at exactly 2x input and 3x output would be under-counted, which is
+# documented in the estimate caveat.
+#
+# GPT-5.6 Luna / Qwen3.7-Plus / Qwen3.6-Plus have a token-window split
+# (≤272K/≤256K vs above); we price the ≤-window tier (the dominant agentic
+# case; long-context runs at 2x+).
+#
+# Models present in the catalog but NOT priced here are either free
+# (``ox-alpha-free``) or not listed on any public OpenCode price sheet
+# (``mimo-v2-pro``, ``mimo-v2-omni``) — see ``_OPENCODE_UNPRICED_ALLOWLIST``
+# for the explicit keep-list.
+_OPENCODE_COST_PER_M: dict[str, tuple[float, float]] = {
+    # DeepSeek (off-peak tier)
+    "deepseek-v4-flash": (0.22, 0.66),
+    "deepseek-v4-flash-vision-exp": (0.22, 0.66),
+    "deepseek-v4-pro": (0.66, 1.98),
+    # GLM
+    "glm-5.3": (1.40, 4.40),
+    "glm-5.2": (1.40, 4.40),
+    "glm-5.1": (1.40, 4.40),
+    "glm-5": (1.00, 3.20),
+    # Kimi
+    "kimi-k3": (3.00, 15.00),
+    "kimi-k2.7-code": (0.95, 4.00),
+    "kimi-k2.6": (0.95, 4.00),
+    "kimi-k2.5": (0.60, 3.00),
+    # Qwen
+    "qwen3.8-max": (2.00, 6.00),
+    "qwen3.7-max": (2.50, 7.50),
+    "qwen3.7-plus": (0.40, 1.60),
+    "qwen3.6-plus": (0.50, 3.00),
+    "qwen3.5-plus": (0.20, 1.20),
+    # MiniMax
+    "minimax-m3": (0.30, 1.20),
+    "minimax-m2.7": (0.30, 1.20),
+    "minimax-m2.5": (0.30, 1.20),
+    # MiMo
+    "mimo-v2.5-pro": (0.435, 0.87),
+    "mimo-v2.5": (0.14, 0.28),
+    # Others
+    "grok-4.5": (2.00, 6.00),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "longcat-2.0": (0.30, 1.20),
+    "hy3": (0.14, 0.58),
+    "muse-spark-1.2-contributor": (0.10, 0.20),
+    # Free tier (zero token price on Go/Zen; kept explicit so the catalog
+    # parity test sees a real pricing decision, not a silent zero).
+    "ox-alpha-free": (0.0, 0.0),
+}
+
+# OpenCode catalog models with NO public price — kept explicit. The parity
+# test fails if any catalog model is missing from BOTH the price table and
+# this allowlist (a newly-priced model must move from the allowlist into
+# ``_OPENCODE_COST_PER_M``).
+_OPENCODE_UNPRICED_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "mimo-v2-pro",  # served by the gateway, not on any public price sheet
+        "mimo-v2-omni",  # served by the gateway, not on any public price sheet
+    }
+)
 
 # Fraction of input rate charged for cached tokens (e.g. 0.1 → 10%).
 # Provider-level default — used when no model-specific match applies.
@@ -848,6 +938,46 @@ _MODEL_CACHE_RATE: dict[str, float] = {
     "glm-4.7": 0.11,
     "glm-4.6": 0.11,
     "glm-4.5": 0.11,
+}
+
+# OpenCode gateway cached-input rates — $/1M tokens (same Go/Zen sources as
+# ``_OPENCODE_COST_PER_M``, verified 2026-08-25). Consulted only when
+# provider == "opencode" (see ``_get_cached_input_rate``). Rates are the
+# off-peak / ≤window tiers, consistent with ``_OPENCODE_COST_PER_M``.
+_OPENCODE_CACHE_RATE: dict[str, float] = {
+    # DeepSeek (off-peak)
+    "deepseek-v4-flash": 0.007,
+    "deepseek-v4-flash-vision-exp": 0.007,
+    "deepseek-v4-pro": 0.022,
+    # GLM
+    "glm-5.3": 0.26,
+    "glm-5.2": 0.26,
+    "glm-5.1": 0.26,
+    "glm-5": 0.20,
+    # Kimi
+    "kimi-k3": 0.30,
+    "kimi-k2.7-code": 0.19,
+    "kimi-k2.6": 0.16,
+    "kimi-k2.5": 0.10,
+    # Qwen (≤-window tier)
+    "qwen3.8-max": 0.25,
+    "qwen3.7-max": 0.50,
+    "qwen3.7-plus": 0.04,
+    "qwen3.6-plus": 0.05,
+    "qwen3.5-plus": 0.02,
+    # MiniMax
+    "minimax-m3": 0.06,
+    "minimax-m2.7": 0.06,
+    "minimax-m2.5": 0.06,
+    # MiMo
+    "mimo-v2.5-pro": 0.003625,
+    "mimo-v2.5": 0.0028,
+    # Others
+    "grok-4.5": 0.30,
+    "gpt-5.6-luna": 0.02,
+    "longcat-2.0": 0.006,
+    "hy3": 0.035,
+    "muse-spark-1.2-contributor": 0.002,
 }
 
 
@@ -896,6 +1026,34 @@ _CACHE_TOKENS_SEPARATE: set = {"anthropic", "zai"}
 _CACHE_CREATION_MULT: dict[str, float] = {"anthropic": 1.25}
 
 
+def _catalog_unpriced_models() -> dict[str, list[str]]:
+    """Enumerate catalog models with NO model-specific rate — priced only by
+    the provider-level fallback (or at (0,0) when the provider has none).
+
+    The model catalog (external_llm.model_catalog) is the SSOT for which IDs
+    exist; the cost tables in this module are hand-maintained and drift
+    independently. A newly added catalog model without a rate entry is
+    silently priced at the provider fallback — exactly the drift this report
+    surfaces. The parity test pins the report to an explicit expected list,
+    so a new unpriced model fails the gate until it gets a rate entry (or
+    the expected list is deliberately extended).
+
+    Returns: {provider: [model ids with no model-specific rate]}. Free-tier
+    and allowlisted opencode ids are covered by their own decisions and are
+    not reported.
+    """
+    from external_llm.model_catalog import valid_models  # lazy: avoid import-time cycle
+
+    missing: dict[str, list[str]] = {}
+    for provider in sorted(_COST_PER_M):
+        model_table = _OPENCODE_COST_PER_M if provider == "opencode" else _MODEL_COST_PER_M
+        allowlist = _OPENCODE_UNPRICED_ALLOWLIST if provider == "opencode" else frozenset()
+        for model in valid_models(provider):
+            if _longest_prefix_match(model.lower(), model_table) is None and model not in allowlist:
+                missing.setdefault(provider, []).append(model)
+    return missing
+
+
 def _longest_prefix_match(model_lower: str, table: dict[str, Any]):
     """Return the value for the LONGEST matching prefix in ``table``, or None.
 
@@ -916,14 +1074,26 @@ def _get_rates(provider: str, model: str = "") -> tuple[float, float]:
     """Get (input_per_M_usd, output_per_M_usd) for a provider+model combination.
 
     Tries model-specific pricing first (longest-prefix-matched against
-    ``_MODEL_COST_PER_M``), then falls back to provider-level pricing via
+    ``_MODEL_COST_PER_M`` — or ``_OPENCODE_COST_PER_M`` when the provider is
+    the OpenCode gateway), then falls back to provider-level pricing via
     ``_COST_PER_M``.
     """
+    prov = provider.lower()
+    if prov == "opencode":
+        if model:
+            rates = _longest_prefix_match(model.lower(), _OPENCODE_COST_PER_M)
+            if rates is not None:
+                return rates
+        # A catalog model with no public price (mimo-v2-pro/mimo-v2-omni) or
+        # an unknown id: price via the provider floor rather than silently
+        # zeroing. The allowlist documents the unpriced ids; anything else
+        # here is a genuinely new model that must be added to the table.
+        return _COST_PER_M.get("opencode", (0.0, 0.0))
     if model:
         rates = _longest_prefix_match(model.lower(), _MODEL_COST_PER_M)
         if rates is not None:
             return rates
-    return _COST_PER_M.get(provider.lower(), (0.0, 0.0))
+    return _COST_PER_M.get(prov, (0.0, 0.0))
 
 
 def estimate_cost(provider: str, prompt_tok: int, completion_tok: int, model: str = "") -> float:
@@ -936,7 +1106,8 @@ def _get_cached_input_rate(provider: str, in_rate: float, model: str = "", base_
     """Return the per-M-token rate charged for cached input tokens.
 
     Tries a model-specific cached rate first (prefix-matched against
-    ``_MODEL_CACHE_RATE``), then derives one from the provider-level discount
+    ``_MODEL_CACHE_RATE`` — or ``_OPENCODE_CACHE_RATE`` for the OpenCode
+    gateway), then derives one from the provider-level discount
     in ``_CACHE_DISCOUNT``. Returns ``None`` when the provider does not offer a
     cache discount (full input price applies to cached tokens).
 
@@ -945,14 +1116,24 @@ def _get_cached_input_rate(provider: str, in_rate: float, model: str = "", base_
     a cache discount, while the pay-as-you-go endpoint (/paas/v4) does.
     When empty (default), assumes Coding Plan (no discount).
     """
-    if provider.lower() == "zai" and not _is_zai_payg_url(base_url):
+    prov = provider.lower()
+    if prov == "zai" and not _is_zai_payg_url(base_url):
         # z.ai Coding Plan: cached tokens billed at full input rate (no discount).
         return None
+    if prov == "opencode":
+        if model:
+            cached_rate = _longest_prefix_match(model.lower(), _OPENCODE_CACHE_RATE)
+            if cached_rate is not None:
+                return cached_rate
+        # Unpriced OpenCode model: fall back to the provider's cache discount
+        # (10% of the input rate — the OpenCode price sheet's typical
+        # cached-read ratio for DeepSeek-tier models).
+        return in_rate * 0.1
     if model:
         cached_rate = _longest_prefix_match(model.lower(), _MODEL_CACHE_RATE)
         if cached_rate is not None:
             return cached_rate
-    discount = _CACHE_DISCOUNT.get(provider.lower())
+    discount = _CACHE_DISCOUNT.get(prov)
     return in_rate * discount if discount is not None else None
 
 

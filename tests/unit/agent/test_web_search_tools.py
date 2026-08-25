@@ -877,6 +877,35 @@ def test_http_retry_honours_retry_after_for_wait(monkeypatch):
     assert sleeps == [7.0]
 
 
+def test_http_retry_status_backoff_escalates_without_retry_after(monkeypatch):
+    """A 429 with NO Retry-After hint must back off on the escalating ladder
+    (backoff * 2^attempt → 1.5s, then 3s) instead of a flat 1.5s — a still-
+    throttled backend is not re-hit at the same instant every try."""
+    sleeps = []
+    monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
+    client = _SequenceClient([_resp(503), _resp(503), _resp(200, text="ok")])
+    resp = wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/", retries=3)
+    assert resp.status_code == 200
+    assert client.calls == 3
+    assert sleeps == [1.5, 3.0], f"expected escalating ladder, got {sleeps}"
+
+
+def test_http_retry_retry_after_overrides_ladder(monkeypatch):
+    """The server's Retry-After hint wins over the ladder rung."""
+    sleeps = []
+    monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
+    client = _SequenceClient(
+        [
+            _resp(429, headers={"retry-after": "2"}),
+            _resp(429, headers={"retry-after": "2"}),
+            _resp(200, text="ok"),
+        ]
+    )
+    resp = wst.WebSearchToolsMixin._http_request_with_retry(client, "GET", "https://x/", retries=3)
+    assert resp.status_code == 200
+    assert sleeps == [2.0, 2.0]
+
+
 # ── connect-error fail-fast + session circuit breaker ────────────────────
 
 
@@ -1551,6 +1580,70 @@ def test_web_fetch_retries_on_429_then_succeeds(monkeypatch):
     assert "finally ok" in res["content"]
     assert client.calls == 2
     assert sleeps  # did back off
+
+
+def test_web_fetch_429_no_hint_escalates_ladder(monkeypatch):
+    """web_fetch's inline status retry mirrors the search backends' ladder: no
+    Retry-After hint → 1.5s then 3.0s between the three attempts."""
+    sleeps = []
+    monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
+
+    client = _FetchRetryClient(
+        [
+            httpx.Response(
+                429,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"content-type": "text/plain"},
+            ),
+            httpx.Response(
+                429,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"content-type": "text/plain"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"content-type": "text/plain; charset=utf-8"},
+                text="ok at last",
+            ),
+        ]
+    )
+    monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: client)
+    host = _Host()
+    res = host._tool_web_fetch({"url": "https://x/rate"})
+    assert res["ok"], res.get("error")
+    assert "ok at last" in res["content"]
+    assert client.calls == 3
+    assert sleeps == [1.5, 3.0], f"expected escalating ladder in web_fetch, got {sleeps}"
+
+
+def test_web_fetch_retry_after_overrides_ladder(monkeypatch):
+    """web_fetch honours a server-supplied Retry-After (7s) over the ladder rung."""
+    sleeps = []
+    monkeypatch.setattr(wst.time, "sleep", lambda s: sleeps.append(s))
+
+    client = _FetchRetryClient(
+        [
+            httpx.Response(
+                429,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"retry-after": "7", "content-type": "text/plain"},
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("GET", "https://x/rate"),
+                headers={"content-type": "text/plain; charset=utf-8"},
+                text="recovered",
+            ),
+        ]
+    )
+    monkeypatch.setattr(wst.httpx, "Client", lambda *a, **k: client)
+    host = _Host()
+    res = host._tool_web_fetch({"url": "https://x/rate"})
+    assert res["ok"], res.get("error")
+    assert "recovered" in res["content"]
+    assert client.calls == 2
+    assert sleeps == [7.0], f"Retry-After must win over the ladder, got {sleeps}"
 
 
 def test_web_fetch_retries_on_transient_error_then_succeeds(monkeypatch):

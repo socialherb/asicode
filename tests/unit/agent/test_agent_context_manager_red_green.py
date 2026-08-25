@@ -173,8 +173,17 @@ class TestTrimAndCompress:
 
     def test_trim_delegates_to_sliding(self):
         h = _CtxHost()
-        h._context_sliding = SimpleNamespace(prepare_before_call=lambda m: ["trimmed"])
+        h._context_sliding = SimpleNamespace(prepare_before_call=lambda m, budget=None: ["trimmed"])
         assert h._trim_context(["x"]) == ["trimmed"]
+
+    def test_trim_with_budget_delegates_token_budget(self):
+        h = _CtxHost()
+        seen = {}
+        h._context_sliding = SimpleNamespace(
+            prepare_before_call=lambda m, budget=None: seen.update(budget=budget) or ["trimmed"]
+        )
+        assert h._trim_context(["x"], token_budget=1234) == ["trimmed"]
+        assert seen["budget"] == 1234
 
     def test_compress_without_manager_returns_empty(self):
         h = _CtxHost()

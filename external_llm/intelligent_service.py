@@ -28,7 +28,7 @@ from .client import DEFAULT_LLM_TIMEOUT, OLLAMA_LLM_TIMEOUT
 from .languages import LanguageId
 from .multi_planner import ExecutionPlan, FileOperation, LLMEnhancedMultiFilePlanner, MultiFilePlanner
 from .output_modes import OutputMode
-from .project_analyzer import ProjectAnalyzer, ProjectStructure
+from .project_analyzer import ProjectAnalyzer, ProjectStructure, format_project_structure
 from .service import ExternalLLMService
 from .smart_analyzer import RequestAnalysis, SmartRequestAnalyzer
 
@@ -1077,35 +1077,12 @@ class IntelligentLLMService:
         }
 
     def _build_project_context_summary(self, project_structure: ProjectStructure) -> str:
-        """Build concise project context summary for LLM planning"""
-        lines = []
+        """Build concise project context summary for LLM planning.
 
-        if project_structure.frameworks:
-            lines.append(f"- **Frameworks**: {', '.join(project_structure.frameworks)}")
-        elif project_structure.framework:
-            lines.append(f"- **Framework**: {project_structure.framework}")
-
-        if project_structure.project_types:
-            lines.append(f"- **Project Type**: {', '.join(project_structure.project_types)}")
-
-        if project_structure.directories:
-            lines.append("- **Directory Structure**:")
-            for purpose, dirs in project_structure.directories.items():
-                if purpose != "other" and dirs:
-                    lines.append(f"  - {purpose}: {', '.join(dirs)}")
-
-        if project_structure.naming_style:
-            lines.append(f"- **Naming Convention**: {project_structure.naming_style}")
-
-        if project_structure.common_imports:
-            lines.append(f"- **Common Imports**: {', '.join(project_structure.common_imports[:5])}")
-
-        if project_structure.example_files:
-            lines.append("- **Example Files**:")
-            for file_type, path in list(project_structure.example_files.items())[:3]:
-                lines.append(f"  - {file_type}: `{path}`")
-
-        return "\n".join(lines) if lines else "No project context available."
+        Delegates to ``format_project_structure`` (project_analyzer.py) — the
+        single source of truth shared with LLMEnhancedMultiFilePlanner.
+        """
+        return format_project_structure(project_structure)
 
     def _build_enhanced_context(
         self,

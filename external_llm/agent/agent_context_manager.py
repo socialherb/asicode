@@ -15,6 +15,7 @@ Moved here:
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import threading
 import time
@@ -24,6 +25,8 @@ from typing import Any  # f821-protected
 from external_llm.common.repo_files import canonical_repo_key
 
 from ._shared_utils import _capped_put
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level git result cache (10 s TTL, per-root keyed)
@@ -355,12 +358,49 @@ class ContextManagerMixin:
     # Context trimming / compression (delegated to SlidingWindowContext)
     # ------------------------------------------------------------------
 
-    def _trim_context(self, messages: list) -> list:
-        """Apply sliding window via SlidingWindowContext."""
+    def _trim_context(self, messages: list, token_budget: int | None = None) -> list:
+        """Apply sliding window via SlidingWindowContext.
+
+        When ``token_budget`` is provided, the window is compressed until the
+        estimated prompt fits *below* the budget (token-driven force-trim,
+        R3).  Without it, the plain count-driven sliding window runs as before.
+        """
         mgr = getattr(self, "_context_sliding", None)
         if mgr is None:
             return messages
-        return mgr.prepare_before_call(messages)
+        return mgr.prepare_before_call(messages, budget=token_budget)
+
+    def _force_trim_context(self, messages: list) -> list:
+        """Force-compress ``messages`` to fit the current token budget.
+
+        Used as the CRITICAL-ratio trim callback from ContextBudgetManager
+        (agent_loop pre-flight).  The sliding window's token-driven trim runs
+        the same historical compression as the normal path, so no extra
+        provider round-trip is introduced — it only fires when the estimate
+        exceeds 95% of the prompt-allowable cap, which the count-based window
+        alone cannot prevent (a few huge tool results can blow the budget
+        without crossing the message-count threshold).
+        """
+        if not messages:
+            return messages
+        mgr = getattr(self, "_context_sliding", None)
+        if mgr is None:
+            return messages
+        try:
+            from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
+            _cap = self._context_budget.total_budget if getattr(self, "_context_budget", None) else None
+            if _cap is None:
+                return messages
+            # Only force-trim when the current estimate actually exceeds the cap —
+            # otherwise the token-driven trim below would rewrite a warm prefix
+            # (cache-miss) for no benefit.
+            if estimate_tokens_from_msgs(messages) < _cap:
+                return messages
+            return mgr.prepare_before_call(messages, budget=_cap)
+        except Exception as _exc:
+            logger.warning("_force_trim_context failed: %s", _exc)
+            return messages
 
     def _trajectory_compress(self, turns: list) -> str:
         """Compress trajectory via SlidingWindowContext."""

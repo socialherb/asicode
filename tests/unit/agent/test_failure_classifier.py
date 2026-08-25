@@ -2,6 +2,8 @@
 
 import errno
 
+import pytest
+
 from external_llm.agent.failure_classifier import (
     FailureClassifier,
     RecoveryAction,
@@ -159,17 +161,36 @@ class TestClassifyByType:
 
 
 class TestClassifyByCode:
-    def test_numeric_enoent(self):
-        err = FakeErrorWithAttrs(errno_val=errno.ENOENT)
+    @pytest.mark.parametrize(
+        ("attrs", "expected"),
+        [
+            # Numeric errno → classified by errno table.
+            ({"errno_val": errno.ENOENT}, RecoveryAction.SWITCH_TOOL),
+            ({"errno_val": errno.EACCES}, RecoveryAction.ABORT),
+            # String .code attribute (case-insensitive canonical aliases).
+            ({"code": "already_exists"}, RecoveryAction.SKIP),
+            ({"code": "timeout_error"}, RecoveryAction.RETRY_SAME),
+            # .error_code attribute (checked after .code).
+            ({"error_code": "missing_file"}, RecoveryAction.SWITCH_TOOL),
+            # Priority: .code wins over .error_code; .error_code wins over .errno.
+            ({"code": "already_exists", "error_code": "unknown"}, RecoveryAction.SKIP),
+            ({"error_code": "missing_file", "errno_val": 0}, RecoveryAction.SWITCH_TOOL),
+        ],
+        ids=[
+            "numeric_enoent",
+            "numeric_eacces",
+            "code_attribute",
+            "transient_string_code",
+            "error_code_attribute",
+            "priority_code_over_error_code",
+            "priority_error_code_over_errno",
+        ],
+    )
+    def test_classify_by_code_attrs(self, attrs, expected):
+        err = FakeErrorWithAttrs(**attrs)
         result = _classify_by_code(err)
         assert result is not None
-        assert result.action == RecoveryAction.SWITCH_TOOL
-
-    def test_numeric_eacces(self):
-        err = FakeErrorWithAttrs(errno_val=errno.EACCES)
-        result = _classify_by_code(err)
-        assert result is not None
-        assert result.action == RecoveryAction.ABORT
+        assert result.action == expected
 
     def test_numeric_transient(self):
         for en in (errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED):
@@ -177,24 +198,6 @@ class TestClassifyByCode:
             result = _classify_by_code(err)
             assert result is not None
             assert result.action == RecoveryAction.RETRY_SAME
-
-    def test_code_attribute(self):
-        err = FakeErrorWithAttrs(code="already_exists")
-        result = _classify_by_code(err)
-        assert result is not None
-        assert result.action == RecoveryAction.SKIP
-
-    def test_error_code_attribute(self):
-        err = FakeErrorWithAttrs(error_code="missing_file")
-        result = _classify_by_code(err)
-        assert result is not None
-        assert result.action == RecoveryAction.SWITCH_TOOL
-
-    def test_transient_string_code(self):
-        err = FakeErrorWithAttrs(code="timeout_error")
-        result = _classify_by_code(err)
-        assert result is not None
-        assert result.action == RecoveryAction.RETRY_SAME
 
     def test_code_is_none(self):
         err = FakeErrorWithAttrs()  # all None

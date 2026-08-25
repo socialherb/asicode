@@ -81,7 +81,7 @@ def test_agent_loop_preflight_raises_on_collapse_before_request():
     loop.model = "tiny-model"
     loop.config = _tiny_config()
     loop._context_budget = mock.MagicMock()  # truthy → pre-flight guard runs
-    loop._context_budget.fit_messages.side_effect = lambda m: m
+    loop._context_budget.fit_messages.side_effect = lambda m, **kw: m
     loop.registry = mock.MagicMock()
     loop.registry.get_tool_schemas.return_value = _big_schema()
     loop.registry.repo_language = "python"

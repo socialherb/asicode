@@ -1362,6 +1362,28 @@ class ZAIClient(OpenAIClient):
         return self._apply_glm_reasoning_fallback(resp)
 
 
+class OpenCodeClient(OpenAIClient):
+    """OpenCode Go/Zen API client — OpenAI-compatible protocol.
+
+    OpenCode (https://opencode.ai) is the OpenCode team's own gateway serving
+    a curated set of open coding models (DeepSeek, GLM, Kimi, MiniMax, Qwen,
+    Grok, ...) over the OpenAI-compatible ``/zen/go/v1`` endpoint.
+
+    Distinct provider identity: despite being an OpenAI-protocol client, this
+    class reports ``provider_name == "opencode"`` so cost accounting
+    (``_shared_utils._get_rates``) prices these models against the OpenCode
+    price sheet — NOT the OpenAI fallback (5.00/15.00) that a plain
+    ``OpenAIClient`` would apply. All protocol behaviour is inherited from
+    ``OpenAIClient`` (chat completions, tool calling, subset cache accounting).
+    """
+
+    DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+    DEFAULT_MODEL = "deepseek-v4-flash"
+
+    def get_provider_name(self) -> str:
+        return "opencode"
+
+
 class OpenRouterClient(OpenAIClient):
     """OpenRouter API client — OpenAI-compatible protocol.
 

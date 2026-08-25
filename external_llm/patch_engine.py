@@ -2202,10 +2202,17 @@ class PatchEngine:
         Skipping 3-way there avoids one wasted subprocess and keeps the
         repair ladder (reanchor / AST / symbol) the actual recovery path.
 
+        All SHAs are probed in ONE `git cat-file --batch-check` subprocess
+        (stdin line protocol) instead of one `git cat-file -e` per SHA — the
+        batch form keeps N spawns → 1 while preserving every observable
+        behavior: first missing SHA trips the gate, probe failure is
+        conservative (returns False, keeps prior 3-way behavior).
+
         Returns True  — an `index` line names a SHA absent from the store.
         Returns False — no index line, all SHAs resolve, or the probe itself
                         failed (conservative: keep prior 3-way behavior).
         """
+        shas: list[str] = []
         for m in re.finditer(
             r"^index ([0-9a-f]{7,40})\.\.([0-9a-f]{7,40})",
             patch_text,
@@ -2216,19 +2223,30 @@ class PatchEngine:
                 # (old side) or deletion (new side); skip it.
                 if sha.strip("0") == "":
                     continue
-                try:
-                    chk = subprocess.run(
-                        ["git", "cat-file", "-e", sha],
-                        cwd=self.repo_root,
-                        capture_output=True,
-                        timeout=5,
-                        check=False,
-                    )
-                    if chk.returncode != 0:
-                        return True
-                except Exception as e:
-                    logger.debug("cat-file probe failed for %s: %s", sha, e)
-                    return False
+                shas.append(sha)
+        if not shas:
+            return False
+        try:
+            chk = subprocess.run(
+                ["git", "cat-file", "--batch-check"],
+                cwd=self.repo_root,
+                input=("".join(sha + "\n" for sha in shas)).encode("utf-8"),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception as e:
+            logger.debug("cat-file batch probe failed for %s: %s", shas, e)
+            return False
+        if chk.returncode != 0:
+            return False
+        # --batch-check echoes one line per input SHA, in order:
+        # "<sha> <type> <size>" for existing objects, "<sha> missing" otherwise
+        # (abbrev SHAs resolve via the same disambiguation as `cat-file -e`).
+        for line in chk.stdout.decode("utf-8", errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "missing":
+                return True
         return False
 
     def _apply_diff_once(self, patch_text: str, target_file: str | None = None) -> tuple[bool, str | None]:
@@ -2499,72 +2517,76 @@ class PatchEngine:
                 continue
             encoded = try_patch.encode("utf-8")
             try:
-                # --check first
-                check = subprocess.run(
-                    ["git", "apply", "--check", *flags, "-"],
+                # PERF: no separate `git apply --check` pre-spawn — the apply
+                # itself is the decider. git apply is atomic on failure: a
+                # non-3way variant exits rc!=0 with the tree untouched
+                # (measured: context mismatch -> rc=1, tree byte-identical),
+                # so a pre-check was pure diagnostic and cost one extra
+                # subprocess per variant (up to 12 spawns per patch in the
+                # drift case). The apply below either succeeds, or fails
+                # cleanly and the next variant is tried.
+                #
+                # Snapshot ONLY for the mutating-on-failure variants:
+                #   • -C0 / --unidiff-zero: a WRONG-LINE apply returns rc=0 —
+                #     the placement check below catches it and needs the
+                #     pre-image to roll back.
+                #   • --3way: a CONFLICT writes merge markers + stages the
+                #     unmerged result and exits rc!=0; rollback needs both
+                #     content and index snapshots.
+                # Plain variants (--recount ± whitespace flags) are atomic on
+                # failure (measured: rc!=0, tree byte-identical), so snapshot
+                # for them would be pure waste (2 subprocesses per variant).
+                _pre_snapshot: dict[str, str | None] | None = None
+                _pre_index: dict[str, tuple[str, str]] | None = None
+                if _is_c0 or "--3way" in flags:
+                    _pre_snapshot = self._snapshot_patch_targets(try_patch)
+                    _pre_index = self._snapshot_index_entries(try_patch)
+                # Actually apply
+                apply_r = subprocess.run(
+                    ["git", "apply", *flags, "-"],
                     cwd=self.repo_root,
                     input=encoded,
                     capture_output=True,
-                    timeout=10,
+                    timeout=30,
                     check=False,
                 )
-                if check.returncode == 0:
-                    # Snapshot before EVERY apply, not only -C0. There are two
-                    # distinct ways an apply mutates the tree and still reports
-                    # failure, and only the first used to be covered:
-                    #   • -C0 lands a hunk at the wrong line with rc=0 (caught
-                    #     by the placement check below);
-                    #   • --3way CONFLICTS: git writes merge markers into the
-                    #     file, STAGES the unmerged result, and exits non-zero.
-                    #     That is the documented behaviour of the last-resort
-                    #     mode ("creates merge markers if needed"), not a rare
-                    #     anomaly — and `--check --3way` returns 0 for it, so it
-                    #     lands squarely in the "check OK but apply failed"
-                    #     branch. The markers used to be left on disk, where the
-                    #     caller's re-anchor pass (_exact_reanchor_patch) then
-                    #     read them back as if they were source.
-                    _pre_snapshot = self._snapshot_patch_targets(try_patch)
-                    _pre_index = self._snapshot_index_entries(try_patch)
-                    # Actually apply
-                    apply_r = subprocess.run(
-                        ["git", "apply", *flags, "-"],
-                        cwd=self.repo_root,
-                        input=encoded,
-                        capture_output=True,
-                        timeout=30,
-                        check=False,
-                    )
-                    if apply_r.returncode == 0:
-                        if _is_c0:
-                            _place_ok, _place_detail = self._verify_c0_placement(try_patch)
-                            if not _place_ok:
-                                self._restore_patch_targets(_pre_snapshot)
-                                _c0_verify_fail = _place_detail
-                                logger.warning(
-                                    "tolerant_git_apply: mode=%s applied but placement "
-                                    "verification failed — rolled back: %s",
-                                    mode_name,
-                                    _place_detail,
-                                )
-                                continue
-                        logger.info("tolerant_git_apply succeeded mode=%s flags=%s", mode_name, flags)
-                        return True, None, mode_name
-                    err = apply_r.stderr.decode("utf-8", errors="ignore").strip()
-                    # Undo the partial/conflicted write before reporting
-                    # failure: "failed" must mean the tree is untouched,
-                    # otherwise every downstream repair step reads a file
-                    # this attempt corrupted. Content first, then the index
-                    # (restoring bytes does NOT clear --3way's unmerged
-                    # stages — measured).
+                if apply_r.returncode == 0:
+                    if _is_c0:
+                        _place_ok, _place_detail = self._verify_c0_placement(try_patch)
+                        if not _place_ok:
+                            self._restore_patch_targets(_pre_snapshot)
+                            _c0_verify_fail = _place_detail
+                            logger.warning(
+                                "tolerant_git_apply: mode=%s applied but placement "
+                                "verification failed — rolled back: %s",
+                                mode_name,
+                                _place_detail,
+                            )
+                            continue
+                    logger.info("tolerant_git_apply succeeded mode=%s flags=%s", mode_name, flags)
+                    return True, None, mode_name
+                err = apply_r.stderr.decode("utf-8", errors="ignore").strip()
+                # Non-3way failures leave the tree untouched (measured) — no
+                # rollback needed. Only the --3way failure path (CONFLICT)
+                # mutates (markers + staging) and must be undone here:
+                # "failed" must mean the tree is untouched, otherwise every
+                # downstream repair step reads a file this attempt corrupted.
+                # Content first, then the index (restoring bytes does NOT
+                # clear --3way's unmerged stages — measured).
+                if "--3way" in flags:
                     self._restore_patch_targets(_pre_snapshot)
                     self._restore_index_entries(_pre_index)
                     logger.warning(
-                        "tolerant_git_apply: --check passed but apply failed mode=%s flags=%s — rolled back: error=%s",
+                        "tolerant_git_apply: --3way apply failed mode=%s — rolled back: error=%s",
                         mode_name,
-                        flags,
                         err,
                     )
-                    return False, f"check OK but apply failed ({mode_name}): {err}", mode_name
+                    return False, f"3way apply failed — rolled back: {err}", mode_name
+                logger.debug(
+                    "tolerant_git_apply: mode=%s failed (tree untouched) — next variant: error=%s",
+                    mode_name,
+                    err,
+                )
             except Exception as exc:
                 logger.debug("tolerant apply(%s) exception: %s", mode_name, exc)
 
@@ -2673,29 +2695,35 @@ class PatchEngine:
         the unmerged stages and reinstates stage 0 in one step. (The previous
         ``git update-index --cacheinfo mode,sha,path`` form is rejected by
         Apple git 2.39.5 with "option `cacheinfo' takes no value".)
+
+        All changed paths are re-added in ONE ``git add -- <paths>``
+        subprocess instead of one ``git add <path>`` per path — same
+        observable effect (each changed path staged, healthy index untouched),
+        N spawns → 1. The per-path error log is preserved via the one
+        combined stderr.
         """
         if not snapshot:
             return
         current = self._read_index_entries(list(snapshot))
-        for path, entry in snapshot.items():
-            if current.get(path) == entry:
-                continue
-            try:
-                r = subprocess.run(
-                    ["git", "add", path],
-                    cwd=self.repo_root,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
+        changed = [path for path, entry in snapshot.items() if current.get(path) != entry]
+        if not changed:
+            return
+        try:
+            r = subprocess.run(
+                ["git", "add", "--", *changed],
+                cwd=self.repo_root,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if r.returncode != 0:
+                logger.error(
+                    "tolerant_git_apply: index rollback failed for %s: %s",
+                    changed,
+                    r.stderr.decode("utf-8", errors="ignore").strip(),
                 )
-                if r.returncode != 0:
-                    logger.error(
-                        "tolerant_git_apply: index rollback of %s failed: %s",
-                        path,
-                        r.stderr.decode("utf-8", errors="ignore").strip(),
-                    )
-            except (OSError, subprocess.SubprocessError) as exc:
-                logger.exception("tolerant_git_apply: index rollback of %s failed: %s", path, exc)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.exception("tolerant_git_apply: index rollback of %s failed: %s", changed, exc)
 
     def _restore_patch_targets(self, snapshot: dict[str, str | None]) -> None:
         """Undo an applied patch from a _snapshot_patch_targets snapshot."""

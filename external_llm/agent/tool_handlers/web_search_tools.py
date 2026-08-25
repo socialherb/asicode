@@ -2406,10 +2406,13 @@ class WebSearchToolsMixin:
         retry policy. Two retry triggers, each backed off ``retries`` times:
 
         * transient NETWORK errors (``_transient_http_errors()``: connect/read
-          timeouts, protocol errors) — retry after ``backoff`` seconds.
+          timeouts, protocol errors) — retry after ``backoff`` seconds (flat: a
+          re-connect to a down host must not keep re-paying the timeout).
         * transient HTTP STATUS codes (``retry_statuses``: 429 rate-limit,
           502/503/504 gateway overload) — retry after the server's ``Retry-After``
-          hint (capped at 30s via ``_retry_after_seconds``), or ``backoff``.
+          hint (capped at 30s via ``_retry_after_seconds``), or an escalating
+          ladder ``backoff * 2^attempt`` (1.5s → 3s → 6s) when the server gives
+          no hint, so a still-throttled backend is not re-hit on a flat 1.5s.
 
         A non-retryable status (e.g. 4xx other than 429) is returned as-is so the
         caller's ``raise_for_status()`` raises the precise HTTPStatusError, and the
@@ -2456,9 +2459,11 @@ class WebSearchToolsMixin:
                 raise  # final attempt failed — propagate
 
             # Transient status code (rate-limit / gateway): back off and retry,
-            # honouring Retry-After when the server supplies it.
+            # honouring Retry-After when the server supplies it. Without a hint,
+            # escalate per attempt (backoff * 2^attempt) — a flat backoff would
+            # re-hit a still-throttled backend at the same instant every try.
             if resp.status_code in retry_statuses and attempt < retries - 1:
-                wait = _retry_after_seconds(resp, backoff)
+                wait = _retry_after_seconds(resp, backoff * (2**attempt))
                 logger.warning(
                     "web_search: HTTP %d (attempt %d/%d); retrying in %.1fs…",
                     resp.status_code,
@@ -3362,7 +3367,9 @@ class WebSearchToolsMixin:
                     except httpx.HTTPStatusError as e:
                         code = e.response.status_code
                         if code in _RETRYABLE_HTTP_STATUSES and attempt < 2:
-                            wait = _retry_after_seconds(e.response, 1.5)
+                            # Escalating ladder (1.5s → 3s) matching the search
+                            # backends; Retry-After header wins when present.
+                            wait = _retry_after_seconds(e.response, 1.5 * (2**attempt))
                             logger.warning(
                                 "web_fetch: HTTP %d (attempt %d/3); retrying in %.1fs…",
                                 code,

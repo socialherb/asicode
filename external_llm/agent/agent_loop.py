@@ -94,7 +94,7 @@ def _new_session_id() -> str:
 # False for zai, which (a) makes the zai branch of _append_native_tool_messages
 # dead code and (b) degrades zai tool calls to text-mode simulation in the
 # main agent loop and the PLANNER_FALLTHROUGH/clarification fallback paths.
-_NATIVE_TOOL_PROVIDERS = {"openai", "anthropic", "google", "deepseek", "ollama", "zai"}
+_NATIVE_TOOL_PROVIDERS = {"openai", "anthropic", "google", "deepseek", "ollama", "zai", "opencode"}
 
 # Bounded adaptive tool memory cap. Entries are keyed by a sha256 tool signature
 # (one per distinct (tool, args) combination), and only the last 3 entries of
@@ -997,7 +997,12 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # repair_tool_message_sequence count below. A len() comparison would
         # be permanently dead code.
         if self._context_budget:
-            messages = self._context_budget.fit_messages(messages)
+            messages = self._context_budget.fit_messages(
+                messages,
+                tool_schemas=None,
+                warn_cb=self._cb,
+                trim_cb=self._force_trim_context,
+            )
 
         # Pre-flight: repair orphaned tool messages before sending to provider.
         # fit_messages may leave orphaned tool messages when dropping exchange groups;
@@ -1763,7 +1768,7 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # turn that carries the tool results.
         extra_text = "\n\n".join((m.content or "") for m in extra_msgs).strip()
 
-        if provider in ("openai", "deepseek"):
+        if provider in ("openai", "deepseek", "opencode"):
             # OpenAI/DeepSeek format: tool messages are only valid if they
             # directly follow an assistant message that actually contains tool_calls.
             assistant_tool_calls = None

@@ -63,6 +63,59 @@ class ProjectStructure:
     example_files: dict[str, str] = field(default_factory=dict)  # {type: path}
 
 
+def format_project_structure(structure: ProjectStructure) -> str:
+    """Render a ProjectStructure as a concise, human/LLM-readable summary.
+
+    Single source of truth for the "concise project context summary" block
+    consumed by LLM planners.  Previously two byte-identical copies lived in
+    ``IntelligentLLMService._build_project_context_summary`` and
+    ``LLMEnhancedMultiFilePlanner._build_project_context_summary`` — any edit
+    to one (e.g. the ``purpose != "other"`` directory guard) drifted silently
+    from the other.  Both now delegate here.
+
+    Output contract (pinned by tests in test_intelligent_service_red_green_helpers.py
+    and test_multi_planner_contract.py — keep in sync if changed):
+
+    - ``**Frameworks**`` line, falling back to ``**Framework**`` when the
+      plural list is empty.
+    - ``**Project Type**`` line when project_types is non-empty.
+    - ``**Directory Structure**`` section listing each purpose except "other"
+      (its entries are noise for planners).
+    - ``**Naming Convention**`` line.
+    - ``**Common Imports**`` line (first 5).
+    - ``**Example Files**`` section (first 3).
+    - If nothing matched: ``"No project context available."``
+    """
+    lines = []
+
+    if structure.frameworks:
+        lines.append(f"- **Frameworks**: {', '.join(structure.frameworks)}")
+    elif structure.framework:
+        lines.append(f"- **Framework**: {structure.framework}")
+
+    if structure.project_types:
+        lines.append(f"- **Project Type**: {', '.join(structure.project_types)}")
+
+    if structure.directories:
+        lines.append("- **Directory Structure**:")
+        for purpose, dirs in structure.directories.items():
+            if purpose != "other" and dirs:
+                lines.append(f"  - {purpose}: {', '.join(dirs)}")
+
+    if structure.naming_style:
+        lines.append(f"- **Naming Convention**: {structure.naming_style}")
+
+    if structure.common_imports:
+        lines.append(f"- **Common Imports**: {', '.join(structure.common_imports[:5])}")
+
+    if structure.example_files:
+        lines.append("- **Example Files**:")
+        for file_type, path in list(structure.example_files.items())[:3]:
+            lines.append(f"  - {file_type}: `{path}`")
+
+    return "\n".join(lines) if lines else "No project context available."
+
+
 class ProjectAnalyzer:
     """
     Analyzes project structure to provide context for LLM

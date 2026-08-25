@@ -230,6 +230,11 @@ class SlidingWindowContext(ContextManager):
 
         Always keeps the system prompt(s).
         Dropped messages are summarised into a compressed context block.
+
+        When ``budget`` (int, token budget) is provided, the window is
+        compressed until the estimated prompt tokens fit *below* the budget —
+        token-driven force-trim (R3).  Without a budget the plain count-driven
+        sliding window runs as before.
         """
         window = self._config.context_window_size
         if not window or window <= 0:
@@ -238,6 +243,24 @@ class SlidingWindowContext(ContextManager):
         # Split system messages (always kept) from the rest
         system_msgs = [m for m in messages if getattr(m, "role", "") == "system"]
         other_msgs = [m for m in messages if getattr(m, "role", "") != "system"]
+
+        # ── Token-budget path (R3 force-trim) ───────────────────────────────
+        # The count-based window below cannot prevent a few huge tool results
+        # from blowing the token budget without crossing the message-count
+        # threshold.  When a budget is supplied, try the token-driven trim
+        # first; fall through to the count window when it is a no-op.
+        if budget is not None:
+            try:
+                _tb = int(budget)
+            except (TypeError, ValueError):
+                _tb = 0
+            if _tb > 0:
+                try:
+                    _trimmed = self._token_budget_trim(system_msgs, other_msgs, _tb)
+                    if _trimmed is not None:
+                        return _trimmed
+                except Exception as _exc:
+                    logger.debug("token-budget trim failed, falling back to count window: %s", _exc)
 
         if len(other_msgs) <= window:
             return messages
@@ -296,6 +319,84 @@ class SlidingWindowContext(ContextManager):
         summary_msg = self._build_compressed_message(dropped)
         return [*system_msgs, summary_msg, *kept]
 
+    def _token_budget_trim(
+        self,
+        system_msgs: list,
+        other_msgs: list,
+        token_budget: int,
+    ) -> list | None:
+        """Token-driven force-trim (R3).
+
+        Keeps the system prompts + the NEWEST suffix of the conversation that
+        still satisfies the estimate <= budget invariant, and compresses the
+        OLDEST prefix into the compact [COMPRESSED CONTEXT] block (exactly the
+        count-driven path's direction — only the trigger differs).  Keeping the
+        newest suffix is essential for an in-flight tool loop: the latest tool
+        result / assistant exchange is what the model needs next, and the
+        count-driven window's orphan guards already handle the boundary.
+
+        The budget must fit the kept suffix AND the newly-built compressed
+        summary, so the binary search reserves an estimate for the summary
+        block (bounded via ``detail_cap``).  Returns None when no suffix
+        satisfies the budget (single message already over, or already fits) —
+        caller falls back to the count window.
+        """
+        from external_llm.agent._shared_utils import estimate_tokens_from_msgs
+
+        # Reserve for the summary: the compressed block is far smaller than
+        # the dropped content, but not free — cap its rendered detail to a
+        # byte budget derived from the token budget, and reserve a flat
+        # estimate for it in the search below (detail_cap ≈ actual built size;
+        # +1024 covers headers/keywords/carry-forward slack).
+        _detail_cap = max(256, min(2048, token_budget // 4))
+        _summary_reserve = _detail_cap + 1024
+
+        n = len(other_msgs)
+        if n == 0:
+            return None
+        # Find the LARGEST keep-count (<= n) whose NEWEST suffix fits.
+        # Upper-bound binary search: keep the newest ``best`` messages that
+        # still leave room for the summary reserve.
+        lo, hi = 1, n
+        best = -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            _keep_est = estimate_tokens_from_msgs(other_msgs[-mid:])
+            if _keep_est + _summary_reserve <= token_budget:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best < 0:
+            return None  # even a single newest message + summary doesn't fit
+        if best == n:
+            return None  # already fits — no trim needed
+        # Verify with the ACTUAL summary (the flat reserve is an estimate);
+        # step down a few times if the real build overflows, then give up.
+        kept = other_msgs[-best:]
+        for _attempt in range(4):
+            dropped = other_msgs[: n - best]
+            summary_msg = self._build_compressed_message(dropped, detail_cap=_detail_cap)
+            _total = estimate_tokens_from_msgs([summary_msg]) + estimate_tokens_from_msgs(kept)
+            if _total <= token_budget:
+                break
+            best -= 1  # keep less (trim more) to make room
+            if best <= 0:
+                return None
+            kept = other_msgs[-best:]
+        else:
+            return None
+        trimmed = len(dropped)
+        logger.info(
+            "Sliding window (token budget): trimmed %d older messages (budget=%d, kept=%d)",
+            trimmed,
+            token_budget,
+            best,
+        )
+        self._cb("context_trimmed", {"trimmed": trimmed, "kept": best, "reason": "token_budget"})
+        self._cb("agent_working", {"reason": "context_compressed", "kept": best})
+        return [*system_msgs, summary_msg, *kept]
+
     def trajectory_summary(self, turns: list) -> str:
         """Compress previous agent trajectory."""
         if not turns:
@@ -309,11 +410,18 @@ class SlidingWindowContext(ContextManager):
 
     # ── Internal helpers ────────────────────────────────────────────────
 
-    def _build_compressed_message(self, dropped: list) -> Any:
+    def _build_compressed_message(self, dropped: list, detail_cap: int | None = None) -> Any:
         """Build a [COMPRESSED CONTEXT] user message from dropped messages.
 
         Categorises events (errors, writes, reads, discussion) so the LLM
         can quickly locate what matters without scanning a flat bullet list.
+
+        ``detail_cap`` bounds the RENDERED detail (bytes) of the fresh
+        categorisation when set: instead of showing every snippet, keeps the
+        newest N entries per category and aggregates the rest as ``+K more``
+        tallies.  Used by the token-budget force-trim (R3) so the summary
+        block cannot silently inflate past the budget it was built to fit.
+        A tiny (<= 0) or missing cap behaves exactly as before.
 
         Carries forward the content of any PREVIOUS [COMPRESSED CONTEXT]
         message found in ``dropped`` — without this, successive trims would
@@ -502,7 +610,16 @@ class SlidingWindowContext(ContextManager):
             _entries = categories.get(_key, [])
             if _entries:
                 sections.append(f"\n{_label} (oldest → newest):")
-                sections.extend(f"  • {e}" for e in _entries)
+                # detail_cap: keep the NEWEST entries (errors/changes first), and
+                # aggregate older ones as "+K more" so the rendered block stays
+                # within the byte budget even when the dropped window is huge.
+                _shown = _entries
+                if detail_cap is not None and detail_cap > 0:
+                    _keep = max(2, detail_cap // 80)
+                    if len(_entries) > _keep:
+                        _shown = _entries[-_keep:]
+                        sections.append(f"  +{len(_entries) - _keep} more omitted")
+                sections.extend(f"  • {e}" for e in _shown)
 
         # Recent topics (keyword extraction)
         topic_keywords = _extract_topics(_remaining)
