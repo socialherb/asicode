@@ -177,15 +177,73 @@ def _main() -> int:
     p.add_argument("--input-eof", action="store_true", help="builtins.input raises EOFError -> EOF branches")
     p.add_argument("--verify-kb", action="store_true", help="verify DesignChatLoop raises KeyboardInterrupt")
     p.add_argument("--rich", action="store_true", help="enable the rich console render paths")
+    # stage-3 fourth wave: /claude collaboration branches + ESC during design chat
+    p.add_argument(
+        "--sdk-missing",
+        action="store_true",
+        help="is_claude_sdk_installed returns False -> /claude install-prompt branch",
+    )
+    p.add_argument(
+        "--collab-crash",
+        action="store_true",
+        help="_run_collaborate_session raises -> /claude error branch (pair with --verbose)",
+    )
+    p.add_argument(
+        "--collab-ok",
+        action="store_true",
+        help="_run_collaborate_session returns a fake success result -> verdict-record branch",
+    )
+    p.add_argument(
+        "--collab-kb",
+        action="store_true",
+        help="_run_collaborate_session raises KeyboardInterrupt -> /claude cancelled branch",
+    )
+    p.add_argument(
+        "--pip-fail",
+        action="store_true",
+        help="_pip_install returns False -> /claude install-failed branch",
+    )
+    p.add_argument(
+        "--pip-ok",
+        action="store_true",
+        help="_pip_install returns True + sdk becomes installed -> /claude installed branch",
+    )
+    p.add_argument(
+        "--pip-kb",
+        action="store_true",
+        help="_pip_install raises KeyboardInterrupt -> /claude install cancelled branch",
+    )
+    p.add_argument(
+        "--pending-fail",
+        action="store_true",
+        help="_finalize_pending_design_chat raises -> pending-finalize except branch",
+    )
+    p.add_argument(
+        "--pending-kb",
+        action="store_true",
+        help="_finalize_pending_design_chat raises KeyboardInterrupt -> session end",
+    )
+    p.add_argument(
+        "--dc-slow",
+        action="store_true",
+        help="DesignChatLoop.respond sleeps 6s before returning -> ESC-cancel window",
+    )
     ns = p.parse_args()
 
     import tempfile
 
     import coverage
 
+    # Reuse the active coverage instance when present (e.g. the a1_coverage.pth
+    # hook started one under cov.sh), exactly like repl_stage2_child.py. Starting
+    # a SECOND instance would double-instrument the process and its data file
+    # can end up malformed (observed: "database disk image is malformed" for the
+    # child's suffixed file, which then fails to combine).
     data_file = os.environ.get("COVERAGE_FILE") or os.path.join(tempfile.gettempdir(), f"covstage3-{os.getpid()}")
-    cov = coverage.Coverage(data_file=data_file)
-    cov.start()
+    cov = coverage.Coverage.current()
+    if cov is None:
+        cov = coverage.Coverage(data_file=data_file)
+        cov.start()
     try:
         import asi
         import external_llm.agent.design_chat_loop as dcl_mod
@@ -809,6 +867,23 @@ def _main() -> int:
                     raise KeyboardInterrupt()
 
             _loop_cls = _VerifyKBLoop
+        elif ns.dc_slow:
+
+            class _SlowLoop(FakeDesignChatLoop):
+                """respond() blocks 6s so the pty test can press ESC mid-turn.
+
+                The ESC watcher sets cancel_event; the main thread's
+                ``while _dc_thread.is_alive(): join(timeout=0.15)`` loop sees
+                it and takes the pending-design-chat branch (5952-5962).
+                """
+
+                def respond(self, messages, stream_callback=None, **kw):
+                    import time as _time
+
+                    _time.sleep(6)
+                    return super().respond(messages, stream_callback=stream_callback)
+
+            _loop_cls = _SlowLoop
         elif ns.dc_crash:
             _loop_cls = _CrashLoop
         elif ns.no_result:
@@ -886,6 +961,81 @@ def _main() -> int:
         tool_registry_mod.AgentConfig = FakeAgentConfig
 
         dcl_mod.DesignChatLoop = lambda client, registry, model: _loop_cls(client, registry, model)
+        if ns.sdk_missing:
+            # /claude's availability gate imports is_claude_sdk_installed inside
+            # _dispatch_command from external_llm.repl.collaborate — patching the
+            # module attribute covers the typing gate (never keyed off message text).
+            import external_llm.repl.collaborate as _collab_mod
+
+            _collab_mod.is_claude_sdk_installed = lambda: False
+        if ns.collab_crash:
+            # _run_collaborate_session is a module-level async fn in repl_impl;
+            # raising inside it drives the /claude except branch (verbose traceback).
+            async def _collab_boom(*a, **k):
+                raise RuntimeError("fake collaboration crash")
+
+            repl_impl._run_collaborate_session = _collab_boom
+        elif ns.collab_ok:
+
+            class _FakeVerdictInner:
+                status = "success"
+                confidence = 1.0
+                summary = "fake summary"
+                details = "fake details"
+                suggestions: ClassVar[list[str]] = ["s1"]
+
+            class _FakeVerdict:
+                error = None
+                verdict = _FakeVerdictInner()
+
+            async def _collab_ok_impl(*a, **k):
+                return _FakeVerdict()
+
+            repl_impl._run_collaborate_session = _collab_ok_impl
+        elif ns.collab_kb:
+
+            async def _collab_kb_impl(*a, **k):
+                raise KeyboardInterrupt()
+
+            repl_impl._run_collaborate_session = _collab_kb_impl
+        if ns.pip_fail:
+            # /claude install path: pip install returns False -> the "did not
+            # complete" branch. With sdk_missing the install prompt is reached;
+            # answering "y" drives the install attempt.
+            repl_impl._pip_install = lambda *a, **k: False
+        elif ns.pip_ok:
+            # pip "succeeds" AND the SDK becomes visible -> the installed branch.
+            # is_claude_sdk_installed is patched to flip True on the 2nd call
+            # (the first call is the availability gate, which must stay False).
+            _sdk_calls = {"n": 0}
+            import external_llm.repl.collaborate as _collab_mod
+
+            def _sdk_flaky():
+                _sdk_calls["n"] += 1
+                return _sdk_calls["n"] >= 2
+
+            _collab_mod.is_claude_sdk_installed = _sdk_flaky
+            repl_impl._pip_install = lambda *a, **k: True
+        elif ns.pip_kb:
+
+            def _pip_kb(*a, **k):
+                raise KeyboardInterrupt()
+
+            repl_impl._pip_install = _pip_kb
+        if ns.pending_fail:
+            # ESC leaves a pending design chat; the next input finalizes it.
+            # Raising here exercises the finalize except branch (no crash — the
+            # session continues because the exception is caught and logged).
+            def _pending_boom(*a, **k):
+                raise RuntimeError("fake finalize crash")
+
+            repl_impl._finalize_pending_design_chat = _pending_boom
+        elif ns.pending_kb:
+
+            def _pending_kb(*a, **k):
+                raise KeyboardInterrupt()
+
+            repl_impl._finalize_pending_design_chat = _pending_kb
         if ns.llm_client_fail:
 
             def _client_boom(*a, **k):

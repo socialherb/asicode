@@ -302,6 +302,51 @@ def test_run_once_json_blob_keeps_stdout_to_single_json_line(tmp_path, monkeypat
     assert rc == 0
 
 
+def test_run_once_json_blob_cancelled_emits_error_line(tmp_path, monkeypatch, capsys):
+    """--json + engine returns None (user cancel) must emit a single JSON error
+    line with status "cancelled" and exit 130 (matching the interactive ^C path).
+
+    Covers the ``result is None`` cancelled branch in run_once that the
+    success/exception tests don't reach (json blob mode, 6741).
+    """
+    captured = {}
+
+    def _fake_build_engine(config, **kw):
+        captured["stream_cb"] = config.stream_cb
+        return object()
+
+    monkeypatch.setattr(repl_impl, "_build_engine", _fake_build_engine)
+    monkeypatch.setattr(repl_impl, "_git_baseline", lambda root: "")
+
+    def _fake_run_with_cancel(loop, request, context, cancel_event, stream_callback=None):
+        # Cancel path: engine returns None → run_once must emit cancelled JSON.
+        if stream_callback:
+            stream_callback("done", {})
+
+    monkeypatch.setattr(repl_impl, "_run_with_cancel", _fake_run_with_cancel)
+
+    args = SimpleNamespace(
+        repo=str(tmp_path),
+        verbose=False,
+        json_stream=False,
+        json=True,
+        provider="",
+        model="",
+        api_key=None,
+        max_turns=3,
+        thinking_mode=None,
+        reasoning_effort=None,
+    )
+    rc = asi.run_once(args, "do something")
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected single JSON line, got: {lines!r}"
+    obj = json.loads(lines[0])
+    assert obj["status"] == "cancelled"
+    assert obj["error"] == "Request cancelled by user"
+    assert rc == 130
+
+
 # ── F7: cancelled result error field ─────────────────────────────────────────
 
 

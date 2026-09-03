@@ -1605,11 +1605,21 @@ class ExternalLLMService:
         """
         Parse LLM output -> dict {"patch": ..., "explanation": ...}
 
-        Wraps parse_llm_output() with safe fallback (empty on error).
+        Wraps parse_llm_output() with safe fallback (empty on error). The
+        fallback is logged (debug) rather than swallowed silently: without it a
+        parse failure is indistinguishable from an empty response — the user
+        just sees an empty patch with no cause anywhere in the logs.
         """
         try:
             out = parse_llm_output(text)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "parse_llm_output failed (%s: %s) — falling back to empty patch/explanation; "
+                "raw LLM output head: %.200r",
+                type(exc).__name__,
+                exc,
+                text or "",
+            )
             return {"explanation": "", "patch": ""}
 
         return {

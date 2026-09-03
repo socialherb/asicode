@@ -45,9 +45,9 @@ def test_every_catalog_model_has_rate_or_nonzero_provider_fallback(provider, mod
     """No catalog model may be silently priced at (0,0) — a model-specific
     entry, or a non-zero provider-level fallback, must cover it (or it must
     be an explicitly-allowlisted zero-rate model: unpriced ids on the opencode
-    table, and the free tier ox-alpha-free)."""
+    table)."""
     in_rate, out_rate = _get_rates(provider, model)
-    free_by_design = provider == "opencode" and (model in OPENCODE_UNPRICED or model == "ox-alpha-free")
+    free_by_design = provider == "opencode" and model in OPENCODE_UNPRICED
     assert in_rate or out_rate or free_by_design, (
         f"{provider}/{model} prices at (0,0) — add a {provider} rate entry or unpriced allowlist"
     )
@@ -61,7 +61,7 @@ def test_no_catalog_model_with_nonzero_fallback_is_reported():
         reported = model in _catalog_unpriced_models().get(provider, [])
         if provider == "opencode":
             has_rate = _longest_prefix_match(model.lower(), _OPENCODE_COST_PER_M) is not None
-            has_decision = has_rate or model in OPENCODE_UNPRICED or model == "ox-alpha-free"
+            has_decision = has_rate or model in OPENCODE_UNPRICED
         else:
             has_rate = _longest_prefix_match(model.lower(), _MODEL_COST_PER_M) is not None
             has_decision = has_rate
@@ -115,9 +115,6 @@ def test_opencode_catalog_models_priced_via_opencode_table_not_openai():
         if model in OPENCODE_UNPRICED:
             # Unpriced by design: falls to the opencode provider floor (0.22/0.66).
             assert in_rate == _COST_PER_M["opencode"][0], model
-        elif model == "ox-alpha-free":
-            # Free tier — explicit zero in the opencode table.
-            assert in_rate == 0.0, model
         else:
             assert in_rate > 0.0, f"opencode/{model} unpriced outside allowlist"
         # Never the OpenAI fallback rate by accidental prefix match:

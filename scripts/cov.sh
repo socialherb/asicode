@@ -18,6 +18,16 @@
 # sessions' `.coverage*` files); `coverage combine` merges them and
 # `coverage report` shows the true picture.
 #
+# pty child drivers (tests/unit/repl_stage2_child.py / repl_stage3_child.py,
+# spawned via SpawnPtySession) are the one deliberate exception: pty_driver
+# strips COVERAGE_PROCESS_START/CONFIG from the child env, so the .pth hook
+# does NOT start there. The child starts its OWN Coverage instance instead,
+# writing into the inherited COVERAGE_FILE (this script's private COV_DIR) or
+# /tmp/covstage*-{pid}; with COVERAGE_FILE set, coverage's parallel suffix
+# naming puts the child's data beside the main process's files in COV_DIR, so
+# the `coverage combine` below merges the pty session's lines too (verified
+# 2026-08-25: repl_impl.py 8% → 33% when the child data is included).
+#
 # Usage:
 #   ./scripts/cov.sh [pytest args...]      # default: tests/unit -q
 #   PYTHON=/path/to/python ./scripts/cov.sh ...

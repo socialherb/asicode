@@ -348,6 +348,18 @@ class SpawnPtySession:
         # strip the auto-start vars AFTER merging caller env too.
         child_env.pop("COVERAGE_PROCESS_START", None)
         child_env.pop("COVERAGE_PROCESS_CONFIG", None)
+        # NOTE (coverage bridge): the pop above makes the child MISS the
+        # a1_coverage.pth auto-start hook, so the child drivers themselves
+        # start a Coverage instance (repl_stage2/3_child.py) writing into
+        # COVERAGE_FILE (inherited from cov.sh) or /tmp/covstage*-{pid}.
+        # Under cov.sh the inherited COVERAGE_FILE + parallel suffix naming
+        # lands in the same private COV_DIR, so `coverage combine` merges the
+        # child's data along with the main process — the pty session's
+        # repl_impl turn-loop lines ARE measured (verified 2026-08-25: stage2
+        # repl_impl 8% → 33% with the child files included). Keep the pop:
+        # without it the .pth hook would start a SECOND instance in children
+        # that don't call coverage.Coverage.current() (repl_stage3_child),
+        # racing on the same sqlite file ("database disk image is malformed").
         self._proc = subprocess.Popen(
             argv,
             stdin=slave,

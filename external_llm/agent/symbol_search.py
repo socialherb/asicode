@@ -1659,9 +1659,10 @@ class SymbolSearcher:
                 _ts_outline = self._outline_ts_js(p, rel)
                 if _ts_outline:
                     return _ts_outline
-            _ast_outline = self._outline_treesitter(p, rel)
-            if _ast_outline:
-                return _ast_outline
+            # _outline_treesitter deliberately excludes TS/JS (they keep the
+            # richer TSSemanticTracer path above), so calling it here would
+            # read+parse the file only to return [] — dead chain. Fall
+            # straight to the provider-regex path.
             return self._outline_ripgrep(p, rel)
         # AST-first: tree-sitter gives an accurate (start, end) per symbol
         # and handles modifiers/annotations structurally. Fall back to the
@@ -1755,6 +1756,46 @@ class SymbolSearcher:
         results.sort(key=lambda s: s.line)
         return results
 
+    def _provider_patterns(self, file_path: Path) -> list[tuple[str, str, str]]:
+        """Resolve LanguageProvider symbol patterns to ``(regex, kind, name_capture)``
+        tuples, or the hardcoded Rust fallback when no provider is registered.
+
+        Shared by :meth:`_outline_ripgrep` (single-file rg) and
+        :meth:`_nonpy_index_for` (batched rg per provider): both substitute
+        ``{name}`` with the provider's own ``name_capture`` group (default
+        ``\\w+``) so broader captures (Lua ``[\\w.:]+``, CSS ``[-\\w]+``) work
+        in both paths. This MUST stay in sync — the inline comments at both
+        former call sites required it.
+        """
+        provider = LanguageRegistry.instance().get(str(file_path))
+        if provider is None:
+            # Fallback for languages without a registered provider (Rust, etc.)
+            return [
+                (r"^\s*(?:pub\s+)?fn\s+(\w+)", "function", r"\w+"),  # Rust
+                (r"^\s*(?:pub\s+)?struct\s+(\w+)", "class", r"\w+"),  # Rust
+                (r"^\s*(?:pub\s+)?enum\s+(\w+)", "enum", r"\w+"),  # Rust
+            ]
+        return self._provider_patterns_for(provider)
+
+    @staticmethod
+    def _provider_patterns_for(provider) -> list[tuple[str, str, str]]:
+        """Tuple form of :meth:`_provider_patterns` for an already-resolved
+        provider (the non-Python index holds the provider, not a path)."""
+
+        patterns: list[tuple[str, str, str]] = []
+        for sp in provider.get_symbol_patterns(kind="any"):
+            # Convert {name} placeholder to capture group for outline mode.
+            # Use the pattern's OWN name_capture (default \w+) — NOT a hardcoded
+            # \w+ — so providers that capture broader names work here too: Lua
+            # [\w.:]+ for dotted/colon methods (M.foo / Account:bar), CSS [-\w]+
+            # for kebab-case. With a hardcoded \w+ the dotted form silently failed
+            # to match (the whole regex aborted at the '.'), dropping the symbol.
+            # This MUST mirror the repo-index substitution in the same places;
+            # both consumers go through this one substitution.
+            outline_regex = sp.regex.replace("{name}", f"({sp.name_capture})")
+            patterns.append((outline_regex, sp.kind, sp.name_capture))
+        return patterns
+
     def _outline_ripgrep(self, file_path: Path, rel: str) -> list[SymbolDef]:
         """Ripgrep-based outline for non-Python files (JS/TS/Go/Rust/etc.).
 
@@ -1766,28 +1807,9 @@ class SymbolSearcher:
         seen: set = set()
 
         # Build patterns from LanguageProvider when possible
-        patterns: list = []
-        provider = LanguageRegistry.instance().get(str(file_path))
-        if provider is not None:
-            for sp in provider.get_symbol_patterns(kind="any"):
-                # Convert {name} placeholder to capture group for outline mode.
-                # Use the pattern's OWN name_capture (default \w+) — NOT a hardcoded
-                # \w+ — so providers that capture broader names work here too: Lua
-                # [\w.:]+ for dotted/colon methods (M.foo / Account:bar), CSS [-\w]+
-                # for kebab-case. With a hardcoded \w+ the dotted form silently failed
-                # to match (the whole regex aborted at the '.'), dropping the symbol.
-                # This MUST mirror the repo-index substitution in _nonpy_index_for.
-                outline_regex = sp.regex.replace("{name}", f"({sp.name_capture})")
-                patterns.append((outline_regex, sp.kind))
-        else:
-            # Fallback for languages without a registered provider (Rust, etc.)
-            patterns = [
-                (r"^\s*(?:pub\s+)?fn\s+(\w+)", "function"),  # Rust
-                (r"^\s*(?:pub\s+)?struct\s+(\w+)", "class"),  # Rust
-                (r"^\s*(?:pub\s+)?enum\s+(\w+)", "enum"),  # Rust
-            ]
+        patterns = self._provider_patterns(file_path)
 
-        for pat, kind in patterns:
+        for pat, kind, _name_capture in patterns:
             with contextlib.suppress(AttributeError, TypeError, OSError, subprocess.SubprocessError):
                 # OSError covers rg-absent FileNotFoundError (rg is an OPTIONAL dep,
                 # see pyproject [search]); SubprocessError covers TimeoutExpired on
@@ -2919,7 +2941,12 @@ class SymbolSearcher:
             # (~1.1s here), each re-walking the tree; merging cuts that to one
             # spawn per provider (~0.13s).  All globs and patterns ride in a
             # single invocation via repeated --glob / -e.
-            pats = [sp.regex.replace("{name}", f"({sp.name_capture})") for sp in patterns]
+            # Same {name} → capture-group substitution as _outline_ripgrep's
+            # single-file path (shared via _provider_patterns); the per-provider
+            # pattern list here is exactly that helper's output minus the
+            # unconditional Rust fallback (index only runs for registered
+            # providers, so `provider` is never None here).
+            pats = [pat for pat, _k, _c in self._provider_patterns_for(provider)]
             # Caps scale with the merged pattern/glob counts so a single
             # pattern cannot starve the others of their per-pattern budget:
             # -m is a per-FILE total across the merged alternation, and the

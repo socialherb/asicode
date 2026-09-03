@@ -52,7 +52,6 @@ _prompt_session: Any = None  # runtime type bound lazily by asi._load_prompt_too
 # Toggled per _collect_input call; referenced by ConditionalContainer/menu filters in the layout.
 _input_underline: bool = False
 _prompt_history_path: str = ""  # run_repl sets to <repo>/.asicode/cli_history
-_ctrlc_armed: bool = False  # True after 1st Ctrl+C on empty prompt — reset by typing/sending etc.
 # ── Ghost suggestion for next action (filled by background LLM after turn end) ──
 _next_prompt_suggestion: str = ""  # Suggestion text shown dimmed on empty prompt
 _next_suggestion_gen: int = 0  # Incremented each new turn — invalidates stale suggestions
@@ -2665,6 +2664,55 @@ def _graceful_join_design_chat(
     return not thread.is_alive()
 
 
+def _handle_design_chat_keyboard_interrupt(
+    thread: threading.Thread | None,
+    cancel_event: threading.Event | None,
+    print_fn: Callable,
+    summary_fn: Callable,
+) -> str:
+    """Design-chat Ctrl+C handler — extracted from the REPL main loop.
+
+    ``_run_repl_impl``'s ``_run_chat_turn`` catches ``KeyboardInterrupt`` while
+    the design-chat worker runs; the old inline body (graceful join + session
+    summary + ``return "break"``) now lives here so the branch is unit-testable
+    without a pty harness.
+
+    ``print_fn`` receives ``(text, style)``; ``summary_fn`` is a no-arg
+    callable (the caller wraps ``_print_session_summary`` with its own session
+    token dict and start time from the enclosing frame).  Returns the action
+    code the caller must propagate ("break").
+    """
+    _graceful_join_design_chat(thread, cancel_event)
+    print_fn("", "")
+    summary_fn()
+    print_fn("session ended.", "")
+    return "break"
+
+
+def _advance_auto_continue_state(
+    state: dict,
+    was_auto_input: bool,
+    print_fn: Callable,
+    muted_style: Any = None,
+) -> None:
+    """Auto-continue depth bookkeeping — extracted from the REPL main loop.
+
+    Countdown-submitted input deepens the chain (capped by ``state["cap"]``);
+    any manual input re-anchors the loop (depth reset) — the user took over.
+    ``print_fn`` receives ``(text, style)``; ``muted_style`` is the ANSI style
+    token used for the progress line (``None`` skips the print).
+    """
+    if was_auto_input:
+        state["depth"] += 1
+        if muted_style is not None:
+            print_fn(
+                f"  🔁 auto-continue step {state['depth']}/{state['cap']}",
+                muted_style,
+            )
+    else:
+        state["depth"] = 0
+
+
 # ─── REPL ────────────────────────────────────────────────────────────────────
 
 
@@ -2692,37 +2740,34 @@ def _format_result(result) -> str:
 
 
 def _eval_ctrlc_armed(
-    current_armed: bool,
     is_main_prompt: bool,
     buffer_has_text: bool,
 ) -> tuple[bool, bool]:
-    """Pure Ctrl+C state machine — returns ``(new_armed, should_raise)``.
+    """Pure Ctrl+C handler decision — returns ``(should_clear_buffer, should_raise)``.
 
-    The two-button ``Ctrl+C → arm → Ctrl+C → exit`` pattern is implemented
-    as a deterministic state machine so it can be unit-tested without
-    prompt_toolkit fixtures.  See ``_handle_ctrlc`` (inside
-    ``_collect_input``) for the keybinding usage with side effects
-    (buffer reset, hint print).
+    Single-press exit: Ctrl+C raises ``KeyboardInterrupt`` immediately on an
+    empty prompt (main or auxiliary); on in-progress input it only clears the
+    buffer. Implemented as a pure function so it can be unit-tested without
+    prompt_toolkit fixtures; the ``c-c`` keybinding in ``_collect_input``
+    calls it and applies the side effects (buffer reset, app exit).
 
-    Transitions:
+    Decisions (all 2x2 = 4 input combinations):
 
-    ============= ============ ============== =========== =============
-    current_armed is_main_      buffer_has     new_armed   should_raise
-                   prompt        _text
-    ============= ============ ============== =========== =============
-    any           False        any            False       True
-    any           True         True           False       False
-    False         True         False          True        False
-    True          True         False          False       True
-    ============= ============ ============== =========== =============
+    =========== ============== ================ =============
+    is_main_    buffer_has_    should_clear_    should_raise
+    prompt      _text          buffer
+    =========== ============== ================ =============
+    False       False          False            True
+    False       True           False            True
+    True        False          False            True
+    True        True           True             False
+    =========== ============== ================ =============
     """
     if not is_main_prompt:
-        return (False, True)  # y/N etc → always raise immediately
+        return (False, True)  # auxiliary (y/N, selectors) → exit immediately
     if buffer_has_text:
-        return (False, False)  # clear buffer + disarm
-    if current_armed:
-        return (False, True)  # second Ctrl+C → raise
-    return (True, False)  # first Ctrl+C → arm
+        return (True, False)  # clear buffer; do not exit
+    return (False, True)  # empty main prompt → single-press exit
 
 
 def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
@@ -2817,39 +2862,27 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
                     "  🔁 auto-continue: cancelled this step (mode stays on — /auto off to disable)", _C["muted"]
                 )
 
-        # Ctrl+C: clear buffer only if input is in progress, require double press on empty prompt
-        # to propagate KeyboardInterrupt (session exit) — prevents accidental
-        # loss of a long session from a habitual single Ctrl+C (paste cancel, etc.). Ctrl+D exits immediately.
-        # No time limit (past 2s expiry reset while reading hints, requiring
-        # 3-4 presses to exit) — instead, typing/sending etc. disarms.
+        # Ctrl+C: clear buffer if input is in progress; on an empty prompt (main
+        # or auxiliary — e.g. y/N) propagate KeyboardInterrupt immediately
+        # (session exit). Single-press exit — no two-button arm protocol.
+        # Ctrl+D exits immediately as well. Buffer reset keeps the "clear
+        # current input" behavior for in-progress text.
         @kb.add("c-c")
         def _handle_ctrlc(event):
-            global _ctrlc_armed
-            new_armed, should_raise = _eval_ctrlc_armed(
-                _ctrlc_armed,
+            should_clear, should_raise = _eval_ctrlc_armed(
                 _input_underline,
                 bool(event.current_buffer.text),
             )
-            if not should_raise and event.current_buffer.text:
-                # Buffer reset is a side effect not captured by the pure
-                # state machine — it clears the user's current input.
+            if should_clear:
+                # Clear the user's in-progress input (no exit).
                 event.current_buffer.reset()
-            _ctrlc_armed = new_armed
+                return
             if should_raise:
                 # raise 금지: 키바인딩은 이벤트 루프 콜백 안에서 실행되므로
                 # 여기서 raise하면 prompt()로 전파되지 않고 loop의 예외 핸들러로
                 # 새어나가 "Unhandled exception in event loop" 트레이스백이 찍힌다.
                 # app.exit(exception=...)가 prompt() 호출 지점에서 raise되는 정석 경로.
                 event.app.exit(exception=KeyboardInterrupt(), style="class:aborting")
-                return
-            if new_armed:
-                # First Ctrl+C on main prompt: show "press again" hint.
-                try:
-                    from prompt_toolkit.application import run_in_terminal
-
-                    run_in_terminal(lambda: _print("  press Ctrl+C again to exit", _C["muted"]))
-                except Exception:  # pragma: no cover — hint display is best-effort
-                    logging.getLogger(__name__).debug("ctrl+c hint print failed", exc_info=True)
 
         # Enter: immediate submit. Newline via Option(Alt)+Enter or Ctrl+J.
         # multiline=True means basic Enter inserts newline, so explicitly bind to submit.
@@ -2858,8 +2891,7 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
         #  requires an extra press in Korean, so submit stays as single Enter.)
         @kb.add("enter")
         def _handle_enter(event):
-            global _ctrlc_armed, _last_input_was_auto
-            _ctrlc_armed = False
+            global _last_input_was_auto
             _buf = event.current_buffer
             # Enter on an empty buffer while an auto-continue countdown is
             # pending = "run now": accept the ghost as this auto step (still
@@ -2948,18 +2980,14 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
             reserve_space_for_menu=0,
         )
 
-        # Typing (text change) disarms the Ctrl+C double-confirm armed state —
-        # prevents accidental "habitual single Ctrl+C after reading hint" exit.
-        def _disarm_ctrlc(_buf):
-            global _ctrlc_armed
-            _ctrlc_armed = False
-            # Typing vetoes a pending auto-continue countdown (the auto submit
-            # itself inserts text, but it deactivates the countdown first, so
-            # this only fires for real user keystrokes).
+        # Typing vetoes a pending auto-continue countdown (the auto submit
+        # itself inserts text, but it deactivates the countdown first, so
+        # this only fires for real user keystrokes).
+        def _on_text_changed(_buf):
             if _auto_countdown_active:
                 _cancel_auto_submit()
 
-        _prompt_session.default_buffer.on_text_changed += _disarm_ctrlc
+        _prompt_session.default_buffer.on_text_changed += _on_text_changed
         # ── Input underline layout ────────────────────────────
         # Default bottom_toolbar is always fixed at screen bottom (large gap of cursor-above margin),
         # cannot serve as "input underline". Instead, place a separator window right after
@@ -3090,8 +3118,8 @@ def _collect_input(prompt: str, bottom_toolbar: bool = False) -> str:
     # raw=True: our output (rich _print, RichHandler logs) is already rendered
     # to VT100/ANSI (Console force_terminal=True). patch_stdout's default
     # raw=False routes writes through output.write(), which *sanitizes* escape
-    # sequences — showing e.g. the muted-gray "press Ctrl+C again to exit" hint
-    # as a literal "?[38;2;…m …?[0m". raw=True uses write_raw() so those escapes
+    # sequences — showing e.g. the muted-gray "session ended" notice or the
+    # Ctrl+C exit path's output as a literal "?[38;2;…m …?[0m". raw=True uses write_raw() so those escapes
     # are passed through and interpreted (color preserved), still reflowed above
     # the live prompt.
     try:
@@ -5983,11 +6011,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # Signal cancel (worker unwinds at its next checkpoint via
             # AgentCancelled) and join with a bounded timeout; a second Ctrl+C
             # during the wait skips it (helper returns False immediately).
-            _graceful_join_design_chat(_dc_thread, _dc_cancel)
-            _print("", "")
-            _print_session_summary(_session_tokens, _session_t0)
-            _print("session ended.", "")
-            return "break"
+            return _handle_design_chat_keyboard_interrupt(
+                _dc_thread,
+                _dc_cancel,
+                _print,
+                lambda: _print_session_summary(_session_tokens, _session_t0),
+            )
         except Exception as _de:
             _print(f"  ✗ design chat error: {_de}", _C["red"])
             if args.verbose:
@@ -6278,14 +6307,12 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # input re-anchors the loop (depth reset) — the user took over.
             _was_auto_input = _last_input_was_auto
             _last_input_was_auto = False
-            if _was_auto_input:
-                _auto_continue_state["depth"] += 1
-                _print(
-                    f"  🔁 auto-continue step {_auto_continue_state['depth']}/{_auto_continue_state['cap']}",
-                    _C["muted"],
-                )
-            else:
-                _auto_continue_state["depth"] = 0
+            _advance_auto_continue_state(
+                _auto_continue_state,
+                _was_auto_input,
+                _print,
+                _C["muted"],
+            )
 
             # ── Image file drag/clipboard/Data URL detection → base64 conversion ──
             _current_user_images: list[dict[str, str]] = []

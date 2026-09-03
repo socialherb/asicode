@@ -331,11 +331,11 @@ class TestReplPtySession:
     def test_ctrl_c_exits_session(self, tmp_path):
         """Ctrl+C at the plain prompt raises KeyboardInterrupt -> session end.
 
-        The 2-press arm/hint protocol (1st ^C shows "press Ctrl+C again",
-        2nd exits) only applies to the rich underline prompt
-        (bottom_toolbar=True, _input_underline=True). The plain branch that
-        the child runs (bottom_toolbar=False) raises on the FIRST ^C — the
-        hint path itself is covered by the in-process pty tests.
+        Single-press exit: an empty prompt (main or auxiliary) exits on the
+        FIRST ^C — no two-button arm protocol. This applies to the rich
+        underline prompt (bottom_toolbar=True, _input_underline=True) and the
+        plain branch the child runs (bottom_toolbar=False) alike; the pure
+        decision is unit-tested in test_ctrlc_state_machine.py.
         """
         repo = str(tmp_path)
         self._write_insights(repo)

@@ -86,17 +86,85 @@ def test_second_ctrl_c_skips_wait(monkeypatch):
 def test_keyboard_interrupt_handler_calls_graceful_join():
     """Source-level wiring contract: the design-chat KeyboardInterrupt handler
     (nested closure — not directly invocable without a live LLM service) must
-    signal + join the worker before exiting. Precedent: test_helper_command.py
+    delegate to ``_handle_design_chat_keyboard_interrupt`` (which signals +
+    joins the worker before exiting). Precedent: test_helper_command.py
     source-contract guards."""
     src = pathlib.Path(repl_impl.__file__).read_text(encoding="utf-8")
-    trio = (
-        '            _print("", "")\n'
-        "            _print_session_summary(_session_tokens, _session_t0)\n"
-        '            _print("session ended.", "")\n'
-        '            return "break"'
-    )
-    assert trio in src
-    idx = src.index(trio)
+    # 1) The extracted handler itself joins the worker via the graceful helper.
+    handler_src = src[
+        src.index("def _handle_design_chat_keyboard_interrupt") : src.index("def _advance_auto_continue_state")
+    ]
+    assert "_graceful_join_design_chat(thread, cancel_event)" in handler_src
+    # 2) The REPL KeyboardInterrupt handler delegates to the extracted helper.
+    call = "return _handle_design_chat_keyboard_interrupt("
+    assert call in src
+    idx = src.index(call)
     window = src[max(0, idx - 800) : idx]
     assert "except KeyboardInterrupt:" in window
-    assert "_graceful_join_design_chat(_dc_thread, _dc_cancel)" in window
+
+
+# ── Extracted REPL-loop helpers (source-level refactor: P5) ────────────────
+
+
+def test_handle_design_chat_kb_joins_and_breaks(monkeypatch):
+    """Ctrl+C handler joins the worker via the graceful helper, prints the
+    session summary, and returns "break" — no pty required."""
+    joined: list = []
+    monkeypatch.setattr(
+        repl_impl,
+        "_graceful_join_design_chat",
+        lambda thread, cancel: joined.append((thread, cancel)) or True,
+    )
+    printed: list = []
+    summarized: list = []
+    t = threading.Thread(target=lambda: None)  # dummy, never started
+    cancel = threading.Event()
+    code = repl_impl._handle_design_chat_keyboard_interrupt(
+        t,
+        cancel,
+        lambda text, style: printed.append(text),
+        lambda: summarized.append(1),
+    )
+    assert code == "break"
+    assert joined == [(t, cancel)]  # thread + cancel passed through
+    assert printed == ["", "session ended."]
+    assert summarized == [1]
+
+
+def test_handle_design_chat_kb_none_thread_is_safe():
+    """Handler tolerates a missing worker (e.g. Ctrl+C before thread start)."""
+    code = repl_impl._handle_design_chat_keyboard_interrupt(None, None, lambda text, style: None, lambda: None)
+    assert code == "break"
+
+
+def test_advance_auto_continue_auto_input_increments():
+    state = {"on": True, "cap": 5, "depth": 2}
+    printed: list = []
+    repl_impl._advance_auto_continue_state(state, True, lambda text, style: printed.append((text, style)), "muted")
+    assert state["depth"] == 3
+    assert printed == [("  🔁 auto-continue step 3/5", "muted")]
+
+
+def test_advance_auto_continue_auto_input_no_style():
+    """muted_style=None (test caller) skips the progress print."""
+    state = {"on": True, "cap": 5, "depth": 2}
+    printed: list = []
+    repl_impl._advance_auto_continue_state(state, True, lambda text, style: printed.append(text))
+    assert state["depth"] == 3
+    assert printed == []
+
+
+def test_advance_auto_continue_manual_input_resets():
+    state = {"on": True, "cap": 5, "depth": 4}
+    printed: list = []
+    repl_impl._advance_auto_continue_state(state, False, lambda text, style: printed.append(text), "muted")
+    assert state["depth"] == 0
+    assert printed == []
+
+
+def test_advance_auto_continue_cap_is_honored():
+    """Depth keeps increasing past cap (cap is enforced at fire time, not
+    bookkeeping time) — regression guard for the extracted helper."""
+    state = {"on": True, "cap": 5, "depth": 5}
+    repl_impl._advance_auto_continue_state(state, True, lambda text, style: None, None)
+    assert state["depth"] == 6

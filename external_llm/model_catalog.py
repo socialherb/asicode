@@ -84,8 +84,9 @@ KNOWN_MODELS: dict[str, list[str]] = {
     ],
     "opencode": [
         # Curated list from https://opencode.ai/zen/go/v1/models.
-        # Verified 2026-08-19 against the live API (28 ids returned). hy3-preview
+        # Verified 2026-09-02 against the live API (34 ids returned). hy3-preview
         # is served but handled via MODEL_ALIASES (→ hy3), so it is omitted here.
+        "glm-5.3-flash",
         "glm-5.3",
         "glm-5.2",
         "glm-5.1",
@@ -104,27 +105,24 @@ KNOWN_MODELS: dict[str, list[str]] = {
         "minimax-m2.7",
         "minimax-m2.5",
         "qwen3.8-max",
+        "qwen3.8-flash",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
         "qwen3.5-plus",
+        "hy4-preview",
         "hy3",
         "gpt-5.6-luna",
+        "grok-4.6",
         "grok-4.5",
-        # Meta Muse Spark 1.2 (released 2026-08-05; on the gateway since
-        # 2026-08-19). "contributor" is the ~12x cheaper variant whose data is
-        # used for training — a distinct routable id, not an alias. The base
-        # muse-spark-1.2 was dropped by the gateway on 2026-08-20 (27 ids);
-        # only the contributor variant is served now. 1M (2^20) window;
-        # decision recorded in _FALLBACK_IS_CORRECT.
+        # Meta Muse Spark 1.2/1.3 (released 2026-08-05/2026-09-01; on the
+        # gateway since 2026-08-19/2026-09). "contributor" is the ~12x cheaper
+        # variant whose data is used for training — a distinct routable id, not
+        # an alias. The base muse-spark-1.2 was dropped by the gateway on
+        # 2026-08-20; only the contributor variants are served now. 1M (2^20)
+        # window for both; decision recorded in _FALLBACK_IS_CORRECT.
+        "muse-spark-1.3-contributor",
         "muse-spark-1.2-contributor",
-        # Ox Alpha Free (stealth model; served since 2026-08-21). Free tier,
-        # zero-retention policy, no training on user data (opencode docs). The
-        # docs page spells the config id "x-preview-f-free", but the live
-        # /zen/go/v1/models endpoint serves "ox-alpha-free" — the catalog tracks
-        # the live id (fetch-time test pin). Context window unpublished →
-        # decided in _FALLBACK_IS_CORRECT (UNVERIFIED).
-        "ox-alpha-free",
         # DeepSeek v4 Flash vision variant (served since 2026-08-21 alongside
         # deepseek-v4-flash; vision suffix = multimodal front-end over the
         # same v4-flash core). 1M window like deepseek-v4-flash →

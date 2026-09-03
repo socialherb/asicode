@@ -739,6 +739,24 @@ def test_parse_llm_output_best_effort_error(monkeypatch):
     assert out == {"explanation": "", "patch": ""}
 
 
+def test_parse_llm_output_best_effort_error_logs_cause(monkeypatch, caplog):
+    """The silent-fallback regression: a parse failure used to return the empty
+    dict with no trace anywhere, so the user saw a blank patch with no cause.
+    The fallback must log the exception type + a raw-output head for diagnosis."""
+    import logging
+
+    def _boom(text):
+        raise ValueError("parse fail")
+
+    monkeypatch.setattr(svc_mod, "parse_llm_output", _boom)
+    with caplog.at_level(logging.WARNING, logger="external_llm.service"):
+        out = ExternalLLMService._parse_llm_output_best_effort("RAW LLM OUTPUT HEAD")
+    assert out == {"explanation": "", "patch": ""}
+    assert any("parse fail" in rec.message and "RAW LLM OUTPUT HEAD" in rec.message for rec in caplog.records), (
+        f"parse failure not logged with cause: {[r.message for r in caplog.records]}"
+    )
+
+
 def test_normalize_candidate_patch_empty():
     normalized, error = ExternalLLMService._normalize_candidate_patch("", None)
     assert (normalized, error) == ("", None)

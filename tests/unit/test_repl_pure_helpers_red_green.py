@@ -304,18 +304,14 @@ class TestValidateNextSuggestion:
 
 class TestEvalCtrlCArmed:
     def test_not_main_prompt_always_raises(self):
-        assert _eval_ctrlc_armed(True, False, True) == (False, True)
-        assert _eval_ctrlc_armed(False, False, False) == (False, True)
+        assert _eval_ctrlc_armed(False, True) == (False, True)
+        assert _eval_ctrlc_armed(False, False) == (False, True)
 
-    def test_buffer_has_text_disarms(self):
-        assert _eval_ctrlc_armed(False, True, True) == (False, False)
-        assert _eval_ctrlc_armed(True, True, True) == (False, False)
+    def test_buffer_has_text_clears(self):
+        assert _eval_ctrlc_armed(True, True) == (True, False)
 
-    def test_first_ctrlc_arms(self):
-        assert _eval_ctrlc_armed(False, True, False) == (True, False)
-
-    def test_second_ctrlc_raises(self):
-        assert _eval_ctrlc_armed(True, True, False) == (False, True)
+    def test_empty_main_prompt_raises_single_press(self):
+        assert _eval_ctrlc_armed(True, False) == (False, True)
 
 
 # ── _wrap_preserve_code ──────────────────────────────────────────────────────

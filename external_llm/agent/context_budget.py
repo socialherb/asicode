@@ -110,10 +110,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # hy3-preview is aliased to hy3 in _MODEL_ALIASES (asi.py); both resolve here.
     "hy3": 128_000,
     "hy3-preview": 128_000,
-    # Grok 4.5 (opencode) — 500K context (xAI docs: a reduction from Grok 4.3's 1M).
-    # MUST be explicit: the _DEFAULT_CONTEXT_LIMIT fallback is 1M, which would
-    # over-allocate and risk HTTP errors on >500K-token requests.
+    # Grok 4.5/4.6 (opencode) — 500K context (xAI docs: a reduction from Grok
+    # 4.3's 1M). MUST be explicit: the _DEFAULT_CONTEXT_LIMIT fallback is 1M,
+    # which would over-allocate and risk HTTP errors on >500K-token requests.
     "grok-4.5": 500_000,
+    "grok-4.6": 500_000,
 }
 
 
@@ -194,10 +195,18 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset(
         "gemini-3.1-pro",
         "gemini-3-flash",
         "qwen3.8-max",
-        # Ox Alpha Free (opencode stealth model, free tier, zero-retention). Window
-        # not published by opencode docs; live id ships as "ox-alpha-free" while
-        # the docs page calls the config id "x-preview-f-free".
-        "ox-alpha-free",
+        "qwen3.8-flash",
+        # GLM-5.3-Flash (Z.ai, released 2026-08-25; on the opencode gateway
+        # since 2026-09-01). 1M window — matches glm-5.3 (docs.z.ai:
+        # "support for a 1M-token context window"). 1M fallback is correct.
+        "glm-5.3-flash",
+        # Tencent Hy4 preview (open-sourced 2026-08-28; on the opencode gateway
+        # since 2026-09). Context window "exceeding 1M tokens" per Technode/
+        # Tencent release. 1M fallback slightly under-allocates — safe direction.
+        "hy4-preview",
+        # Meta Muse Spark 1.3 Contributor (released 2026-09-01). Same 1M (2^20)
+        # window as the 1.2 contributor variant — OpenRouter model page.
+        "muse-spark-1.3-contributor",
         # DeepSeek v4 Flash vision variant — same 1M fallback as deepseek-v4-flash.
         "deepseek-v4-flash-vision-exp",
         # LongCat-2.0 (Meituan 1.6T MoE, open-sourced 2026-07-05; on the opencode

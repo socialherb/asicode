@@ -53,6 +53,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from external_llm.agent.config.thresholds import config as _cfg
+from external_llm.client import interruptible_sleep
 from external_llm.common.walk_policy import _walk_dir_sort_key, _walk_should_skip_dir
 from utils.llm_utils import simple_llm_call
 from utils.string_helper import parse_json, utf8_trailing_incomplete_len
@@ -2569,19 +2570,9 @@ class OrchestratorAgent:
             # brief grace window to land its "exited" idle-heartbeat marker
             # before deciding the slot is safe to return to the pool;
             # otherwise a dead worker gets reused and the next dispatch burns
-            # the full ipc_timeout_s.
-            from .subagent_ipc import read_worker_idle_heartbeat_state
-
-            _grace_deadline = time.monotonic() + 2.0
-            while time.monotonic() < _grace_deadline:
-                try:
-                    if read_worker_idle_heartbeat_state(repo_root, _worker_id) == "exited":
-                        _worker_confirmed_exited = True
-                        break
-                except Exception:
-                    logger.debug("idle-heartbeat read failed for %s", _worker_id)
-                    break
-                time.sleep(0.2)
+            # the full ipc_timeout_s. Cancel-aware (R-CANCEL): wakes early on
+            # orchestrator cancel instead of sleeping through the window.
+            _worker_confirmed_exited = self._wait_worker_exited_grace(repo_root, _worker_id, 2.0)
 
         # Diff cross-verification (shared with the in-process path).
         # IPC is the DEFAULT mode on macOS (the terminal auto-launch
@@ -5251,6 +5242,46 @@ Approve if the change correctly implements what was asked without breaking exist
         with self._bg_lock:
             self._reusable_worker_ids.add(worker_id)
 
+    def _wait_worker_exited_grace(self, repo_root: str, worker_id: str, grace_s: float = 2.0) -> bool:
+        """Poll the worker's idle-heartbeat for an ``exited`` marker within *grace_s*.
+
+        Cancel-aware: wakes the moment ``orch_config.cancel_event`` fires
+        (``interruptible_sleep``) instead of finishing the full grace — a user
+        ESC during the wait must not stall the cancel machinery for the whole
+        window. Returns True only when the marker confirmed a clean exit.
+        """
+        from .subagent_ipc import read_worker_idle_heartbeat_state
+
+        _ce = self.orch_config.cancel_event
+        deadline = time.monotonic() + grace_s
+        while time.monotonic() < deadline:
+            try:
+                if read_worker_idle_heartbeat_state(repo_root, worker_id) == "exited":
+                    return True
+            except Exception:
+                logger.debug("idle-heartbeat read failed for %s", worker_id)
+                return False
+            if interruptible_sleep(0.2, _ce):
+                return False
+        return False
+
+    def _wait_ipc_result_quiesce(self, result_path: str, grace_s: float) -> bool:
+        """Poll for ``result.json`` within *grace_s* (soft-cancel quiescence).
+
+        Cancel-aware: wakes the moment ``orch_config.cancel_event`` fires so a
+        user ESC does not wait out the full grace window (~12s) before the
+        cancel machinery proceeds. Returns True when the file appeared — the
+        worker quiesced and is safe to keep alive for reuse.
+        """
+        _ce = self.orch_config.cancel_event
+        deadline = time.monotonic() + grace_s
+        while time.monotonic() < deadline:
+            if os.path.isfile(result_path):
+                return True
+            if interruptible_sleep(0.3, _ce):
+                return False
+        return False
+
     def _abandon_ipc_worker(
         self,
         repo_root: str,
@@ -5343,7 +5374,6 @@ Approve if the change correctly implements what was asked without breaking exist
                 _result_dir_id,
                 "result.json",
             )
-            _quiesce_deadline = time.monotonic() + grace_s
             _quiesced = False
             # Perf #8: a worker that is ALREADY dead (poll() != None) — e.g. its
             # heartbeat went stale during wait_for_result because it crashed — will
@@ -5364,11 +5394,9 @@ Approve if the change correctly implements what was asked without breaking exist
                     grace_s,
                 )
             else:
-                while time.monotonic() < _quiesce_deadline:
-                    if os.path.isfile(_result_path):
-                        _quiesced = True
-                        break
-                    time.sleep(0.3)
+                # Cancel-aware (R-CANCEL): wakes the moment cancel_event
+                # fires instead of sleeping through the full grace_s (~12s).
+                _quiesced = self._wait_ipc_result_quiesce(_result_path, grace_s)
                 if _quiesced:
                     logger.info(
                         "IPC: worker %s quiesced (result.json appeared) after soft "

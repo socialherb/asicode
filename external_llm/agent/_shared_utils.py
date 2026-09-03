@@ -856,6 +856,7 @@ _OPENCODE_COST_PER_M: dict[str, tuple[float, float]] = {
     "deepseek-v4-flash-vision-exp": (0.22, 0.66),
     "deepseek-v4-pro": (0.66, 1.98),
     # GLM
+    "glm-5.3-flash": (0.15, 0.50),
     "glm-5.3": (1.40, 4.40),
     "glm-5.2": (1.40, 4.40),
     "glm-5.1": (1.40, 4.40),
@@ -867,6 +868,7 @@ _OPENCODE_COST_PER_M: dict[str, tuple[float, float]] = {
     "kimi-k2.5": (0.60, 3.00),
     # Qwen
     "qwen3.8-max": (2.00, 6.00),
+    "qwen3.8-flash": (0.15, 0.47),
     "qwen3.7-max": (2.50, 7.50),
     "qwen3.7-plus": (0.40, 1.60),
     "qwen3.6-plus": (0.50, 3.00),
@@ -879,14 +881,14 @@ _OPENCODE_COST_PER_M: dict[str, tuple[float, float]] = {
     "mimo-v2.5-pro": (0.435, 0.87),
     "mimo-v2.5": (0.14, 0.28),
     # Others
+    "grok-4.6": (2.00, 6.00),  # ≤200K tier; >200K is 4.00/12.00
     "grok-4.5": (2.00, 6.00),
     "gpt-5.6-luna": (0.20, 1.20),
     "longcat-2.0": (0.30, 1.20),
+    "hy4-preview": (0.834, 2.501),
     "hy3": (0.14, 0.58),
+    "muse-spark-1.3-contributor": (0.10, 0.20),
     "muse-spark-1.2-contributor": (0.10, 0.20),
-    # Free tier (zero token price on Go/Zen; kept explicit so the catalog
-    # parity test sees a real pricing decision, not a silent zero).
-    "ox-alpha-free": (0.0, 0.0),
 }
 
 # OpenCode catalog models with NO public price — kept explicit. The parity
@@ -950,6 +952,7 @@ _OPENCODE_CACHE_RATE: dict[str, float] = {
     "deepseek-v4-flash-vision-exp": 0.007,
     "deepseek-v4-pro": 0.022,
     # GLM
+    "glm-5.3-flash": 0.03,
     "glm-5.3": 0.26,
     "glm-5.2": 0.26,
     "glm-5.1": 0.26,
@@ -961,6 +964,7 @@ _OPENCODE_CACHE_RATE: dict[str, float] = {
     "kimi-k2.5": 0.10,
     # Qwen (≤-window tier)
     "qwen3.8-max": 0.25,
+    "qwen3.8-flash": 0.016,
     "qwen3.7-max": 0.50,
     "qwen3.7-plus": 0.04,
     "qwen3.6-plus": 0.05,
@@ -973,10 +977,13 @@ _OPENCODE_CACHE_RATE: dict[str, float] = {
     "mimo-v2.5-pro": 0.003625,
     "mimo-v2.5": 0.0028,
     # Others
+    "grok-4.6": 0.50,
     "grok-4.5": 0.30,
     "gpt-5.6-luna": 0.02,
     "longcat-2.0": 0.006,
+    "hy4-preview": 0.042,
     "hy3": 0.035,
+    "muse-spark-1.3-contributor": 0.002,
     "muse-spark-1.2-contributor": 0.002,
 }
 

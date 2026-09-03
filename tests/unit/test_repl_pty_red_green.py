@@ -77,7 +77,6 @@ _REPL_GLOBALS: ClassVar[tuple[str, ...]] = (
     "_prompt_session",
     "_input_underline",
     "_prompt_history_path",
-    "_ctrlc_armed",
     "_next_prompt_suggestion",
     "_next_suggestion_gen",
     "_auto_continue_state",
@@ -459,10 +458,15 @@ class TestCollectInput:
         t.join(timeout=12)
         assert isinstance(result["exc"], KeyboardInterrupt)
 
-    def test_ctrlc_main_arm_hint_then_second_raises(self, tty):
+    def test_ctrlc_main_empty_prompt_raises(self, tty):
         t, result = _start_prompt(tty, "x> ", True)
         tty.send(b"\x03")
-        tty.wait_for(b"press Ctrl+C again to exit", timeout=12)
+        t.join(timeout=12)
+        assert isinstance(result["exc"], KeyboardInterrupt)
+
+    def test_ctrlc_main_empty_prompt_raises_plain(self, tty):
+        """Plain (non-underline) main prompt also exits on a single Ctrl+C."""
+        t, result = _start_prompt(tty, "x> ")
         tty.send(b"\x03")
         t.join(timeout=12)
         assert isinstance(result["exc"], KeyboardInterrupt)

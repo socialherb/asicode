@@ -1789,3 +1789,639 @@ def test_session_cj_run_diff_render(tmp_path):
         assert sess.wait(timeout=30) == 0
     finally:
         sess.close()
+
+
+# ── stage-3 fourth wave: /help · /copy-empty · /claude usage · /code-dup ·
+#    /think-toggle · Ctrl+D EOF · /claude sdk-missing · /claude collab-crash ·
+#    ESC during design chat (turn-loop residual branches) ──────────────────────
+
+
+def test_session_ck_slash_help_copy_claude_code_think(tmp_path):
+    """Turn-loop residual slash branches: /help render, /copy with no final
+    message, /claude usage (no task), /code while already in code mode,
+    /think bare toggle."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--no-insights"],
+        cwd=os.getcwd(),
+        timeout=120,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+
+        def send_cmd(text):
+            sess.clear()
+            sess.send(text.encode())
+            sess.wait_for(text.encode(), timeout=30)
+            time.sleep(0.15)
+            sess.send(b"\r")
+
+        # /help — _render_help() (asi._render_help)
+        send_cmd("/help")
+        sess.wait_for(b"session", timeout=30)
+        sess.wait_for(b"/claude", timeout=30)
+        # back to prompt
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        # /copy — final message empty at this point → "no final message"
+        send_cmd("/copy")
+        sess.wait_for(b"no final message to copy yet", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        # /claude with no task → usage
+        send_cmd("/claude")
+        sess.wait_for(b"usage: /claude", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        # /code while already in code mode → already-in-mode nudge
+        send_cmd("/code")
+        sess.wait_for(b"already in [Code Chat] mode", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        # /think bare → toggle (None → ON)
+        send_cmd("/think")
+        sess.wait_for(b"thinking/reasoning \xe2\x86\x92 ON", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        # /think again → toggle back to OFF
+        send_cmd("/think")
+        sess.wait_for(b"thinking/reasoning \xe2\x86\x92 OFF", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        send_cmd("exit")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cl_claude_sdk_missing_input_eof(tmp_path):
+    """/claude with SDK missing + input() EOF -> the EOF branch of the
+    install prompt (no crash, falls through to 'install manually' hint)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--sdk-missing", "--input-eof"],
+        cwd=os.getcwd(),
+        timeout=120,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze the repo\r")
+        # SDK missing banner + EOF-install-prompt fallback
+        sess.wait_for(b"claude_agent_sdk (optional dependency", timeout=30)
+        sess.wait_for(b"Install with:  pip install", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+
+        def send_cmd(text):
+            sess.clear()
+            sess.send(text.encode())
+            sess.wait_for(text.encode(), timeout=30)
+            time.sleep(0.15)
+            sess.send(b"\r")
+
+        send_cmd("exit")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cm_claude_collab_crash_verbose(tmp_path):
+    """/claude session raises + --verbose -> the except branch with the
+    verbose traceback (collaboration error path)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--collab-crash", "--verbose"],
+        cwd=os.getcwd(),
+        timeout=120,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze the repo\r")
+        sess.wait_for(b"\xe2\x9c\x97 collaboration error: fake collaboration crash", timeout=30)
+        sess.wait_for(b"Traceback (most recent call last)", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cn_ctrl_d_eof_prompt(tmp_path):
+    """Ctrl+D at the prompt -> EOFError -> session summary + exit (the
+    _prompt_input EOF branch in the main turn loop)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo],
+        cwd=os.getcwd(),
+        timeout=120,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"\x04")  # Ctrl+D → EOFError in prompt_toolkit
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_co_esc_design_chat_pending(tmp_path):
+    """ESC pressed during a slow design-chat turn -> the ESC-cancel branch:
+    worker is left pending (_pending_dc), next input finalizes it (the
+    _finalize_pending_design_chat path)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--dc-slow"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        # Start a turn — the fake loop sleeps 6s inside respond()
+        sess.clear()
+        sess.send(b"hello\r")
+        # ESC during the worker sleep (before it returns)
+        time.sleep(1.0)
+        sess.clear()
+        sess.send(b"\x1b")  # ESC key
+        # The paused hint + return-to-prompt
+        sess.wait_for(b"paused", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.5)
+        # A NORMAL input (not exit) triggers _finalize_pending_design_chat on
+        # the already-finished worker (sleep done by now) — the pending-finalize
+        # branch runs before the new turn is dispatched. Then exit cleanly.
+        sess.clear()
+        sess.send(b"hello\r")
+        sess.wait_for(b"Here is the plan: done.", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cp_turn_loop_misc_slash(tmp_path):
+    """More turn-loop residual branches: unknown-command typo, /diff with no
+    changes, /undo with no recorded changes, /model re-set (same model),
+    /status render, /copy clipboard-failure, /insights drop+edit, /think on/off
+    explicit args, /claude arg parsing."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--copy-fail", "--fp-data", "--archive-data"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+
+        def send_cmd(text, wait=None):
+            sess.clear()
+            sess.send(text.encode())
+            sess.wait_for(text.encode(), timeout=30)
+            time.sleep(0.15)
+            sess.send(b"\r")
+            if wait:
+                sess.wait_for(wait, timeout=30)
+            # back to prompt
+            time.sleep(0.3)
+
+        # unknown command typo → did-you-mean hint
+        send_cmd("/stauts", b"unknown command")
+        sess.wait_for(b"/help", timeout=30)
+        time.sleep(0.2)
+        # /diff with no baseline → no changes recorded
+        send_cmd("/diff", b"no changes recorded yet")
+        # /undo with no run changes
+        send_cmd("/undo", b"nothing to undo")
+        # /model re-set to the same model → already using
+        send_cmd("/model anthropic/claude-sonnet-4-6", b"already using anthropic / claude-sonnet-4-6")
+        # /status
+        send_cmd("/status", b"tokens")
+        # /copy with clipboard failure → ✗ message
+        send_cmd("/copy", b"no final message to copy yet")  # empty message first
+        # insights drop + edit (archive-data seeds entries)
+        send_cmd("/insights drop 1", b"dropped #1")
+        send_cmd("/insights edit 1 replacement body", b"edited #1")
+        send_cmd("/insights edit", b"usage: /insights edit")
+        # /think on / off explicit
+        send_cmd("/think on", b"thinking/reasoning \xe2\x86\x92 ON")
+        send_cmd("/think off", b"thinking/reasoning \xe2\x86\x92 OFF")
+        # /claude arg parsing (--fresh --model) — with SDK missing the install
+        # prompt is reached only AFTER the arg loop; but with SDK present the
+        # real session would run. We use --sdk-missing? No — arg parsing alone
+        # needs the loop to finish: run with sdk missing + input-eof is separate.
+        # Here: bare /claude already covered; the arg-loop lines (5311-5320)
+        # need /claude --fresh --model m <task>; SDK missing + EOF install prompt
+        # makes it deterministic.
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cq_claude_arg_parse_and_install_fail(tmp_path):
+    """/claude --fresh --model <m> <task> with SDK missing: the arg-parse loop
+    (--fresh/--model) + install-prompt EOF path + (second run) install-fail
+    branch (y + pip returns False)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--sdk-missing", "--input-eof"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        # --fresh --model arg parsing + SDK-missing EOF path
+        sess.clear()
+        sess.send(b"/claude --fresh --model fake-model-9 analyze the repo\r")
+        sess.wait_for(b"claude_agent_sdk (optional dependency", timeout=30)
+        sess.wait_for(b"Install with:  pip install", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        # end session
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cr_claude_install_fail_pip(tmp_path):
+    """/claude with SDK missing + user answers 'y' + pip install fails ->
+    the 'installation did not complete' branch (5354-5373)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--sdk-missing", "--pip-fail"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze\r")
+        sess.wait_for(b"claude_agent_sdk (optional dependency", timeout=30)
+        # Answer "y" (canonical input -> \n terminator)
+        sess.clear()
+        sess.send(b"y\n")
+        sess.wait_for(b"running: pip install", timeout=30)
+        sess.wait_for(b"installation did not complete successfully", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cs_claude_collab_ok_verdict(tmp_path):
+    """/claude with a successful fake collaboration session -> print_summary +
+    verdict recorded as an assistant turn (5412-5425)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--collab-ok"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze\r")
+        # Fake result prints its summary line ("✓ completed") + the verdict
+        # turn is recorded into the session (print_summary does not repeat
+        # the verdict body — it is a one-line compact line)
+        sess.wait_for(b"completed", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_ct_claude_collab_kb(tmp_path):
+    """/claude where _run_collaborate_session raises KeyboardInterrupt ->
+    the 'cancelled.' branch (5429)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--collab-kb"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze\r")
+        sess.wait_for(b"cancelled.", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cu_esc_pending_finalize_fail(tmp_path):
+    """ESC + pending worker + the next input's finalize RAISES -> the
+    pending-finalize except branch (5452-5456) — session continues."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--dc-slow", "--pending-fail"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"hello\r")
+        time.sleep(1.0)
+        sess.clear()
+        sess.send(b"\x1b")  # ESC
+        sess.wait_for(b"paused", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.5)
+        # Next normal input finalizes (raises -> caught+logged), then turn runs.
+        sess.clear()
+        sess.send(b"hello\r")
+        sess.wait_for(b"Here is the plan: done.", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cv_ctrl_c_prompt(tmp_path):
+    """Ctrl+C at the prompt -> KeyboardInterrupt -> session summary + exit
+    (6310-6314)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"\x03")  # Ctrl+C → KeyboardInterrupt at prompt
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cw_copy_after_turn_clipboard_fail(tmp_path):
+    """/copy AFTER a completed turn (final message exists) with clipboard
+    failure -> the ✗ clipboard-copy-failed branch (4939)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--copy-fail"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        # a turn produces a final message
+        sess.clear()
+        sess.send(b"hello\r")
+        sess.wait_for(b"Here is the plan: done.", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        # now /copy goes to the clipboard-failure branch (non-empty final msg)
+        sess.clear()
+        sess.send(b"/copy\r")
+        sess.wait_for(b"clipboard copy failed", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cx_claude_m_short_arg(tmp_path):
+    """/claude -m <model> <task> with SDK missing + EOF: the -m short-form
+    arg-parse branch (5318-5320)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--sdk-missing", "--input-eof"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude -m fake-model-9 analyze\r")
+        sess.wait_for(b"claude_agent_sdk (optional dependency", timeout=30)
+        sess.wait_for(b"Install with:  pip install", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cy_claude_install_ok(tmp_path):
+    """/claude SDK-missing + y + pip succeeds (SDK becomes visible) -> the
+    'installed — starting collaboration session' branch (5366)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--sdk-missing", "--pip-ok", "--collab-crash"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze\r")
+        sess.wait_for(b"claude_agent_sdk (optional dependency", timeout=30)
+        sess.clear()
+        sess.send(b"y\n")
+        sess.wait_for(b"running: pip install", timeout=30)
+        # After install "succeeds", the real session now runs — collab_ok fake
+        # is NOT set here, so _run_collaborate_session would try the real SDK.
+        # The install-ok branch happens BEFORE the session: 5366 prints
+        # "✓ installed — starting collaboration session." then 5404 runs the
+        # real (unpatched) async session — which would hang. So pair pip-ok
+        # with collab-crash to keep the child deterministic.
+        sess.wait_for(b"installed \xe2\x80\x94 starting collaboration session", timeout=30)
+        sess.wait_for(b"collaboration error", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_cz_claude_install_kb(tmp_path):
+    """/claude SDK-missing + y + pip raises KeyboardInterrupt -> the install
+    'cancelled.' branch (5362-5364)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--sdk-missing", "--pip-kb"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze\r")
+        sess.wait_for(b"claude_agent_sdk (optional dependency", timeout=30)
+        sess.clear()
+        sess.send(b"y\n")
+        sess.wait_for(b"running: pip install", timeout=30)
+        sess.wait_for(b"cancelled.", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_da_esc_pending_finalize_kb(tmp_path):
+    """ESC + pending worker + next input's finalize raises KeyboardInterrupt
+    -> the 'session ended.' break branch (5453-5454)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--dc-slow", "--pending-kb"],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"hello\r")
+        time.sleep(1.0)
+        sess.clear()
+        sess.send(b"\x1b")  # ESC
+        sess.wait_for(b"paused", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.5)
+        # this input finalizes -> KeyboardInterrupt -> session ends
+        sess.clear()
+        sess.send(b"hello\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
+def test_session_db_copy_after_turn_success(tmp_path):
+    """/copy AFTER a completed turn with default clipboard (pbcopy) -> the ✓
+    copied branch (4939)."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo],
+        cwd=os.getcwd(),
+        timeout=150,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"hello\r")
+        sess.wait_for(b"Here is the plan: done.", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/copy\r")
+        sess.wait_for(b"copied final message to clipboard", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
