@@ -92,6 +92,7 @@ class TestInstallSpecFallbacks:
         assert build_collaborate_install_spec() == ["asicode[collaborate]"]
 
 
+@pytest.mark.skipif(not HAVE_SDK, reason="claude_agent_sdk not installed")
 class TestToolAnnotations:
     """_get_tool_annotations returns None when SDK absent; neutral tools return None."""
 
@@ -110,6 +111,7 @@ class TestToolAnnotations:
         assert ann.openWorldHint is False
 
 
+@pytest.mark.skipif(not HAVE_SDK, reason="claude_agent_sdk not installed")
 class TestBuildAsrMcpServerSkips:
     """Read-only builds skip unclassified tools and schema-without-handler tools."""
 

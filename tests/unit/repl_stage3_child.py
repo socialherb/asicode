@@ -25,6 +25,20 @@ from typing import ClassVar
 
 sys.path.insert(0, os.getcwd())  # repo root: import asi / external_llm / tests.unit
 
+# Clean-install simulation: hide the real SDK from find_spec/import BEFORE any
+# external_llm import so the availability gate behaves exactly as on CI (the
+# gate probes find_spec, not sys.modules). finders raise ModuleNotFoundError
+# (importlib semantics for 'not found'), other modules are untouched.
+if os.environ.get("ASICODE_TEST_HIDE_CLAUDE_SDK"):
+
+    class _HideClaudeSdkFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "claude_agent_sdk" or fullname.startswith("claude_agent_sdk."):
+                raise ModuleNotFoundError("claude_agent_sdk hidden for pty test", name="claude_agent_sdk")
+            return None  # noqa: RET501, PLR1711 — finder protocol returns None for "not mine"
+
+    sys.meta_path.insert(0, _HideClaudeSdkFinder())
+
 
 def _main() -> int:
     p = argparse.ArgumentParser()
@@ -968,6 +982,16 @@ def _main() -> int:
             import external_llm.repl.collaborate as _collab_mod
 
             _collab_mod.is_claude_sdk_installed = lambda: False
+        if (ns.collab_crash or ns.collab_ok or ns.collab_kb) and not ns.pip_ok and not ns.pip_kb:
+            # The /claude availability gate must pass for the faked session to
+            # run. Without a real SDK (clean-install CI) the gate is False and
+            # the child stops at the y/N install prompt, hanging the pty
+            # harness (v0.2.32 release-gate failure). --pip-ok keeps its
+            # False->True flaky transition (install prompt must fire); --pip-kb
+            # keeps the gate False (install is cancelled before the session).
+            import external_llm.repl.collaborate as _collab_mod_gate
+
+            _collab_mod_gate.is_claude_sdk_installed = lambda: True
         if ns.collab_crash:
             # _run_collaborate_session is a module-level async fn in repl_impl;
             # raising inside it drives the /claude except branch (verbose traceback).

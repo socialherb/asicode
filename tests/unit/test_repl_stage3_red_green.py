@@ -1923,6 +1923,40 @@ def test_session_cm_claude_collab_crash_verbose(tmp_path):
         sess.close()
 
 
+def test_session_cm2_collab_crash_without_real_sdk(tmp_path):
+    """--collab-crash with NO real SDK visible (clean-install CI): the child
+    must fake the availability gate True so the faked session runs instead of
+    parking at the y/N install prompt (v0.2.32 release-gate regression).
+    ASICODE_TEST_HIDE_CLAUDE_SDK=1 makes the child's is_claude_sdk_installed
+    probe fail closed before the child applies its fakes."""
+    from tests.unit.pty_driver import SpawnPtySession
+
+    repo = str(tmp_path)
+    child_env = dict(os.environ)
+    child_env["ASICODE_TEST_HIDE_CLAUDE_SDK"] = "1"
+    sess = SpawnPtySession(
+        [sys.executable, _CHILD, "--repo", repo, "--collab-crash", "--verbose"],
+        cwd=os.getcwd(),
+        timeout=120,
+        env=child_env,
+    )
+    try:
+        sess.wait_for(b"asicode", timeout=60)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.3)
+        sess.clear()
+        sess.send(b"/claude analyze the repo\r")
+        sess.wait_for(b"\xe2\x9c\x97 collaboration error: fake collaboration crash", timeout=30)
+        sess.wait_for(b"Code mode", timeout=30)
+        time.sleep(0.2)
+        sess.clear()
+        sess.send(b"exit\r")
+        sess.wait_for(b"session ended.", timeout=30)
+        assert sess.wait(timeout=30) == 0
+    finally:
+        sess.close()
+
+
 def test_session_cn_ctrl_d_eof_prompt(tmp_path):
     """Ctrl+D at the prompt -> EOFError -> session summary + exit (the
     _prompt_input EOF branch in the main turn loop)."""
