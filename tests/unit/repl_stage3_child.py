@@ -441,6 +441,15 @@ def _main() -> int:
             repl_impl._checkpoint_changed_files = lambda repo_root, checkpoint_id: ["a.txt"]
 
         # ── OCR enrichment ──
+        if ns.ocr_text or ns.ocr_fail:
+            # The 3c block is gated on the DECLARED vision capability
+            # (model_registry.vision_capable → model_catalog.MODEL_CAPABILITIES), so
+            # the branch this flag exists to cover is only reachable with an id
+            # declared vision=False.  The default harness model
+            # (claude-sonnet-4-6) is undeclared, and undeclared means
+            # vision-capable: the image goes out and a rejection is absorbed by the
+            # client's strip-and-retry net.
+            ns.model = "deepseek-v4-flash"
         if ns.ocr_text:
             from external_llm import providers as _providers_mod
 

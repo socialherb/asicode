@@ -17,6 +17,7 @@ always sees a fully initialized module. Never import this module before ``asi``.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 import math
@@ -44,6 +45,7 @@ from external_llm.image_utils import _check_clipboard_image, _extract_images_fro
 from external_llm.model_catalog import (
     KNOWN_MODELS as _KNOWN_MODELS,
 )
+from external_llm.model_registry import vision_capable
 
 # ─── REPL shared state (moved from asi.py; re-exported by the asi.py barrel) ──────
 # prompt_toolkit session reused across prompts for persistent history
@@ -4569,7 +4571,10 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             _reasoning_effort, \
             _thinking_state, \
             _input_truncated, \
-            _pending_dc
+            _pending_dc, \
+            _session_id, \
+            _session_tokens, \
+            _session_t0
         # ── Slash commands (utilities) ──
         _cmd_tok = user_input.strip().split(None, 1)
         _cmd_name = _SLASH_ALIASES.get(_cmd_tok[0].lower()) if _cmd_tok else None
@@ -4917,7 +4922,7 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                         )
                     _print("", "")
                     _print("  usage: /helper <name>  or  /helper off", _C["muted"])
-                    _print("  e.g.:  /helper gpt-4o-mini  or  /helper deepseek/deepseek-chat", _C["muted"])
+                    _print("  e.g.:  /helper gpt-4o-mini  or  /helper deepseek/deepseek-flash", _C["muted"])
                 elif _helper_arg.lower() == "off":
                     _helper_provider_str = ""
                     _helper_model_str = ""
@@ -5323,6 +5328,108 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
             # already `continue` falls through here. (/orchestrate is NOT in that
             # tuple — it is a persistent mode handled by the mode-switch parsing
             # block further below, like /code and /general.)
+            return ("continue", user_input)
+
+        # ── /resume: switch the live session binding to a previous design-chat session ──
+        # Session rebinding contract: _session_id/_session_tokens/_session_t0 are declared
+        # nonlocal at the TOP of this function (they are read by earlier handlers such as
+        # /clear and the quit path), so this block must NOT re-declare them — a second
+        # nonlocal here would be a SyntaxError (use before nonlocal declaration).
+        if _cmd_name == "/resume":
+            _r_tok = user_input.strip().split(None, 1)
+            _r_arg = _r_tok[1].strip() if len(_r_tok) > 1 else ""
+            try:
+                _r_sessions = _session_mgr.list_sessions()
+            except Exception as _r_err:
+                _print(f"  session list read failed: {_r_err}", _C["red"])
+                return ("continue", user_input)
+            if not _r_sessions:
+                _print("  no previous sessions found.", _C["muted"])
+                return ("continue", user_input)
+
+            def _r_render_list() -> None:
+                """Render the numbered session table (newest first, current marked)."""
+                _print("  design-chat sessions (newest first):", _C["sky"])
+                for _r_i, _r_s in enumerate(_r_sessions, 1):
+                    _r_sid = str(_r_s.get("session_id") or "?")
+                    _r_upd = _r_s.get("updated_at") or 0
+                    _r_when = datetime.datetime.fromtimestamp(_r_upd).strftime("%m-%d %H:%M") if _r_upd else "?"
+                    _r_mark = " 📋" if _r_s.get("has_summary") else ""
+                    _r_now = "  ← current" if _r_sid == _session_id else ""
+                    _print(f"    {_r_i}. {_r_sid}{_r_mark}{_r_now}", _C["muted"])
+                    _print(f"       updated {_r_when} · {_r_s.get('turn_count', 0)} turns", _C["muted"])
+
+            def _r_pick(arg: str) -> str | None:
+                """Resolve a user-supplied selector (index / exact id / substring) → session_id.
+
+                Prints diagnostics and returns None on no/ambiguous match. Pure listing
+                data — no I/O beyond what list_sessions already did."""
+                _ids = [str(s.get("session_id") or "") for s in _r_sessions]
+                if arg.isdigit():
+                    _idx = int(arg)
+                    if 1 <= _idx <= len(_r_sessions):
+                        return _r_sessions[_idx - 1].get("session_id")
+                    _print(f"  no session #{arg}  (valid: 1-{len(_r_sessions)})", _C["yellow"])
+                    return None
+                if arg in _ids:
+                    return arg
+                _matches = [sid for sid in _ids if arg.lower() in sid.lower()]
+                if len(_matches) == 1:
+                    return _matches[0]
+                if len(_matches) > 1:
+                    _print(f"  {len(_matches)} sessions match '{arg}':", _C["yellow"])
+                    for _mi, _mid in enumerate(_matches, 1):
+                        _print(f"    {_mi}. {_mid}", _C["muted"])
+                    _print("  (use a longer prefix or a numeric index)", _C["muted"])
+                else:
+                    _print(f"  no session matching '{arg}'.", _C["yellow"])
+                return None
+
+            # Resolve the target: explicit arg, else table + interactive pick (TTY only).
+            _r_target = _r_pick(_r_arg) if _r_arg else None
+            if _r_arg and _r_target is None:
+                return ("continue", user_input)
+            if _r_target is None:
+                _r_render_list()
+                _print("  usage: /resume <n|id>", _C["muted"])
+                if not sys.stdin.isatty():
+                    return ("continue", user_input)
+                try:
+                    _r_ans = _collect_input("  resume which? [n / id / Enter=cancel] ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    _r_ans = ""
+                if not _r_ans:
+                    _print("  cancelled.", _C["muted"])
+                    return ("continue", user_input)
+                _r_target = _r_pick(_r_ans)
+                if _r_target is None:
+                    return ("continue", user_input)
+
+            if _r_target == _session_id:
+                _print("  already on that session.", _C["muted"])
+                return ("continue", user_input)
+
+            # Unfinalize any pending design chat first — its turns belong to the OLD
+            # session id, so flushing them AFTER the rebind would land in the NEW one.
+            if _pending_dc is not None:
+                try:
+                    _finalize_pending_design_chat(_pending_dc, _session_mgr, _session_id, svc.model or "")
+                except Exception as _r_fe:
+                    logging.getLogger(__name__).warning("pending design chat finalize failed: %s", _r_fe)
+                finally:
+                    _pending_dc = None
+
+            # Rebind session state. The binding lives in this function's locals (declared
+            # nonlocal at the top), so this write propagates to every
+            # get_or_create/add_turn/run(session_id=…) site below — the whole REPL
+            # (orchestrator, design chat, compression) transparently follows. Token
+            # counters are reset: usage belongs to the session's lifetime, not the process.
+            _session_id = _r_target
+            _session_mgr.get_or_create(_session_id)
+            _session_tokens = {"prompt": 0, "completion": 0, "cost": 0.0, "actual_cost": 0.0}
+            _session_t0 = time.monotonic()
+            _print(f"  ✓ resumed session {_session_id}", _C["green"])
+            _print("  conversation history (summary + recent turns) is shared on the next turn.", _C["muted"])
             return ("continue", user_input)
 
         # ── /claude: Claude Code Agent collaboration ──
@@ -5868,8 +5975,16 @@ def _run_repl_impl(args: argparse.Namespace) -> None:
                 for _i, _cm in enumerate(_context_msgs)
             ]
 
-            # 3c. OCR enrichment: extract text from images for non-vision contexts
-            if _current_user_images:
+            # 3c. OCR enrichment: for non-vision contexts ONLY — a model that reads
+            # the image must not also be handed a SYSTEM-role transcription of it
+            # (double cost for the same pixels, and OCR mistakes would outrank the
+            # image they came from).  Undeclared ids count as vision-capable: the
+            # image goes out and a rejection is absorbed by the client's
+            # strip-and-retry net, which is the same rule the client itself uses.
+            # The route is part of the question: one id reads images behind a
+            # gateway and rejects them at the vendor, so the base URL decides
+            # (getattr keeps injected/fake services on the route-agnostic default).
+            if _current_user_images and not vision_capable(svc.model or "", getattr(svc, "route_base", "")):
                 try:
                     from external_llm.providers import _images_to_text
 

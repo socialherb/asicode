@@ -625,7 +625,7 @@ def test_get_default_model():
     assert ExternalLLMService._get_default_model("openai") == "gpt-5.6-sol"
     assert ExternalLLMService._get_default_model("anthropic") == "claude-sonnet-5"
     assert ExternalLLMService._get_default_model("google") == "gemini-2.5-flash"
-    assert ExternalLLMService._get_default_model("deepseek") == "deepseek-v4-flash"
+    assert ExternalLLMService._get_default_model("deepseek") == "deepseek-flash"
     assert ExternalLLMService._get_default_model("zai") == "glm-5.3"
     assert ExternalLLMService._get_default_model("openrouter") == "deepseek/deepseek-v4-flash"
     assert ExternalLLMService._get_default_model("opencode") == "deepseek-v4-flash"

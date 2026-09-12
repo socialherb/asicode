@@ -1502,11 +1502,25 @@ def _print_session_summary(session_tokens: dict, t0: float) -> None:
     debug _log line). Token counts / elapsed time are objective usage metrics, so
     they're kept. This principle applies uniformly to every run-summary token line
     and the session-end summary.
+
+    The accumulated session cost IS persisted here — to the log file only, never
+    the terminal: this function is the single funnel for every session-end path
+    (quit, Ctrl+C, design-chat exit), so the session's cost estimate would
+    otherwise be lost with the session (the per-turn _log lines cover turns,
+    not the session total). The "asicode.session" logger name is INFO-suppressed
+    on the terminal by _TerminalInfoFilter but always kept by the file handler.
     """
     pt = session_tokens.get("prompt", 0)
     ct = session_tokens.get("completion", 0)
     if not (pt or ct):
         return
+    # File-only session cost record (see docstring). Skipped when both are 0
+    # (local models report no cost data — nothing to record).
+    cost = session_tokens.get("cost", 0.0) or 0.0
+    actual = session_tokens.get("actual_cost", 0.0) or 0.0
+    if cost or actual:
+        suffix = f" (actual billed ${actual:.4f}, cache savings)" if actual and abs(actual - cost) > 1e-6 else ""
+        logging.getLogger("asicode.session").info("session cost: estimated $%.4f%s", cost, suffix)
     dur = _fmt_elapsed(time.monotonic() - t0)
     _print(
         f"  session  {dur}  ·  ↑{_abbrev_tokens(pt)} ↓{_abbrev_tokens(ct)} tokens",
@@ -1556,6 +1570,12 @@ _SLASH_COMMANDS: list[tuple[str, tuple[str, ...], str, str]] = [
         "<task>",
         "enter Orchestrator mode (persistent — inherits session context; /code to exit)",
     ),
+    (
+        "/resume",
+        (),
+        "[n|id]",
+        "switch to a previous design-chat session (no arg: list sessions, pick by number/id)",
+    ),
     ("/quit", (":q", "/exit"), "", "end the session"),
 ]
 
@@ -1568,7 +1588,7 @@ _FAILURE_PATTERNS_SUBCOMMANDS: list[str] = ["list", "clear", "drop", "prune"]
 # Section groups for /help rendering — a flat list of 15 is slow to scan. Commands not listed here
 # are gathered into the "other" section by _render_help, so omissions still display.
 _SLASH_GROUPS: list[tuple[str, tuple[str, ...]]] = [
-    ("session", ("/help", "/status", "/clear", "/quit")),
+    ("session", ("/help", "/status", "/clear", "/resume", "/quit")),
     ("model", ("/model", "/helper", "/think")),
     ("mode", ("/code", "/general", "/orchestrate", "/claude", "/auto")),
     ("output", ("/diff", "/undo", "/copy")),
@@ -2190,6 +2210,35 @@ class _SlashCommandCompleter:
             yield from self._yield_subcommand_completions(after, _FAILURE_PATTERNS_SUBCOMMANDS)
         elif cmd_name == "/insights":
             yield from self._yield_subcommand_completions(after, _INSIGHTS_SUBCOMMANDS)
+        elif cmd_name == "/resume":
+            yield from self._yield_session_completions(after)
+
+    def _yield_session_completions(self, prefix):
+        """Session-id autocomplete for /resume — reads the on-disk session list lazily.
+
+        No eager I/O: the glob runs only when the user actually types '/resume ' (tab
+        or during typing). Completer runs inline in the ptk event loop (see
+        get_completions_async docstring), so the list must stay cheap — capped at
+        list_sessions' 20 newest entries, prefix-filtered. On read failure yields
+        nothing (best-effort UX, never breaks input)."""
+        try:
+            from external_llm.design_session import DesignSessionManager
+
+            _mgr = DesignSessionManager(str(Path.cwd()))
+            _sids = [s.get("session_id", "") for s in _mgr.list_sessions()]
+        except Exception:
+            # Best-effort UX (never break input) — but observable, not silent.
+            logging.getLogger(__name__).debug("/resume session completion failed", exc_info=True)
+            return
+        _low = prefix.strip().lower()
+        for _sid in _sids:
+            if _sid and _sid.lower().startswith(_low):
+                yield Completion(
+                    _sid,
+                    start_position=-len(prefix),
+                    display=_sid,
+                    display_meta="design-chat session",
+                )
 
     def _yield_model_completions(self, prefix):
         """Model-name autocomplete for the /model command.

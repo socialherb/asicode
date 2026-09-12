@@ -85,6 +85,7 @@ EXCLUDE_FILES = {
     # repository by construction, so these tests cannot run there — they
     # belong upstream of the export, exactly like the three above.
     "tests/unit/test_release_verify_mode.py",
+    "tests/unit/test_release_egg_info_gate.py",
     "tests/unit/test_export_coupled_pattern.py",
     # Fifth of the family: ghost-import gate enumerates tracked files via
     # `git ls-files` — meaningless in the non-git snapshot.

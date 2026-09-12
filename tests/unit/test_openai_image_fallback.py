@@ -1,11 +1,19 @@
 """Non-vision models must never receive image_url parts.
 
-deepseek-v4-flash via OpenCode Go returns HTTP 400 ("Upstream request failed")
-for ANY image_url part — verified 2026-07-26 with a 67-byte 1x1 PNG, the same
-400 as a 1.5 MB screenshot — and the native DeepSeek API is likewise text-only.
-Images therefore convert to OCR/placeholder text before the request for known
-text-only models (model_registry.TEXT_ONLY_MODEL_PREFIXES), with a one-shot
-strip-and-retry net in _request_with_retry for models not yet in the registry.
+deepseek-v4-flash via OpenCode Go returns HTTP 400 ("Model only supports text
+input; received unsupported content type 'image_url'") for ANY image_url part —
+verified 2026-07-26 with a 67-byte 1x1 PNG, the same 400 as a 1.5 MB screenshot,
+and re-measured 2026-09-10 at max_tokens 128-4096.  Images therefore convert to
+OCR/placeholder text before the request for every id whose DECLARED capability
+vector says ``vision=False`` (model_catalog.MODEL_CAPABILITIES, read through
+model_registry.text_only_model), with a one-shot strip-and-retry net in
+_request_with_retry for models not yet in the registry.
+
+The declaration decides, not the name: the same 2026-09-10 probe saw
+``deepseek-v4-flash-vision-exp`` read a test image correctly while the
+``deepseek-v4`` family prefix still called it text-only, and ``deepseek-v4-pro``
+answer "NOIMAGE" — accepting the part and dropping it, the worst case, since the
+model then has neither the image nor the OCR text.
 """
 
 from __future__ import annotations
@@ -89,6 +97,29 @@ def test_vision_unknown_model_gets_image_parts():
     assert content[0]["type"] == "image_url"
     assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert content[-1] == {"type": "text", "text": "what is this?"}
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "deepseek-v4-flash-vision-exp",
+        "openrouter/deepseek/deepseek-v4-flash-vision-exp",
+        "deepseek-flash",
+    ],
+)
+def test_declared_vision_model_keeps_image_parts(model):
+    """The declared vector wins over the family prefix (V-1).
+
+    ``deepseek-v4`` in TEXT_ONLY_MODEL_PREFIXES used to match
+    ``deepseek-v4-flash-vision-exp``, so the one id whose name says it reads images
+    was handed OCR text instead — and because no image part ever went out, the
+    gateway could not return the 400 that would have corrected the guess.  Live
+    2026-09-10: the id reads a red/blue test image correctly.
+    """
+    content = _openai_content(_img_msg(), model)
+    assert isinstance(content, list)
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
 def test_no_images_passes_through():

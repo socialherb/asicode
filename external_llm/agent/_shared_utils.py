@@ -769,6 +769,9 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
     # DeepSeek — V4-Pro 75% discount made permanent 2026-05-22
     "deepseek-v4-flash": (0.14, 0.28),
     "deepseek-v4-pro": (0.435, 0.87),
+    # DeepSeek V4.1 Flash (GA 2026-09-10) — off-peak 0.15/0.60, cache 0.003
+    # (DeepSeek pricing notice effective 2026-09-10 04:00 UTC).
+    "deepseek-flash": (0.15, 0.60),
     "deepseek-reasoner": (0.55, 2.19),
     "deepseek-r1": (0.55, 2.19),
     "deepseek-chat": (0.27, 1.10),
@@ -818,14 +821,19 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
     "minimax/minimax-m3": (0.30, 1.20),
     "z-ai/glm-5.2": (0.966, 3.036),
     "qwen/qwen3.7-max": (1.475, 4.425),
-    # Z.AI — source: https://docs.z.ai/guides/overview/pricing (verified 2026-06)
+    # Z.AI — source: https://docs.z.ai/guides/overview/pricing (verified 2026-06;
+    # glm-5.3/5.3-flash/4.6/4.5-air refreshed 2026-09-07 from the same docs +
+    # OpenRouter live pricing).
+    "glm-5.3": (1.40, 4.40),
+    "glm-5.3-flash": (0.15, 0.50),  # list price; 50% promo (0.075/0.25) ends 2026-09-09
     "glm-5.2": (1.40, 4.40),
     "glm-5.1": (1.40, 4.40),
     "glm-5-turbo": (1.20, 4.00),
     "glm-5": (1.00, 3.20),
     "glm-4.7": (0.60, 2.20),
-    "glm-4.6": (0.60, 2.20),
+    "glm-4.6": (0.43, 1.75),
     "glm-4.5": (0.60, 2.20),
+    "glm-4.5-air": (0.13, 0.85),
 }
 
 # OpenCode gateway model pricing — $/1M (input, output) per token.
@@ -852,6 +860,7 @@ _MODEL_COST_PER_M: dict[str, tuple[float, float]] = {
 # for the explicit keep-list.
 _OPENCODE_COST_PER_M: dict[str, tuple[float, float]] = {
     # DeepSeek (off-peak tier)
+    "deepseek-flash": (0.15, 0.60),  # V4.1 Flash (2026-09-10 GA; Go plan 0.15/0.60 off-peak, cached read 0.003)
     "deepseek-v4-flash": (0.22, 0.66),
     "deepseek-v4-flash-vision-exp": (0.22, 0.66),
     "deepseek-v4-pro": (0.66, 1.98),
@@ -889,6 +898,9 @@ _OPENCODE_COST_PER_M: dict[str, tuple[float, float]] = {
     "hy3": (0.14, 0.58),
     "muse-spark-1.3-contributor": (0.10, 0.20),
     "muse-spark-1.2-contributor": (0.10, 0.20),
+    # Omen Alpha — 0.20/0.66 per the OpenCode gateway price sheet (pi.dev
+    # model card, 2026-09-07).
+    "omen-alpha": (0.20, 0.66),
 }
 
 # OpenCode catalog models with NO public price — kept explicit. The parity
@@ -929,17 +941,25 @@ _MODEL_CACHE_RATE: dict[str, float] = {
     # Stored as $/1M tokens (not a discount fraction) to avoid rounding error.
     "deepseek-v4-flash": 0.0028,
     "deepseek-v4-pro": 0.003625,
+    # DeepSeek V4.1 Flash — cache-hit 0.003 (pricing notice, effective
+    # 2026-09-10 04:00 UTC; same rate as V4 Flash's 0.003 off-peak tier).
+    "deepseek-flash": 0.003,
     "deepseek-chat": 0.07,
     "deepseek-reasoner": 0.14,
     "deepseek-r1": 0.14,
     # Z.AI GLM models — source: https://docs.z.ai/guides/overview/pricing
+    # (glm-5.3/5.3-flash/4.6/4.5-air refreshed 2026-09-07 from the same docs +
+    # OpenRouter live pricing).
+    "glm-5.3": 0.26,
+    "glm-5.3-flash": 0.03,
     "glm-5.2": 0.26,
     "glm-5.1": 0.26,
     "glm-5-turbo": 0.24,
     "glm-5": 0.20,
     "glm-4.7": 0.11,
-    "glm-4.6": 0.11,
+    "glm-4.6": 0.08,
     "glm-4.5": 0.11,
+    "glm-4.5-air": 0.025,
 }
 
 # OpenCode gateway cached-input rates — $/1M tokens (same Go/Zen sources as
@@ -948,6 +968,7 @@ _MODEL_CACHE_RATE: dict[str, float] = {
 # off-peak / ≤window tiers, consistent with ``_OPENCODE_COST_PER_M``.
 _OPENCODE_CACHE_RATE: dict[str, float] = {
     # DeepSeek (off-peak)
+    "deepseek-flash": 0.003,  # V4.1 Flash cached-read rate (Go off-peak sheet)
     "deepseek-v4-flash": 0.007,
     "deepseek-v4-flash-vision-exp": 0.007,
     "deepseek-v4-pro": 0.022,
@@ -985,6 +1006,8 @@ _OPENCODE_CACHE_RATE: dict[str, float] = {
     "hy3": 0.035,
     "muse-spark-1.3-contributor": 0.002,
     "muse-spark-1.2-contributor": 0.002,
+    # Omen Alpha — cache read 0.04 per the 2026-09-07 price card.
+    "omen-alpha": 0.04,
 }
 
 

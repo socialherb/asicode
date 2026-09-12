@@ -82,6 +82,16 @@ class IntelligentLLMService:
 
         logger.info("Initialized IntelligentLLMService: provider=%s, model=%s", provider, self.model)
 
+    @property
+    def route_base(self) -> str:
+        """Base URL of the route this service's underlying client posts to.
+
+        Forwarded from ``ExternalLLMService.route_base`` so a caller holding either
+        service can ask the route-scoped question (``model_registry.vision_capable``)
+        without reaching into ``llm_service.client``.
+        """
+        return self.llm_service.route_base
+
     def _emit_progress(
         self,
         progress_callback: Callable[[str, str, int | None, int | None], None] | None,

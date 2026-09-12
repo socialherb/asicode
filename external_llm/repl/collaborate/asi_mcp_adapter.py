@@ -188,8 +188,15 @@ _EXCLUDED_TOOLS: set[str] = {
     "delegate_to_helper",  # internal sub-agent delegation
     "update_memory",  # asicode internal memory
     "read_image",  # LLM sees OCR text via system; schema overhead not worth it
-    "grep",  # overlaps native Grep; low MCP added value (but Bash is now MCP-exposed since native Bash is disallowed)
-    "glob",  # overlaps native Glob; same reasoning as grep
+    # grep/glob: real read-only MCP handlers exist (both are in ToolRegistry's
+    # cacheable read set), but this list is shared with the editor's MCP clients,
+    # which carry their own search tools. Collaboration sessions disallow native
+    # Grep/Glob, so there the read-only shell prefixes (grep/rg/find) are the
+    # search path — exposing these two would be a strict improvement for that
+    # caller but changes the tool surface for every client, so it is a separate
+    # change, not a free win.
+    "grep",
+    "glob",
     "search_web",  # Claude Code has native web search
     "web_fetch",  # Claude Code has native web fetch
     "browser_action",  # Claude Code has native browser automation
@@ -226,13 +233,23 @@ _DESTRUCTIVE_TOOLS: set[str] = {
     "edit_file",
 }
 
-# Not strictly read-only, but safe to expose to analysis sessions.
-# Read-only sessions are exposed via whitelist (_READ_ONLY_TOOLS U this set) only —
-# the blacklist (_DESTRUCTIVE_TOOLS) approach is fail-open: if a new handler is
-# misclassified, write tools leak into the analysis session.
+# Not read-only themselves, but exposable to analysis sessions — this set is the
+# FIRST of two layers. Read-only sessions are exposed via whitelist
+# (_READ_ONLY_TOOLS U this set) only — the blacklist (_DESTRUCTIVE_TOOLS) approach
+# is fail-open: if a new handler is misclassified, write tools leak into the
+# analysis session.
+#
+# A name whitelist cannot judge `bash`: the shell is a CHANNEL, not a tool — the
+# same handler that runs `git status` also writes files (cp/mv/tee/>), rewrites git
+# state (git stash, git commit) and runs arbitrary code
+# (python3 -c "open('f','w')…"). So read-only sessions add a SECOND layer, the act
+# gate in `_read_only_refusal` (wired by `_make_async_handler`): every call is
+# classified with ToolRegistry's mutation SSOT and refused when it mutates.
+# Keeping bash exposed UNDER that gate is what makes read-only inspection (ls,
+# grep, git status, find) possible at all.
 _ANALYSIS_SAFE_TOOLS: set[str] = {
     "ask_user",
-    "bash",  # shell command execution — needed in analysis mode for file lookup/search/stats etc.
+    "bash",  # shell commands — read-only acts only (see the act gate above)
 }
 
 # ─── Read-tool executor isolation ─────────────────────────────────────────
@@ -295,7 +312,11 @@ The verdict is your final output — write NOTHING after calling StructuredOutpu
 _READ_ONLY_SYSTEM_APPEND = """\
 - This is a READ-ONLY analysis session. Do NOT attempt to modify files — \
 no write/patch tools (apply_patch, edit_text, modify_symbol, …) are available \
-to you — and do NOT spawn sub-agents (Agent/Task are disabled). Deliver every \
+to you — and do NOT spawn sub-agents (Agent/Task are disabled). Enforcement is \
+not prose-only: a bash command that would change files or git state (cp, mv, tee, \
+>, git commit, git stash, python -c that writes, …) is REFUSED with \
+READ_ONLY_DENIED and never runs — do not retry it. Read-only shell inspection \
+still works (ls, cat, grep, find, wc, git status/log/diff/show). Deliver every \
 change you would make as concrete suggestions in the verdict, not as edits."""
 
 
@@ -303,9 +324,10 @@ def get_excluded_tools(allow_write: bool = False) -> set[str]:
     """Tools to exclude from MCP exposure for a collaboration session.
 
     Analysis mode (default): internal tools + destructive tools (apply_patch,
-    edit_*, …) are all excluded — the agent gets a read-only view. Bash is
-    allowed even in analysis mode for file inspection and utility commands.
-    Pass allow_write=True for execution-mode sessions.
+    edit_*, …) are all excluded — the agent gets a read-only view. Bash stays
+    exposed there for inspection, but only read-only commands actually run: the
+    act gate (``_read_only_refusal``) refuses any command that changes file or
+    git state. Pass allow_write=True for execution-mode sessions.
     """
     excluded = set(_EXCLUDED_TOOLS)
     if not allow_write:
@@ -361,7 +383,10 @@ def build_asr_mcp_server(
         version: Server version string.
         read_only: If True, only whitelist-classified tools
             (_READ_ONLY_TOOLS U _ANALYSIS_SAFE_TOOLS) are exposed —
-            fail-closed against unclassified new handlers.
+            fail-closed against unclassified new handlers — and every
+            dispatched call passes the act gate (``_read_only_refusal``),
+            so a whitelisted-but-mutating act (``bash git stash``) is
+            refused instead of executed.
 
     Returns:
         McpSdkServerConfig — pass to ClaudeAgentOptions(mcp_servers={"asi": result}).
@@ -411,8 +436,11 @@ def build_asr_mcp_server(
         input_schema = _convert_schema_to_input_type(s)
         annotations = _get_tool_annotations(tool_name)
 
-        # Create the async handler with closure capture via factory
-        handler = _make_async_handler(registry, tool_name)
+        # Create the async handler with closure capture via factory. read_only is
+        # forwarded so exposure and enforcement read the SAME flag — otherwise a
+        # session could be advertised read-only while its handlers dispatch
+        # mutating calls, which is exactly the hole the act gate closes.
+        handler = _make_async_handler(registry, tool_name, read_only=read_only)
 
         sdk_tools.append(
             SdkMcpTool(
@@ -464,14 +492,66 @@ def _resolve_mcp_timeout(tool_name: str, args: Any) -> int:
     return max(static, inner * reruns + _MCP_TIMEOUT_GRACE)
 
 
-def _make_async_handler(registry: ToolRegistry, tool_name: str):
+def _read_only_refusal(registry: ToolRegistry, tool_name: str, args: Any) -> str | None:
+    """Why a read-only session must not run this call — ``None`` when it may run.
+
+    The exposure whitelist (``_READ_ONLY_TOOLS U _ANALYSIS_SAFE_TOOLS``) gates tool
+    NAMES, but the shell is a channel, not a tool: ``bash`` must stay exposed for
+    inspection (``ls``, ``grep``, ``git status``, ``find``) while its SAME handler
+    writes files (``cp``/``mv``/``tee``/``>``), rewrites git state (``git stash``,
+    ``git commit``) and runs arbitrary code (``python3 -c "open('f','w')…"``). No
+    name-level whitelist can express that, so the ACT is classified here with
+    :meth:`ToolRegistry.is_read_only_call` — the mutation classifier that cache
+    invalidation, ``dispatch_parallel`` and DesignChatLoop's phase partition also
+    share — and a mutating act is refused before it reaches an executor.
+
+    Fails CLOSED: unrecognised commands classify as mutating (the classifier's
+    stated policy), and a classifier that raises refuses too, since an
+    unclassifiable call cannot be shown to be read-only.
+    """
+    try:
+        if registry.is_read_only_call(tool_name, args):
+            return None
+    except Exception:
+        # A classifier that cannot run must not widen the surface — fall through
+        # and refuse. Never silent: the traceback names the failing command shape.
+        logger.exception("Read-only session: mutation classifier failed for %s", tool_name)
+
+    command = args.get("command") if isinstance(args, dict) else None
+    detail = f" Refused command: {command!r}." if tool_name == "bash" and isinstance(command, str) else ""
+    return (
+        f"READ_ONLY_DENIED: '{tool_name}' was not executed — this collaboration session is "
+        f"READ-ONLY and the call was classified as changing file or git state.{detail} "
+        f"Read-only shell inspection still works (ls, cat, head, tail, wc, find, grep, rg, "
+        f"git status/log/diff/show). Deliver this change as a concrete suggestion in the "
+        f"verdict instead of applying it — do not retry the command."
+    )
+
+
+def _make_async_handler(registry: ToolRegistry, tool_name: str, read_only: bool = False):
     """Factory: create an async handler for a specific tool.
 
     Uses closure to properly capture tool_name without loop-variable issues.
+
+    ``read_only`` carries the session's write policy into the handler so the
+    whitelisted TOOL and the executed ACT are judged by the same flag: a
+    read-only session refuses a mutating call before it reaches an executor
+    thread, while a write session dispatches it unchanged.
     """
     import time
 
     async def handler(args: dict) -> dict[str, Any]:
+        # Act gate — first thing in the handler, before any executor hop or
+        # timeout budget is spent. The exposure whitelist decided this tool NAME
+        # may exist in the session; this decides whether THIS call may run.
+        if read_only:
+            refusal = _read_only_refusal(registry, tool_name, args)
+            if refusal is not None:
+                logger.warning("MCP tool %s refused in read-only session", tool_name)
+                return {
+                    "content": [{"type": "text", "text": refusal}],
+                    "isError": True,
+                }
         loop = asyncio.get_running_loop()
         timeout = _resolve_mcp_timeout(tool_name, args)
         # Dedicated pool for always-fast read tools so they are not queued

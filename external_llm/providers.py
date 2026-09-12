@@ -1074,6 +1074,80 @@ def _deepseek_non_stream_events(response: Any) -> Iterator[dict[str, Any]]:
     yield chunk
 
 
+# ── DeepSeek native route: shared content + request plumbing ───────────────
+# The DeepSeek endpoint is OpenAI-compatible, so both halves of image handling
+# are delegated to the implementations the OpenAI-protocol routes already use
+# instead of being re-derived here. Re-deriving them is exactly how this route
+# drifted: it folded every attachment through ``_images_to_text()``
+# unconditionally, so ``deepseek-v4-flash-vision-exp`` — the one id in the
+# catalog built to read images — sent OCR text instead, and because no image
+# part ever left the process the gateway could not return the 400 that the
+# strip-and-retry net turns into a correction. Silent in every direction: no
+# error, no warning, and no chance for the capability to be learned.
+
+
+def _deepseek_content(msg: Any, model: str, base: str) -> Any:
+    """Content for one DeepSeek message: str, or a parts list when images may go.
+
+    Delegates the decision to ``openai_client._openai_content`` — the single
+    function the OpenAI/OpenRouter/OpenCode/ZAI routes use — so the vision axis
+    (declaration table first, name-prefix table as the fallback for undeclared
+    ids, runtime-learned rejections in between) is consulted in exactly one
+    place per protocol. Imported lazily because openai_client pulls in the agent
+    package, which providers must not load at import time.
+    """
+    from .openai_client import _openai_content
+
+    return _openai_content(msg, model, base)
+
+
+def _deepseek_post(
+    client: DeepSeekClient,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    *,
+    stream: bool,
+) -> requests.Response:
+    """POST to the DeepSeek route, degrading image parts to OCR text on HTTP 400.
+
+    Every DeepSeek request goes through here, so the recovery covers ``chat``,
+    ``_chat_streaming`` and ``chat_with_tools`` alike. Two rules are inherited
+    from ``OpenAIClient._request_with_retry``'s net and both matter: only a 400
+    whose request actually carried image parts is retried (anything else —
+    context overflow, bad tool schema — is returned untouched so the caller
+    raises as before), and the route is only *remembered* as image-rejecting
+    when the retry is NOT another error, so an unrelated 400 cannot poison the
+    capability for the process lifetime.
+    """
+    response = client._session.post(url, headers=headers, json=payload, timeout=client.timeout, stream=stream)
+    if response.status_code != 400:
+        return response
+
+    from .openai_client import _IMAGE_REJECTING_MODELS, _bare_model_name, _norm_base, _strip_image_parts
+
+    stripped = _strip_image_parts(payload)
+    if stripped is None:
+        return response
+
+    model = str(payload.get("model", ""))
+    # Release the 400 before retrying: a streaming response whose body was never
+    # consumed would keep its connection out of the pool (same invariant the
+    # OpenAI net documents before it recurses).
+    response.close()
+    retry = client._session.post(url, headers=headers, json=stripped, timeout=client.timeout, stream=stream)
+    if retry.status_code < 400:
+        base = _norm_base(client.base_url or client.DEFAULT_BASE_URL)
+        _IMAGE_REJECTING_MODELS.add((base, _bare_model_name(model)))
+        logger.warning(
+            "DeepSeek HTTP 400 with image attachment(s) — %s rejects image input on %s; "
+            "retried with OCR text and remembered for this process",
+            model,
+            base,
+        )
+    return retry
+
+
 class DeepSeekClient(LLMClient):
     """
     DeepSeek API client
@@ -1082,7 +1156,17 @@ class DeepSeekClient(LLMClient):
     """
 
     DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
-    DEFAULT_MODEL = "deepseek-v4-flash"
+    # Must be an id this vendor's own registry serves. ``GET {base}/models``
+    # answers with exactly ``deepseek-flash`` + ``deepseek-v4-pro``, and every
+    # other deepseek spelling answers 404 "Model Not Found" — including the id
+    # that used to sit here (``deepseek-v4-flash``, a spelling only the opencode
+    # gateway serves). Every modelless call (``chat`` / ``chat_with_tools`` /
+    # ``_chat_streaming`` all do ``if not model: model = self.DEFAULT_MODEL``)
+    # therefore used to send an id the endpoint does not route. See
+    # KNOWN_MODELS["deepseek"] for the 2026-09-11 probe and the models.dev
+    # conflict; the live gate in test_model_catalog_context_parity re-reads the
+    # registry, and the tier-membership gate there pins this constant to it.
+    DEFAULT_MODEL = "deepseek-flash"
 
     def get_provider_name(self) -> str:
         return "deepseek"
@@ -1108,15 +1192,13 @@ class DeepSeekClient(LLMClient):
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-        # Convert to DeepSeek format (same as OpenAI)
+        # Convert to DeepSeek format (same as OpenAI) — attachments included:
+        # _deepseek_content() asks the capability axis, so a declared-vision id
+        # keeps its images on the wire instead of being replaced by OCR text.
         is_reasoner = "reasoner" in (model or "").lower()
         api_messages: list[dict[str, Any]] = []
         for msg in messages:
-            images = getattr(msg, "images", None)
-            content = msg.content
-            if images:
-                content = _images_to_text(images) + ("\n" + content if content else "")
-            d: dict[str, Any] = {"role": msg.role, "content": content}
+            d: dict[str, Any] = {"role": msg.role, "content": _deepseek_content(msg, model, base_url)}
             # DeepSeek Reasoner: reasoning_content is REQUIRED on all assistant messages
             if msg.role == "assistant":
                 rc = getattr(msg, "reasoning_content", None) or ""
@@ -1171,7 +1253,7 @@ class DeepSeekClient(LLMClient):
         t0 = time.monotonic()
 
         try:
-            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
+            response = _deepseek_post(self, url, headers, payload, stream=False)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -1289,7 +1371,7 @@ class DeepSeekClient(LLMClient):
         t0 = time.monotonic()
         response = None
         try:
-            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout, stream=True)
+            response = _deepseek_post(self, url, headers, payload, stream=True)
 
             if response.status_code in (401, 403):
                 err_label = "authentication" if response.status_code == 401 else "forbidden"
@@ -1435,11 +1517,10 @@ class DeepSeekClient(LLMClient):
 
         api_messages: list[dict[str, Any]] = []
         for m in messages:
-            images = getattr(m, "images", None)
-            content = m.content
-            if images:
-                content = _images_to_text(images) + ("\n" + content if content else "")
-            d: dict[str, Any] = {"role": m.role, "content": content}
+            # Same single source of truth as chat(): the tools path historically
+            # dropped attachments entirely, so both paths must build content
+            # through one function to stay byte-identical for the same input.
+            d: dict[str, Any] = {"role": m.role, "content": _deepseek_content(m, model, base_url)}
             if m.role == "assistant" and getattr(m, "tool_calls", None):
                 d["tool_calls"] = m.tool_calls
                 if d.get("content") is None:
@@ -1509,7 +1590,7 @@ class DeepSeekClient(LLMClient):
         t0 = time.monotonic()
         response = None
         try:
-            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout, stream=use_stream)
+            response = _deepseek_post(self, url, headers, payload, stream=use_stream)
 
             if response.status_code == 401:
                 raise LLMAuthenticationError("Invalid DeepSeek API key.")

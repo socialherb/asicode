@@ -64,12 +64,28 @@ class FakeSession:
 
 
 class FakeDSM:
+    # Class-level instance log — the spawned child's /resume test reads the
+    # per-session turn record from here (same pattern as FakeToolRegistry.instances).
+    instances: ClassVar[list] = []
+
     def __init__(self, repo_root):
         self.repo_root = repo_root
         self.sessions = {}
+        FakeDSM.instances.append(self)
 
     def get_or_create(self, sid):
         return self.sessions.setdefault(sid, FakeSession())
+
+    def list_sessions(self):
+        """/resume support: fake on-disk session table (newest first).
+
+        'cli-older' sorts FIRST so index 1 is the non-default candidate — an
+        index pick must be able to move AWAY from the auto-created default
+        session for the rebind test to mean anything."""
+        return [
+            {"session_id": "cli-older", "created_at": 0.0, "updated_at": 111.0, "turn_count": 7, "has_summary": True},
+            {"session_id": "cli-newer", "created_at": 0.0, "updated_at": 222.0, "turn_count": 2, "has_summary": False},
+        ]
 
     def add_turn(self, session_id, role, note, **kw):
         self.get_or_create(session_id).add_turn(session_id, role, note, **kw)

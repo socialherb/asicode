@@ -10,6 +10,7 @@ import pytest
 import requests
 
 import external_llm.providers as providers_module
+from external_llm import openai_client
 from external_llm.client import (
     LLMAPIError,
     LLMAuthenticationError,
@@ -19,6 +20,8 @@ from external_llm.client import (
     LLMRateLimitError,
     LLMServerUnavailableError,
 )
+from external_llm.model_catalog import KNOWN_MODELS
+from external_llm.model_registry import vision_capable
 from external_llm.providers import DeepSeekClient
 
 
@@ -57,12 +60,21 @@ def test_get_provider_name() -> None:
 
 
 def test_chat_default_model_and_message_serialization(monkeypatch) -> None:
-    monkeypatch.setattr(providers_module, "_images_to_text", lambda imgs: "OCR!")
+    """Empty ``model`` falls back to ``DEFAULT_MODEL``, and that id is declared to
+    read images — so the attachment must go out as a part, not as OCR text (the OCR
+    branch belongs to text-only ids; see
+    test_text_only_model_still_folds_images_into_text).
+    """
+    monkeypatch.setattr(
+        providers_module,
+        "_images_to_text",
+        lambda _imgs: pytest.fail("the default model reads images — OCR must not run"),
+    )
     c = _client(_resp(json_data=_ok_json()))
     c.chat(
         [
             LLMMessage(role="system", content="S"),
-            LLMMessage(role="user", content="u", images=[{"data": "x"}]),
+            LLMMessage(role="user", content="u", images=_image_uri()),
             LLMMessage(role="assistant", content="a", reasoning_content="cot"),
             LLMMessage(role="assistant", content="b"),
         ],
@@ -72,9 +84,15 @@ def test_chat_default_model_and_message_serialization(monkeypatch) -> None:
     sent = c._session.post.call_args
     assert "/chat/completions" in sent.args[0]
     payload = sent.kwargs["json"]
-    assert payload["model"] == "deepseek-v4-flash"
+    assert payload["model"] == "deepseek-flash"
     assert payload["max_tokens"] == 50
-    assert payload["messages"][1] == {"role": "user", "content": "OCR!\nu"}
+    assert payload["messages"][1] == {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "u"},
+        ],
+    }
     assert payload["messages"][2]["reasoning_content"] == "cot"
 
 
@@ -276,7 +294,7 @@ def test_chat_with_tools_default_model_and_messages() -> None:
     c.chat_with_tools(
         [
             LLMMessage(role="system", content="S"),
-            LLMMessage(role="user", content="u", images=[{"data": "x"}]),
+            LLMMessage(role="user", content="u", images=_image_uri()),
             LLMMessage(
                 role="assistant",
                 content=None,
@@ -291,10 +309,13 @@ def test_chat_with_tools_default_model_and_messages() -> None:
     sent = c._session.post.call_args
     assert "/chat/completions" in sent.args[0]
     payload = sent.kwargs["json"]
-    assert payload["model"] == "deepseek-v4-flash"
+    assert payload["model"] == "deepseek-flash"
     assert payload["stream"] is True
     msgs = payload["messages"]
-    assert msgs[1]["content"].startswith("[Image 1")  # _images_to_text applied
+    assert msgs[1]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "text", "text": "u"},
+    ]  # the default model reads images — no OCR text
     assert msgs[2]["tool_calls"] is not None and msgs[2]["content"] == ""
     assert msgs[3]["tool_call_id"] == "c1" and msgs[3]["name"] == "f"
     assert payload["tools"][0]["function"]["name"] == "f"
@@ -742,3 +763,171 @@ def test_chat_with_tools_null_function_in_tool_call_delta() -> None:
     assert r.tool_calls[0].args == {}
     assert r.tool_calls[0].call_id == "tc1"
     assert r.finish_reason == "tool_calls"
+
+
+# ── image capability axis on the native route ────────────────────────────────
+# The native route folded EVERY attachment through _images_to_text(), so the one
+# catalog id built to read images (deepseek-v4-flash-vision-exp) never put an
+# image on the wire — and because no image part left the process, the gateway
+# could not return the 400 that the strip-and-retry net turns into a correction.
+# Silent in every direction: no error, no warning, nothing learned. These tests
+# pin the repaired axis: one content builder shared by both entry points, the
+# declaration table as the decision, and a recovery path for the unverified case.
+
+
+@pytest.fixture
+def learned_rejections(monkeypatch) -> set:
+    """Isolate the process-wide (base_url, model) set that the recovery writes."""
+    learned: set = set()
+    monkeypatch.setattr(openai_client, "_IMAGE_REJECTING_MODELS", learned)
+    return learned
+
+
+def _route_key(model: str) -> tuple[str, str]:
+    return (openai_client._norm_base(DeepSeekClient.DEFAULT_BASE_URL), openai_client._bare_model_name(model))
+
+
+def _image_uri(ocr_text: str = "OCR-BODY") -> list[dict[str, str]]:
+    return [{"data": "AAAA", "media_type": "image/png", "ocr_text": ocr_text}]
+
+
+def test_chat_declared_vision_model_sends_image_parts(monkeypatch) -> None:
+    """The vision variant must get image_url parts. _images_to_text is
+    booby-trapped so a regression fails loudly instead of quietly succeeding."""
+
+    def _boom(_imgs):
+        raise AssertionError("declared-vision model must not be routed through OCR")
+
+    monkeypatch.setattr(providers_module, "_images_to_text", _boom)
+    c = _client(_resp(json_data=_ok_json()))
+    c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model="deepseek-v4-flash-vision-exp")
+    content = c._session.post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    assert content[1] == {"type": "text", "text": "u"}
+
+
+def test_chat_with_tools_declared_vision_model_sends_image_parts(monkeypatch) -> None:
+    """Parity with chat(): the tools path historically dropped attachments
+    entirely, so both entry points must build the same content for one input."""
+    monkeypatch.setattr(providers_module, "_images_to_text", lambda _imgs: pytest.fail("unexpected OCR"))
+    c = _client(_resp(sse=[_tc_chunk({"content": "ok"}, "stop")]))
+    c.chat_with_tools(
+        [LLMMessage(role="user", content="u", images=_image_uri())],
+        tools=[],
+        model="deepseek-v4-flash-vision-exp",
+        token_callback=lambda _t: None,
+    )
+    content = c._session.post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["image_url"]["url"] == "data:image/png;base64,AAAA"
+
+
+def test_text_only_model_still_folds_images_into_text() -> None:
+    """The other half of the axis: a declared text-only id keeps its OCR fold
+    (its gateway 400s on image_url parts even for a 1x1 PNG)."""
+    c = _client(_resp(json_data=_ok_json()))
+    c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model="deepseek-v4-flash")
+    content = c._session.post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert content == "[Image 1 — OCR Extracted Text:\nOCR-BODY\n]\nu"
+
+
+@pytest.mark.parametrize("model_id", KNOWN_MODELS["deepseek"])
+def test_route_agrees_with_the_declared_vision_axis(model_id: str) -> None:
+    """Catalog-driven contract: whatever the pickers can offer must be
+    classified by the native route exactly as the declaration table does, so a
+    newly cataloged vision id is covered without touching this test.
+
+    Asked per ROUTE, not per id: the image axis is declared per route
+    (model_catalog.ROUTE_VISION), and this client always posts to
+    ``DEFAULT_BASE_URL``. Comparing against the route-agnostic answer instead —
+    as this test did until 2026-09-11 — passes only while every route agrees, and
+    then breaks for the wrong reason the moment one disagrees (V4.1 Flash reads
+    images both at the vendor and behind the gateway; the same id is text-only on
+    neither route today, but ``deepseek-v4-pro`` will be re-routed to it at the
+    vendor on 2026-09-14).
+    """
+    c = _client(_resp(json_data=_ok_json()))
+    c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model=model_id)
+    content = c._session.post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert isinstance(content, list) is vision_capable(model_id, DeepSeekClient.DEFAULT_BASE_URL)
+
+
+def test_400_with_images_retries_stripped_and_learns_route(learned_rejections) -> None:
+    """Native image acceptance for a versioned id is not fully measured, so a
+    400 must degrade to OCR text instead of being fatal."""
+    bad = _resp(status=400, text="unsupported content type 'image_url'")
+    c = _client(_resp(json_data=_ok_json()))
+    c._session.post.side_effect = [bad, _resp(json_data=_ok_json())]
+    out = c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model="deepseek-v4-flash-vision-exp")
+    assert out.content == "hi"
+    assert c._session.post.call_count == 2
+    assert bad.close.called  # connection released before retrying
+    retry_content = c._session.post.call_args.kwargs["json"]["messages"][0]["content"]
+    # The wire has no room for the precomputed ocr_text cache, so the strip
+    # rebuilds the attachment from the data URI and re-derives its text (the LRU
+    # OCR cache absorbs the recomputation in production).
+    assert isinstance(retry_content, str)
+    assert retry_content.startswith("[Image 1") and retry_content.endswith("\nu")
+    assert _route_key("deepseek-v4-flash-vision-exp") in learned_rejections
+
+
+def test_learned_route_sends_text_on_the_next_call(learned_rejections) -> None:
+    """Learning is per process and per route: the next call must not pay the
+    failed round trip (nor re-attach an image the route just rejected)."""
+    learned_rejections.add(_route_key("deepseek-v4-flash-vision-exp"))
+    c = _client(_resp(json_data=_ok_json()))
+    c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model="deepseek-v4-flash-vision-exp")
+    assert c._session.post.call_count == 1
+    content = c._session.post.call_args.kwargs["json"]["messages"][0]["content"]
+    assert isinstance(content, str) and "OCR-BODY" in content
+
+
+def test_400_without_images_is_not_retried() -> None:
+    """Only an image-carrying 400 is recoverable — a text-only id already sent
+    no image part, so retrying would repeat the same bad request."""
+    c = _client(_resp(status=400, text="bad tool schema"))
+    with pytest.raises(LLMAPIError):
+        c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model="deepseek-v4-flash")
+    assert c._session.post.call_count == 1
+
+
+def test_400_image_retry_that_also_fails_does_not_learn_the_route(learned_rejections) -> None:
+    """A 400 that survives the strip is not an image problem (context overflow,
+    bad schema) — teaching the route would disable vision for the process."""
+    c = _client()
+    c._session.post.side_effect = [_resp(status=400, text="a"), _resp(status=400, text="b")]
+    with pytest.raises(LLMAPIError):
+        c.chat([LLMMessage(role="user", content="u", images=_image_uri())], model="deepseek-v4-flash-vision-exp")
+    assert c._session.post.call_count == 2
+    assert learned_rejections == set()
+
+
+def test_streaming_400_with_images_retries_as_a_stream(learned_rejections) -> None:
+    """The recovery belongs to the request, not to one code path: the streaming
+    route must retry with stream=True and keep its callbacks."""
+    c = _client()
+    c._session.post.side_effect = [_resp(status=400, text="nope"), _resp(sse=[_tc_chunk({"content": "ok"}, "stop")])]
+    out = c.chat(
+        [LLMMessage(role="user", content="u", images=_image_uri())],
+        model="deepseek-v4-flash-vision-exp",
+        token_callback=lambda _t: None,
+    )
+    assert out.content == "ok"
+    assert c._session.post.call_count == 2
+    assert c._session.post.call_args.kwargs["stream"] is True
+    assert isinstance(c._session.post.call_args.kwargs["json"]["messages"][0]["content"], str)
+
+
+def test_chat_with_tools_400_with_images_retries_stripped(learned_rejections) -> None:
+    c = _client()
+    c._session.post.side_effect = [_resp(status=400, text="nope"), _resp(sse=[_tc_chunk({"content": "ok"}, "stop")])]
+    out = c.chat_with_tools(
+        [LLMMessage(role="user", content="u", images=_image_uri())],
+        tools=[],
+        model="deepseek-v4-flash-vision-exp",
+        token_callback=lambda _t: None,
+    )
+    assert out.content == "ok"
+    assert c._session.post.call_count == 2
+    assert learned_rejections != set()

@@ -233,11 +233,13 @@ class TestSubagentWorker:
 class TestReplPtySession:
     CHILD = str(Path(__file__).parent / "repl_stage2_child.py")
 
-    def _spawn(self, repo_root, timeout=60.0):
+    def _spawn(self, repo_root, timeout=60.0, extra_args=None):
         from tests.unit.pty_driver import SpawnPtySession
 
         return SpawnPtySession(
-            [sys.executable, self.CHILD, "--mode", "repl", "--repo", repo_root], cwd=os.getcwd(), timeout=timeout
+            [sys.executable, self.CHILD, "--mode", "repl", "--repo", repo_root, *(extra_args or [])],
+            cwd=os.getcwd(),
+            timeout=timeout,
         )
 
     def _send_cmd(self, sess, text):
@@ -394,3 +396,55 @@ class TestReplPtySession:
             sess.wait_for(b"compression helper: (none", timeout=30)
         finally:
             sess.close()
+
+    def test_resume_rebinds_session_id(self, tmp_path):
+        """`/resume <n>` must rebind the LIVE session binding for every later consumer.
+
+        Full-flow proof through the real dispatcher (no unit-level monkeypatch):
+        1. a chat turn runs against the default session, recording its turns
+           under the auto-created id (cli-<md5(repo)>);
+        2. `/resume 1` selects the OLDEST entry of the fake list table
+           (cli-older - deliberately sorted first so the pick moves AWAY from
+           the default), and the "resumed session cli-older" line proves the
+           switch happened;
+        3. a second chat turn must be recorded under cli-older - observed via
+           the child's `--dump-sessions` JSON (the child is a separate
+           process, so in-process instance inspection is impossible; a file
+           handoff is the same pattern the coverage harness uses).
+
+        Non-TTY stdin makes the no-arg path print the table and return without
+        prompting (documented /resume contract), so the test uses an explicit
+        index argument.
+        """
+        repo = str(tmp_path)
+        self._write_insights(repo)
+        dump_path = str(tmp_path / "sessions_dump.json")
+        sess = self._spawn(repo, extra_args=["--dump-sessions", dump_path])
+        try:
+            sess.wait_for(b"asicode", timeout=60)
+            # Turn 1: default session
+            self._send_cmd(sess, "hello world")
+            sess.wait_for(b"Here is the plan: done.", timeout=30)
+            # Switch away from the default via the table index
+            self._send_cmd(sess, "/resume 1")
+            sess.wait_for(b"resumed session cli-older", timeout=30)
+            # Turn 2: must be recorded under the RESUMED session id
+            self._send_cmd(sess, "hello again")
+            sess.wait_for(b"Here is the plan: done.", timeout=30)
+            # Clean exit so the child reaches its --dump-sessions write (the
+            # dump runs after the REPL loop returns, so a close() kill would
+            # skip it entirely).
+            self._send_cmd(sess, "exit")
+            sess.wait_for(b"session ended.", timeout=30)
+            assert sess.wait(timeout=30) == 0
+        finally:
+            sess.close()
+
+        import json as _json
+
+        dump = _json.loads(Path(dump_path).read_text(encoding="utf-8"))
+        assert "cli-older" in dump, f"resumed session never created: {sorted(dump)}"
+        turns = dump["cli-older"]
+        assert any(isinstance(t, dict) and t.get("role") == "user" for t in turns), (
+            f"post-resume user turn missing from the resumed session: {turns}"
+        )

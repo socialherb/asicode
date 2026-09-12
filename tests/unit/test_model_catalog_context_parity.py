@@ -28,6 +28,8 @@ snapshot: the contract has to hold in the wheel, not just the private tree.
 from __future__ import annotations
 
 import json
+import os
+import urllib.error
 import urllib.request
 
 import pytest
@@ -39,7 +41,7 @@ from external_llm.agent.context_budget import (
     _resolve_base_context_limit,
     _resolve_context_limit,
 )
-from external_llm.model_catalog import KNOWN_MODELS, LEGACY_MODELS, MODEL_ALIASES
+from external_llm.model_catalog import KNOWN_MODELS, LEGACY_MODELS, MODEL_ALIASES, valid_models
 from external_llm.model_registry import bare_model_name, detect_cloud_provider
 
 # ``detect_cloud_provider`` maps a model to the API that natively serves it, so
@@ -223,9 +225,12 @@ def test_opencode_catalog_is_up_to_date_with_live_api():
     live_ids = {m["id"] for m in payload["data"]}
 
     catalog = set(KNOWN_MODELS["opencode"])
-    # hy3-preview is deliberately omitted (MODEL_ALIASES → hy3), so it is
-    # expected to appear on the live API but not in the catalog.
-    expected_missing_from_catalog = {"hy3-preview"}
+    # hy3-preview is deliberately omitted (MODEL_ALIASES → hy3);
+    # deepseek-v4.1-flash is the versioned gateway spelling of deepseek-flash
+    # (MODEL_ALIASES → the vendor id the native API routes); omen-alpha is
+    # LEGACY (dropped from the Go plan 2026-09-10, id still served by the API).
+    # All three are expected to appear on the live API but not in KNOWN_MODELS.
+    expected_missing_from_catalog = {"hy3-preview", "deepseek-v4.1-flash", "omen-alpha"}
     assert catalog <= live_ids, (
         f"opencode catalog names a model the live API no longer serves: {sorted(catalog - live_ids)}"
     )
@@ -326,3 +331,110 @@ def test_provider_default_models_have_a_context_decision():
         "_CONTEXT_LIMITS (real window), _FAMILY_PREFIX_LIMITS (family), or "
         "_FALLBACK_IS_CORRECT (verified 1M):\n  " + "\n  ".join(f"{m}: {why}" for m, why in warned)
     )
+
+
+# (provider, client class name in external_llm.providers, registry listing path,
+# API-key env var). Only DeepSeek is listed: it is the one native tier whose
+# ambient key authenticates, so its registry can actually be read. The keys the
+# anthropic/openai tiers would need answer 401 here — a probe of those would go
+# red for an auth reason, not a catalog one, and a silently-skipped probe would
+# be worse than this honest absence (both tiers stay covered offline by
+# test_client_default_models_are_in_their_tier below).
+_LIVE_NATIVE_REGISTRIES = [
+    ("deepseek", "DeepSeekClient", "/models", "DEEPSEEK_API_KEY"),
+]
+
+
+@pytest.mark.parametrize("provider,client_name,path,key_env", _LIVE_NATIVE_REGISTRIES)
+def test_native_tier_is_served_by_the_vendor_registry(provider, client_name, path, key_env):
+    """A native tier asserts what ONE endpoint routes — the vendor's own.
+
+    The gateway gates above cannot cover this: a gateway serving an id proves
+    nothing about the vendor behind it. That is how ``deepseek-v4-flash`` and
+    ``deepseek-v4-flash-vision-exp`` sat in the deepseek tier — one of them being
+    ``DeepSeekClient.DEFAULT_MODEL``, i.e. the id every modelless call sends —
+    while ``api.deepseek.com`` answered 404 "Model Not Found" for both.
+
+    Needs ``DEEPSEEK_API_KEY``: the registry requires auth (unlike the gateway
+    listings) and a chat probe cannot substitute for it — a zero-balance key gets
+    402 "Insufficient Balance" *before* the model is validated, for a valid id and
+    a bogus one alike.
+    """
+    key = (os.getenv(key_env) or "").strip()
+    if not key:
+        pytest.skip(f"{key_env} not set — the vendor registry requires auth")
+
+    import external_llm.providers as providers_mod
+
+    client_cls = getattr(providers_mod, client_name)
+    base = client_cls.DEFAULT_BASE_URL.rstrip("/")
+
+    def _probe(suffix: str):
+        req = urllib.request.Request(
+            f"{base}{suffix}",
+            headers={"Authorization": f"Bearer {key}", "User-Agent": "curl/8.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as exc:
+            return exc.code, {}
+
+    status, payload = _probe(path)
+    assert status == 200, f"{provider}: registry unreachable (HTTP {status})"
+    live_ids = {m["id"] for m in payload.get("data", [])}
+    assert live_ids, f"{provider}: registry returned no ids — a subset check against an empty set passes vacuously"
+
+    catalog = set(valid_models(provider))
+    assert catalog <= live_ids, (
+        f"catalog names ids the {provider} vendor does not serve: {sorted(catalog - live_ids)} "
+        f"(registry serves {sorted(live_ids)})"
+    )
+    # Per-id probe: the listing could omit an id the endpoint still routes, and a
+    # set difference would bury that disagreement.
+    absent = sorted(m for m in catalog if _probe(f"{path}/{m}")[0] != 200)
+    assert not absent, f"{provider}: catalog ids the vendor answers non-200 for: {absent}"
+    # Anti-vacuity: the per-id probe must discriminate. A bogus id has to come back
+    # non-200, or "every catalog id answers 200" would be an artifact of an endpoint
+    # that answers 200 to anything.
+    bogus_status, _ = _probe(f"{path}/asicode-bogus-probe-xyz")
+    assert bogus_status != 200, f"{provider}: registry answered {bogus_status} for a bogus id"
+    # The id a modelless call falls back to must be one of them.
+    assert client_cls.DEFAULT_MODEL in live_ids, (
+        f"{provider}: {client_name}.DEFAULT_MODEL={client_cls.DEFAULT_MODEL!r} is not served by the vendor"
+    )
+
+
+def test_client_default_models_are_in_their_tier():
+    """Offline companion to the live gate: a ``DEFAULT_MODEL`` outside its own
+    provider's tier is unusable by construction — no picker offers it and no other
+    gate here sees it (which is how the DeepSeek client's default became an id the
+    vendor does not route).
+
+    ``test_provider_default_models_have_a_context_decision`` above pins the
+    *window* of these constants; this pins their existence in the catalog.
+    """
+    import external_llm.providers as providers_mod
+    from external_llm.anthropic_client import AnthropicClient, ZAIAnthropicClient
+    from external_llm.openai_client import OpenAIClient, OpenRouterClient, ZAIClient
+
+    clients = {
+        "anthropic": AnthropicClient,
+        "deepseek": providers_mod.DeepSeekClient,
+        "google": providers_mod.GoogleClient,
+        "openai": OpenAIClient,
+        "openrouter": OpenRouterClient,
+        "zai": ZAIAnthropicClient,
+    }
+    # opencode is served by the generic OpenAIClient (whose default belongs to the
+    # openai tier), so it is the one catalog provider without a class of its own.
+    assert set(clients) == set(KNOWN_MODELS) - {"opencode"}, (
+        "a catalog provider gained/lost a client class — give its DEFAULT_MODEL a tier check here"
+    )
+    for provider, client_cls in clients.items():
+        assert client_cls.DEFAULT_MODEL in KNOWN_MODELS[provider], (
+            f"{provider}: {client_cls.__name__}.DEFAULT_MODEL={client_cls.DEFAULT_MODEL!r} "
+            f"is not in KNOWN_MODELS[{provider!r}]"
+        )
+    # zai is served by two protocol clients; neither may carry an off-tier id.
+    assert ZAIClient.DEFAULT_MODEL in KNOWN_MODELS["zai"]

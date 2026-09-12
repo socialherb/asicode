@@ -1898,6 +1898,33 @@ class ToolRegistry(
         # kill mutates process state; can race with concurrent job output
         return tool_name == "job" and (args or {}).get("action") == "kill"
 
+    def is_read_only_call(self, tool_name: str, args: dict | None = None) -> bool:
+        """Public read-only predicate — the inverse of :meth:`_tool_call_mutates`.
+
+        For consumers OUTSIDE this module that must decide "may this call run
+        WITHOUT write access?" — currently the collaboration MCP adapter's
+        read-only session gate (``asi_mcp_adapter._read_only_refusal``), wired
+        into every handler it builds. Using this instead of re-deriving a
+        per-caller ladder is what keeps the shell channel judged by the same
+        classifier that cache invalidation, ``dispatch_parallel`` and
+        DesignChatLoop's read/write phase partition already share: a new
+        mutating command shape is closed for all four by one edit here.
+
+        Fail-open on TOOL NAME, by design — ``_tool_call_mutates`` returns False
+        for any tool that is neither a write tool nor ``bash``, including names
+        this registry has never seen. Callers therefore MUST pair this act
+        predicate with their own name whitelist (the adapter's fail-closed
+        ``_READ_ONLY_TOOLS U _ANALYSIS_SAFE_TOOLS``): this closes the
+        ARGUMENT-dependent channel (``bash``), not the name axis.
+
+        Non-dict ``args`` (malformed call) classify as read-only — verified that
+        ``dispatch`` rejects those before any handler runs (``bash`` with a
+        non-dict argument returns ``ok=False, error='command is required'``), so
+        deferring to the tool preserves its error message without opening a write
+        path.
+        """
+        return not self._tool_call_mutates(tool_name, args if isinstance(args, dict) else {})
+
     def _tool_call_is_serial(self, tool_name: str, args: dict) -> bool:
         """Must this call run strictly alone, never batched with other calls?
 

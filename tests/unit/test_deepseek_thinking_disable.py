@@ -48,6 +48,12 @@ from external_llm.openai_client import (
         # Provider/route prefixes must be stripped.
         ("deepseek/deepseek-v4-flash", True),
         ("openrouter/deepseek/deepseek-v4-pro", True),
+        # DeepSeek V4.1 Flash (2026-09-10) — same native thinking param as its
+        # v4 sibling, but its id carries no ``v4``, so prefix inference orphaned
+        # it (thinking_mode=False used to send NOTHING). Live 2026-09-10 on
+        # opencode: with thinking:{type:disabled} reasoning_tokens=None vs 22.
+        ("deepseek-flash", True),
+        ("deepseek/deepseek-flash", True),
         # Negative cases — these must NOT match.
         ("deepseek-chat", False),
         ("deepseek-reasoner", False),  # legacy reasoner, not v4
@@ -249,6 +255,47 @@ def test_chat_with_tools_deepseek_off_sends_thinking_disabled(monkeypatch):
     p = cap[-1]
     assert p.get("thinking") == {"type": "disabled"}
     assert "reasoning_effort" not in p
+
+
+def test_chat_deepseek_flash_off_sends_thinking_disabled(monkeypatch):
+    """V4.1 Flash takes the same native thinking param as ``deepseek-v4-flash``.
+
+    Before the declared capability table this id classified as NON-reasoning
+    (no ``v4`` in it), so ``chat(..., thinking_mode=False)`` sent no control at
+    all and the model kept reasoning — the toggle was a silent no-op.
+    """
+    c, cap = _capture_client(monkeypatch)
+    c.chat([LLMMessage(role="user", content="hi")], model="deepseek-flash", thinking_mode=False, max_tokens=1000)
+    p = cap[-1]
+    assert p.get("thinking") == {"type": "disabled"}
+    assert "reasoning_effort" not in p
+
+
+def test_chat_with_tools_deepseek_flash_off_sends_thinking_disabled(monkeypatch):
+    """chat_with_tools() parity for V4.1 Flash — same dispatch helper."""
+    c, cap = _capture_client(monkeypatch)
+    c.chat_with_tools(
+        [LLMMessage(role="user", content="hi")],
+        tools=[],
+        model="deepseek-flash",
+        thinking_mode=False,
+        max_tokens=1000,
+    )
+    assert cap[-1].get("thinking") == {"type": "disabled"}
+
+
+def test_chat_deepseek_flash_drops_temperature_like_its_sibling(monkeypatch):
+    """A reasoning model gets no temperature — pinned deliberately.
+
+    V4.1 Flash now behaves exactly like ``deepseek-v4-flash``.  Measured
+    2026-09-10 on the opencode gateway: ``deepseek-flash`` ACCEPTS
+    ``temperature=0.1`` (HTTP 200), so this is consistency with the sibling
+    (and the o-series contract, which rejects a non-default temperature
+    outright), not a gateway requirement.
+    """
+    c, cap = _capture_client(monkeypatch)
+    c.chat([LLMMessage(role="user", content="hi")], model="deepseek-flash", temperature=0.1, max_tokens=1000)
+    assert "temperature" not in cap[-1]
 
 
 # ── max_completion_tokens dispatch parity (chat vs chat_with_tools) ──

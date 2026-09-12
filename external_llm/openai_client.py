@@ -36,7 +36,8 @@ from .client import (
     parse_retry_after,
     raise_sse_iteration_failure,
 )
-from .model_registry import text_only_model
+from .model_catalog import ThinkingControl
+from .model_registry import bare_model_name, model_capabilities, text_only_model
 from .output_parser import parse_tool_args
 
 logger = logging.getLogger(__name__)
@@ -52,8 +53,15 @@ _IMAGE_REJECTING_MODELS: set[tuple[str, str]] = set()
 
 
 def _bare_model_name(model: str) -> str:
-    """Strip route prefixes: 'openrouter/deepseek/deepseek-v4-flash' → 'deepseek-v4-flash'."""
-    return (model or "").strip().lower().split("/")[-1]
+    """Strip route prefixes: 'openrouter/deepseek/deepseek-v4-flash' → 'deepseek-v4-flash'.
+
+    Delegates to ``model_registry.bare_model_name`` — the one normaliser every
+    exact-lookup table in this repo shares, alias table included — so a fact learned
+    at runtime and a declared vector name the same model: a 400 observed for the
+    gateway's versioned spelling ``deepseek-v4.1-flash`` is a fact about
+    ``deepseek-flash``, exactly as the catalog's alias entry claims.
+    """
+    return bare_model_name(model)
 
 
 def _norm_base(base: str) -> str:
@@ -61,8 +69,17 @@ def _norm_base(base: str) -> str:
 
 
 def _model_rejects_images(model: str, base: str = "") -> bool:
+    """Two route-scoped sources, OR'd: the declared axis and what was learned here.
+
+    ``text_only_model(model, base)`` reads ``model_catalog.ROUTE_VISION`` for the
+    route behind *base* (falling back to the route-agnostic vector), and
+    ``_IMAGE_REJECTING_MODELS`` holds what this process already saw a 400 for on
+    that exact base URL.  Both answer for a route, so passing *base* is what keeps
+    one gateway's verdict from being applied to another's endpoint — the same id
+    reads images on opencode and rejects them at the vendor.
+    """
     return bool(model) and (
-        text_only_model(model) or (_norm_base(base), _bare_model_name(model)) in _IMAGE_REJECTING_MODELS
+        text_only_model(model, base) or (_norm_base(base), _bare_model_name(model)) in _IMAGE_REJECTING_MODELS
     )
 
 
@@ -150,6 +167,14 @@ def _is_reasoning_model(model: str) -> bool:
     Reasoning models: o1, o3, o4, gpt-5, deepseek-reasoner, deepseek-v4-*, etc.
     Non-reasoning: gpt-4o, gpt-4, gpt-3.5, deepseek-chat, etc.
 
+    The DECLARED capability vector decides first
+    (``model_registry.model_capabilities`` → ``model_catalog.MODEL_CAPABILITIES``);
+    the name-prefix rules below are only the fallback for ids the catalog does
+    not list.  Treating the prefixes as the source of truth is what orphaned
+    ``deepseek-flash``: V4.1 Flash's id carries no ``v4``, so the v4-flash
+    successor classified as non-reasoning — its thinking toggle silently
+    no-opped and ``/insights compact`` lost the 32k headroom its sibling got.
+
     DeepSeek v4 (flash/pro) emits ``reasoning_tokens`` in ``completion_tokens_details``
     and shares the ``max_tokens`` budget between reasoning + content — so on providers
     that treat it as a reasoner (OpenCode Go, OpenRouter) the reasoning tokens eat the
@@ -158,6 +183,9 @@ def _is_reasoning_model(model: str) -> bool:
     so content survives. The native DeepSeek endpoint honors ``thinking:{type:disabled}``
     and produces zero reasoning tokens regardless, so this classification is safe there too.
     """
+    declared = model_capabilities(model)
+    if declared is not None:
+        return declared.reasoning
     _m = model.strip().lower()
     # strip provider/route prefixes (e.g. "deepseek/deepseek-v4-flash",
     # "openrouter/deepseek/deepseek-v4-flash") down to the bare model name so the
@@ -173,7 +201,11 @@ def _is_reasoning_model(model: str) -> bool:
 
 
 def _is_deepseek_v4(model: str) -> bool:
-    """True for DeepSeek v4 models (flash/pro), which support the native ``thinking`` parameter.
+    """True for ids that take the native DeepSeek ``thinking`` parameter.
+
+    Named for the family that introduced it (v4 flash/pro); V4.1 ``deepseek-flash``
+    belongs to it too — the DECLARED table decides (``ThinkingControl.THINKING``),
+    not the spelling, and the prefix check below only covers ids outside the catalog.
 
     DeepSeek v4 is unique among reasoning models routed through ``OpenAIClient``:
     ``reasoning_effort="low"`` only *dials down* reasoning (measured 882→742 tokens
@@ -185,6 +217,9 @@ def _is_deepseek_v4(model: str) -> bool:
     Strips provider/route prefixes (``deepseek/``, ``openrouter/deepseek/``) so the
     bare model name is checked regardless of caller prefixing.
     """
+    declared = model_capabilities(model)
+    if declared is not None:
+        return declared.thinking is ThinkingControl.THINKING
     _bare = _bare_model_name(model)
     return _bare.startswith("deepseek-v4")
 
@@ -198,8 +233,13 @@ def _is_kimi_k3(model: str) -> bool:
     * Thinking is always enabled and cannot be disabled.
     * The ``thinking`` parameter (used by K2.x) must NOT be sent.
 
-    Strips provider/route prefixes so ``opencode/kimi-k3`` matches.
+    The declared vector decides for catalog ids (``ThinkingControl.MAX_ONLY``); the
+    substring check below covers variants outside the catalog (kimi-k3-0711,
+    kimi-k3-turbo), and strips provider/route prefixes so ``opencode/kimi-k3`` matches.
     """
+    declared = model_capabilities(model)
+    if declared is not None:
+        return declared.thinking is ThinkingControl.MAX_ONLY
     _bare = _bare_model_name(model)
     return "kimi-k3" in _bare  # substring to match variants (kimi-k3-0711, kimi-k3-turbo, etc.)
 

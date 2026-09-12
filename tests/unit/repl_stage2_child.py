@@ -65,6 +65,12 @@ def _main() -> int:
     p.add_argument(
         "--force-underline", action="store_true", help="_input_underline stays True -> auto-submit countdown can fire"
     )
+    p.add_argument(
+        "--dump-sessions",
+        metavar="PATH",
+        default="",
+        help="write FakeDSM session table (id -> turns) as JSON on exit — /resume rebind observation",
+    )
     ns = p.parse_args()
 
     import tempfile
@@ -341,6 +347,25 @@ def _main() -> int:
             sys.stderr.write("\nCOV-SAVE-FAIL\n")
             _tb.print_exc()
             sys.stderr.flush()
+        # /resume rebind observation: dump the fake session table after the
+        # REPL loop returns. Must sit AFTER cov.save() — ordering contract in
+        # the harness comments above (os._exit bypasses atexit, so anything
+        # not flushed here is lost).
+        if ns.dump_sessions:
+            try:
+                import json as _json
+
+                _dump = {
+                    sid: list(getattr(sess_obj, "turns", [])) for sid, sess_obj in FakeDSM.instances[0].sessions.items()
+                }
+                with open(ns.dump_sessions, "w", encoding="utf-8") as _f:
+                    _json.dump(_dump, _f, ensure_ascii=False, default=str)
+            except BaseException:
+                import traceback as _tb2
+
+                sys.stderr.write("\nSESSION-DUMP-FAIL\n")
+                _tb2.print_exc()
+                sys.stderr.flush()
     return rc
 
 

@@ -34,7 +34,33 @@ OPENCODE_UNPRICED = _OPENCODE_UNPRICED_ALLOWLIST
 
 
 def _every_catalog_model() -> list[tuple[str, str]]:
-    return [(p, m) for p, models in {**KNOWN_MODELS, **LEGACY_MODELS}.items() for m in models]
+    """Every (provider, model) pair declared by *either* table.
+
+    The two tables must be traversed independently: ``{**KNOWN_MODELS,
+    **LEGACY_MODELS}`` collapses on the provider key, so for the 5 providers
+    present in both tables every KNOWN model is replaced by the LEGACY list —
+    95 declared pairs silently shrank to 36 parametrized cases.
+    """
+    return sorted(
+        {
+            (provider, model)
+            for table in (KNOWN_MODELS, LEGACY_MODELS)
+            for provider, models in table.items()
+            for model in models
+        }
+    )
+
+
+def test_every_catalog_model_enumerates_both_tables_per_provider():
+    """Regression guard for the merged-mapping enumeration: every model of every
+    table must appear in the parametrization. A ``{**KNOWN, **LEGACY}``
+    comprehension keeps only the LEGACY list wherever a provider appears in both
+    tables, so this fails for it (e.g. deepseek/'deepseek-flash' drops out)."""
+    enumerated = set(_every_catalog_model())
+    for table_name, table in (("KNOWN_MODELS", KNOWN_MODELS), ("LEGACY_MODELS", LEGACY_MODELS)):
+        for provider, models in table.items():
+            missing = [m for m in models if (provider, m) not in enumerated]
+            assert not missing, f"{table_name}[{provider!r}] not enumerated: {missing}"
 
 
 @pytest.mark.parametrize(
@@ -144,6 +170,10 @@ def test_opencode_cache_rates_match_go_zen_sheet():
     assert _OPENCODE_COST_PER_M["qwen3.6-plus"] == (0.50, 3.00)
     assert _OPENCODE_COST_PER_M["glm-5.3"] == (1.40, 4.40)
     assert _OPENCODE_COST_PER_M["deepseek-v4-flash"] == (0.22, 0.66)
+    # DeepSeek V4.1 Flash — added to the Go plan 2026-09-10 (go-models.ts
+    # "add DeepSeek V4.1 Flash", commit 28a62b7). Off-peak 0.15/0.60, cached 0.003.
+    assert _OPENCODE_COST_PER_M["deepseek-flash"] == (0.15, 0.60)
+    assert _OPENCODE_CACHE_RATE["deepseek-flash"] == 0.003
     assert _OPENCODE_CACHE_RATE["kimi-k2.6"] == 0.16
     assert _OPENCODE_CACHE_RATE["qwen3.7-plus"] == 0.04
 

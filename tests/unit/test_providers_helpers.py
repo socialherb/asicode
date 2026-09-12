@@ -258,3 +258,62 @@ def test_count_delimiters_parity_openai_streaming_uses_helper():
         "OpenAI streaming must emit finish_reason='truncated' for content-curly, "
         "content-square, and tool-call-args paths (parity with DeepSeek)"
     )
+
+
+# ── DeepSeek native route: image axis plumbing (AST guards) ─────────────────
+
+
+def _deepseek_class_node() -> ast.ClassDef:
+    tree = ast.parse(inspect.getsource(providers_module))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "DeepSeekClient":
+            return node
+    pytest.fail("DeepSeekClient not found in providers.py")
+
+
+def test_deepseek_route_folds_images_only_through_the_shared_axis():
+    """AST guard for the defect class that produced a silent capability loss.
+
+    The native route called ``_images_to_text()`` unconditionally, so
+    ``deepseek-v4-flash-vision-exp`` — the one catalog id built to read images —
+    had its attachment replaced by OCR text before the request; no image part
+    ever reached the gateway, so the 400 that the strip-and-retry net turns into
+    a correction could not happen either. Every message-building site must go
+    through the single helper that asks the capability axis, and no method may
+    fold attachments on its own.
+    """
+    cls = _deepseek_class_node()
+    callers: dict[str, list[str]] = {}
+    for fn in [n for n in cls.body if isinstance(n, ast.FunctionDef)]:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Name):
+                callers.setdefault(node.id, []).append(fn.name)
+    assert "_images_to_text" not in callers, (
+        "DeepSeekClient must not fold attachments itself — _deepseek_content owns the image/text "
+        f"decision (currently called from {sorted(set(callers['_images_to_text']))})"
+    )
+    assert set(callers.get("_deepseek_content", [])) == {"chat", "chat_with_tools"}, (
+        "both DeepSeek entry points must build message content through _deepseek_content, got "
+        f"{sorted(callers.get('_deepseek_content', []))}"
+    )
+
+
+def test_deepseek_requests_all_go_through_the_image_recovery_helper():
+    """The 400 recovery is only a net if every request passes through it: a raw
+    ``self._session.post`` in any method would bypass the degrade silently."""
+    cls = _deepseek_class_node()
+    for fn in [n for n in cls.body if isinstance(n, ast.FunctionDef)]:
+        direct = [
+            node
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "post"
+        ]
+        assert not direct, f"DeepSeekClient.{fn.name} posts directly — route it through _deepseek_post"
+    module_calls = [
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(providers_module)))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_deepseek_post"
+    ]
+    assert len(module_calls) >= 3, (
+        f"_deepseek_post must carry chat / _chat_streaming / chat_with_tools (found {len(module_calls)} calls)"
+    )

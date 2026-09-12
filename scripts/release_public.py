@@ -38,9 +38,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import email
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -74,6 +77,66 @@ FIRST_PARTY_PREFIXES = export_public.FIRST_PARTY_PREFIXES
 def _version() -> str:
     m = re.search(r'^version\s*=\s*"([^"]+)"', (REPO / "pyproject.toml").read_text(encoding="utf-8"), re.M)
     return m.group(1) if m else "0.0.0"
+
+
+def _pyproject_name_version(repo: Path) -> tuple[str, str] | None:
+    """Read ``(name, version)`` from the ``project`` table of pyproject.toml.
+
+    Returns None when the file is missing or has no project table — callers
+    treat that as "nothing to compare against", never as a fabricated pair.
+    """
+    try:
+        text = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m_name = re.search(r'^name\s*=\s*"([^"]+)"', text, re.M)
+    m_ver = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    if not (m_name and m_ver):
+        return None
+    return m_name.group(1), m_ver.group(1)
+
+
+def _stale_egg_info_warnings(repo: Path) -> bool:
+    """Preflight WARNING: a legacy ``<name>.egg-info/`` in the repo root.
+
+    PR #10 (0.2.32): a leftover ``asicode.egg-info/`` (0.2.29) shadowed the
+    site-packages metadata — sys.path puts the CWD first, so
+    ``importlib.metadata.version("asicode")`` resolved to the stale
+    install-time version and version-dependent behaviour silently misfired.
+    The directory is gitignored, so it cannot corrupt the snapshot or the
+    wheel; it only poisons the ambient interpreter. Hence a WARNING (release
+    proceeds), not a hard gate — a local dev artifact must not false-red the
+    release on every machine that ever ran ``pip install -e .``.
+
+    Returns True when at least one warning was printed.
+    """
+    pair = _pyproject_name_version(repo)
+    if pair is None:
+        return False
+    name, version = pair
+    warned = False
+    for egg in sorted(repo.glob("*.egg-info")):
+        # Only the SHIPPED project's egg-info can shadow its own metadata — an
+        # unrelated ``some_pkg.egg-info`` (an editable dep installed by accident)
+        # does not answer importlib.metadata.version(name) and is noise.
+        if not egg.is_dir() or egg.name != f"{name}.egg-info":
+            continue
+        try:
+            msg = email.message_from_string((egg / "PKG-INFO").read_text(encoding="utf-8", errors="replace"))
+            egg_version = str(msg.get("Version", "")).strip()
+        except OSError:
+            egg_version = ""
+        if egg_version == version:
+            continue
+        warned = True
+        print(
+            f"warning: {egg.name}/ has Version {egg_version or '<unreadable>'} but pyproject.toml says {version}.\n"
+            f"  A stale egg-info in the repo root shadows site-packages metadata (sys.path puts\n"
+            f"  the CWD first): importlib.metadata.version({name!r}) resolves to the stale value.\n"
+            f"  Quarantine it (move it out of the repo) and re-run:  pip install -e .",
+            file=sys.stderr,
+        )
+    return warned
 
 
 def _check_untracked_imports() -> bool:
@@ -327,29 +390,93 @@ _VERIFY_UNIT_TIMEOUT_S = 2400
 _VERIFY_DURATIONS_COUNT = 40
 _VERIFY_ARTIFACT_DIRNAME = ".verify_artifacts"
 _VERIFY_ARTIFACT_KEEP = 12  # full snapshot unit suite: ~5-6 min in CI
+_VERIFY_ABORT_TAIL_LINES = 30
+_VERIFY_REAP_TIMEOUT_S = 5
+
+
+def _kill_process_group(proc: subprocess.Popen) -> bool:
+    """Kill *proc*'s whole process group (best-effort), then SIGKILL it.
+
+    The verify step is its own session leader (``start_new_session=True``), so
+    SIGKILL to ``-pgid`` reaches the xdist workers and any pty-test
+    grandchildren in one shot. A child that escaped its group (own ``setsid``)
+    still dies via the direct ``proc.kill()``. Reap failure is logged, not
+    raised: this runs on the abort path, where the release is already failing.
+
+    Returns ``True`` when the group kill landed on the direct child's own
+    group (the normal path), ``False`` when the child had escaped its group
+    (own ``setsid``) and only the direct kill fallback ran. The caller uses
+    this to distinguish the normal reap from the escape fallback in its
+    diagnostic detail.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return False  # already dead and reaped by someone else; nothing to signal
+    if pgid != proc.pid:
+        # Child escaped its group (own setsid) — fall back to direct kill only.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return False
+    # ProcessLookupError here = group already gone (all members dead).
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    return True
 
 
 def _run_verify_step(args: list[str], cwd: Path, timeout: float) -> tuple[bool, str, str]:
     """Run one verify step. Returns (ok, output-tail, full-output) — never
     raises, never sys.exits: the caller decides what an abort looks like.
     The full output feeds the durations artifact; the tail is for the abort
-    message."""
+    message.
+
+    The step is launched as its own session leader (``start_new_session=True``)
+    so a timeout can kill the WHOLE process group, not just the direct child:
+    verify steps run pytest with ``-n auto`` (xdist workers) and the pty tests
+    spawn grandchildren of their own — ``subprocess.run(timeout=...)`` would
+    SIGKILL only the direct pytest process and orphan the workers/grandchildren,
+    which can then hold locks/pty holders and pollute the NEXT verify attempt.
+    Unlike ``run_bounded_subprocess`` (fail-open: returns rc=-9 instead of
+    raising), this stays fail-closed — a timeout is still a hard verify failure.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, *args],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            [sys.executable, *args],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return False, f"timed out after {exc.timeout:.0f}s", ""
-    out = proc.stdout + proc.stderr
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        group_killed = _kill_process_group(proc)
+        try:
+            out, err = proc.communicate(timeout=_VERIFY_REAP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            # Pathological: a group member ignored SIGKILL or escaped the group
+            # (own setsid). Kill the direct child and reap whatever we can —
+            # fail-closed matters more than perfect output here.
+            proc.kill()
+            out, err = proc.communicate()
+            captured = (out or "") + (err or "")
+            detail = f"timed out after {timeout:.0f}s — direct child re-killed after {_VERIFY_REAP_TIMEOUT_S}s"
+        else:
+            captured = (out or "") + (err or "")
+            if group_killed:
+                detail = f"timed out after {timeout:.0f}s — process group killed"
+            else:
+                detail = f"timed out after {timeout:.0f}s — child escaped its group; direct kill only"
+        if captured.strip():
+            detail += "\n" + "\n".join(captured.strip().splitlines()[-_VERIFY_ABORT_TAIL_LINES:])
+        return False, detail, captured
+    output = out + err
     if proc.returncode == 0:
-        return True, "", out
-    tail = "\n".join(out.strip().splitlines()[-30:])
-    return False, f"exit {proc.returncode}\n{tail}", out
+        return True, "", output
+    tail = "\n".join(output.strip().splitlines()[-_VERIFY_ABORT_TAIL_LINES:])
+    return False, f"exit {proc.returncode}\n{tail}", output
 
 
 def _write_verify_artifact(mode: str, dt: float, failed: int, total: int, chunks: list[str]) -> Path | None:
@@ -509,6 +636,12 @@ def main(argv: list[str] | None = None) -> int:
     if pub_dirty:
         print(f"error: public repo {public} has uncommitted changes — resolve first.", file=sys.stderr)
         return 1
+
+    # ── Preflight WARNING: stale egg-info shadowing installed metadata ──────
+    # Non-fatal by design (see _stale_egg_info_warnings): the directory is
+    # gitignored, so the snapshot and wheel are unaffected — only the ambient
+    # interpreter's importlib.metadata view is poisoned (the 0.2.32 incident).
+    _stale_egg_info_warnings(REPO)
 
     # ── CHANGELOG gate: the version being released must have an entry ───────
     # Computed once here and reused for the commit message below.

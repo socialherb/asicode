@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 #   OpenRouter:https://openrouter.ai/
 #   Kimi:      https://platform.kimi.ai/docs/models
 # DeepSeek v4-flash/v4-pro, GLM-5.2, Qwen3.7-max/plus, Qwen3.6-plus/3.5-plus,
-# MiMo-v2.5-pro/v2.5/v2-pro, MiniMax-M3, kimi-k3, deepseek-chat, deepseek-reasoner
+# MiMo-v2.5-pro/v2.5/v2-pro, MiniMax-M3, kimi-k3
 # are all 1M+ models — no explicit entry needed (use _DEFAULT_CONTEXT_LIMIT fallback).
 _CONTEXT_LIMITS: dict[str, int] = {
     # OpenAI
@@ -75,19 +75,24 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "claude-3-opus-20240229": 200_000,
     "claude-3-sonnet-20240229": 200_000,
     "claude-3-haiku-20240307": 200_000,
-    # DeepSeek — original deepseek-r1 (64K context); deepseek-chat/reasoner are
-    # deprecated aliases for deepseek-v4-flash thinking/non-thinking → 1M fallback.
+    # DeepSeek — original deepseek-r1 (64K context); the v4 generation is 1M (falls
+    # back, allowlisted above).
     "deepseek-r1": 64_000,
     # Zhipu GLM (zai + opencode). glm-5.3 is the DEFAULT_MODEL and 1M is verified
     # (Z.ai docs: "Context Length: 1M" — generational leap from the 200K family).
     # Listed EXPLICITLY (not via _DEFAULT fallback) so the default model's window
     # cannot silently drift if _DEFAULT_CONTEXT_LIMIT changes. glm-5/5.1/5-turbo 200K; glm-4.7 128K.
+    # glm-5.3/5.3-flash are actually 1,310,720 (1.31M) per OpenRouter — the 1M
+    # figure is a slight under-allocation (safe direction, < real window).
     "glm-5.3": 1_000_000,
     "glm-5.2": 1_000_000,
     "glm-5.1": 200_000,
     "glm-5-turbo": 200_000,
     "glm-5": 200_000,
     "glm-4.7": 128_000,
+    "glm-4.6": 128_000,  # GLM-4 line (zai legacy) — 128K, same as glm-4.7
+    "glm-4.5": 128_000,  # GLM-4 line (zai legacy) — 128K per OpenRouter spec
+    "glm-4.5-air": 128_000,  # GLM-4 line (zai legacy) — 128K per OpenRouter spec
     # Qwen3 (opencode provider) — 3.8-max/3.7-max/plus, 3.6-plus, 3.5-plus are 1M (fallback)
     # qwen3.6 is the base model at 262_144 (= 2^18 = binary 256K). Source: openrouter.ai.
     "qwen3.6": 262_144,
@@ -115,6 +120,9 @@ _CONTEXT_LIMITS: dict[str, int] = {
     # which would over-allocate and risk HTTP errors on >500K-token requests.
     "grok-4.5": 500_000,
     "grok-4.6": 500_000,
+    # Omen Alpha (opencode) — 500K window per the gateway model card (pi.dev,
+    # 2026-09-07); must be explicit or it would take the 1M fallback.
+    "omen-alpha": 500_000,
 }
 
 
@@ -154,8 +162,13 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset(
         # ── Verified 1M+ (sources in the _CONTEXT_LIMITS header above) ──────────
         "deepseek-v4-flash",
         "deepseek-v4-pro",
-        "deepseek-chat",
-        "deepseek-reasoner",  # aliases of v4-flash thinking/non-thinking
+        # deepseek-chat / deepseek-reasoner sat here as "aliases of v4-flash
+        # thinking/non-thinking" until 2026-09-11, when the ids left the catalog
+        # (the vendor registry no longer routes them — see
+        # KNOWN_MODELS["deepseek"]). Their entries went with them: the staleness
+        # gate in test_model_catalog_context_parity fails on an allowlist entry
+        # naming a non-catalog id. A session still spelling one now warns once and
+        # takes the same 1M fallback it always took.
         "kimi-k3",  # 1,048,576 = 2^20
         # Meta Muse Spark 1.2 contributor — 1,048,576 = 2^20, carried over from
         # 1.1 unchanged. The base muse-spark-1.2 was dropped by the opencode
@@ -209,6 +222,11 @@ _FALLBACK_IS_CORRECT: frozenset[str] = frozenset(
         "muse-spark-1.3-contributor",
         # DeepSeek v4 Flash vision variant — same 1M fallback as deepseek-v4-flash.
         "deepseek-v4-flash-vision-exp",
+        # DeepSeek V4.1 Flash (2026-09-10 GA, served by the opencode Go gateway
+        # as "deepseek-flash" and by the DeepSeek native API under the same id).
+        # 1M context + 384K max output per the launch materials; identical
+        # window to v4-flash, so the 1M fallback is correct.
+        "deepseek-flash",
         # LongCat-2.0 (Meituan 1.6T MoE, open-sourced 2026-07-05; on the opencode
         # gateway since 2026-08-24). Native 1M context per the release blog
         # (longcat.chat/blog/longcat-2.0) and github.com/meituan-longcat/

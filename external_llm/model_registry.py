@@ -12,6 +12,21 @@ Matching rules:
   - OLLAMA_VISION_KEYWORDS uses substring matching (keyword in name), not exact tags.
   - CLOUD_PROVIDER_PREFIXES and MODEL_ANSWER_MAX_TOKENS are checked in order;
     first match wins — put more specific entries before general ones.
+  - Reasoning-budget / thinking-control dispatch is DECLARED per id in
+    model_catalog.MODEL_CAPABILITIES and read through model_capabilities();
+    name-prefix inference survives only as a fallback for ids the catalog does
+    not list (variants, hand-typed ids), because a prefix rule silently orphans
+    every new id that breaks the family spelling (deepseek-flash, 2026-09-10).
+    The same holds for the image axis — text_only_model() / vision_capable()
+    read the vector's ``vision`` field before TEXT_ONLY_MODEL_PREFIXES, because a
+    family prefix cannot exempt the one member that gained the capability
+    (deepseek-v4-flash-vision-exp, 2026-09-10).
+  - The image axis is also ROUTE-scoped: the same id can read an image on one
+    gateway and reject or silently drop it on another (deepseek-flash: image
+    input on opencode/openrouter, text-only at the vendor). Callers that know
+    their base URL pass it — model_capabilities(model, base) — and the
+    declaration table consulted last is model_catalog.ROUTE_VISION; the bare
+    vector stays the answer for routes nobody measured.
   - Any table doing an EXACT lookup must reduce the id with bare_model_name()
     first; a model arrives spelled however its route spells it. Skipping that
     is what gave context_budget._CONTEXT_LIMITS two different windows for one
@@ -26,7 +41,15 @@ Matching rules:
 
 from __future__ import annotations
 
-from external_llm.model_catalog import MODEL_ALIASES
+from dataclasses import replace
+
+from external_llm.model_catalog import (
+    MODEL_ALIASES,
+    MODEL_CAPABILITIES,
+    ROUTE_VISION,
+    ModelCapabilities,
+    route_key,
+)
 from external_llm.ollama_api import query_ollama_capabilities
 
 # ── Ollama: Vision-capable models ─────────────────────────────────────────────
@@ -114,26 +137,42 @@ CLOUD_PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
 )
 
 # ── Cloud models: text-only (reject image input) ──────────────────────────────
+# Human-readable FALLBACK only: ``text_only_model`` asks the declared capability
+# vector first (``model_catalog.MODEL_CAPABILITIES[bare].vision``) and reaches
+# this table solely for ids the catalog does not list — a hand-typed id, an
+# unreleased variant.  The table survives because such an id still has to be
+# classified somehow, and a family prefix remains the best available guess.
 # Bare-model-name prefix match (route prefixes like "openrouter/deepseek/…"
-# stripped first). DeepSeek models (chat/reasoner/v4-flash/v4-pro) accept only
-# string content — an image_url part draws HTTP 400 regardless of image size.
-# Verified 2026-07-26 on three independent sources: (1) opencode Go rejected a
-# 67-byte 1x1 PNG for BOTH v4-flash and v4-pro while the same route carried
-# images fine for kimi-k3 (so it is the model, not the gateway); (2) OpenRouter
-# metadata lists both v4 models as modality=text->text, input=['text'];
-# (3) DeepSeek's official API docs describe no image/vision input. Only add
-# entries verified text-only on EVERY route — per-route rejections belong to
-# the runtime strip-and-retry net in openai_client, which keys on
-# (base_url, model).
-# DeepSeek models verified text-only on EVERY route.  Exclude prefixes that
-# would falsely match vision-capable models (deepseek-vl, deepseek-vl2,
-# deepseek-ocr).  Unlisted models are caught at runtime by the strip-and-retry
-# net in openai_client.
+# stripped first).  Verified 2026-07-26 on three independent sources: (1) opencode
+# Go rejected a 67-byte 1x1 PNG for BOTH v4-flash and v4-pro while the same route
+# carried images fine for kimi-k3 (so it is the model, not the gateway);
+# (2) OpenRouter metadata lists both v4 models as modality=text->text,
+# input=['text']; (3) DeepSeek's official API docs describe no image/vision input.
+# Only add entries verified text-only on EVERY route — per-route facts belong to
+# model_catalog.ROUTE_VISION (declared, keyed by route) or to the runtime
+# strip-and-retry net in openai_client (learned, keyed by base_url + model).
+# A bare-id entry is route-invariant by construction: it answers for endpoints
+# nobody measured, so it may only carry a route-agnostic fact and never a
+# conservative guess about one gateway.
+# ``deepseek-v4`` is GONE from this tuple (2026-09-10).  It was the only entry
+# covering catalog ids, and a family prefix cannot express "one member of the
+# family is the exception": it matched ``deepseek-v4-flash-vision-exp``, the id
+# whose whole purpose is reading images, so the client OCR-substituted it and the
+# capability was silently lost.  Every catalog id in that family is declared
+# individually now (v4-flash/v4-pro vision=False, the vision-exp id vision=True),
+# and only the native-endpoint ids DeepSeekClient routes (chat/reasoner/r1) stay
+# here.  ``deepseek-v4-flash`` still 400s on an image part on the opencode route
+# (re-measured 5/5), but it READ the image in 7 of 8 runs inside one window on the
+# same route, so that route is inconsistent rather than text-only; the static OCR
+# path is kept as the deterministic behaviour, and capturing the opportunistic
+# case needs a retry net that does not learn "text-only" from a single 400.
+# Exclude prefixes that would falsely match vision-capable models (deepseek-vl,
+# deepseek-vl2, deepseek-ocr).  Unlisted models are caught at runtime by the
+# strip-and-retry net in openai_client.
 TEXT_ONLY_MODEL_PREFIXES: tuple[str, ...] = (
     "deepseek-chat",
     "deepseek-reasoner",
     "deepseek-r1",
-    "deepseek-v4",
 )
 
 
@@ -239,6 +278,72 @@ def bare_model_name(model: str) -> str:
     return MODEL_ALIASES.get(bare, bare)
 
 
-def text_only_model(model: str) -> bool:
-    """True if this cloud model is known to reject image (vision) input."""
+def model_capabilities(model: str, base: str = "") -> ModelCapabilities | None:
+    """Declared capability vector for *model*, or None when the id is undeclared.
+
+    The table (``model_catalog.MODEL_CAPABILITIES``) is keyed on bare ids, so the
+    lookup normalises first — alias resolution included: ``deepseek-v4`` and
+    ``deepseek-v4-pro`` share one declaration.
+
+    *base* scopes the lookup to the route the request will actually take, which
+    only the IMAGE axis depends on: one id can read an image on one gateway and
+    reject or silently drop it on another (``ROUTE_VISION``, keyed by
+    ``route_key(base)``).  The route overlay replaces that field alone — the
+    reasoning and thinking axes are route-invariant facts about the id — and an
+    unmeasured route (or a base whose host matches no known route) keeps the bare
+    vector.
+
+    None means "*no decision was recorded* for this id", NOT "no capabilities".
+    Callers that own a name-prefix heuristic (``openai_client._is_reasoning_model``
+    and its siblings) fall back to it; the catalog ids those heuristics serve are
+    required to be declared by
+    ``tests/unit/test_model_catalog_capabilities_parity.py``, so a None here
+    means a variant or a hand-typed id.
+    """
+    bare = bare_model_name(model)
+    declared = MODEL_CAPABILITIES.get(bare)
+    if declared is None:
+        return None
+    route = route_key(base)
+    if route is None:
+        return declared
+    route_vision = ROUTE_VISION.get((route, bare))
+    if route_vision is None or route_vision is declared.vision:
+        return declared
+    return replace(declared, vision=route_vision)
+
+
+def text_only_model(model: str, base: str = "") -> bool:
+    """True if this model cannot use image (vision) input on the route it takes.
+
+    Declaration first, exactly like the reasoning classifiers: a catalog id
+    reports the ``vision`` field of its capability vector — scoped to *base*
+    when the caller knows its route — and the name-prefix table below is only
+    the fallback for ids the catalog does not list.  Order matters the same way
+    here — the prefix rule alone classified ``deepseek-v4-flash-vision-exp`` as
+    text-only (the ``deepseek-v4`` family prefix), so the one id built to read
+    images had its attachments replaced by OCR text before the request, and since
+    no image part ever went out, the gateway could never return the 400 that would
+    have corrected the guess.
+
+    Leaving *base* empty asks the route-agnostic question ("is this id text-only
+    everywhere?"), which is what a caller without a wire identity — a picker, a
+    test — wants.  A caller that knows the endpoint passes it: the same id is
+    text-only at the vendor and image-capable behind a gateway.
+    """
+    declared = model_capabilities(model, base)
+    if declared is not None:
+        return not declared.vision
     return bare_model_name(model).startswith(TEXT_ONLY_MODEL_PREFIXES)
+
+
+def vision_capable(model: str, base: str = "") -> bool:
+    """True if the client may put image parts on the wire for *model*.
+
+    The exact inverse of ``text_only_model`` — the declared vector decides (the
+    route-specific one when *base* is given), the prefix table is the fallback —
+    exposed under its own name because callers read better with it: the
+    OCR-enrichment blocks in the REPL and the webapp ask "will this model receive
+    the image?", not "is it text-only".
+    """
+    return not text_only_model(model, base)

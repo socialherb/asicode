@@ -39,6 +39,15 @@ from external_llm.openai_client import _is_reasoning_model
         ("deepseek/deepseek-v4-flash", True),
         ("openrouter/deepseek/deepseek-v4-flash", True),
         ("openrouter/deepseek/deepseek-v4-pro", True),
+        # DeepSeek V4.1 Flash — the prefix-orphan regression. Its id carries no
+        # ``v4``, so the prefix rules never saw it and the v4-flash successor
+        # classified as NON-reasoning (thinking toggle = silent no-op, no 32k
+        # /insights compact headroom). The declared capability table
+        # (model_catalog.MODEL_CAPABILITIES) classifies it now.
+        ("deepseek-flash", True),
+        ("deepseek/deepseek-flash", True),
+        ("openrouter/deepseek/deepseek-flash", True),
+        ("deepseek-v4-flash-vision-exp", True),
         # Non-reasoning
         ("gpt-4o", False),
         ("gpt-4", False),

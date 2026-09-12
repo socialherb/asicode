@@ -33,6 +33,7 @@ from external_llm.repl.collaborate.asi_mcp_adapter import (
     _TOOL_SPECIFIC_TIMEOUTS,
     _convert_schema_to_input_type,
     _get_tool_annotations,
+    _read_only_refusal,
     _resolve_mcp_timeout,
     build_asr_mcp_server,
     build_collaborate_install_command,
@@ -228,9 +229,19 @@ class TestToolExclusion:
         assert "update_memory" in _EXCLUDED_TOOLS
 
     def test_bash_is_in_analysis_safe_tools_not_excluded(self):
-        """bash must be available in analysis sessions and not in excluded."""
+        """bash is exposed for inspection AND paired with the act gate.
+
+        Exposure alone is not a read-only guarantee — the same handler mutates
+        through cp/mv/tee/>/git stash/interpreter writes — so this test pins the
+        PAIR: whitelisted name plus a refused mutating act. The gate's behaviour
+        through the built server is covered in test_mcp_read_only_gate.py.
+        """
         assert "bash" in _ANALYSIS_SAFE_TOOLS
         assert "bash" not in _EXCLUDED_TOOLS
+        registry = ToolRegistry(repo_root=".", config=AgentConfig())
+        refusal = _read_only_refusal(registry, "bash", {"command": "git stash"})
+        assert refusal is not None
+        assert "READ_ONLY_DENIED" in refusal
 
     def test_has_tool_handler_bash(self):
         """bash handler (_tool_shell_exec) must be discoverable via has_tool_handler."""

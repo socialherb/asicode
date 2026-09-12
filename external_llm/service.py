@@ -739,6 +739,20 @@ class ExternalLLMService:
             self.model,
         )
 
+    @property
+    def route_base(self) -> str:
+        """Base URL of the route this service's client actually posts to.
+
+        Route-scoped capability declarations (``model_catalog.ROUTE_VISION``) are
+        keyed by host, so whoever makes a decision about the wire has to hand over
+        the URL the request will use — the provider name is not enough, since
+        ``EXTERNAL_LLM_BASE_URL`` can point a provider at another vendor's gateway
+        (``resolve_provider_base_url``).  Empty when the client knows neither its
+        instance URL nor a default; the caller then asks the route-agnostic
+        question.
+        """
+        return str(getattr(self.client, "base_url", "") or getattr(self.client, "DEFAULT_BASE_URL", "") or "")
+
     # ---------------------------------------------------------------------
     # ── Default model per provider ─────────────────────────────────────────
     # Used as fallback when no model is explicitly provided.
@@ -751,7 +765,7 @@ class ExternalLLMService:
         "openai": "gpt-5.6-sol",
         "anthropic": "claude-sonnet-5",
         "google": "gemini-2.5-flash",
-        "deepseek": "deepseek-v4-flash",
+        "deepseek": "deepseek-flash",
         "zai": "glm-5.3",
         "openrouter": "deepseek/deepseek-v4-flash",
         "opencode": "deepseek-v4-flash",

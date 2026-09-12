@@ -283,7 +283,7 @@ class TestZaiModelCacheRate:
 
     Source: https://docs.z.ai/guides/overview/pricing (verified 2026-06)
         GLM-5.2: input $1.40, cached $0.26
-        GLM-4.6: input $0.60,  cached $0.11
+        GLM-4.6: input $0.43,  cached $0.08 (refreshed 2026-09-07 from docs)
     Z.AI is served over the Anthropic Messages API (ZAIAnthropicClient), so its
     usage shape matches Anthropic: ``prompt_tok`` (input_tokens) EXCLUDES the
     separately-reported cached tokens. Per-model cached rates still apply, and
@@ -295,8 +295,9 @@ class TestZaiModelCacheRate:
         [
             ("glm-5.2", 1.40, 0.26),
             ("glm-5", 1.00, 0.20),
-            ("glm-4.6", 0.60, 0.11),
+            ("glm-4.6", 0.43, 0.08),
             ("glm-4.5", 0.60, 0.11),
+            ("glm-4.5-air", 0.13, 0.025),
         ],
     )
     def test_separate_reprice_bit_exact(self, model, in_rate, cached_rate):
@@ -305,7 +306,7 @@ class TestZaiModelCacheRate:
         # its own rate on top of the full-priced prompt.
         # Pass PAYG base_url so the model-specific cached rate applies.
         prompt, cached, completion = 12327, 3968, 3312
-        out_rate = {"glm-5.2": 4.40, "glm-5": 3.20, "glm-4.6": 2.20, "glm-4.5": 2.20}[model]
+        out_rate = {"glm-5.2": 4.40, "glm-5": 3.20, "glm-4.6": 1.75, "glm-4.5": 2.20, "glm-4.5-air": 0.85}[model]
         actual = estimate_cache_adjusted_cost(
             "zai",
             prompt,
