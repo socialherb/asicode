@@ -266,30 +266,65 @@ jobs:
         run: node tests/js/run_coverage_gate.js
 
   # ── Unit-test gate ─────────────────────────────────────────────────────────
-  # This is the ONLY workflow that executes on every push/PR (release.yml only
-  # runs on tags). Until this job existed, a green CI meant ZERO tests had run — the
-  # whole suite was gated by nothing but ruff/AST checks.
+  # This is one of only two workflows that execute on every push/PR (release.yml
+  # only runs on tags; private-tests.yml runs the private-only test slice).
+  # Until this job existed, a green CI meant ZERO tests had run — the whole
+  # suite was gated by nothing but ruff/AST checks.
   #
   # The job mirrors release.yml's test job — same command, same Python
   # version, no deselections — so a PR faces the same gate a release faces.
-  # TREE REALITY (re-verified 2026-08-24, P28): this job does NOT check out the
-  # full private tree. actions/checkout@v4 with no `repository:` override checks
-  # out `github.repository` = the PUBLIC repo `socialherb/asicode`, whose main
-  # branch is the EXPORTED public snapshot (lane/, webapp/, tools/ and their
-  # coupled tests are absent — measured: public tree has 493 tests/unit files,
-  # private tree has 577; CI collects 13424 items vs 16067 locally). The CI head
-  # SHA (e.g. 480ca0d5c) does not exist in the private repo — the two repos have
-  # divergent commit histories, the public one being rebuilt from releases.
+  # TREE REALITY (re-verified 2026-09-12, P31): this workflow executes in BOTH
+  # repos — the public mirror `socialherb/asicode` (the EXPORTED snapshot: lane/,
+  # webapp/, tools/ and their coupled tests are absent) and the private
+  # development repo (the full tree, which owns those paths). The
+  # `actions/checkout@v4` below has no `repository:` override, so each run
+  # checks out its own `github.repository` — measured: the private full tree
+  # collects 16494 items (2026-09-12), the snapshot 13424 (P28, 2026-08-24 —
+  # the private workflow was disabled manually then, so public runs were all
+  # P28 could observe; re-enabled 2026-09-12, see P30-1). The two repos have
+  # divergent histories (the snapshot is rebuilt from releases), so a SHA that
+  # resolves in one does not resolve in the other.
+  #
+  # Every tree-dependent step below is therefore gated on a hashFiles() marker
+  # of an export-EXCLUDED path (JS gate: webapp/ui/static/**; vulture extra:
+  # the structural-scanner gate test; history: the SSE gate test) — never on
+  # the repo name, which must not appear in a public-shipped file and which a
+  # rename or fork would silently void. In the snapshot every marker is absent,
+  # so the gated step is inert by construction.
   # The install below adds the webapp extra for historical reasons (the comment
   # block this replaces claimed 83 files import webapp); on the public tree no
   # webapp-coupled test exists, so the extra is inert-but-harmless. It is kept to
   # match release.yml's identical install command (SSOT for the gate surface).
   unit-tests:
-    name: Unit tests (public exported tree, clean install)
+    name: Unit tests (clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Deepen history for the private red-proof test (full-tree checkouts only)
+        # `test_sse_emit_consume_gate::test_red_proof_pre_a_map` re-proves the
+        # silent subagent-event drift by reading a blob from a PAST commit
+        # (`git show 59d52bdb^:webapp/ui/static/agent-panel.js`); a depth-1
+        # checkout has no parent commit to show — measured red in run
+        # 34680698084: `invalid object name '59d52bdb^'`, exit 128. The same
+        # test passes in private-tests.yml, whose checkout pins fetch-depth: 0.
+        #
+        # Tree-shape condition, deliberately not a repo-name one: that test file
+        # is auto-excluded from the public snapshot (coupled-test — it loads
+        # paths under an excluded tree), so its PRESENCE means the full private
+        # tree is checked out. Where the file is absent there is nothing to
+        # deepen for — and the snapshot's history could never satisfy the sha
+        # anyway (it is rebuilt from releases).
+        #
+        # Shallow guard: `--unshallow` is FATAL on a complete repository, so
+        # fetch only when the checkout is actually shallow. The guard also
+        # keeps this step correct if the job ever pins fetch-depth: 0 itself.
+        if: hashFiles('tests/unit/test_sse_emit_consume_gate.py') != ''
+        run: |
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow --quiet
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -305,12 +340,41 @@ jobs:
           sudo apt-get install -y -qq ripgrep
 
       - name: Install package + test dependencies
-        # [dev,webapp] — see the job comment above: the full-tree checkout
-        # includes webapp-coupled unit tests, so fastapi/uvicorn/jinja2 must
-        # be present or collection fails before any test runs.
+        # [dev,webapp] — see the job comment above: the private full-tree
+        # checkout includes webapp-coupled unit tests, so fastapi/uvicorn/
+        # jinja2 must be present or collection fails before any test runs.
+        # (The snapshot installs the same extra to keep this command identical
+        # to release.yml's — SSOT for the gate surface.)
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev,webapp]'
+
+      - name: Install optional scanner dep (full-tree checkouts only)
+        # 8 tests of tests/unit/test_check_structural_scanners.py run
+        # scripts/check_structural_scanners.py main() end-to-end and assert exit 0.
+        # That gate FAILS CLOSED when an optional scanner dep is missing (vulture
+        # silently judges nothing without the package), so on a tree that ships
+        # those tests they red as `assert 1 == 0`, each printing "❌ optional
+        # scanner dependency missing — vulture_dead_code_scanner": measured in lint
+        # run 34676144074 (private full tree, 10 failed). private-tests.yml already
+        # appends the extra for ITS private-only slice; THIS job runs the whole
+        # tree — which in the private repo is the exact tree owning those tests.
+        #
+        # Tree-shape condition, deliberately not a repo-name one: that test file is
+        # in export_public.EXCLUDE_FILES (it asserts a zero-candidate scan over the
+        # tree that owns webapp/, false by construction after export), so its
+        # PRESENCE is the "full tree checked out" marker — the same idiom as the
+        # coverage-gate step's hashFiles(...) guard above, and it keeps the private
+        # repo name out of a file that ships publicly.
+        #
+        # NOT installed in the public snapshot, also deliberately:
+        # tests/unit/analysis/test_vulture_scanner.py ships publicly behind
+        # pytest.importorskip("vulture.core"), so installing there would flip a
+        # skipped module into an executing one — a different gate surface, not a
+        # better one. The baseline-diff job above installs '.[vulture]' for the
+        # scanner step itself because that job runs in both trees.
+        if: hashFiles('tests/unit/test_check_structural_scanners.py') != ''
+        run: python -m pip install -e '.[vulture]' --quiet
 
       - name: Unit tests
         # pytest-timeout is active via the pyproject.toml ini default
@@ -360,7 +424,7 @@ jobs:
   # (marker doc: deselected by default) and optional-dependency tests (numpy/faiss
   # vector cache) self-skip. Measured locally: 358 passed in ~3 min.
   integration-tests:
-    name: Integration tests (public exported tree, clean install)
+    name: Integration tests (clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

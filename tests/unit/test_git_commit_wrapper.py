@@ -13,7 +13,6 @@ The gate's contract (see the module docstring):
 import importlib.util
 import os
 import subprocess
-import threading
 import time
 from pathlib import Path
 
@@ -136,69 +135,123 @@ def test_snapshot_scoped_excludes_staged_paths(repo):
 
 
 # --- settle ------------------------------------------------------------------
+def _churning_runner(repo: Path, *, delay: float = 0.0) -> tuple[w.Runner, dict[str, int]]:
+    """A runner that rewrites ``a.txt`` immediately before every real snapshot.
+
+    The settle loop judges stability by comparing ``git diff`` samples, so
+    "the tree changed between consecutive samples" must not depend on when a
+    writer thread happens to be scheduled. A wall-clock writer starved across
+    two whole intervals makes a continuously changing tree look settled — the
+    loop then returns ``True`` and any ``assert not _wait_for_settle(...)``
+    flips on an idle-vs-loaded machine with no product change involved.
+
+    Driving the write from the sample injection point removes the scheduler
+    from the equation: every sample observes a fresh tree, so the loop can only
+    leave through its deadline. The real ``_default_runner`` still runs the
+    actual ``git diff`` — this is not a stub, and if the write ever stopped
+    reaching the snapshot (e.g. untracked path) the samples would match and the
+    negative assertions below would fail loudly. ``delay`` keeps a single
+    snapshot expensive on purpose.
+    """
+    state = {"samples": 0}
+
+    def runner(args: list[str], cwd: str) -> subprocess.CompletedProcess:
+        state["samples"] += 1
+        (repo / "a.txt").write_text(f"churn{state['samples']}\n")
+        if delay:
+            time.sleep(delay)
+        return w._default_runner(args, cwd)
+
+    return runner, state
+
+
+def _fixed_cost_runner(delay: float = 0.0) -> tuple[w.Runner, dict[str, int]]:
+    """A snapshot of known cost that never repeats — for the overshoot bounds.
+
+    Those assertions bound the *sleep cap*, so the sensible comparison is the
+    budget itself and the measured window must not contain machine latency: a
+    single real ``git diff`` was measured at 0.45s on a box running 16 runnable
+    processes on 8 cores, which blows a sub-second bound on its own with the
+    product behaving perfectly. The churn tests keep the real ``git diff``
+    because they assert the loop's *verdict*; these assert arithmetic, so the
+    cost is an input.
+    """
+    state = {"samples": 0}
+
+    def runner(args: list[str], cwd: str) -> subprocess.CompletedProcess:
+        state["samples"] += 1
+        if delay:
+            time.sleep(delay)
+        return _ok(f"churn{state['samples']}\n".encode())
+
+    return runner, state
+
+
 def test_wait_for_settle_returns_when_stable(repo):
     assert w._wait_for_settle(str(repo), w._default_runner, timeout=5.0, interval=0.01, stable_samples=2)
 
 
 def test_wait_for_settle_times_out_while_tree_keeps_changing(repo):
-    stop = threading.Event()
+    """A tree that changes between every sample must never look settled."""
+    timeout = 0.3
+    runner, state = _churning_runner(repo)
+    start = time.monotonic()
+    waited = w._wait_for_settle(str(repo), runner, timeout=timeout, interval=0.02, stable_samples=2)
+    elapsed = time.monotonic() - start
+    assert waited is False, f"called a churning tree settled after {state['samples']} sample(s)"
+    # Non-vacuity, logically exact: the loop only reaches its deadline check
+    # *after* a sample, so a correct product always samples at least once — and
+    # a regression that returned before looking would otherwise satisfy the
+    # "False" above for the wrong reason (probed: an early-False stub is caught
+    # by exactly this line). The bound stays at 1 on purpose: a snapshot slower
+    # than the whole budget legitimately ends the wait after a single sample, so
+    # any bigger count would re-introduce the scheduler dependence being removed.
+    assert state["samples"] >= 1, "returned before taking a single sample"
+    # The loop can only return False through its own deadline check, so a
+    # negative result is bounded below by the budget. The slack absorbs float
+    # noise only — an early return means the contract changed.
+    assert elapsed >= timeout - 0.01, f"returned at {elapsed:.3f}s, before its {timeout}s deadline"
 
-    def churn():
-        i = 0
-        while not stop.is_set():
-            (repo / "a.txt").write_text(f"churn{i}\n")
-            i += 1
-            time.sleep(0.02)
 
-    t = threading.Thread(target=churn)
-    t.start()
-    try:
-        assert not w._wait_for_settle(str(repo), w._default_runner, timeout=0.3, interval=0.02, stable_samples=2)
-    finally:
-        stop.set()
-        t.join()
-
-
-def test_wait_for_settle_no_overshoot_when_interval_exceeds_timeout(repo):
+def test_wait_for_settle_no_overshoot_when_interval_exceeds_timeout():
     """interval > timeout must not extend the wait past the deadline.
 
     Old code slept the full interval after the deadline check, so a
-    timeout=0.05 / interval=0.5 call blocked ~0.5s (10x the budget) when the
+    timeout=0.05 / interval=0.5 call blocked ~0.5s (10x the budget) while the
     tree kept changing. The sleep is now capped by the remaining budget.
     """
+    timeout, interval = 0.05, 0.5
+    runner, state = _fixed_cost_runner(delay=0.02)
     start = time.monotonic()
-    assert not w._wait_for_settle(str(repo), w._default_runner, timeout=0.05, interval=0.5, stable_samples=1)
+    waited = w._wait_for_settle(".", runner, timeout=timeout, interval=interval, stable_samples=1)
     elapsed = time.monotonic() - start
-    assert elapsed < 0.3, f"overshot the deadline: waited {elapsed:.2f}s for a 0.05s timeout"
+    assert waited is False, f"called a churning tree settled after {state['samples']} sample(s)"
+    assert state["samples"] >= 1, "returned before taking a single sample"
+    # The contract is "never sleep a further full interval": the capped version
+    # ends at the deadline (~0.05s here), the uncapped one always adds another
+    # interval after it. Half an interval of slack absorbs scheduler slop
+    # without letting a whole extra interval through.
+    assert elapsed < timeout + interval / 2, (
+        f"overshot the deadline: waited {elapsed:.2f}s for a {timeout}s timeout / {interval}s interval"
+    )
 
 
-def test_wait_for_settle_no_overshoot_with_slow_snapshot(repo):
-    """A slow snapshot must not push past the deadline while the tree churns."""
-    stop = threading.Event()
-
-    def churn():
-        i = 0
-        while not stop.is_set():
-            (repo / "a.txt").write_text(f"churn{i}\n")
-            i += 1
-            time.sleep(0.01)
-
-    def slow_runner(args, cwd):
-        time.sleep(0.1)  # snapshot cost, larger than the remaining budget
-        return w._default_runner(args, cwd)
-
-    t = threading.Thread(target=churn)
-    t.start()
-    try:
-        start = time.monotonic()
-        assert not w._wait_for_settle(str(repo), slow_runner, timeout=0.25, interval=0.05, stable_samples=1)
-        elapsed = time.monotonic() - start
-        # Budget 0.25s: at most one 0.1s snapshot + capped sleeps. Without the
-        # cap, the last `time.sleep(0.05)` would run after the deadline passed.
-        assert elapsed < 0.5, f"overshot the deadline: waited {elapsed:.2f}s for a 0.25s timeout"
-    finally:
-        stop.set()
-        t.join()
+def test_wait_for_settle_no_overshoot_with_slow_snapshot():
+    """A snapshot slower than the budget must not push past the deadline."""
+    timeout, interval = 0.25, 0.05
+    runner, state = _fixed_cost_runner(delay=0.1)  # snapshot cost > a capped sleep
+    start = time.monotonic()
+    waited = w._wait_for_settle(".", runner, timeout=timeout, interval=interval, stable_samples=1)
+    elapsed = time.monotonic() - start
+    assert waited is False, f"called a churning tree settled after {state['samples']} sample(s)"
+    # Same non-vacuity guard as above: an early-False stub must not pass on the
+    # loose elapsed bound below.
+    assert state["samples"] >= 1, "returned before taking a single sample"
+    # Two 0.1s snapshots + one capped sleep land at ~0.25s. This bound is a
+    # gross-overshoot check only: with interval=0.05 the uncapped sleep
+    # overshoots by one small interval, so the strict cap contract lives in the
+    # interval>timeout test above.
+    assert elapsed < 0.5, f"overshot the deadline: waited {elapsed:.2f}s for a {timeout}s timeout"
 
 
 # --- run_hooks(): success passthrough ----------------------------------------

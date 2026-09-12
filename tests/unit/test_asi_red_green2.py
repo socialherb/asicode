@@ -128,6 +128,11 @@ class TestPromptAuthRetryKey:
     def test_new_key_success(self, monkeypatch):
         svc = type("S", (), {"llm_service": type("L", (), {"client": None})()})()
         monkeypatch.setattr(asi, "_API_KEY_ENV_MAP", {"x": "X_KEY"})
+        # The success path writes the key into os.environ for real (X_KEY here, a
+        # real provider key in production). Register it with monkeypatch so the
+        # teardown clears it, instead of hand-popping it after the assertions —
+        # a manual pop is skipped whenever one of those assertions fails first.
+        monkeypatch.setenv("X_KEY", "placeholder")
         import builtins
 
         monkeypatch.setattr(builtins, "input", lambda p="": "newkey123")
@@ -141,7 +146,6 @@ class TestPromptAuthRetryKey:
         assert asi._prompt_auth_retry_key("x", svc, error_message="401") is True
         assert os.environ.get("X_KEY") == "newkey123"
         assert asi._PENDING_API_KEY.get("key") == "newkey123"
-        os.environ.pop("X_KEY", None)
         asi._PENDING_API_KEY.clear()
 
     def test_client_creation_failure(self, monkeypatch):
@@ -743,7 +747,15 @@ class TestMainArgPaths:
         monkeypatch.setattr(asi, "run_once", _run_once)
         monkeypatch.setattr(asi, "run_repl", lambda a: calls.setdefault("run_repl", a))
         monkeypatch.setattr(asi, "run_subagent_worker", lambda a: calls.setdefault("subagent", a))
-        # _load_dotenv writes into env — keep it real but harmless
+        # ``_load_dotenv`` was previously left real ("harmless"): it is not. It
+        # reads the DEVELOPER's <repo_root>/.env into os.environ for every key the
+        # shell did not export, so these argparse tests (a) changed behaviour
+        # depending on the machine and (b) planted real credentials into the
+        # process environment for every later test in the same xdist worker.
+        # Measured: all 7 tests in this class left DEEPSEEK_API_KEY set (35 chars,
+        # the real key from .env) — the credential-env leak guard in
+        # tests/conftest.py reports exactly that. This class is about CLI paths.
+        monkeypatch.setattr(asi, "_load_dotenv", lambda *_a, **_k: None)
         return calls
 
     def test_collaborate_subcommand(self, monkeypatch):

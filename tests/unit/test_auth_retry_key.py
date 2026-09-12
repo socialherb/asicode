@@ -137,6 +137,17 @@ class TestUnverifiedKeyIsNeverPersisted:
         monkeypatch.setattr(asi, "_save_key_to_dotenv", lambda *a: None)
         monkeypatch.setattr(asi, "_print", lambda msg, *a, **k: warned.append(msg))
         monkeypatch.setattr(asi, "_SHELL_PROVIDED_ENV_KEYS", {"DEEPSEEK_API_KEY"})
+        # Register the key with monkeypatch even though this test asserts about
+        # _SHELL_PROVIDED_ENV_KEYS, not the environment: _prompt_auth_retry_key
+        # writes os.environ["DEEPSEEK_API_KEY"] directly, and monkeypatch only
+        # restores keys it was TOLD about. Without this line "sk-verified"
+        # survives into every later test in the same xdist worker, where a
+        # presence-only credential check (skip when unset) reads the leftover as
+        # a real key — measured: test_model_catalog_context_parity's deepseek
+        # registry probe asserted "registry unreachable (HTTP 401)" for exactly
+        # this reason. The three sibling tests above register the var; this one
+        # did not. The guard in tests/conftest.py now fails the test that leaks.
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "placeholder")
 
         asi._prompt_auth_retry_key("deepseek", _FakeSvc(model="deepseek-chat"))
         asi._commit_verified_api_key()

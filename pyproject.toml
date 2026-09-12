@@ -1,6 +1,6 @@
 [project]
 name = "asicode"
-version = "0.2.32"
+version = "0.2.33"
 description = "Autonomous Software Improvement — AST-precise code editing agent with verification gates (CLI + MCP server)"
 readme = "README.md"
 license = "MIT"
@@ -218,6 +218,17 @@ parallel = true
 # pty tests also drag the total down when they abort early (xdist worker
 # data loss), so the ratchet stays at 90 until CI is green consistently.
 fail_under = 90
+# ignore_errors: a source file that no longer exists must not ABORT the report.
+# Measured incident (lint runs 34687877882 and 34689020064): the pytest step
+# was green (16425 passed on the second) and the job still failed — a
+# test-spawned interpreter had imported an `asi-policy-*` temp-tree copy of
+# the package (the a1_coverage.pth measures every process), its
+# TemporaryDirectory then deleted the tree, and `coverage report` died with
+# `No source for code: '/tmp/asi-policy-…/external_llm/__init__.py'` — rc=1,
+# NO table, no fail_under verdict. This is the documented remedy for "files
+# deleted between the run and the report" (coverage docs, [report] section);
+# the fail_under verdict below is unaffected (a low total still exits 2).
+ignore_errors = true
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",

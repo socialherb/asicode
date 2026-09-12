@@ -73,6 +73,7 @@ def _main() -> int:
     )
     ns = p.parse_args()
 
+    import pathlib
     import tempfile
 
     import coverage
@@ -84,10 +85,28 @@ def _main() -> int:
     # malformed (observed: "database disk image is malformed" for the child's
     # suffixed file, which then fails to combine). Reuse the active instance
     # when present; only start our own otherwise.
+    #
+    # Two constructor arguments are load-bearing, not cosmetic:
+    #   * data_suffix=True — without a suffix this instance writes the BASE name
+    #     of $COVERAGE_FILE, and `coverage combine` (scripts/cov.sh) REPLACES
+    #     that base with its own merge output instead of merging it. Measured
+    #     2026-09-12 (coverage 7.14.3): one base-name write beside one parallel
+    #     file => combine said "Combined 1 file" and the child's lines were gone
+    #     from the report, silently. A suffix keeps every process in its own
+    #     file, which is exactly what combine merges.
+    #   * config_file — pty_driver strips COVERAGE_PROCESS_START/CONFIG from this
+    #     process (so the .pth hook cannot auto-start a second instance), which
+    #     left cwd discovery as the ONLY thing putting the child in parallel
+    #     mode and applying the repo's source= filter. Pinning the repo config
+    #     makes the child's measurement surface independent of its cwd.
     data_file = os.environ.get("COVERAGE_FILE") or os.path.join(tempfile.gettempdir(), f"covstage2-{os.getpid()}")
     cov = coverage.Coverage.current()
     if cov is None:
-        cov = coverage.Coverage(data_file=data_file)
+        cov = coverage.Coverage(
+            data_file=data_file,
+            data_suffix=True,
+            config_file=str(pathlib.Path(__file__).resolve().parents[2] / "pyproject.toml"),
+        )
         cov.start()
     try:
         import asi

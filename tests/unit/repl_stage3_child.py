@@ -244,6 +244,7 @@ def _main() -> int:
     )
     ns = p.parse_args()
 
+    import pathlib
     import tempfile
 
     import coverage
@@ -253,10 +254,20 @@ def _main() -> int:
     # a SECOND instance would double-instrument the process and its data file
     # can end up malformed (observed: "database disk image is malformed" for the
     # child's suffixed file, which then fails to combine).
+    #
+    # data_suffix + config_file mirror repl_stage2_child.py for the same measured
+    # reasons: a base-name write is REPLACED (not merged) by `coverage combine`
+    # — its lines vanish from the report — and with COVERAGE_PROCESS_START
+    # stripped by pty_driver, cwd discovery was the only thing selecting parallel
+    # mode and the repo's source= surface.
     data_file = os.environ.get("COVERAGE_FILE") or os.path.join(tempfile.gettempdir(), f"covstage3-{os.getpid()}")
     cov = coverage.Coverage.current()
     if cov is None:
-        cov = coverage.Coverage(data_file=data_file)
+        cov = coverage.Coverage(
+            data_file=data_file,
+            data_suffix=True,
+            config_file=str(pathlib.Path(__file__).resolve().parents[2] / "pyproject.toml"),
+        )
         cov.start()
     try:
         import asi

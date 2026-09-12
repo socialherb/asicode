@@ -23,10 +23,13 @@
 # strips COVERAGE_PROCESS_START/CONFIG from the child env, so the .pth hook
 # does NOT start there. The child starts its OWN Coverage instance instead,
 # writing into the inherited COVERAGE_FILE (this script's private COV_DIR) or
-# /tmp/covstage*-{pid}; with COVERAGE_FILE set, coverage's parallel suffix
-# naming puts the child's data beside the main process's files in COV_DIR, so
-# the `coverage combine` below merges the pty session's lines too (verified
-# 2026-08-25: repl_impl.py 8% → 33% when the child data is included).
+# /tmp/covstage*-{pid}; the child passes data_suffix=True and pins config_file
+# to the repo pyproject, so its data carries a parallel suffix beside the main
+# process's files in COV_DIR whatever cwd it inherits (a base-name write would
+# be REPLACED by `coverage combine`, losing those lines silently — measured
+# 2026-09-12), so the `coverage combine` below merges the pty session's lines
+# too (verified 2026-08-25: repl_impl.py 8% → 33% when the child data is
+# included).
 #
 # Usage:
 #   ./scripts/cov.sh [pytest args...]      # default: tests/unit -q
@@ -63,7 +66,23 @@ PTH
 fi
 
 # --- private data dir (override with COV_DIR for CI artifact staging) ---
+# COV_DIR is normalized to an ABSOLUTE path before it reaches COVERAGE_FILE.
+# coverage resolves a relative data-file path against the cwd of EVERY process
+# it instruments, so a relative COV_DIR (lint.yml passes `COV_DIR=coverage-data`)
+# scattered parallel data into whatever cwd a test-spawned child happened to
+# have. Measured 2026-09-12: one `tests/unit` run left 99 data files / 5.3MB
+# across 69 directories under pytest's tmp dirs — none of them readable by the
+# `coverage combine` below (which resolves relative to THIS cwd, the repo root),
+# so the gate silently lost those lines; the stray directory in the child's cwd
+# also failed test_export_cli_args.py::test_real_cli_help_is_instant_and_clean
+# in CI. `mkdir -p` must precede the `cd` because a fresh COV_DIR (CI's
+# `coverage-data`) does not exist yet and `set -e` would abort. `cd … && pwd`
+# rather than realpath: POSIX, and it keeps the caller's spelling so a relative
+# COV_DIR still resolves against the repo root (lint.yml uploads
+# `coverage-data/coverage`, workspace-relative).
 COV_DIR="${COV_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/asicode-cov.XXXXXX")}"
+mkdir -p "$COV_DIR"
+COV_DIR="$(cd "$COV_DIR" && pwd)"
 export COVERAGE_FILE="$COV_DIR/coverage"
 # NOTE: COVERAGE_PROCESS_START is interpreted as a CONFIG FILE PATH by
 # coverage.process_startup() (an absolute path is required; `=1` silently
@@ -79,18 +98,36 @@ PYTEST_RC=0
 "$PYTHON" -m pytest "$@" || PYTEST_RC=$?
 # Always combine+report, even on test failures — the report (and the
 # fail_under gate) is the point of this wrapper, and the failed suite's
-# coverage picture is the most useful diagnostic. Exit with the pytest rc.
+# coverage picture is the most useful diagnostic.
+#
+# Every step's rc is captured explicitly instead of being left to `set -e`:
+# an aborted combine/report used to kill the script AT THAT LINE, masking the
+# pytest rc (measured: lint run 34689020064 exited 1 from the report while the
+# suite was 16425 passed / 0 failed) and skipping the footer, so a red log
+# could not say WHICH step failed.
 echo "cov.sh: pytest rc=$PYTEST_RC; combining parallel data files -> $COV_DIR/coverage"
-"$PYTHON" -m coverage combine
+COMBINE_RC=0
+"$PYTHON" -m coverage combine || COMBINE_RC=$?
 
 # COV_FAIL_UNDER overrides [tool.coverage.report] fail_under — e.g.
 # COV_FAIL_UNDER=0 for release.yml's report-only run (a publish pipeline must
 # not be blocked by the threshold tuned to lint's deselected suite).
+REPORT_RC=0
 if [ -n "${COV_FAIL_UNDER:-}" ]; then
-  "$PYTHON" -m coverage report -m --fail-under="$COV_FAIL_UNDER"
+  "$PYTHON" -m coverage report -m --fail-under="$COV_FAIL_UNDER" || REPORT_RC=$?
 else
-  "$PYTHON" -m coverage report -m
+  "$PYTHON" -m coverage report -m || REPORT_RC=$?
 fi
-echo "cov.sh: done. Re-run report/json anytime with:"
+echo "cov.sh: done (pytest rc=$PYTEST_RC, combine rc=$COMBINE_RC, report rc=$REPORT_RC). Re-report with:"
 echo "  COVERAGE_FILE=$COV_DIR/coverage $PYTHON -m coverage report -m"
-exit "$PYTEST_RC"
+# Exit contract: ANY failed step reds the run — a failed suite must not be
+# masked by a clean report, and a failed coverage step must not be masked by a
+# green suite. pytest's rc wins when several steps failed (it is the number a
+# human acts on first).
+if [ "$PYTEST_RC" -ne 0 ]; then
+  exit "$PYTEST_RC"
+fi
+if [ "$COMBINE_RC" -ne 0 ]; then
+  exit "$COMBINE_RC"
+fi
+exit "$REPORT_RC"

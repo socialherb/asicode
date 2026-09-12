@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import shutil
+import sys
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -22,6 +23,137 @@ if TYPE_CHECKING:
     from external_llm.agent.agent_loop import AgentLoop
     from external_llm.agent.orchestrator import FileLockManager
     from external_llm.agent.tool_registry import AgentConfig, ToolRegistry
+
+
+# ── provider-credential env leak guard ──────────────────────────────────────────
+# The auth-retry path writes the key it was handed straight into the process
+# environment (``asi``: ``os.environ[env_var] = new_key``; ``repl_impl`` has three
+# more sites). That write is process-global and outlives the test that triggered
+# it — ``monkeypatch`` only restores keys it was TOLD about, so a test that drives
+# the prompt without first calling ``monkeypatch.setenv(name, ...)`` leaves the
+# fake behind for every later test in the same xdist worker.
+#
+# The damage is indirect, which is why it went unnoticed for so long: other tests
+# gate on *presence* of the same env var (``if not os.getenv("DEEPSEEK_API_KEY"):
+# pytest.skip(...)``), so a leaked fake does not fail the leaker — it makes an
+# unrelated test run against the fake and fail there. Measured in CI: a test in
+# ``test_auth_retry_key.py`` leaked ``DEEPSEEK_API_KEY``, and the deepseek vendor
+# probe in ``test_model_catalog_context_parity.py`` — which shares the worker —
+# skipped in every earlier run but asserted "registry unreachable (HTTP 401)" in
+# that one, reproduced locally on a clean checkout.
+#
+# Two properties are load-bearing, both about WHEN the check runs:
+#   * it is a HOOK WRAPPER, not a fixture. Fixture finalization happens INSIDE
+#     ``pytest_runtest_teardown``, so a fixture's own teardown would still have
+#     monkeypatch's undo pending and would report every legitimate
+#     ``monkeypatch.setenv`` as a leak. Post-yield of the teardown wrapper is the
+#     first moment the test's final state exists.
+#   * the baseline is captured pre-yield of ``pytest_runtest_setup``, i.e. before
+#     any fixture for the item runs: a post-setup baseline would record the
+#     ``monkeypatch.setenv`` values themselves and then flag their undo.
+# The watched set comes from the production SSOT (``asi._API_KEY_ENV_MAP``) rather
+# than a hand-written list, so a newly added provider is covered where the auth
+# path reads it.
+_ENV_GUARD_BASELINE: pytest.StashKey[dict[str, str | None]] = pytest.StashKey()
+
+
+def _provider_key_env_names() -> tuple[str, ...]:
+    """Env var names the auth-retry path can write (production SSOT)."""
+    import asi
+
+    return tuple(sorted({v for v in asi._API_KEY_ENV_MAP.values() if v}))
+
+
+def _describe_env_value(value: str | None) -> str:
+    """Presence and size only — never echo a value, it may be a real key."""
+    return "unset" if value is None else f"set ({len(value)} chars)"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item):
+    """Snapshot credential env vars as they are *before* this item's fixtures."""
+    import os
+
+    item.stash[_ENV_GUARD_BASELINE] = {name: os.environ.get(name) for name in _provider_key_env_names()}
+    return (yield)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Fail the item if it left a provider credential env var behind.
+
+    Runs after fixture finalization (monkeypatch's undo included) — see the
+    section comment above for why this cannot be a fixture. Keys are compared by
+    NAME against the baseline, so a test that rewrites ``_API_KEY_ENV_MAP``
+    itself cannot move the guard's target mid-flight.
+    """
+    import os
+
+    result = yield
+    baseline = item.stash.get(_ENV_GUARD_BASELINE, None)
+    if baseline is not None:
+        leaked = [
+            (name, before, os.environ.get(name))
+            for name, before in sorted(baseline.items())
+            if os.environ.get(name) != before
+        ]
+        if leaked:
+            detail = "; ".join(
+                f"{name} ({_describe_env_value(before)} → {_describe_env_value(after)})"
+                for name, before, after in leaked
+            )
+            pytest.fail(
+                f"test left provider credential env var(s) behind: {detail}\n"
+                "Register every credential key with monkeypatch "
+                "(monkeypatch.setenv(name, 'placeholder')) BEFORE the code under test writes "
+                "os.environ[name] directly: monkeypatch only restores keys it was told about, "
+                "so an unregistered write survives into every later test in this worker and "
+                "silently satisfies presence-only credential checks there.",
+                pytrace=False,
+            )
+    return result
+
+
+# ── coverage data must reach disk BEFORE the interpreter's exit path runs ────────
+# ``scripts/cov.sh`` starts coverage in EVERY process (a1_coverage.pth ->
+# ``coverage.process_startup()``), and coverage keeps the collected lines in
+# memory until process EXIT: its only writer is an ``atexit`` handler. pytest-xdist
+# pays each worker 10 s to die (``WorkerController.EXIT_TIMEOUT``) and SIGKILLs the
+# process once that budget is spent, so a worker whose exit path is slower than the
+# budget loses EVERY line it measured -- the atexit handler never runs at all.
+#
+# Measured 2026-09-12 on an instrumented full-suite run (8 workers): each worker
+# held 37k-51k buffered lines at ``pytest_sessionfinish``, none of the 8 data files
+# existed afterwards, so ``coverage combine`` saw only the test-spawned children and
+# the gate reported ``TOTAL 61474 51900 16%`` where CI reports 92%. The local exit
+# path is dominated by pytest's basetemp rotation
+# (``_pytest.pathlib.cleanup_numbered_dir`` -> ``shutil.rmtree`` over the numbered
+# ``<tmp>/pytest-of-*/pytest-N`` trees), which grows with local run history -- the
+# exact state a fresh CI runner never has. The loss is silent and total, which is
+# why it read as "the tests barely cover anything" rather than "measurement broke".
+#
+# Flushing here makes the data durable while the process is still alive, whatever
+# the exit path does afterwards. Trade-off: coverage's ``CoverageData.write()``
+# finalizes a data file once (``_wrote_hash``), so lines executed after this hook
+# (session-scoped fixture finalizers, teardown) are not persisted -- a rounding
+# error next to discarding the whole run, and the exit-time save is a no-op anyway.
+def pytest_sessionfinish(session, exitstatus):
+    """Persist auto-started coverage data before the interpreter exit path runs."""
+    try:
+        import coverage
+    except ImportError:  # dev-only dependency: a plain run without it must not break
+        return
+
+    cov = getattr(coverage.process_startup, "coverage", None)
+    if cov is None:
+        # Coverage was not auto-started (a plain ``pytest`` run): nothing to save,
+        # and materializing a ``.coverage`` file here would surprise the caller.
+        return
+
+    try:
+        cov.save()
+    except Exception as exc:  # never fail the suite over coverage bookkeeping
+        print(f"conftest: coverage data could not be saved at session finish: {exc!r}", file=sys.stderr)
 
 
 @pytest.fixture

@@ -7,6 +7,9 @@
 *.cover
 cov_stash/
 coverage.json
+# cov.sh's COV_DIR as CI passes it (lint.yml / release.yml: COV_DIR=coverage-data).
+# Anchored: the CI dir lands at the repo root, a local run must not dirty it.
+/coverage-data/
 
 # Python
 __pycache__/

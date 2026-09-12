@@ -858,3 +858,101 @@ for f in ['change_spec_assertions.py', 'symbol_handlers.py', 'intent_verifier.py
   - export dry-run: `.github/workflows/`에 lint.yml/release.yml만 존재, private-tests.yml **없음** (제외 확인).
   - export 기반 테스트 3종 (test_export_structural_baseline / test_release_ignored_py_gate / test_precommit_config) 20 passed.
 - **결론**: private 전용 103개 테스트가 이제 private mirror push 시 CI에서 실행됨. public 트리는 이 워크플로 자체가 없어 no-op (설계상). private mirror 생성·push는 사용자 승인 후 `gh repo create asicode-private --private --source=. --push` (선택).
+
+## 2026-09-12 | P30 — 실측 발견 8건: 프라이빗 CI 게이트 공백(P0) + 死 배선 클러스터 + 상태 소실 3건
+
+> **방법**: 구조 스캐너 8종(webapp 25파일 / external_llm 217파일) → ast_similarity 외 0건(클린). 그래서 이번 라운드는 스캐너가 아니라 **게이트 상태·DOM 계약·영속 상태 3축 실측**에서 발견. 모든 항목은 재현 명령/출력 첨부.
+
+### P30-1. [P0, 발견] 프라이빗 repo의 lint 게이트와 릴리스 워크플로가 **수동 비활성** 상태
+
+- **파일**: `.github/workflows/lint.yml`, `.github/workflows/release.yml` (repo 설정 상태 — 파일 내용은 정상)
+- **근거 (실측)**:
+  - `gh workflow list --all` (프라이빗): `Lint + Unit tests (baseline-diff gates + full tests/unit)` → **disabled_manually**, `Release (PyPI Trusted Publishing)` → **disabled_manually**, `Private-tree unit tests (full tree)` → active. 같은 명령을 `-R socialherb/asicode`(public)로 실행하면 두 워크플로 모두 **active**.
+  - lint.yml의 마지막 런 2건은 2026-08-24 `failure` (32749451561 / 32749428142, 실패 job = `Unit tests (public exported tree, clean install)` — 익스포트 트리 가정과 프라이빗 체크아웃의 불일치). 이후 런 이력(`gh run list -L 60`)에 lint 워크플로가 **한 건도 없음** = 비활성 시점과 일치.
+  - 결과: 프라이빗 트리(=실제 개발·`webapp/`·JS가 있는 유일한 트리)에서 **ruff 전수/F821·F401·F811 베이스라인 diff/silent-except/unguarded-subprocess/구조 스캐너/JS 스위트+커버리지 게이트가 전부 무집행**. P29가 만든 `private-tests.yml`은 pytest만 돈다.
+  - 부작용 2: JS 스위트는 **어느 트리에서도 CI로 돌지 않음** (public은 `hashFiles('webapp/ui/static/**/*.js')` 가드로 스킵) → P30-2의 red가 보이지 않음.
+  - 부작용 3(정정): 프라이빗 `release.yml` 비활성은 **PyPI 경로에 영향 없음** — 태그는 public repo로 push되고 그쪽 release.yml이 active다. 영향은 "프라이빗 repo에 태그를 push해도 아무 일이 없다"뿐. 다만 `.pre-commit-config.yaml`의 "lint.yml is the only workflow that actually runs on every push/PR" 및 CLAUDE.md 릴리스 절차 주석은 현재 상태와 불일치하므로 상태 주석이 필요하다.
+  - **왜 두 테스트 job만 가드하면 되는가**: 마지막 2회 런에서 실패한 job은 `Unit tests (public exported tree, clean install)` 하나뿐이고 **`baseline-diff`는 success**였다(로그 확인). 즉 비활성화의 원인은 익스포트 트리 가정 job이며, lint 게이트 자체는 프라이빗 트리에서도 정상 동작한다.
+- **수리안**: (a) lint.yml의 트리 의존 job 2개(`unit-tests`, `integration`)에 `if: github.repository == 'socialherb/asicode'` 가드 추가 → 프라이빗에서는 `baseline-diff`(ruff·AST·구조 스캐너)와 JS 스텝만 실행, (b) `gh workflow enable` 후 3종 상태를 CLAUDE.md에 명시, (c) "hook ↔ CI 스텝 미러" 주석(.pre-commit-config.yaml)이 더 이상 사실이 아님을 주석 정정.
+- **진행 (2026-09-12)**: `gh workflow enable 341373147` → active(`workflow_dispatch` 부재 → 트리거 실측은 `gh pr close/reopen`, 런 34676144074). 재활성 직후 red 2종: (i) **P30-2 그 자체** — 비활성 기간에 들어온 회귀가 누적돼 있었음(아래에서 수리 완료), (ii) unit-tests 10건 = vulture 미설치 8 + `test_export_cli_args`(cov.sh 상대 `COV_DIR`) 1 + `test_sse_emit_consume_gate`(checkout `fetch-depth: 1`) 1.
+- **vulture 8건 수리 (2026-09-12)**: `lint.yml` unit-tests job에 **트리 형상 조건부** 스텝 추가 — `if: hashFiles('tests/unit/test_check_structural_scanners.py') != ''` → `python -m pip install -e '.[vulture]' --quiet`. 수리안 (a)의 repo명 하드코딩은 (1) 공개로 반입되는 파일에 프라이빗 repo명을 남기고 (2) fork/rename 시 조용히 무력화되므로 **트리 형상 판정**으로 채택(같은 파일의 coverage-gate 스텝이 이미 쓰는 idiom). 그 테스트 파일은 `export_public.EXCLUDE_FILES` 소속이라 공개 스냅샷에서는 조건이 자동으로 거짓 → vulture 미설치 유지 = `tests/unit/analysis/test_vulture_scanner.py`의 `importorskip("vulture.core")` 의미론 보존(무조건 설치 시 공개에서 skip→실행으로 게이트 표면이 바뀐다). 증명: `sitecustomize` meta_path 차단기로 "extras 미설치 러너"를 재현 → 해당 8 nodeid `8 failed`(CI와 동일) → 차단 해제 시 `8 passed`.
+- **남은 하위항목**: (a) unit-tests의 나머지 2 red(위 (ii)) — `scripts/cov.sh`의 상대 `COV_DIR` 절대경로화 + checkout `fetch-depth: 0`, (b) CLAUDE.md/`.pre-commit-config.yaml`의 "lint.yml is the only workflow that runs on every push/PR" 서술 정정, (c) 프라이빗 `release.yml`은 **의도적 비활성 유지**(태그는 public으로 push, PyPI Trusted Publisher도 public 등록).
+- **노력 0.5d / 리스크 하** (워크플로 파일 + 주석만, 테스트 영향 0).
+
+### P30-2. [P1, 발견] JS 데드키 게이트의 부분문자열 오탐 → 스위트 red 고착 (P30-1 때문에 은폐)
+
+- **파일**: `tests/js/test_agent_dead_map_keys_gate.js:66` (`src.includes(name)` 기반 R1 루프)
+- **근거 (실측)**: `node tests/js/test_agent_dead_map_keys_gate.js` → `AssertionError: agent-panel.js must not reference dead key "budget_warning"`. 실제 참조는 **살아있는 키 `context_budget_warning`** — 정화 토큰이 부분문자열로 포함되어 오탐. 그래서 `node tests/js/run_coverage_gate.js`가 로컬 exit 1(게이트 자체 문제가 아니라 이 테스트가 red라서 — 커버리지 diff 인벤토리는 main과 동일).
+- **수리안**: 정화 검사도 심볼 수준으로 — `includes()` 대신 **식별자 경계 매칭**(`\b` + 영숫자/`_` 경계) 또는 소스에서 뽑은 **토큰 집합 비교**(enum/핸들러 키 목록을 구조적으로 수집). 후자가 repo 원칙(키워드/regex 지양)에 부합.
+- **노력 0.25d / 리스크 하** (테스트 1파일 + 경계 케이스 2건).
+- **수리 완료 (2026-09-12)**: `tests/js/test_agent_dead_map_keys_gate.js`(R1/R2 전부) + 신규 `tests/js/test_agent_dead_map_gate_boundaries.js`.
+  - **토큰 형상(shape) 판정** `hasToken(src, token, kind)`: `identifier` — 양쪽 이웃이 식별자 문자(`[A-Za-z0-9_$]`)면 불일치(`context_budget_warning` ≠ `budget_warning`, 그러나 `budget_warning:`, `"budget_warning"`, `x.budget_warning`은 여전히 매치). `class` — CSS 패밀리 **접두**라 우측 `-suffix`는 의도적 매치(무경계), 좌측은 `-` 런을 건너본 뒤 그 런이 다른 식별자를 잇으면 불일치(`--spec-resolver-card`는 매치, `my-spec-resolver-widget`은 불일치). 정규식 컴파일 0회 → 토큰이 메타문자를 가져도 규칙 불변.
+  - **의미 변화 감사(핵심)**: old(substring) ↔ new(boundary) 전수 비교 스크립트 → 변화는 `agent-panel.js:1844` `context_budget_warning` **단 1건**(오탐 지점 자체). 즉 **진짜 재도입을 놓치게 된 사이트 0** — 매처 교체의 유일한 허용 부작용만 발생.
+  - **양방향 증명**: 신규 하네스가 **실제 게이트 파일을 무수정**으로 샌드박스(경로 형상 `__dirname/../../` 재현 + 실표면 복사)에서 12회 실행 — GREEN 3(실트리 / `prefix_budget_warning` / `my-spec-resolver-widget`), RED 9(맵 키·이벤트명·문자열·design 키·CSS 규칙·커스텀 프로퍼티·JS 표면 클래스·고아 헬퍼·ui.html), 각 RED는 게이트 자신의 메시지까지 단언. 하네스 비-vacuous 검증: **수리 전 게이트**(`git show HEAD:...`)를 같은 하네스에 물리면 첫 프로브에서 실패.
+  - **실측**: `node tests/js/test_agent_dead_map_keys_gate.js` RED(exit 1, L66) → GREEN(`47 map keys`); `node tests/js/run_coverage_gate.js` exit 1 → **exit 0 / 49-49 passed**(커버리지 인벤토리 22/47·6/14 불변, NET-NEW 0). 프로브 자식은 `NODE_OPTIONS=""`/`COV_OUT=""`로 환경 격리(상속 시 자식이 이 테스트의 evidence JSON을 덮어써 커버리지 게이트가 NET-NEW를 보고한다).
+
+### P30-3. [P1, 발견] 웹서치 벽(backoff) 상태가 랩스 순간 디스크에서 소실 → 래더 리셋 (U-3 확정)
+
+- **파일**: `external_llm/agent/tool_handlers/web_search_tools.py` — `_backend_in_cooldown` (L1696–1724), 영향: `_trip_backend_cooldown`(L1726), `_clear_backend_wall`(L1767), `_walled_backend_notice`(L1780)
+- **메커니즘**: 만료된 벽 항목을 `del _wall_state[name]`로 **메모리에서만** 지우고(스트라이크는 `_wall_pending_strikes`로 이동) **persist하지 않는다**. 그 사이 다른 백엔드의 trip/clear가 스냅샷(=메모리)을 디스크에 쓰면 그 백엔드의 벽+스트라이크 이력이 디스크에서 사라진다.
+- **근거 (재현 스크립트 출력, `/tmp/scan/u3_repro.py`)**: Startpage strikes=5, `until` 만료 상태에서 →
+  `probe allowed after lapse? in_cooldown = False` / `memory after lapse: {} pending={'Startpage': 5}` / DuckDuckGo trip 후 `disk: {'DuckDuckGo': ...}` — **Startpage가 디스크에서 사라짐** / 프로세스 재시작 시뮬레이션 후 재벽 → `strikes: 1.0` (이력 보존 시 6이어야 함).
+- **영향**: 14일 치 에스컬레이션 끝에 "최대 1일 1회"에 도달한 백엔드가 다시 **15분마다 재프로브** → 차단을 심화시키는 바로 그 실패(주석의 설계 의도와 정반대). 부수 효과로 `_walled_backend_notice`의 "coverage reduced" 고지도 사라진다.
+- **수리안**: 만료 항목을 **삭제하지 않고** `until <= now`(=probe 허용) 상태로 유지해 스냅샷에 계속 포함(스키마 변경 없음, pending/trip 로직 단순화), 또는 랩스 시점에 persist. 회귀 테스트 3건(랩스 후 타 백엔드 trip / 재시작 후 스트라이크 연속성 / 고지 유지).
+- **노력 0.5d / 리스크 중** (영속 상태 스키마 의미 변화 → 기존 4개 테스트 재검토 필요: `test_backend_cooldown_expires` 계열).
+
+### P30-4. [P1, 발견] LLM Context 배선 死 클러스터 — **빌더 모드·레벨·커서가 모두 기본값으로 고정**
+
+- **파일**: `webapp/ui/static/ui.js` (`_getCtxKnobs` L1384–1418, `refreshLLMContext` L8160–8215), `webapp/ui/ui_tools.py` (L786–790, L1146–1170)
+- **근거 (실측, DOM 계약 스캔 `/tmp/scan/dom_ids.py`)**: 템플릿 정의 id 212 / 동적 생성 20 / JS 참조 210 → **미해결 id 21개, 참조 34사이트**. 그중 LLM Context 클러스터가 다수(`llm-context`, `context-pack`, `tab-context-pack`, `llm-context-mode`, `llm-context-chat`, `llm-context-bundle`, `copy-context-pack-btn`, `llm-ctx-toggle`, `ctx-context-level`, `ctx-cursor-line`, `ctx-selection-start-line`, `ctx-selection-end-line`). 실제 템플릿에는 `tab-llm-context`/`llm-context-container`/`llm-context-llm` 등 **다른 이름**으로 존재(= 개명 후 JS가 따라오지 못한 계열).
+- **확정된 기능 손실 3건**:
+  1. `document.getElementById("llm-context-mode")` 가 존재하지 않음 → `ctx_mode`가 **항상 "auto"** (L8211). 서버는 `auto|v7|v8|super|hybrid` 빌더를 지원하지만 UI에서 선택 불가(`ui_tools.py:1150` Query + L1157–1180 분기).
+  2. `ctx-context-level` 부재 → `_getCtxKnobs().context_level`이 항상 `""` → `ctxLevel = "L1"` 고정 → 서버는 v7(헤드 전용)만 반환. L2/L3 경로(+`wantRg`=rg_blocks)는 UI에서 **도달 불가**.
+  3. `ctx-cursor-line`/`ctx-selection-*-line` 부재 → 커서·선택창 0 → 스니펫 선택이 항상 헤드 기준.
+- **수리안**: (a) 위 id를 템플릿에 되살릴지(=기능 복구) 아니면 JS를 현 템플릿 기준으로 정리할지 **의도 결정**(D1 `editor-pane` 때와 동일한 결정 지점), (b) 어느 쪽이든 P30-5 게이트로 재발 차단.
+- **노력 0.5d(정리) ~ 1.5d(복구) / 리스크 중**.
+
+### P30-5. [P2, 신설 제안] DOM-id 해석 게이트 (baseline-diff) — D2 구현
+
+- **대상**: `tests/js/run_coverage_gate.js` 옆에 신규 게이트(또는 `tests/js/test_dom_id_contract.js`) — ① JS가 참조하는 id가 템플릿/동적 생성에 존재하는가(순방향), ② 템플릿에만 있고 JS가 0회 참조하는 id(역방향, 정보성).
+- **필수 정밀도 3가지**: (i) **주석 제외** — 현재 21건 중 `editor-pane`(ui.js:4055)은 D1 수리 주석 안의 언급이라 실참조가 아님(게이트가 오탐하면 안 됨), (ii) 동적 id(`.id =`, `setAttribute('id',…)`, JS 문자열 템플릿) 화이트리스트를 **구조적으로 수집**, (iii) baseline-diff 의미론(net-new만 실패) — 기존 21건은 baseline으로 동결하고 신규만 차단.
+- **노력 0.5d / 리스크 하** (P30-1로 CI에 연결되면 실효).
+
+### P30-6. [P2, 재확인] `context_level="window"`는 서버 enum 밖 → 조용히 L1 강등
+
+- **파일**: `webapp/ui/static/ui.js:1361` (`_applyAutoExpandLLMContextKnobs` — `_getCtxKnobs` L1418이 항상 호출) ↔ `webapp/ui/ui_tools.py:786–790`
+- **근거**: 자동 확장의 **기본(비-entropy) 경로가 `"window"`** 를 넣고 그대로 `context_level` 파라미터로 전송되는데, 서버는 `AUTO→L1`, 그 외 미지값→**L1**로 강등한다(서버 계약: `auto|L1|L2|L3`). 결과적으로 UI 배지는 `AUTO window ±320 (cursor=N)`을 표시하지만 실제 페이로드는 헤드 전용 v7 — 사용자에게 보이는 상태와 서버 동작이 불일치.
+- **수리안**: 두 표면을 하나로 — 클라이언트가 `L2`(커서 창 의미)를 보내거나, 서버가 `window`를 L2 별칭으로 수용(+Query enum·docstring 갱신). 재발 방지는 **클라이언트가 보낼 수 있는 값 집합 ↔ 서버 수용 집합 패리티 게이트**(모델 카탈로그 패리티 게이트와 동일 형태).
+- **노력 0.25d / 리스크 하**.
+
+### P30-7. [P2, 재확인] pty 자식 자가종료(D2)·하네스 watchdog(D3) 미구현 → 고아 프로세스 경로 잔존
+
+- **파일**: `tests/unit/pty_driver.py` (D1 SIGKILL 에스컬레이션만 구현됨), `tests/unit/repl_stage2_child.py`
+- **근거**: 과거 15시간 100% CPU 고아(PID 16530, PPID=1)의 3중 결함 중 D1만 수리. 자식은 `start_new_session=True`로 부모와 분리되어 TERM 미수신 시 busy-loop, 하네스에는 누수 감시 없음.
+- **수리안**: 자식에 SIGHUP/stdin-EOF 자가종료, 하네스 spawn 레지스트리 watchdog(세션 종료 시 잔존 pid 정리 + 실패 로그).
+- **노력 0.5d / 리스크 하**.
+
+### P30-8. [P3, 재확인] 로컬 기본 모델 3b/7b 불일치 + 게이트 부재 (U-4)
+
+- **파일**: `external_llm/providers.py:1831` (`OllamaClient.DEFAULT_MODEL = "qwen2.5-coder:3b"`) ↔ `webapp/schemas.py:81` + `webapp/ui/static/ui.js:4662,4702,5166,6050` (`"qwen2.5-coder:7b"`)
+- **근거**: 동일 개념의 기본값이 5+2 사이트에 하드코딩, 상호 검증 게이트 없음(카탈로그 축은 패리티 게이트가 있으나 **로컬 Ollama 기본값 축은 미커버**).
+- **수리안**: SSOT 상수 1개(파이썬) + JS는 카탈로그/픽커 DOM에서 유도, `(provider, default)` 패리티 게이트 신설.
+- **노력 0.25d / 리스크 하**.
+
+### P30-9. [P2, 재확인] `test_release_verify_mode.py` 타임아웃 테스트의 zombie-reap 경합 → CI 플레이크
+
+- **파일**: `tests/unit/test_release_verify_mode.py:210` (`test_verify_step_timeout_kills_whole_process_group`)
+- **근거**: SIGKILL 직후 `os.kill(pid, 0)` 즉시 단언 → subreaper reap 지연 시 zombie가 살아있는 것으로 보임. PR #20 첫 CI에서 `DID NOT RAISE ProcessLookupError`로 실패, 재실행 green, 로컬 8/8 green, diff에 해당 파일 없음.
+- **수리안**: 같은 파일의 `_wait_for_file` 패턴처럼 **reaping 폴링**(상한 시간 + `os.waitpid`/`kill(pid,0)` 재시도)으로 전환. PR #20의 바이트 동일성 증명을 깨지 않도록 **별도 PR**.
+- **노력 0.25d / 리스크 하**.
+
+### P30 우선순위 권장
+
+| 순위 | 항목 | 근거 강도 | 노력 | 비고 |
+|:--:|------|:--:|:--:|------|
+| 1 | P30-1 (CI 게이트 공백) | 실측(gh 상태·런 이력) | 0.5d | 다른 항목의 **은폐 원인** — 활성화+vulture 스텝 수리 완료, 나머지 2 red |
+| 2 | P30-2 (JS 게이트 오탐) | 실행 red | 0.25d | ✅ 수리 + 양방향 증명 완료 (2026-09-12) |
+| 3 | P30-3 (벽 상태 소실) | 재현 스크립트 | 0.5d | 실사용 영향(차단 심화) |
+| 4 | P30-4/P30-6 (Context 배선) | DOM 스캔 + 코드 경로 | 0.5–1.5d | 의도 결정 선행 |
+| 5 | P30-5 (게이트 신설) | 스캔 인프라 존재 | 0.5d | 4의 재발 차단 |
+| 6 | P30-7/8/9 | 기존 진단 | 0.25–0.5d | 개별 분리 PR |

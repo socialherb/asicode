@@ -31,6 +31,15 @@
  *                     ≥40 live map keys, design_token (the real stream) and
  *                     design_typing (emitted noop).
  *
+ * R1/R2 match by TOKEN SHAPE, never by bare substring: a purged name counts as
+ * absent only when it is absent as a WHOLE token, because a live name that
+ * merely CONTAINS it (measured 2026-09-12: the live handler key
+ * `context_budget_warning` contains the purged `budget_warning`) otherwise reads
+ * as a re-introduction — a false alarm, which is indistinguishable from a real
+ * regression and trains people to weaken the gate. See `hasToken` below; both
+ * directions of every rule it implements are pinned by
+ * tests/js/test_agent_dead_map_gate_boundaries.js.
+ *
  * Run: node tests/js/test_agent_dead_map_keys_gate.js
  */
 "use strict";
@@ -60,31 +69,84 @@ const AGENT_KEYS = [
 ];
 const DESIGN_KEYS = ["design_chunk", "design_tool_stream"];
 
+// ── Token matching ─────────────────────────────────────────────────────────
+// A purge gate written as `!src.includes(name)` is a SUBSTRING test, so a LIVE
+// name that merely CONTAINS a purged one reads as its re-introduction. Measured
+// 2026-09-12: the live handler key `context_budget_warning` (agent-panel.js,
+// added after this suite last ran in CI) contains the purged `budget_warning`,
+// so the gate failed on a tree whose purge was fully intact. Every token
+// therefore declares the SHAPE it is looked for in:
+//
+//   identifier — a whole JS identifier: a handlers-map key, an SSE event name, a
+//                helper name. Present only when NEITHER neighbour is an
+//                identifier character ([A-Za-z0-9_$]), so `context_budget_warning`
+//                no longer counts as `budget_warning`, while `budget_warning:`,
+//                `"budget_warning"`, `(budget_warning)` and `x.budget_warning`
+//                still do.
+//   class      — a CSS family PREFIX: `.spec-resolver-card` and
+//                `.spec-resolver-header` ARE references to the purged
+//                `.spec-resolver` family, so a trailing `-suffix` deliberately
+//                stays part of the match (right side unbounded). The token must
+//                still BEGIN an identifier run, so a preceding `-` is a boundary
+//                only when the separator run it crosses does not itself continue
+//                an identifier: `--spec-resolver-card` (a custom property) is a
+//                hit, `my-spec-resolver-widget` (a class with its own head) is
+//                not.
+//
+// Both rules are character predicates evaluated per occurrence — no token ever
+// reaches a regex compiler, so a token carrying regex metacharacters cannot
+// change the rule it is judged by.
+const IDENT_CHAR = /[A-Za-z0-9_$]/;
+const IDENT_RUN_CHAR = /[A-Za-z0-9_]/;
+
+function hasToken(src, token, kind) {
+  for (let i = src.indexOf(token); i !== -1; i = src.indexOf(token, i + 1)) {
+    if (kind === "class") {
+      let j = i;
+      while (j > 0 && src[j - 1] === "-") j -= 1; // cross the family separator run
+      if (j === 0 || !IDENT_RUN_CHAR.test(src[j - 1])) return true;
+    } else {
+      const before = src[i - 1];
+      const after = src[i + token.length];
+      if ((before === undefined || !IDENT_CHAR.test(before)) &&
+          (after === undefined || !IDENT_CHAR.test(after))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // ── R1: removal — absent from every consumer surface ──────────────────────
 for (const [file, src] of Object.entries(surfaces)) {
   for (const name of AGENT_KEYS) {
-    assert.ok(!src.includes(name), `${file} must not reference dead key "${name}"`);
+    assert.ok(!hasToken(src, name, "identifier"),
+      `${file} must not reference dead key "${name}"`);
   }
   if (file === "design-chat.js") {
     for (const name of DESIGN_KEYS) {
-      assert.ok(!src.includes(name), `design-chat.js must not reference dead key "${name}"`);
+      assert.ok(!hasToken(src, name, "identifier"),
+        `design-chat.js must not reference dead key "${name}"`);
     }
   }
 }
 for (const name of [...AGENT_KEYS, ...DESIGN_KEYS]) {
-  assert.ok(!html.includes(name), `ui.html must not reference dead key "${name}"`);
+  assert.ok(!hasToken(html, name, "identifier"),
+    `ui.html must not reference dead key "${name}"`);
 }
 
 // ── R2: orphaned CSS + helper absent everywhere ────────────────────────────
 const ORPHAN_CSS = ["spec-resolver", "spec-file", "spec-symbols", "agent-graph-enrichment"];
 for (const token of ORPHAN_CSS) {
-  assert.ok(!css.includes(token), `ui.css must not define orphaned rule ".${token}"`);
+  assert.ok(!hasToken(css, token, "class"),
+    `ui.css must not define orphaned rule ".${token}"`);
   for (const [file, src] of Object.entries(surfaces)) {
-    assert.ok(!src.includes(token), `${file} must not reference removed class "${token}"`);
+    assert.ok(!hasToken(src, token, "class"),
+      `${file} must not reference removed class "${token}"`);
   }
 }
 for (const [file, src] of Object.entries(surfaces)) {
-  assert.ok(!src.includes("_agentUpdateLastReviewCard"),
+  assert.ok(!hasToken(src, "_agentUpdateLastReviewCard", "identifier"),
     `${file} must not reference the orphaned helper _agentUpdateLastReviewCard`);
 }
 
