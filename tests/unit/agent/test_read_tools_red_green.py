@@ -397,6 +397,54 @@ def test_get_file_outline_kind_rendering(tool_registry, monkeypatch):
 # ── find_relevant_files / read_image ────────────────────────────────────────
 
 
+def _b64_of(path) -> str:
+    import base64
+
+    return base64.b64encode(Path(path).read_bytes()).decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        (".png", "image/png"),
+        (".jpg", "image/jpeg"),
+        (".jpeg", "image/jpeg"),
+        (".gif", "image/gif"),
+        (".bmp", "image/bmp"),
+        (".tif", "image/tiff"),
+        (".tiff", "image/tiff"),
+        # An extension outside the OCR whitelist still has to declare A type:
+        # sending image/png for a JPEG is an HTTP 400 at the vendor, but a
+        # suffix-less file has no better answer than the default.
+        (".webp", "image/png"),
+        (".PNG", "image/png"),
+    ],
+)
+def test_read_image_declares_the_media_type_from_the_suffix(tool_registry, monkeypatch, suffix, expected):
+    img = Path(tool_registry.repo_root) / f"pic{suffix}"
+    img.write_bytes(b"\x89PNG fake")
+    monkeypatch.setattr("external_llm.providers._try_ocr_base64", lambda data: "OCR TEXT")
+
+    res = tool_registry.dispatch("read_image", {"path": f"pic{suffix}"})
+
+    assert res.ok, res.error
+    assert res.metadata["attach_images"][0]["media_type"] == expected
+
+
+def test_read_image_declares_the_image_for_the_no_text_branch_too(tool_registry, monkeypatch):
+    """An image with no OCR text is exactly when the pixels matter MOST — the
+    text form is empty, so a vision route is the only way to answer at all."""
+    img = Path(tool_registry.repo_root) / "blank.png"
+    img.write_bytes(b"\x89PNG fake")
+    monkeypatch.setattr("external_llm.providers._try_ocr_base64", lambda data: "")
+
+    res = tool_registry.dispatch("read_image", {"path": "blank.png"})
+
+    assert res.ok
+    assert "No text detected" in res.content
+    assert res.metadata["attach_images"][0]["caption"] == "blank.png"
+
+
 def test_find_relevant_files_empty_query_error(tool_registry):
     res = tool_registry.dispatch("find_relevant_files", {})
     assert not res.ok
@@ -426,6 +474,9 @@ def test_read_image_all_paths(tool_registry, monkeypatch):
     res4 = tool_registry.dispatch("read_image", {"path": "pic.png"})
     assert res4.ok, res4.error
     assert "OCR TEXT" in res4.content
+    # The tool DECLARES the pixels alongside the text; whether the model may see
+    # them is decided later, by the transport's route gate (image_transport).
+    assert res4.metadata["attach_images"] == [{"media_type": "image/png", "data": _b64_of(img), "caption": "pic.png"}]
 
     (Path(tool_registry.repo_root) / "pic2.png").write_bytes(b"\x89PNG fake2")
     monkeypatch.setattr(

@@ -1007,10 +1007,12 @@ SCHEMA_WEB_FETCH = {
 SCHEMA_READ_IMAGE = {
     "name": "read_image",
     "description": (
-        "Read text from an image file using OCR (Optical Character Recognition). "
+        "Read an image file: OCR text with positional labels (top-left, middle-center, etc.) "
+        "AND, when the model can see images, the picture itself — you then look directly "
+        "instead of reasoning only from the extracted text. "
         "Supports PNG, JPEG, GIF, BMP, TIFF. "
-        "Returns extracted text with positional labels (top-left, middle-center, etc.). "
-        "Use when the user pastes an image or asks you to look at a screenshot/image file."
+        "Use when the user pastes an image, asks you to look at a screenshot/image file, "
+        "or another tool saved one for you (e.g. browser_action's screenshot)."
     ),
     "parameters": {
         "type": "object",
@@ -1059,18 +1061,34 @@ SCHEMA_BROWSER_ACTION = {
     "description": (
         "Browser automation using Playwright (headless Chromium). "
         "Opens a browser that persists across calls within the same session.\n\n"
-        "Actions:\n"
+        "Actions — page level:\n"
         "  navigate  — Open a URL and return the rendered page text (SPA/JS content included)\n"
-        "  click     — Click an element by CSS selector\n"
+        "  click     — Click an element by CSS selector (prefer this when a selector is available)\n"
         "  type      — Type text into an input field (replaces existing content)\n"
         "  extract   — Get the current page's rendered text\n"
-        "  screenshot— Take a full-page screenshot (returns file path; use read_image to view)\n"
+        "  screenshot— Capture the page AND see it (the image is attached to you)\n"
         "  evaluate  — Execute JavaScript and return the result\n"
         "  wait      — Wait for a CSS selector to appear, or wait N ms\n"
         "  close     — Close the browser and release resources\n\n"
+        "Actions — pointer/keyboard, for what a selector cannot reach "
+        "(canvas, maps, WebGL, drag-and-drop, ambiguous elements):\n"
+        "  mouse_move      — Move the pointer to (x, y)\n"
+        "  click_at        — Left-click at (x, y)\n"
+        "  double_click_at — Double-click at (x, y)\n"
+        "  right_click_at  — Right-click at (x, y) (context menus)\n"
+        "  drag            — Press at (x, y), move to (to_x, to_y), release\n"
+        "  scroll_at       — Scroll the pane under (x, y) by (dx, dy); dy>0 scrolls down\n"
+        "  key             — Press a key or chord: 'Enter', 'Tab', 'Escape', 'Control+a'\n"
+        "  type_text       — Type into the focused element (click/keys first to focus it)\n\n"
+        "★ COORDINATES: x/y are pixels measured on the screenshot you most recently took — "
+        "screenshot first, then click what you see. The tool converts them to the pointer's "
+        "space and reports both in the result. Never guess a coordinate you have not seen.\n"
+        "★ screenshot defaults to the VIEWPORT (what you can click). Use full_page=true only to "
+        "READ a long page — its y coordinates are page-absolute, not where the pointer is.\n"
         "★ Use instead of web_fetch when: the page is a JavaScript SPA (React/Vue), "
         "you need to interact (click/type), or you need a screenshot.\n"
         "★ The browser stays open between calls — navigate once, then click/extract repeatedly.\n"
+        "★ To let the user watch, pass headless=false (this restarts the browser, losing open tabs).\n"
         "★ Call action='close' when done to free memory.\n"
         "★ Heavy SPAs (YouTube/React/ad-heavy): keep default 30s timeout; for faster returns use "
         "wait_until='domcontentloaded', not a shorter timeout."
@@ -1080,8 +1098,29 @@ SCHEMA_BROWSER_ACTION = {
         "properties": {
             "action": {
                 "type": "string",
-                "description": ("Action to perform: navigate, click, type, extract, screenshot, evaluate, wait, close"),
-                "enum": ["navigate", "click", "type", "extract", "screenshot", "evaluate", "wait", "close"],
+                "description": (
+                    "Action to perform: navigate, click, type, extract, screenshot, evaluate, wait, close "
+                    "(page level), or mouse_move, click_at, double_click_at, right_click_at, drag, scroll_at, "
+                    "key, type_text (pointer/keyboard)."
+                ),
+                "enum": [
+                    "navigate",
+                    "click",
+                    "type",
+                    "extract",
+                    "screenshot",
+                    "evaluate",
+                    "wait",
+                    "close",
+                    "mouse_move",
+                    "click_at",
+                    "double_click_at",
+                    "right_click_at",
+                    "drag",
+                    "scroll_at",
+                    "key",
+                    "type_text",
+                ],
             },
             "url": {
                 "type": "string",
@@ -1093,7 +1132,70 @@ SCHEMA_BROWSER_ACTION = {
             },
             "text": {
                 "type": "string",
-                "description": "Text to type into the selected input field (required for type action).",
+                "description": (
+                    "Text: for 'type' it is typed into the selected input field (replacing its "
+                    "content); for 'type_text' it is sent to whatever element has focus."
+                ),
+            },
+            "x": {
+                "type": "number",
+                "description": (
+                    "X in IMAGE pixels from your most recent screenshot. Required for mouse_move, "
+                    "click_at, double_click_at, right_click_at, scroll_at; the drag start for 'drag'."
+                ),
+            },
+            "y": {
+                "type": "number",
+                "description": "Y in the same image-pixel space as 'x'.",
+            },
+            "to_x": {"type": "number", "description": "Drag end X, in the same image-pixel space as 'x'."},
+            "to_y": {"type": "number", "description": "Drag end Y, in the same image-pixel space as 'x'."},
+            "steps": {
+                "type": "integer",
+                "description": (
+                    "Drag only: intermediate pointer moves between press and release (default 10, max 100). "
+                    "Drag-and-drop UIs watch for movement and ignore a teleport."
+                ),
+                "default": 10,
+            },
+            "dx": {
+                "type": "number",
+                "description": "scroll_at only: horizontal scroll amount (positive = right). Default 0.",
+                "default": 0,
+            },
+            "dy": {
+                "type": "number",
+                "description": "scroll_at only: vertical scroll amount (positive = down the page). Required.",
+            },
+            "keys": {
+                "type": "string",
+                "description": (
+                    "key only: the key or chord to press — 'Enter', 'Tab', 'Escape', 'ArrowDown', "
+                    "'Control+a', 'Meta+Enter'."
+                ),
+            },
+            "button": {
+                "type": "string",
+                "description": "click_at only: which mouse button (default 'left').",
+                "enum": ["left", "middle", "right"],
+                "default": "left",
+            },
+            "full_page": {
+                "type": "boolean",
+                "description": (
+                    "screenshot only: capture the whole scrollable page instead of the viewport "
+                    "(default false). Use true to READ a long page; its coordinates are NOT clickable, "
+                    "so take a viewport screenshot before acting on coordinates."
+                ),
+                "default": False,
+            },
+            "headless": {
+                "type": "boolean",
+                "description": (
+                    "Any action: visible window (false) or hidden (true, the default). Passing a "
+                    "different value RESTARTS the browser, so open tabs and login state are lost — "
+                    "set it once, at the start, when the user wants to watch."
+                ),
             },
             "js": {
                 "type": "string",
@@ -1123,6 +1225,92 @@ SCHEMA_BROWSER_ACTION = {
                 ),
                 "enum": ["load", "domcontentloaded", "networkidle", "commit"],
                 "default": "load",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
+SCHEMA_COMPUTER = {
+    "name": "computer",
+    "description": (
+        "Control the machine the user is sitting at: capture the screen and synthesise "
+        "pointer and keyboard input. This is NOT sandboxed — it drives the real desktop — "
+        "and it is OFF unless the operator opted in, so a refusal here is a configuration "
+        "answer, not a failure.\n\n"
+        "★ Prefer browser_action for anything a browser can do: it is sandboxed by Playwright "
+        "and needs no system permission. Use this for native apps, the menu bar, dialogs, and "
+        "anything outside a browser.\n\n"
+        "Actions:\n"
+        "  screenshot      — Capture the main display AND see it (the image is attached to you)\n"
+        "  cursor_position — Where the pointer is now, in the same pixels as the screenshot\n"
+        "  move            — Move the pointer to (x, y)\n"
+        "  click           — Left-click at (x, y)\n"
+        "  double_click    — Double-click at (x, y)\n"
+        "  right_click     — Right-click at (x, y)\n"
+        "  drag            — Press at (x, y), move to (to_x, to_y), release\n"
+        "  scroll          — Scroll at (x, y) by dy (positive scrolls content up)\n"
+        "  type            — Type Unicode text at the focused element (no keymap involved)\n"
+        "  key             — Press a named key or chord: 'return', 'escape', 'tab', 'cmd+tab'\n\n"
+        "★ COORDINATES: x/y are pixels measured on the screenshot you most recently took — "
+        "screenshot first, then act on what you see. Never guess a coordinate you have not seen.\n"
+        "★ Every action is recorded in ~/.asicode/computer_use.log.\n"
+        "★ Screenshots and clicks need macOS Screen Recording and Accessibility permission "
+        "respectively; without them the action is refused rather than silently ineffective."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": (
+                    "Action to perform: screenshot, cursor_position, move, click, double_click, "
+                    "right_click, drag, scroll, type, key."
+                ),
+                "enum": [
+                    "screenshot",
+                    "cursor_position",
+                    "move",
+                    "click",
+                    "double_click",
+                    "right_click",
+                    "drag",
+                    "scroll",
+                    "type",
+                    "key",
+                ],
+            },
+            "x": {
+                "type": "number",
+                "description": (
+                    "X in IMAGE pixels from your most recent screenshot. Required for move, click, "
+                    "double_click, right_click, scroll; the drag start for 'drag'."
+                ),
+            },
+            "y": {"type": "number", "description": "Y in the same image-pixel space as 'x'."},
+            "to_x": {"type": "number", "description": "Drag end X, in the same image-pixel space as 'x'."},
+            "to_y": {"type": "number", "description": "Drag end Y, in the same image-pixel space as 'x'."},
+            "dx": {
+                "type": "number",
+                "description": "scroll only: horizontal amount (positive = right). Default 0.",
+                "default": 0,
+            },
+            "dy": {
+                "type": "number",
+                "description": "scroll only: vertical amount. Required. Positive scrolls content up.",
+            },
+            "text": {
+                "type": "string",
+                "description": "type only: the text to type at the focused element (any Unicode).",
+            },
+            "keys": {
+                "type": "string",
+                "description": (
+                    "key only: named key or chord — 'return', 'escape', 'tab', 'space', 'delete', "
+                    "'up'/'down'/'left'/'right', 'pageup', 'pagedown', 'f1'..'f6', or a modifier "
+                    "chord such as 'cmd+tab', 'cmd+shift+t', 'ctrl+c'. For text, use action='type'."
+                ),
             },
         },
         "required": ["action"],
@@ -1205,6 +1393,7 @@ AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     SCHEMA_EDIT_INSIGHT,
     SCHEMA_SEARCH_WEB,
     SCHEMA_BROWSER_ACTION,  # ★ New: Playwright browser automation (SPA, click, type, screenshot)
+    SCHEMA_COMPUTER,  # ★ Host desktop: capture + pointer/keyboard (opt-in, permission-gated)
     SCHEMA_UPDATE_PLAN,  # work plan for large goals — drives the design-chat completion gate
     SCHEMA_ASK_USER,
     SCHEMA_WEB_FETCH,  # ★ Re-enabled: structured web page content fetching

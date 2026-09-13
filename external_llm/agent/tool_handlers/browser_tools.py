@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 from external_llm.pip_env import ensure_user_site_importable, pip_install_flags
 
 from ...client import interruptible_sleep
+from ...image_utils import png_size as _png_size
 from ..agent_loop_types import AgentCancelled
 from ..cancel_scope import (
     _CompositeCancel,
@@ -201,6 +202,65 @@ def _reset_browser_on_wedge() -> None:
 # renderer) would block the executor worker forever, and in turn the calling
 # shared_pool worker that blocks on .result(). This is a safety net so a stuck
 # browser cannot wedge an entire agent session.
+# ── Pointer/keyboard interaction (computer use) ──────────────────────────────
+# Actions that ACT on the page rather than observe it. Single source of truth,
+# imported by ``tool_registry._tool_call_mutates`` so the four consumers of "is
+# this a mutating call?" (read-cache invalidation, the parallel gate, the
+# design-chat phase partition, the read-only session gate) cannot disagree
+# about a new action added here.
+#
+# ``navigate``/``extract``/``screenshot``/``evaluate``/``wait``/``mouse_move``
+# stay read-only: they reach the network or move a pointer, but nothing is
+# committed. A click, a keypress or typed text is an act on a third party's
+# system, which is the side effect this set exists to name.
+INTERACTION_ACTIONS: frozenset[str] = frozenset(
+    {
+        "click_at",
+        "double_click_at",
+        "right_click_at",
+        "drag",
+        "scroll_at",
+        "key",
+        "type_text",
+    }
+)
+
+# Where a click that navigates may take the pointer: any of the three buttons
+# Playwright exposes. ``middle`` is here because closing tabs / opening links in
+# a background tab is a real browser gesture, not a curiosity.
+_MOUSE_BUTTONS: frozenset[str] = frozenset({"left", "right", "middle"})
+
+_SCREENSHOT_DEFAULT_FULL_PAGE = False
+"""Screenshots default to the VIEWPORT, because that is what coordinates mean.
+
+A full-page capture of a long document is a tall image whose y coordinates do
+not correspond to anywhere the pointer can go without scrolling first — the
+model reasons about pixel (x, 4000) on a page it is actually looking at from
+scroll 0. ``full_page=true`` remains available for READING a long page (as a
+document), which is what it was always good for."""
+
+# A wheel event is applied ASYNCHRONOUSLY by Chromium: measured on a real page,
+# ``window.scrollY`` is still 0 when ``mouse.wheel()`` returns and reaches its
+# final value within ~50ms. A computer-use loop's very next call is a
+# screenshot, so without waiting for the scroll to land the model is shown the
+# PRE-scroll page, reads its own action as a no-op, and repeats it. Bounded and
+# best-effort — a pane that legitimately does not move must not become an error.
+_SCROLL_SETTLE_TIMEOUT_SEC = 0.6
+_SCROLL_POLL_SEC = 0.02
+
+# Counts scroll events from ANY scroller (the window or a nested pane) by
+# listening in the CAPTURE phase: scroll events do not bubble, so a bubbling
+# listener on the document would miss everything but the window. Armed once and
+# idempotent; used only to detect "the page has stopped moving".
+_SCROLL_WATCH_ARM_JS = (
+    "if (!window.__asicodeScrollWatch) {"
+    "  window.__asicodeScrollWatch = true;"
+    "  window.__asicodeScrolls = 0;"
+    "  document.addEventListener('scroll', () => { window.__asicodeScrolls++; }, true);"
+    "}"
+)
+_SCROLL_WATCH_READ_JS = "window.__asicodeScrolls || 0"
+
 _BROWSER_HARD_TIMEOUT_SEC = 120
 
 # Per-call Playwright timeout ceiling (ms). The LLM-supplied ``timeout`` arg is
@@ -213,6 +273,16 @@ _BROWSER_HARD_TIMEOUT_SEC = 120
 # always resolves before the wedge path, leaving the session intact.
 _PER_CALL_TIMEOUT_MARGIN_SEC = 5
 _PER_CALL_TIMEOUT_CEIL_MS = max((_BROWSER_HARD_TIMEOUT_SEC - _PER_CALL_TIMEOUT_MARGIN_SEC) * 1000, 1000)
+
+
+def _as_coordinate(value: Any) -> float | None:
+    """A finite float coordinate, or ``None`` (bool is not a coordinate)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
 
 
 def _clamp_per_call_timeout_ms(requested: Any) -> int:
@@ -245,6 +315,15 @@ class BrowserActionToolsMixin:
     _page = None
     _user_agent = None  # de-headlessed UA, derived once per browser (see _browser_user_agent)
     _pw_install_lock = threading.Lock()  # serialise Playwright install across threads
+    # False = a visible window the user can watch. Set through the ``headless``
+    # argument on any action; a change relaunches the browser (see
+    # _ensure_browser_mode), because the mode is a property of the launch.
+    _headless = True
+    # IMAGE pixels per CSS pixel, derived from the last screenshot's bytes. The
+    # coordinate actions divide by it, so a model clicking on what it SAW lands
+    # where it meant even if the context was built with a device scale factor.
+    # None = no screenshot yet → 1.0, which is Chromium's default.
+    _view_scale: float | None = None
 
     # ── Host contract (provided by ToolRegistry / AgentToolsMixin) ───── #
     # These names are supplied by the host classes this mixin is mounted
@@ -272,14 +351,51 @@ class BrowserActionToolsMixin:
         return effective_cancel(getattr(getattr(self, "config", None), "cancel_event", None))
 
     def _tool_browser_action(self, args: dict[str, Any]) -> ToolResult:
-        """Browser automation: navigate, click, type, extract, screenshot, evaluate, wait, close."""
+        """Browser automation: the action table below is the closed set of verbs."""
         action = str(args.get("action", "")).strip().lower()
+
+        # The action table is pure argument validation, so it is built and
+        # consulted BEFORE the Playwright branch below. That order is not
+        # cosmetic: that branch prompts the user to ``pip install playwright``,
+        # so a malformed call must not be able to raise an install prompt for a
+        # verb that does not exist — nor answer a user with a typo by sending
+        # them to install a dependency. (The clean-install CI unit job has no
+        # Playwright and caught exactly that: a typo'd action answered
+        # "Playwright is not available".)
+        _actions = {
+            "navigate": self._browser_navigate,
+            "click": self._browser_click,
+            "type": self._browser_type,
+            "extract": self._browser_extract,
+            "screenshot": self._browser_screenshot,
+            "evaluate": self._browser_evaluate,
+            "wait": self._browser_wait,
+            "close": self._browser_close,
+            # ── Pointer/keyboard interaction (computer use) ────────────────
+            # Coordinates are IMAGE pixels from the most recent screenshot.
+            "mouse_move": self._browser_mouse_move,
+            "click_at": self._browser_click_at,
+            "double_click_at": self._browser_double_click_at,
+            "right_click_at": self._browser_right_click_at,
+            "drag": self._browser_drag,
+            "scroll_at": self._browser_scroll_at,
+            "key": self._browser_key,
+            "type_text": self._browser_type_text,
+        }
 
         if not action:
             return self._make_result(
                 ok=False,
                 content="",
-                error="'action' is required. Choose: navigate, click, type, extract, screenshot, evaluate, wait, close",
+                error="'action' is required. Choose: " + ", ".join(sorted(_actions)),
+            )
+
+        handler = _actions.get(action)
+        if handler is None:
+            return self._make_result(
+                ok=False,
+                content="",
+                error=f"Unknown action: '{action}'. Available: {', '.join(sorted(_actions))}",
             )
 
         if not HAS_PLAYWRIGHT or not _ensure_playwright_imported():
@@ -297,24 +413,10 @@ class BrowserActionToolsMixin:
                     )
             # Module-level names updated by _reload_playwright_module; proceed.
 
-        _actions = {
-            "navigate": self._browser_navigate,
-            "click": self._browser_click,
-            "type": self._browser_type,
-            "extract": self._browser_extract,
-            "screenshot": self._browser_screenshot,
-            "evaluate": self._browser_evaluate,
-            "wait": self._browser_wait,
-            "close": self._browser_close,
-        }
-
-        handler = _actions.get(action)
-        if handler is None:
-            return self._make_result(
-                ok=False,
-                content="",
-                error=f"Unknown action: '{action}'. Available: {', '.join(sorted(_actions))}",
-            )
+        # Browser mode is a launch property, so a change must happen BEFORE the
+        # handler asks for a page: on a mismatch the shared browser is torn down
+        # and the next _get_page() builds one in the requested mode.
+        self._ensure_browser_mode(args.get("headless"))
 
         # Per-call cancel scope capture: this method runs on the calling
         # (dispatch/executor) thread, but the handler itself runs on the
@@ -509,7 +611,7 @@ class BrowserActionToolsMixin:
             _ensure_playwright_imported()
             p = sync_playwright().start()
             try:
-                BrowserActionToolsMixin._browser = p.chromium.launch(headless=True)
+                BrowserActionToolsMixin._browser = p.chromium.launch(headless=BrowserActionToolsMixin._headless)
             except Exception:
                 # launch() failed (missing browser binary, sandbox error, …).
                 # Stop the just-started Playwright driver so its node process
@@ -555,6 +657,78 @@ class BrowserActionToolsMixin:
                 return None
         return BrowserActionToolsMixin._user_agent
 
+    def _ensure_browser_mode(self, requested: Any) -> None:
+        """Relaunch the shared browser when the caller asks for a different mode.
+
+        ``headless`` is a launch argument, so it cannot be changed on a running
+        browser: a mismatch tears the session down and the next ``_get_page``
+        builds a new one. That costs the open tabs and login state, which is
+        exactly why it happens only when the caller actually asks (omitting the
+        argument keeps whatever mode is running).
+        """
+        if not isinstance(requested, bool):
+            return
+        headless = bool(requested)
+        if headless == BrowserActionToolsMixin._headless:
+            return
+        logger.info(
+            "browser_action: switching to %s mode — restarting the browser", "headless" if headless else "headed"
+        )
+        self._close_shared_browser()
+        BrowserActionToolsMixin._headless = headless
+
+    def _coordinate_scale(self) -> float:
+        """IMAGE px per CSS px for the coordinates the model is about to send."""
+        scale = BrowserActionToolsMixin._view_scale
+        return scale if isinstance(scale, (int, float)) and scale > 0 else 1.0
+
+    def _image_coordinates(self, args: dict[str, Any], *, prefix: str = "") -> tuple[float, float] | None:
+        """``(css_x, css_y)`` from IMAGE coordinates in *args*.
+
+        The model reports what it saw, which is the screenshot; the pointer
+        moves in CSS pixels. Dividing by the recorded scale is what makes those
+        the same place (see ``_view_scale``). Returns ``None`` when either
+        coordinate is missing or not a number — the caller turns that into an
+        error message the model can act on.
+        """
+        x = _as_coordinate(args.get(f"{prefix}x"))
+        y = _as_coordinate(args.get(f"{prefix}y"))
+        if x is None or y is None:
+            return None
+        scale = self._coordinate_scale()
+        return (x / scale, y / scale)
+
+    def _arm_scroll_watch(self, page: Any) -> int:
+        """Install the scroll counter and return its current value (best effort)."""
+        try:
+            page.evaluate(_SCROLL_WATCH_ARM_JS)
+            return int(page.evaluate(_SCROLL_WATCH_READ_JS) or 0)
+        except Exception as exc:  # a page that refuses evaluate still scrolls
+            logger.debug("scroll watch unavailable: %s", exc)
+            return -1
+
+    def _settle_scroll(self, page: Any, armed_at: int) -> None:
+        """Wait until the wheel event has been applied (see the module constants).
+
+        ``armed_at`` of -1 means the watch could not be installed, in which case
+        there is nothing to poll and this returns immediately — the scroll still
+        happened, we just cannot tell when it landed.
+        """
+        if armed_at < 0:
+            return
+        deadline = time.monotonic() + _SCROLL_SETTLE_TIMEOUT_SEC
+        last = armed_at
+        while time.monotonic() < deadline:
+            time.sleep(_SCROLL_POLL_SEC)
+            try:
+                now = int(page.evaluate(_SCROLL_WATCH_READ_JS) or 0)
+            except Exception as exc:  # page navigated away mid-settle
+                logger.debug("scroll watch read failed: %s", exc)
+                return
+            if now == last:
+                return  # stopped moving (or never moved — one poll, then out)
+            last = now
+
     def _get_page(self) -> Any:
         """Get or create a page in the shared browser.
 
@@ -589,6 +763,9 @@ class BrowserActionToolsMixin:
         # The next browser may be a different Chromium build, so its UA must be
         # re-derived rather than inherited from the one just torn down.
         BrowserActionToolsMixin._user_agent = None
+        # A new browser means a new page and possibly a different scale; an
+        # inherited scale would misplace every later click.
+        BrowserActionToolsMixin._view_scale = None
 
     def _render_and_eval(
         self,
@@ -772,17 +949,245 @@ class BrowserActionToolsMixin:
         )
 
     def _browser_screenshot(self, args: dict[str, Any]) -> ToolResult:
+        """Capture the page AND hand the pixels to the model.
+
+        The image is declared through ``image_transport``
+        (``ToolResult.metadata["attach_images"]``), so the model that asked to
+        look can SEE the page instead of reasoning from a file path. That is
+        also what makes the coordinate actions usable at all: they take image
+        pixels, and the caption states both coordinate spaces so the model never
+        has to infer them.
+
+        Defaults to the VIEWPORT (see ``_SCREENSHOT_DEFAULT_FULL_PAGE``): a
+        full-page capture of a long document is a tall image whose y coordinates
+        do not correspond to anywhere the pointer can go without scrolling
+        first.
+        """
         page = self._get_page()
+        full_page = bool(args.get("full_page", _SCREENSHOT_DEFAULT_FULL_PAGE))
         filename = f"browser_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
         filepath = os.path.join(self._screenshot_dir(), filename)
 
-        page.screenshot(path=filepath, full_page=True)
+        page.screenshot(path=filepath, full_page=full_page)
+
+        try:
+            payload = pathlib.Path(filepath).read_bytes()
+        except OSError as exc:
+            # The capture SUCCEEDED — the file is on disk — and only the hand-over
+            # failed. Reporting a failure here would send the agent to retake a
+            # screenshot it already has; the honest result is a success that SAYS
+            # the pixels were not attached, so the model can still read_image the
+            # path rather than describe an image it never received.
+            return self._make_result(
+                ok=True,
+                content=(
+                    f"Screenshot saved to {filepath}, but its bytes could not be read back ({exc}), "
+                    "so the image was NOT attached to this conversation. "
+                    "Use read_image on that path if you need to see it."
+                ),
+                metadata={"filepath": filepath, "url": page.url, "full_page": full_page, "attached": False},
+            )
+
+        image_w, image_h = _png_size(payload)
+        viewport = getattr(page, "viewport_size", None) or {}
+        view_w = int(viewport.get("width") or 0)
+        view_h = int(viewport.get("height") or 0)
+        # Image px per CSS px. Derived from the bytes rather than assumed, so a
+        # context built with a device scale factor can never turn into a silent
+        # mis-click: the click action divides by exactly this number.
+        scale = (image_w / view_w) if (image_w and view_w) else 1.0
+        BrowserActionToolsMixin._view_scale = scale
+
+        kind = "Full-page" if full_page else "Viewport"
+        size = f"{image_w}x{image_h} px" if image_w else "size unknown"
+        where = f"viewport {view_w}x{view_h} CSS px" if view_w else "viewport size unavailable"
+        note = (
+            "Coordinates for mouse_move/click_at/double_click_at/right_click_at/drag/scroll_at "
+            "are IMAGE pixels measured on THIS screenshot."
+            if full_page is False
+            else "This is page-absolute, so its y coordinates are NOT where the pointer is; "
+            "take a viewport screenshot (full_page=false) before acting on coordinates."
+        )
+        caption = f"{kind.lower()} screenshot, {size}, scale {scale:g} ({where}). {note}"
+
+        import base64 as _b64
 
         return self._make_result(
             ok=True,
-            content=f"Screenshot saved to {filepath}",
-            metadata={"filepath": filepath, "url": page.url},
+            content=(
+                f"{kind} screenshot saved to {filepath} — {size}, {where}, scale {scale:g}.\n"
+                f"The image is attached above, so you can see it. {note}"
+            ),
+            metadata={
+                "filepath": filepath,
+                "url": page.url,
+                "full_page": full_page,
+                "image": {"width": image_w, "height": image_h},
+                "viewport": {"width": view_w, "height": view_h},
+                "scale": scale,
+                "attach_images": [
+                    {
+                        "media_type": "image/png",
+                        "data": _b64.b64encode(payload).decode("utf-8"),
+                        "caption": caption,
+                    }
+                ],
+            },
         )
+
+    # ── Pointer/keyboard interaction (computer use) ───────────────────────── #
+    # Every handler below takes IMAGE coordinates from the most recent
+    # screenshot and lets _image_coordinates translate them to CSS pixels.
+
+    def _browser_mouse_move(self, args: dict[str, Any]) -> ToolResult:
+        point = self._image_coordinates(args)
+        if point is None:
+            return self._make_result(ok=False, content="", error="'x' and 'y' are required for mouse_move action")
+
+        page = self._get_page()
+        page.mouse.move(*point)
+        return self._make_result(ok=True, content=f"Pointer moved to {self._point_label(args, point)}")
+
+    def _browser_click_at(self, args: dict[str, Any]) -> ToolResult:
+        return self._click_at(args, clicks=1, default_button="left")
+
+    def _browser_double_click_at(self, args: dict[str, Any]) -> ToolResult:
+        return self._click_at(args, clicks=2, default_button="left")
+
+    def _browser_right_click_at(self, args: dict[str, Any]) -> ToolResult:
+        return self._click_at(args, clicks=1, default_button="right")
+
+    def _click_at(self, args: dict[str, Any], *, clicks: int, default_button: str) -> ToolResult:
+        """Shared click path — the button and click count are the only variation."""
+        point = self._image_coordinates(args)
+        if point is None:
+            return self._make_result(ok=False, content="", error="'x' and 'y' are required for click actions")
+
+        button = str(args.get("button", default_button)).strip().lower()
+        if button not in _MOUSE_BUTTONS:
+            return self._make_result(
+                ok=False,
+                content="",
+                error=f"'button' must be one of {', '.join(sorted(_MOUSE_BUTTONS))} (got {button!r})",
+            )
+
+        page = self._get_page()
+        if clicks == 2:
+            page.mouse.dblclick(*point, button=button)
+        else:
+            page.mouse.click(*point, button=button)
+        # Same settle the selector click uses: a click that navigates must not
+        # leave the next screenshot racing the new document. Returns immediately
+        # when the click did not navigate (the state is already reached).
+        page.wait_for_load_state("domcontentloaded")
+
+        label = "Double-clicked" if clicks == 2 else f"{button.capitalize()}-clicked"
+        return self._make_result(
+            ok=True,
+            content=f"{label} {self._point_label(args, point)}",
+            metadata={"x": point[0], "y": point[1], "button": button, "url": page.url},
+        )
+
+    def _browser_drag(self, args: dict[str, Any]) -> ToolResult:
+        start = self._image_coordinates(args)
+        end = self._image_coordinates(args, prefix="to_")
+        if start is None or end is None:
+            return self._make_result(
+                ok=False,
+                content="",
+                error="'x'/'y' (start) and 'to_x'/'to_y' (end) are required for drag action",
+            )
+
+        steps = args.get("steps", 10)
+        steps = int(steps) if isinstance(steps, (int, float)) and not isinstance(steps, bool) else 10
+        steps = max(1, min(steps, 100))
+
+        page = self._get_page()
+        page.mouse.move(*start)
+        page.mouse.down()
+        # Intermediate moves matter: drag-and-drop UIs (sliders, sortable lists)
+        # watch for pointermove between down and up and ignore a teleport.
+        page.mouse.move(*end, steps=steps)
+        page.mouse.up()
+
+        return self._make_result(
+            ok=True,
+            content=(
+                f"Dragged from image ({args.get('x')}, {args.get('y')}) to "
+                f"({args.get('to_x')}, {args.get('to_y')}) in {steps} steps."
+            ),
+            metadata={"from": list(start), "to": list(end), "steps": steps},
+        )
+
+    def _browser_scroll_at(self, args: dict[str, Any]) -> ToolResult:
+        point = self._image_coordinates(args)
+        if point is None:
+            return self._make_result(ok=False, content="", error="'x' and 'y' are required for scroll_at action")
+
+        dy = _as_coordinate(args.get("dy", args.get("delta_y")))
+        dx = _as_coordinate(args.get("dx", args.get("delta_x"))) or 0.0
+        if dy is None:
+            return self._make_result(
+                ok=False,
+                content="",
+                error="'dy' is required for scroll_at action (positive scrolls the page down)",
+            )
+
+        page = self._get_page()
+        # Position first: scrolling happens under the pointer, so a wheel event
+        # sent from wherever the pointer was left can scroll the wrong pane.
+        page.mouse.move(*point)
+        armed_at = self._arm_scroll_watch(page)
+        page.mouse.wheel(dx, dy)
+        # ...and last: the wheel is applied asynchronously, so a screenshot taken
+        # the moment this returns would still show the pre-scroll page.
+        self._settle_scroll(page, armed_at)
+
+        return self._make_result(
+            ok=True,
+            content=f"Scrolled by ({dx:g}, {dy:g}) at {self._point_label(args, point)}",
+            metadata={"x": point[0], "y": point[1], "dx": dx, "dy": dy},
+        )
+
+    def _browser_key(self, args: dict[str, Any]) -> ToolResult:
+        keys = str(args.get("keys", args.get("key", ""))).strip()
+        if not keys:
+            return self._make_result(
+                ok=False,
+                content="",
+                error="'keys' is required for key action (e.g. 'Enter', 'Tab', 'Control+a')",
+            )
+
+        page = self._get_page()
+        page.keyboard.press(keys)
+        return self._make_result(ok=True, content=f"Pressed '{keys}'", metadata={"keys": keys})
+
+    def _browser_type_text(self, args: dict[str, Any]) -> ToolResult:
+        text = args.get("text", "")
+        if not isinstance(text, str) or not text:
+            return self._make_result(ok=False, content="", error="'text' is required for type_text action")
+
+        delay = args.get("delay", 0)
+        delay = int(delay) if isinstance(delay, (int, float)) and not isinstance(delay, bool) else 0
+
+        page = self._get_page()
+        page.keyboard.type(text, delay=max(0, delay))
+
+        snippet = text[:50] + "..." if len(text) > 50 else text
+        return self._make_result(
+            ok=True,
+            content=f"Typed '{snippet}' at the focused element",
+            metadata={"text_length": len(text)},
+        )
+
+    def _point_label(self, args: dict[str, Any], css_point: tuple[float, float]) -> str:
+        """``image (x, y) -> CSS (cx, cy)`` for the action's result text.
+
+        Both spaces are shown because a mis-scaled pointer is otherwise
+        invisible: the model sees "it clicked (640, 400)" and has no way to
+        notice that the pointer actually went elsewhere.
+        """
+        return f"image ({args.get('x')}, {args.get('y')}) -> CSS ({css_point[0]:.0f}, {css_point[1]:.0f})"
 
     def _browser_evaluate(self, args: dict[str, Any]) -> ToolResult:
         js = str(args.get("js", "")).strip()

@@ -134,6 +134,22 @@ _BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
 # Extensions read_image can OCR — the alternative worth naming by tool.
 _IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff"})
 
+# read_image hands the model BOTH forms: the OCR text always (a text-only route
+# has nothing else, and it is the readable record once the pixels are elided),
+# and the encoded pixels so a vision-capable route can look directly. The media
+# type has to be declared per file — guessing image/png for a JPEG is an HTTP
+# 400 at the vendor — so it is resolved from the suffix, with the OCR whitelist
+# as the reason every member below maps to a real type.
+_IMAGE_MEDIA_TYPES: dict[str, str] = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "tif": "image/tiff",
+    "tiff": "image/tiff",
+}
+
 _BINARY = "binary"
 
 # How long a search process may take to EXIT after it has closed stdout. Kept
@@ -1795,13 +1811,34 @@ class ReadToolsMixin:
 
         ocr_text = _ocr_fn(data)
 
+        # Declare the pixels alongside the text (image_transport). The tool does
+        # not decide whether the model may see them — the transport gates that on
+        # the route's vision axis, so this handler never needs to know which model
+        # is asking. When the route cannot take images it is told so explicitly
+        # rather than silently served OCR as if that were the whole answer.
+        _media_type = _IMAGE_MEDIA_TYPES.get(abs_path.suffix.lower().lstrip("."), "image/png")
+        _metadata = {
+            "attach_images": [
+                {
+                    "media_type": _media_type,
+                    "data": data,
+                    # The only field that survives an elision as readable text —
+                    # which file these pixels were, once a newer screenshot has
+                    # pushed them out of the retention window.
+                    "caption": abs_path.name,
+                }
+            ]
+        }
+
         if ocr_text:
             return self._make_result(
                 ok=True,
                 content=f"[Image OCR — {abs_path.name}]\n{ocr_text}",
+                metadata=_metadata,
             )
         return self._make_result(
             ok=True,
             content=f"[Image OCR — {abs_path.name}] No text detected in the image. "
             "The image may contain only graphics without text, or OCR could not read it.",
+            metadata=_metadata,
         )

@@ -566,6 +566,59 @@ def test_llm_call_repair_drop_notifies():
     assert loop._cb.call_args.args[1]["dropped"] == 1
 
 
+def _tool_image_msg(tag: str, tool_name: str = "screenshot") -> LLMMessage:
+    image = {"media_type": "image/png", "data": f"payload-{tag}"}
+    return LLMMessage(
+        role="user",
+        content=f"[TOOL IMAGE] 1 image attached by tool '{tool_name}' — you can see the pixels directly.",
+        images=[image],
+    )
+
+
+def _sent_images(loop) -> list:
+    sent = loop.llm_client.chat_with_tools.call_args.kwargs["messages"]
+    return [m for m in sent if getattr(m, "images", None)]
+
+
+def test_llm_call_elides_surplus_tool_images_before_the_request():
+    """The pre-flight bound: a screenshot per step must not keep every frame on
+    the wire (and must not leave the model guessing which frame is current)."""
+    from external_llm.agent.image_context_policy import KEEP_RECENT_IMAGES
+
+    loop = _harness()
+    loop.llm_client.chat_with_tools.return_value = _llm_response()
+    msgs = [_tool_image_msg(f"f{i}") for i in range(KEEP_RECENT_IMAGES + 2)]
+
+    loop._llm_call_with_tools(msgs)
+
+    kept = _sent_images(loop)
+    assert len(kept) == KEEP_RECENT_IMAGES
+    # The survivors are the newest ones.
+    assert [m.images[0]["data"] for m in kept] == [f"payload-f{i}" for i in range(2, KEEP_RECENT_IMAGES + 2)]
+    # The caller's own list is not rewritten in place (copy-on-write).
+    assert len([m for m in msgs if m.images]) == KEEP_RECENT_IMAGES + 2
+
+
+def test_llm_call_leaves_images_within_budget_alone():
+    loop = _harness()
+    loop.llm_client.chat_with_tools.return_value = _llm_response()
+    msgs = [_tool_image_msg("only")]
+
+    loop._llm_call_with_tools(msgs)
+
+    assert _sent_images(loop) == msgs
+
+
+def test_llm_call_without_images_is_unchanged():
+    loop = _harness()
+    loop.llm_client.chat_with_tools.return_value = _llm_response()
+    msgs = [LLMMessage(role="user", content="hi")]
+
+    loop._llm_call_with_tools(msgs)
+
+    assert loop.llm_client.chat_with_tools.call_args.kwargs["messages"] == msgs
+
+
 def test_llm_call_normalizes_dict_tool_calls():
     loop = _harness()
     calls = [{"id": "c1", "name": "read_file", "args": {"path": "a.py"}}]

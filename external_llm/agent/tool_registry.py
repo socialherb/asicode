@@ -48,13 +48,14 @@ from .rag_searcher import RAGSearcher
 from .symbol_search import get_symbol_searcher
 from .tool_handlers.agent_tools import AgentToolsMixin
 from .tool_handlers.analysis_tools import AnalysisToolsMixin
-from .tool_handlers.browser_tools import BrowserActionToolsMixin
+from .tool_handlers.browser_tools import INTERACTION_ACTIONS, BrowserActionToolsMixin
 
 # ask_user default timeout (seconds) — defined once in leaf module, then re-exported.
 # If tool_registry defined this directly, agent_tools would back-reference tool_registry
 # for this constant, causing a circular import (triggered on standalone submodule import).
 # See #constants.
 from .tool_handlers.constants import ASK_USER_DEFAULT_TIMEOUT
+from .tool_handlers.desktop_tools import DESKTOP_INTERACTION_ACTIONS, DesktopToolsMixin
 from .tool_handlers.git_tools import ShellToolsMixin, _literal_intervals, _match_in_quotes
 from .tool_handlers.read_tools import ReadToolsMixin
 from .tool_handlers.test_tools import TestToolsMixin
@@ -427,6 +428,7 @@ class ToolRegistry(
     AgentToolsMixin,
     WebSearchToolsMixin,
     BrowserActionToolsMixin,
+    DesktopToolsMixin,
 ):
     """
     Dispatches tool calls from the agent LLM.
@@ -524,6 +526,7 @@ class ToolRegistry(
         "search_web": "_tool_search_web",
         "web_fetch": "_tool_web_fetch",
         "browser_action": "_tool_browser_action",
+        "computer": "_tool_computer",
         "read_image": "_tool_read_image",
     }
 
@@ -1890,11 +1893,26 @@ class ToolRegistry(
         ``_bash_command_mutates_files`` — the conservative classifier also used
         for cache invalidation). Read-only bash (``ls``, ``git status``, ``grep``
         …) and all pure read tools return False, so they still parallelize.
+
+        ``browser_action`` mutates when its action ACTS on the page — a click, a
+        keypress, typed text, a drag, a scroll (``INTERACTION_ACTIONS``, owned by
+        the tool that defines the actions). Browsing is not a filesystem write,
+        but it is a committed act on a third party's system, and the consumers
+        that read this predicate must not treat a run of clicks as a batch of
+        harmless reads. The cost is one read-cache invalidation per interaction,
+        which is the conservative direction.
         """
         if tool_name in self._WRITE_TOOLS:
             return True
         if tool_name == "bash":
             return self._bash_command_mutates_files((args or {}).get("command", ""))
+        if tool_name == "browser_action":
+            return (args or {}).get("action", "") in INTERACTION_ACTIONS
+        if tool_name == "computer":
+            # The host desktop. Same rule as the browser, higher stakes: the
+            # screen being clicked belongs to the user, and there is no sandbox
+            # behind it.
+            return (args or {}).get("action", "") in DESKTOP_INTERACTION_ACTIONS
         # kill mutates process state; can race with concurrent job output
         return tool_name == "job" and (args or {}).get("action") == "kill"
 
@@ -1939,12 +1957,21 @@ class ToolRegistry(
         ``job`` call as serial regardless of action needlessly serializes read
         batches (and, if a killing call is also treated as mutating, forced
         double-placement in both the write and serial phase).
+
+        ``browser_action`` and ``computer`` are ALWAYS serial, including their
+        read-only actions. Every action shares one page — or one screen — so the
+        calls are a sequence, not a set: ``[screenshot, click_at]`` in a single
+        batch must not be able to run the click before the capture it was aimed
+        at, and ``[navigate, extract]`` must not extract the page it is about to
+        leave. Letting them into the parallel phase would make the model's
+        declared order advisory, which is indistinguishable from a race for the
+        caller.
         """
         if tool_name == "ask_user":
             return True
         if tool_name == "job":
             return (args or {}).get("action") == "kill"
-        return False
+        return tool_name in ("browser_action", "computer")
 
     # ── Path-scoped cache invalidation ───────────────────────────────────
     # Read-only tools whose result depends on exactly one file/dir path named

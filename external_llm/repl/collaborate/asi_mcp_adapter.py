@@ -200,6 +200,11 @@ _EXCLUDED_TOOLS: set[str] = {
     "search_web",  # Claude Code has native web search
     "web_fetch",  # Claude Code has native web fetch
     "browser_action",  # Claude Code has native browser automation
+    # computer drives the user's REAL desktop (their mail, their banking tab).
+    # asicode's own agent asking for it, under the user's eye and behind an
+    # explicit opt-in, is one grant; handing it to a second agent over MCP is a
+    # different and larger one, so it stays out of the surface every client sees.
+    "computer",
     "update_plan",  # asicode internal planner — not useful for Claude Code agent
     "save_insight",  # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry
     "delete_insight",  # design-chat-only; handler lives on DesignChatLoop, not ToolRegistry

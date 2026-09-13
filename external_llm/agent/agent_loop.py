@@ -65,6 +65,8 @@ from .context_budget import (
     _resolve_context_limit,
 )
 from .failure_classifier import FailureClassifier
+from .image_context_policy import apply_image_retention
+from .image_transport import pop_attached_images
 from .json_repair import repair_json_brackets, try_parse_json
 from .performance_metrics import PerformanceCollector, get_global_collector
 from .reasoning_utils import reasoning_ab_kwargs
@@ -1028,6 +1030,13 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 },
             )
 
+        # Pre-flight: bound the images a tool-loop has accumulated. This loop
+        # re-sends its whole history every turn, so a screenshot per step keeps
+        # every frame on the wire at ~1.6k tokens each AND leaves the model
+        # unable to tell which frame is current. The most recent distinct images
+        # survive; the rest are elided in place (see image_context_policy).
+        messages = apply_image_retention(messages)
+
         # Tool schemas are serialised into the prompt, so build them before the
         # token guard below so it can account for their size.
         tool_schemas = self.registry.get_tool_schemas(
@@ -1722,6 +1731,15 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # Keep content machine-readable.
         # Convert metadata to JSON-serializable dict.
         serializable_metadata = dict(result.metadata or {})
+        # A tool's attached images (screenshots — see image_transport) are
+        # REMOVED here, from the copy that becomes the payload. `data` is a full
+        # base64 blob: inside the JSON text the model would be billed ~130k
+        # tokens for one screenshot (pixel geometry, not payload length, is the
+        # real cost — _shared_utils._IMAGE_BLOCK_TOKEN_ESTIMATE) and every
+        # transcript that serialises a tool result would write pixels to disk.
+        # They travel on a sibling user message instead, appended by
+        # _process_tool_results while result.metadata is still intact.
+        pop_attached_images(serializable_metadata)
 
         payload = {
             "ok": bool(result.ok),
@@ -1767,6 +1785,17 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
         # user turn would 400, so there the text is folded into the single user
         # turn that carries the tool results.
         extra_text = "\n\n".join((m.content or "") for m in extra_msgs).strip()
+
+        # Images a tool attached this turn (screenshots — see image_transport)
+        # ride on those extra user messages: a role="tool" payload cannot carry
+        # them portably. Providers that require strict user/assistant
+        # alternation must fold them into the SAME user turn as the tool
+        # results, so collect them once here instead of re-deriving per branch.
+        _extra_images: list[dict[str, Any]] = []
+        for _m in extra_msgs:
+            _imgs = getattr(_m, "images", None)
+            if isinstance(_imgs, list):
+                _extra_images.extend(_imgs)
 
         if provider in ("openai", "deepseek", "opencode"):
             # OpenAI/DeepSeek format: tool messages are only valid if they
@@ -1841,7 +1870,16 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             messages = [
                 *messages,
                 LLMMessage(role="assistant", content=assistant_content, raw_content=raw_blocks),
-                LLMMessage(role="user", content="", raw_content=tool_result_blocks),
+                # `images` joins the tool-result turn rather than opening a
+                # second user turn: Anthropic rejects two user turns in a row.
+                # The client appends the image blocks AFTER the tool_results,
+                # which is the only order the API accepts.
+                LLMMessage(
+                    role="user",
+                    content="",
+                    raw_content=tool_result_blocks,
+                    images=_extra_images or None,
+                ),
             ]
 
         elif provider == "google":
@@ -1861,12 +1899,38 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
                 }
                 for m in tool_msgs
             ]
-            # Fold warnings into the same user turn (alternation-safe).
+            # Fold warnings INTO the functionResponse payload, never beside it.
+            # Gemini requires the function-response turn to carry exactly one
+            # part per function call — "Please ensure that the number of
+            # function response parts is equal to the number of function call
+            # parts of the function call turn" (400 INVALID_ARGUMENT). A
+            # sibling {"text": ...} part is that same failure: it is the shape
+            # google's own gemini-cli files as a bug for tool responses
+            # (issue #16135 — clients "must not return sibling parts for tool
+            # responses"; its fix guidance is "Replace it with a text
+            # placeholder inside the functionResponse"), and it is the shape
+            # the image transport refuses to produce for this provider. The
+            # warning rides the LAST response's `content` — the field a normal
+            # tool result populates — so it reads as the turn's trailing note.
             if extra_text:
-                function_response_parts = [*function_response_parts, {"text": extra_text}]
+                if function_response_parts:
+                    _last_fr = function_response_parts[-1]["functionResponse"]
+                    _base = _last_fr["response"].get("content") or ""
+                    _last_fr["response"]["content"] = f"{_base}\n\n{extra_text}" if _base else extra_text
+                else:
+                    # Nothing was executed this turn, so no response can carry
+                    # the text; a lone text part is the only shape left (and it
+                    # is legal — no function call is awaiting an answer).
+                    function_response_parts = [{"text": extra_text}]
             messages = [
                 *messages,
                 LLMMessage(role="assistant", content=assistant_content, raw_content=raw_parts),
+                # No `images` here, unlike the Anthropic branch: Gemini
+                # requires the function-response part count to EQUAL the
+                # function-call part count, so an added sibling part is a 400
+                # (see GoogleClient.chat_with_tools). The transport does not
+                # offer this provider tool images at all — image_transport
+                # documents why and what would enable it.
                 LLMMessage(role="user", content="", raw_content=function_response_parts),
             ]
 
@@ -1906,7 +1970,11 @@ class AgentLoop(FastPathMixin, ContextManagerMixin, PhaseManagerMixin, TurnPipel
             messages = [
                 *messages,
                 LLMMessage(role="assistant", content=assistant_content),
-                LLMMessage(role="user", content=tool_results_text + "\n\nContinue with the task."),
+                LLMMessage(
+                    role="user",
+                    content=tool_results_text + "\n\nContinue with the task.",
+                    images=_extra_images or None,
+                ),
             ]
 
         return messages

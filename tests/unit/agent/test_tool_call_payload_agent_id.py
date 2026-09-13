@@ -120,6 +120,49 @@ def test_tool_call_early_finish_payload_carries_agent_id():
     assert calls and calls[0]["agent_id"] == "main"
 
 
+def test_tool_images_do_not_require_an_llm_client_on_the_host():
+    """A tool that produced pixels must not break a host without `llm_client`.
+
+    This harness is exactly such a host (the mixin is composed into several), so
+    the attachment path has to read every host attribute defensively — the tool
+    result is what the turn is for, and an attachment is optional.
+    """
+    loop, _events = _make_loop("main")
+    results = [
+        ToolResult(
+            ok=True,
+            content="hit",
+            error="",
+            metadata={"attach_images": [{"media_type": "image/png", "data": "QUJDRA=="}]},
+        )
+    ]
+
+    out = loop._process_tool_results(
+        results=results,
+        prepared_calls=[{"tool": "read_image", "args": {"path": "x.png"}, "call_id": "c1"}],
+        new_messages=[],
+        write_tool_used=False,
+        reads_since_last_edit=0,
+        fail_streak={},
+        fail_streak_threshold=3,
+        session_key="sk",
+        write_tools=set(),
+        read_only_request=False,
+        request="look",
+        session_id="s1",
+        git_state=None,
+        turn_num=1,
+        turns=[],
+    )
+
+    # The tool result is what the turn is for: it is always first and always
+    # present. Anything appended after it is optional, and the image gate fails
+    # CLOSED when it cannot resolve the route (this host's model is a mock, so
+    # it cannot) — the pixels are never attached on a guess.
+    assert out.new_messages[0] == "<msg>"
+    assert all(getattr(m, "images", None) is None for m in out.new_messages[1:])
+
+
 def test_payload_agent_id_never_falls_back_to_constant():
     """The payload must read the config — not a hard-coded literal."""
     loop, events = _make_loop("lane_b")

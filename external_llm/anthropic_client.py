@@ -71,6 +71,76 @@ def _msg_field(msg: Any, is_dict: bool, name: str) -> Any:
     return msg.get(name) if is_dict else getattr(msg, name, None)
 
 
+def _image_block(img: Any) -> dict[str, Any]:
+    """One Anthropic image block from a provider-agnostic image dict.
+
+    Defensive ``.get()`` defaults because these dicts come from tool handlers,
+    not from ``image_utils`` — a malformed one must degrade to an empty part
+    rather than KeyError the whole request.
+    """
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": img.get("media_type", "image/png"),
+            "data": img.get("data", ""),
+        },
+    }
+
+
+def _ride_along_images(raw_blocks: Any, images: Any, role: str) -> Any:
+    """Native Anthropic blocks plus the IMAGES riding on them.
+
+    A message legitimately carries both: ``agent_loop._append_native_tool_messages``
+    folds a tool's images into the one user turn that already holds the
+    tool_result blocks, because Anthropic rejects two user turns in a row and a
+    role="tool" payload cannot carry a content-parts list.
+
+    The images are nested INSIDE the turn's last ``tool_result``, which is the
+    documented form ("Example of tool result with images" — ``tool_result.content``
+    accepts ``text``, ``image``, ``document`` and ``search_result`` blocks). The
+    alternative — extra sibling blocks after the tool results — is not documented
+    for images; the docs constrain only where TEXT may go ("tool_result blocks
+    must come FIRST ... any text must come AFTER all tool results"), and a
+    screenshot that 400s on its first call would cost the entire turn. Nesting
+    also matches how ``_append_native_tool_messages`` reads the pixels back: the
+    token estimator already counts image sub-blocks of a tool_result.
+
+    With several tool results in the turn, every attached image lands under the
+    last one. The mapping images→call is not recoverable at this layer, and it
+    does not need to be: the text note the transport wrote names the tool that
+    produced them, so nothing the model reads claims otherwise.
+
+    Only ``images`` is merged. The pre-existing rule — "raw_content is
+    authoritative, ``content`` is ignored" — is deliberately left intact: an
+    assistant turn's ``content`` mirrors text already inside its blocks (sending
+    both would double-bill it), and the fold's own text is already a block. The
+    merge is scoped to ``role == "user"`` and returns *raw_blocks* untouched
+    otherwise.
+    """
+    if role != "user" or not images:
+        return raw_blocks
+    blocks = list(raw_blocks or [])
+    image_blocks = [_image_block(img) for img in images]
+    last_result = None
+    for idx, block in enumerate(blocks):
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            last_result = idx
+    if last_result is None:
+        # No tool result to nest into (a plain image turn built elsewhere):
+        # images are ordinary user-turn content in that case.
+        return [*blocks, *image_blocks]
+    result_block = dict(blocks[last_result])
+    content = result_block.get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}] if content else []
+    elif not isinstance(content, list):
+        content = []
+    result_block["content"] = [*content, *image_blocks]
+    blocks[last_result] = result_block
+    return blocks
+
+
 def _is_always_thinking_glm(model: str) -> bool:
     """Return True for GLM models where extended thinking is always on.
 
@@ -642,8 +712,10 @@ class AnthropicClient(LLMClient):
                 raw_content = _msg_field(msg, _dict, "raw_content")
                 images = _msg_field(msg, _dict, "images")
                 if raw_content:
-                    # Preserve native Anthropic content blocks (tool_use / tool_result)
-                    api_messages.append({"role": _role, "content": raw_content})
+                    # Preserve native Anthropic content blocks (tool_use /
+                    # tool_result), then the images riding on them — a tool image
+                    # folded into this turn. See _ride_along_images.
+                    api_messages.append({"role": _role, "content": _ride_along_images(raw_content, images, _role)})
                 elif images:
                     # Multimodal: image blocks + text
                     content_blocks: list[dict[str, Any]] = []

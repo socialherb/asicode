@@ -63,6 +63,7 @@ from .agent_loop_types import (
 )
 from .config.thresholds import _env_flag, config
 from .context_budget import _resolve_context_limit
+from .image_transport import attachment_messages_for
 from .performance_metrics import get_global_collector
 from .tool_registry import ToolResult
 
@@ -1781,6 +1782,34 @@ class TurnPipelineMixin:
                     )
 
             new_messages.append(self._build_tool_result_message(call_id, tool_name, result, tool_args))
+
+            # A tool that produced pixels (a screenshot, a rendered chart) gets
+            # one synthetic user message right after its result — see
+            # image_transport for why it cannot ride on the role="tool" payload.
+            # Assembled from result.metadata, not from the message just built:
+            # _build_tool_result_message reads a COPY of the metadata, so the
+            # declaration is still here, while the pixels are already gone from
+            # the payload that becomes the model's JSON text.
+            #
+            # A route that cannot take images still gets a message — one that
+            # says the pixels were dropped rather than never produced, so the
+            # model does not describe an image it never saw.
+            # Every host attribute is read defensively: this mixin is composed
+            # into hosts that carry only some of the loop's surface (the turn
+            # pipeline tests build one with no `llm_client` at all), and a tool
+            # result must not fail over an attachment nobody asked for.
+            _llm_client = getattr(self, "llm_client", None)
+            new_messages.extend(
+                attachment_messages_for(
+                    tool_name,
+                    getattr(result, "metadata", None),
+                    # The host's live model, else the configured one: the vision
+                    # gate must see whichever the route will actually use.
+                    model=(getattr(self, "model", None) or getattr(getattr(self, "config", None), "model", "") or ""),
+                    base_url=getattr(_llm_client, "base_url", None),
+                    provider=(getattr(_llm_client, "get_provider_name", None) or (lambda: ""))(),
+                )
+            )
 
             # Read-only exploration tools. Counting these toward
             # reads_since_last_edit lets the GOAL REMINDER fire when the agent

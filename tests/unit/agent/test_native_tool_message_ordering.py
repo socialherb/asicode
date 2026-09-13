@@ -123,8 +123,94 @@ def test_gemini_warning_folded_keeps_user_turns_alternating():
     user_turns = [m for m in out if m.role == "user"]
     assert len(user_turns) == 1
     parts = user_turns[0].raw_content
-    assert any("functionResponse" in p for p in parts)
-    assert any(p.get("text", "").find("STRATEGY WARNING") >= 0 for p in parts), parts
+    # One part per function call. A sibling part — a bare text note beside the
+    # response — is a 400 on this turn (the parallel test below pins the count).
+    assert len(parts) == 1, parts
+    assert all("functionResponse" in p for p in parts), parts
+    # The warning rides INSIDE the response payload, after the tool output.
+    content = parts[0]["functionResponse"]["response"]["content"]
+    assert '{"ok": false}' in content, parts
+    assert "STRATEGY WARNING" in content, parts
+
+
+def test_gemini_parallel_calls_keep_one_response_part_each():
+    """Two calls → two parts, warning inside the LAST response.
+
+    The function-response turn must stay 1:1 with the function-call turn. The
+    old sibling {"text": ...} append grew the turn's part count, which is
+    exactly the 400 google's gemini-cli files upstream (#16135).
+    """
+    loop = _loop("google")
+    response = {
+        "content": "patching",
+        "raw": types.SimpleNamespace(
+            raw_response={
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"functionCall": {"name": "apply_patch", "args": {}}},
+                                {"functionCall": {"name": "read_file", "args": {}}},
+                            ]
+                        }
+                    }
+                ]
+            }
+        ),
+    }
+    tool_result_messages = [
+        _warn("[STRATEGY WARNING] switch approach"),
+        LLMMessage(role="tool", name="apply_patch", tool_call_id="a", content='{"ok": false}'),
+        LLMMessage(role="tool", name="read_file", tool_call_id="b", content="line1"),
+    ]
+
+    out = loop._append_native_tool_messages([], response, tool_result_messages)
+
+    user_turns = [m for m in out if m.role == "user"]
+    assert len(user_turns) == 1
+    parts = user_turns[0].raw_content
+    assert len(parts) == 2, parts  # one per call — the turn must not grow
+    assert [p["functionResponse"]["name"] for p in parts] == ["apply_patch", "read_file"]
+    assert "STRATEGY WARNING" not in parts[0]["functionResponse"]["response"]["content"]
+    assert "STRATEGY WARNING" in parts[-1]["functionResponse"]["response"]["content"], parts
+
+
+def test_gemini_warning_with_empty_tool_content_leaves_no_blank_prefix():
+    """An empty tool payload must not leave a leading blank line before the
+    warning; the response content is just the warning itself."""
+    loop = _loop("google")
+    response = {
+        "content": "patching",
+        "raw": types.SimpleNamespace(
+            raw_response={
+                "candidates": [{"content": {"parts": [{"functionCall": {"name": "apply_patch", "args": {}}}]}}]
+            }
+        ),
+    }
+    tool_result_messages = [
+        _warn("[STRATEGY WARNING] switch approach"),
+        LLMMessage(role="tool", name="apply_patch", tool_call_id="x", content=""),
+    ]
+
+    out = loop._append_native_tool_messages([], response, tool_result_messages)
+
+    parts = next(m for m in out if m.role == "user").raw_content
+    assert parts[0]["functionResponse"]["response"]["content"] == "[STRATEGY WARNING] switch approach"
+
+
+def test_gemini_warning_without_executed_results_stays_a_lone_text_part():
+    """With nothing executed there is no response to carry the warning; a
+    text-only user turn is the only remaining legal shape."""
+    loop = _loop("google")
+    response = {
+        "content": "",
+        "raw": types.SimpleNamespace(raw_response={"candidates": [{"content": {"parts": []}}]}),
+    }
+    out = loop._append_native_tool_messages([], response, [_warn("[STRATEGY WARNING] give up")])
+
+    user_turns = [m for m in out if m.role == "user"]
+    assert len(user_turns) == 1
+    assert user_turns[0].raw_content == [{"text": "[STRATEGY WARNING] give up"}]
 
 
 def test_no_warnings_is_unchanged_shape():

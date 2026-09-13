@@ -87,6 +87,11 @@ EXCLUDE_FILES = {
     "tests/unit/test_release_verify_mode.py",
     "tests/unit/test_release_egg_info_gate.py",
     "tests/unit/test_export_coupled_pattern.py",
+    # gitignored-.py release gate is a sibling of the family above: its
+    # `test_gate_passes_on_the_current_tree` calls tracked_files() (git
+    # ls-files), which fails in the non-git snapshot — the gitignored-file
+    # enumeration it tests only exists in a real git worktree.
+    "tests/unit/test_release_ignored_py_gate.py",
     # Fifth of the family: ghost-import gate enumerates tracked files via
     # `git ls-files` — meaningless in the non-git snapshot.
     "tests/unit/test_no_ghost_imports.py",
@@ -104,32 +109,36 @@ EXCLUDE_FILES = {
 # re-executed per invocation) so the memoized scan can key on it.
 FIRST_PARTY_PREFIXES = ("external_llm.", "webapp.")
 
-# A test file is excluded when it imports (or patches into) an excluded area.
+# A test file is excluded when its CODE reaches an excluded area — decided with
+# the AST (never regex over raw source), so docstrings, comments and test
+# fixtures cannot exclude a file that would actually run in the snapshot:
 #
-# The ``^\s*`` anchors matter: this repo imports lazily by convention, so an
-# excluded package is routinely reached from *inside* a test function, indented.
-# The anchors were previously ``^from``/``^import`` (column 0 only), which let
-# `tests/unit/agent/test_rollback_shared_tree.py` ship — it does
-# ``import webapp.routes.agent_stream`` inside `test_webapp_injects_file_lock_manager`,
-# and webapp/ does not exist in the public snapshot, so the test failed on a
-# fresh clone of the released repo.
-_COUPLED_TEST_PAT = re.compile(
-    r"(^\s*from webapp|^\s*import webapp\b|from webapp import|from webapp\."
-    r"|^\s*from tools|^\s*import tools\b|from tools import|from tools\."
-    # path-string loading of excluded dirs (importlib.spec_from_file_location,
-    # subprocess script invocations, Path joins that READ an excluded file):
-    # REPO / "tools" / "x.py", _R / "webapp" / "ui" / "ui.html" — any depth of
-    # quoted components, but the join must END in a quoted FILENAME (dot +
-    # extension). A bare quoted token after the slash also occurs in PROSE
-    # (omit "tools"/"tool_choice" keys), and the earlier form
-    # ["']tools["'] */ matched it — silently dropping two provider regression
-    # tests from the 0.2.24 snapshot (caught only as unexpected deletions in
-    # the pre-push release-delta review). Requiring the filename sibling keeps
-    # genuinely webapp-reading gates excluded on principle, not by accident.
+#   * import statements naming tools/webapp (incl. `from . import tools_x`, and
+#     function-level imports — this repo imports lazily by convention, so an
+#     excluded package is routinely reached from inside a test function);
+#   * a string literal (incl. f-string literal parts) that is a PATH JOIN
+#     ending in a quoted FILENAME (dot + extension) whose chain includes a
+#     tools/webapp component — the shapes that actually load excluded files at
+#     runtime (importlib.spec_from_file_location, subprocess script
+#     invocations, Path joins that READ an excluded file): REPO / "tools" /
+#     "x.py", _R / "webapp" / "ui" / "ui.html".
+#
+# Two failure modes motivated the AST form. (1) 0.2.24: the prose token
+# `omit "tools"/"tool_choice"` (comment text) silently dropped two provider
+# regression tests. (2) 0.2.32: docstring prose naming ``webapp/ui/ui_tools.py``
+# matched the pattern and dropped files whose runtime import graph is public
+# (test_bounded_subprocess.py, test_webapp_subprocess_gate.py,
+# test_tools_git_timeout_gate.py). Only WHAT THE FILE EXECUTES can break the
+# public snapshot, so only executable imports/path-joins classify a file.
+# Docstrings/comments are structurally excluded, and fixture DATA strings
+# (e.g. gitignored-file enumerations like "webapp/main.py") are not runtime
+# reach into webapp/, so those files ship.
+_EXCLUDED_PACKAGES = ("webapp", "tools")
+_PATH_JOIN_RE = re.compile(
+    r"(?:^|/|[\"'])(?:tools|webapp)/(?:[\w.-]+/)*[\w.-]+\.\w+"
     r"|[\"'](?:tools|webapp)[\"'] */ *(?:[\"'][\w.-]+[\"'] */ *)*[\"'][\w.-]+\.\w+[\"']"
-    r"|tools/[A-Za-z_]+\.py|webapp/[A-Za-z_]+\.py)",
-    re.M,
 )
+_FILENAME_RE = re.compile(r"[\w.-]+\.\w+")
 
 
 def tracked_files() -> list[str]:
@@ -154,6 +163,115 @@ def tracked_files() -> list[str]:
     return [p.decode("utf-8") for p in out.split(b"\0") if p]
 
 
+def _docstring_literal_ids(tree: ast.AST) -> set[int]:
+    """Object ids of the docstring string-const nodes in *tree*.
+
+    Docstrings are prose, not code: a filename token inside one must not
+    classify a file as coupled. ``ast.get_docstring`` is per-node, so walk all
+    docstring-bearing nodes (module/function/class) and collect the id()s of
+    their leading string constants.
+    """
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                ids.add(id(body[0].value))
+    return ids
+
+
+@cache
+def _coupled_test_src(src: str) -> bool:
+    """True when *src* (a tests/ .py file) executes a reach into webapp/tools.
+
+    AST-based (see the _EXCLUDED_PACKAGES block above for the rationale):
+    docstrings/comments are structurally ignored, so prose cannot exclude a
+    file; only executable import statements and runtime path-joins count.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False
+    # (1) import statements — `import tools.x`, `from tools.y import z`,
+    #     `from . import tools_z` (webapp/tools as a sibling import), and
+    #     function-level imports (this repo imports lazily; anchors at column 0
+    #     used to miss `import webapp...` inside a test body).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in _EXCLUDED_PACKAGES:
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in _EXCLUDED_PACKAGES:
+                return True
+            if not node.module:
+                for alias in node.names:
+                    if alias.name.split(".")[0] in _EXCLUDED_PACKAGES:
+                        return True
+    # (2) string literals (incl. f-string literal parts), but NOT docstrings.
+    #     A path join ending in a filename whose chain includes a tools/webapp
+    #     component is a runtime load (importlib.spec_from_file_location,
+    #     subprocess script invocation, Path join that READS an excluded file).
+    #     The 0.2.32 incident: docstring prose naming webapp/ui/ui_tools.py
+    #     matched the old regex and dropped files whose import graph is public.
+    skip = _docstring_literal_ids(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
+            if _PATH_JOIN_RE.search(node.value):
+                return True
+        elif isinstance(node, ast.JoinedStr):
+            # f-string PART constants: `f"{REPO}/webapp/{name}.py"` is a runtime
+            # join; the whole f-string is one JoinedStr node, so check parts.
+            for part in node.values:
+                if (
+                    isinstance(part, ast.Constant)
+                    and isinstance(part.value, str)
+                    and id(part) not in skip
+                    and _PATH_JOIN_RE.search(part.value)
+                ):
+                    return True
+    # (3) BinOp join chains — `REPO / "webapp" / "routes" / "agent_stream.py"`
+    #     (Path.__truediv__, ast.Div) and `"tools" + "/" + "x.py"` (plain
+    #     string concatenation, ast.Add). Both must end in a quoted FILENAME
+    #     and include a tools/webapp component. This repo reaches excluded
+    #     tools from tests as ``REPO / "tools" / "x.py"`` (the
+    #     importlib.spec_from_file_location shape) and webapp UI files as
+    #     ``REPO / "webapp" / "ui" / "ui.html"``. Docstrings can't appear here
+    #     (a docstring is a single Constant node, not a BinOp), so no skip set.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, (ast.Div, ast.Add))
+            and isinstance(node.right, ast.Constant)
+            and isinstance(node.right.value, str)
+        ):
+            # The OUTERMOST chain's right operand is the JOIN'S LEAF (the
+            # filename, e.g. ``agent_stream.py`` / ``x.py``); the left spine
+            # holds the directory components (``webapp``, ``routes``, ...)
+            # plus the base (``REPO`` or the first quoted component).
+            parts: list[str] = [node.right.value]
+            cur: ast.AST | None = node.left
+            while (
+                isinstance(cur, ast.BinOp)
+                and isinstance(cur.op, (ast.Div, ast.Add))
+                and isinstance(cur.right, ast.Constant)
+                and isinstance(cur.right.value, str)
+            ):
+                parts.append(cur.right.value)
+                cur = cur.left
+            if isinstance(cur, ast.Constant) and isinstance(cur.value, str):
+                parts.append(cur.value)
+            parts.reverse()
+            if parts and any(p in _EXCLUDED_PACKAGES for p in parts) and _FILENAME_RE.fullmatch(parts[-1]):
+                return True
+    return False
+
+
 def _base_exclusion(rel: str) -> str | None:
     """Exclusion by path rule or by the test's own imports (no fixture analysis).
 
@@ -170,7 +288,7 @@ def _base_exclusion(rel: str) -> str | None:
             src = (REPO / rel).read_text(encoding="utf-8")
         except OSError:
             return None
-        if _COUPLED_TEST_PAT.search(src):
+        if _coupled_test_src(src):
             return "coupled-test"
     return None
 

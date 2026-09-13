@@ -156,6 +156,28 @@ _TEXT_INLINE_MAX_BYTES = 64 * 1024
 _IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 
+def png_size(payload: bytes) -> tuple[int, int]:
+    """``(width, height)`` of a PNG, or ``(0, 0)`` when it is not one.
+
+    Read from the IHDR chunk (bytes 16..24, big-endian) rather than through an
+    image library: the question "how big is the picture the model was shown" is
+    asked on the tool path, where PIL is not a dependency. A malformed payload
+    degrades to (0, 0), which callers treat as "unknown" — never as a scale.
+
+    Bytes 16..24 assume the IHDR is the first chunk, which the PNG spec requires
+    ("IHDR ... shall appear first").
+    """
+    if len(payload) < 24 or payload[:8] != b"\x89PNG\r\n\x1a\n":
+        return (0, 0)
+    try:
+        return (
+            int.from_bytes(payload[16:20], "big"),
+            int.from_bytes(payload[20:24], "big"),
+        )
+    except Exception:  # pragma: no cover - int.from_bytes on a byte slice cannot raise
+        return (0, 0)
+
+
 def _read_text_inline(path) -> str | None:
     """Return a labelled text block for a small text file, or None.
 

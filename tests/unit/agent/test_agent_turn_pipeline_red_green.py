@@ -23,6 +23,7 @@ recovery ladder, cancellation/error handlers, and the eviction stub helpers.
 
 from __future__ import annotations
 
+import json
 import queue as queue_mod
 from collections import defaultdict
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from unittest import mock
 import pytest
 
 from external_llm.agent import agent_turn_pipeline as atp
+from external_llm.agent.agent_loop import AgentLoop
 from external_llm.agent.agent_loop_types import (
     AgentCancelled,
     AgentResult,
@@ -1195,6 +1197,89 @@ def _ptr(results, calls, loop=None, **kw):
         turns=[],
     )
     return out, loop, prepared
+
+
+# ── Tool-produced images (computer use): the attachment message ───────────────
+
+
+def _image_result(**meta_over):
+    """A tool result carrying pixels, as read_image / a screenshot tool emits."""
+    meta = {
+        "attach_images": [
+            {"media_type": "image/png", "data": "QUJDRA==", "caption": "shot.png"},
+        ]
+    }
+    meta.update(meta_over)
+    return ToolResult(ok=True, content="[Image OCR — shot.png]\nhi", metadata=meta)
+
+
+def test_ptr_appends_an_attachment_message_for_tool_images():
+    """The pixels must reach the model: a role="tool" payload cannot carry them,
+    so the turn gets one synthetic user message right after the result."""
+    loop = _ptr_loop()
+    loop.llm_client.base_url = ""
+    loop.model = "claude-sonnet-4-5"
+
+    out, loop, _ = _ptr([_image_result()], [("read_image", {"path": "shot.png"})], loop=loop)
+
+    roles = [m.role for m in out.new_messages]
+    assert roles == ["tool", "user"]
+    assert out.new_messages[1].images == [{"media_type": "image/png", "data": "QUJDRA==", "caption": "shot.png"}]
+
+
+def test_ptr_appends_no_attachment_message_without_images():
+    """The overwhelmingly common case must not gain a message."""
+    out, _loop, _ = _ptr([ToolResult(ok=True, content="ok")], [("read_file", {"path": "a.py"})])
+
+    assert [m.role for m in out.new_messages] == ["tool"]
+
+
+def test_ptr_explains_when_the_route_cannot_see_images():
+    """A text-only route is told the pixels were dropped — not served OCR as if
+    that were the whole answer."""
+    loop = _ptr_loop()
+    loop.llm_client.base_url = ""
+    loop.model = "deepseek-chat"
+
+    out, _loop, _ = _ptr([_image_result()], [("read_image", {"path": "shot.png"})], loop=loop)
+
+    attachment = out.new_messages[1]
+    assert attachment.role == "user"
+    assert attachment.images is None
+    assert "NOT attached" in attachment.content
+
+
+def test_ptr_offers_no_attachment_to_a_provider_that_cannot_carry_one():
+    """Gemini's function-response turn must equal the function-call count, so the
+    image is excluded at the source — the fold would otherwise mint a sibling
+    part out of the attachment note and hit the same 400."""
+    loop = _ptr_loop()
+    loop.llm_client.base_url = ""
+    loop.llm_client.get_provider_name.return_value = "google"
+    loop.model = "gemini-2.5-flash"
+
+    out, _loop, _ = _ptr([_image_result()], [("read_image", {"path": "shot.png"})], loop=loop)
+
+    assert [m.role for m in out.new_messages] == ["tool"]
+
+
+def test_ptr_payload_never_contains_the_pixels():
+    """The declaration is stripped from the message the model reads as text."""
+    loop = _ptr_loop()
+    loop.llm_client.base_url = ""
+    loop.model = "claude-sonnet-4-5"
+    # A REAL payload builder, not the mocked one: the strip happens there. The
+    # guidance helpers it delegates to live on AgentLoop (the mixin host in this
+    # harness alone does not carry them), so bind those too.
+    for _name in ("_append_write_plan_guidance", "_append_patch_retry_guidance", "_append_edit_warnings_guidance"):
+        setattr(loop, _name, getattr(AgentLoop, _name).__get__(loop))
+    loop._build_tool_result_message = AgentLoop._build_tool_result_message.__get__(loop)
+
+    out, _loop, _ = _ptr([_image_result()], [("read_image", {"path": "shot.png"})], loop=loop)
+
+    payload = json.loads(out.new_messages[0].content)
+    assert "attach_images" not in payload["metadata"]
+    assert "QUJDRA==" not in out.new_messages[0].content
 
 
 def test_ptr_cache_outcome_three_states():

@@ -766,7 +766,21 @@ class GoogleClient(LLMClient):
                 raw_content = getattr(msg, "raw_content", None)
                 images = getattr(msg, "images", None)
                 if raw_content:
-                    # Preserve native Gemini parts (functionCall / functionResponse)
+                    # Preserve native Gemini parts (functionCall / functionResponse).
+                    #
+                    # Deliberately NOT merged with `images`: Gemini requires the
+                    # number of function-response parts to EQUAL the number of
+                    # function-call parts ("Please ensure that the number of
+                    # function response parts is equal to the number of function
+                    # call parts of the function call turn" — 400
+                    # INVALID_ARGUMENT). An extra sibling part is therefore a
+                    # hard failure, which is how appending one is filed upstream
+                    # in google's own gemini-cli (issue #16135): for models
+                    # without multimodal function responses the client "must not
+                    # return sibling parts for tool responses". The supported
+                    # form nests the image INSIDE the functionResponse and is
+                    # Gemini-3+ only (see image_transport: tool images are not
+                    # offered to this provider yet).
                     contents.append({"role": role, "parts": raw_content})
                 elif images:
                     # Multimodal: inlineData parts + text
