@@ -1,0 +1,177 @@
+# P46-C probe -- ripgrep install recipe measurement (THROWAWAY: probe/* branch only)
+#
+# Compares the three candidates for the 4 install sites in the private tree
+# (lint.yml unit-tests + integration-tests, private-tests.yml, release.yml):
+#   A baseline : sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+#   B candidate: sudo apt-get install -y -qq ripgrep             (no update)
+#   C candidate: pinned release tarball + sha256 (14.1.1 x86_64-unknown-linux-musl)
+# Two independent runners per candidate; each timed step prints PROBE_*_ms
+# (epoch ms deltas) on top of the step-level API timings.
+
+name: probe-ripgrep
+
+on:
+  push:
+    branches: [probe/p46c-ripgrep]
+
+permissions:
+  contents: read
+
+env:
+  RG_VERSION: "14.1.1"
+  RG_TRIPLE: x86_64-unknown-linux-musl
+
+jobs:
+  a-baseline-1:
+    name: "A baseline update+install #1"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Image rg state
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "IMAGE_RG=$(command -v rg)"; rg --version | head -1
+          else
+            echo "IMAGE_RG=absent"
+          fi
+      - name: "A: apt-get update + install (timed)"
+        run: |
+          s=$(date +%s%3N); sudo apt-get update -qq; m=$(date +%s%3N)
+          sudo apt-get install -y -qq ripgrep; e=$(date +%s%3N)
+          echo "PROBE A_update_ms=$((m-s)) A_install_ms=$((e-m)) A_total_ms=$((e-s))"
+      - name: Verify
+        run: |
+          command -v rg
+          rg --version | head -1
+          apt-cache policy ripgrep | sed -n '1,4p'
+
+  a-baseline-2:
+    name: "A baseline update+install #2"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Image rg state
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "IMAGE_RG=$(command -v rg)"; rg --version | head -1
+          else
+            echo "IMAGE_RG=absent"
+          fi
+      - name: "A: apt-get update + install (timed)"
+        run: |
+          s=$(date +%s%3N); sudo apt-get update -qq; m=$(date +%s%3N)
+          sudo apt-get install -y -qq ripgrep; e=$(date +%s%3N)
+          echo "PROBE A_update_ms=$((m-s)) A_install_ms=$((e-m)) A_total_ms=$((e-s))"
+      - name: Verify
+        run: |
+          command -v rg
+          rg --version | head -1
+          apt-cache policy ripgrep | sed -n '1,4p'
+
+  b-no-update-1:
+    name: "B install without update #1"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Image rg state
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "IMAGE_RG=$(command -v rg)"; rg --version | head -1
+          else
+            echo "IMAGE_RG=absent"
+          fi
+      - name: "B: apt-get install only (timed)"
+        run: |
+          echo "apt lists index files: $(find /var/lib/apt/lists -name '*Packages*' 2>/dev/null | wc -l)"
+          s=$(date +%s%3N); sudo apt-get install -y -qq ripgrep; e=$(date +%s%3N)
+          echo "PROBE B_install_ms=$((e-s))"
+      - name: Verify
+        run: |
+          command -v rg
+          rg --version | head -1
+          apt-cache policy ripgrep | sed -n '1,4p'
+
+  b-no-update-2:
+    name: "B install without update #2"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Image rg state
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "IMAGE_RG=$(command -v rg)"; rg --version | head -1
+          else
+            echo "IMAGE_RG=absent"
+          fi
+      - name: "B: apt-get install only (timed)"
+        run: |
+          echo "apt lists index files: $(find /var/lib/apt/lists -name '*Packages*' 2>/dev/null | wc -l)"
+          s=$(date +%s%3N); sudo apt-get install -y -qq ripgrep; e=$(date +%s%3N)
+          echo "PROBE B_install_ms=$((e-s))"
+      - name: Verify
+        run: |
+          command -v rg
+          rg --version | head -1
+          apt-cache policy ripgrep | sed -n '1,4p'
+
+  c-tarball-1:
+    name: "C pinned tarball 14.1.1 musl #1"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Image rg state
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "IMAGE_RG=$(command -v rg)"; rg --version | head -1
+          else
+            echo "IMAGE_RG=absent"
+          fi
+      - name: "C: fetch + sha256 + extract (timed)"
+        run: |
+          base="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}"
+          cd /tmp
+          s=$(date +%s%3N)
+          curl -fsSLO "$base/ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz"
+          curl -fsSLO "$base/ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz.sha256"
+          m=$(date +%s%3N)
+          sha256sum -c "ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz.sha256"
+          sudo tar -xzf "ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz" -C /usr/local/bin --strip-components=1 "ripgrep-${RG_VERSION}-${RG_TRIPLE}/rg"
+          e=$(date +%s%3N)
+          du -h "ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz" | cut -f1 | sed 's/^/tarball size: /'
+          echo "PROBE C_fetch_ms=$((m-s)) C_verify_extract_ms=$((e-m)) C_total_ms=$((e-s))"
+      - name: Verify
+        run: |
+          command -v rg
+          ls -l /usr/local/bin/rg
+          rg --version | head -1
+
+  c-tarball-2:
+    name: "C pinned tarball 14.1.1 musl #2"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Image rg state
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "IMAGE_RG=$(command -v rg)"; rg --version | head -1
+          else
+            echo "IMAGE_RG=absent"
+          fi
+      - name: "C: fetch + sha256 + extract (timed)"
+        run: |
+          base="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}"
+          cd /tmp
+          s=$(date +%s%3N)
+          curl -fsSLO "$base/ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz"
+          curl -fsSLO "$base/ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz.sha256"
+          m=$(date +%s%3N)
+          sha256sum -c "ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz.sha256"
+          sudo tar -xzf "ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz" -C /usr/local/bin --strip-components=1 "ripgrep-${RG_VERSION}-${RG_TRIPLE}/rg"
+          e=$(date +%s%3N)
+          du -h "ripgrep-${RG_VERSION}-${RG_TRIPLE}.tar.gz" | cut -f1 | sed 's/^/tarball size: /'
+          echo "PROBE C_fetch_ms=$((m-s)) C_verify_extract_ms=$((e-m)) C_total_ms=$((e-s))"
+      - name: Verify
+        run: |
+          command -v rg
+          ls -l /usr/local/bin/rg
+          rg --version | head -1
