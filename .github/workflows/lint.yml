@@ -2,11 +2,107 @@ name: Lint + Unit tests (baseline-diff gates + full tests/unit)
 
 on:
   push:
-    branches: [main, rename/asicode]
+    # main only. `rename/asicode` was fast-forwarded into main on 2026-08-22
+    # (4926b8c56) and no longer exists on the remote -- a push could never
+    # fire that entry again, yet it read as a live workflow surface. Pinned
+    # by tests/unit/test_workflow_push_trigger_gate.py.
+    branches: [main]
   pull_request:
 
+# Cancel-superseded-runs backstop. Billed Actions minutes exist only on the
+# private mirror (the public repo's Actions are free); a newer run for THIS
+# workflow+ref makes an in-flight predecessor unreachable — nobody can still
+# act on its tree, so paying for it to finish buys no signal. Group axes:
+# `github.workflow` keeps this gate from cancelling private-tests.yml's run of
+# the same ref (groups are repository-scoped, not workflow-scoped), and
+# `github.ref` keeps one branch from cancelling another's. release.yml is
+# exempt on purpose (`cancel-in-progress: false` — a PyPI upload must queue,
+# never be killed mid-flight). Measured 2026-09-16: 1,814/2,000 included
+# minutes (90% alert), then 2,000/2,000 hours later, reset 2026-10-01, no
+# payment method — the 100% ceiling is a hard runner block, not a bill, and
+# once hit, new jobs stop STARTING until the reset (a probe dispatch failed in
+# 5s with "not started because recent account payments have failed"). The
+# lever left is not spending: this block cancels superseded runs, and the
+# main-push guard job under `jobs:` skips the heavy jobs when the pushed tree
+# was already validated by the PR run (see its comment).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # ── P46-A main-push guard (tree-reuse) ──────────────────────────────────────
+  # A main-push run for a squash merge re-runs a tree the PR run already gated:
+  # with the base an ancestor of the PR head, the merged commit's tree is
+  # byte-identical to the PR head tree — the same checks on the same bytes
+  # re-decide nothing while a main run costs ~24.9 billed minutes (lint 22.0 +
+  # private-tests 2.9; measured 2026-09-16). The guard costs ~2 and emits
+  # skip=true only when the pushed tree EQUALS the PR head tree and every
+  # required check name — folded to its LATEST attempt per name — is SUCCESS
+  # on the PR head's statusCheckRollup.
+  #
+  # Fail-open by construction: scripts/ci_main_push_guard.py prints skip=false
+  # on ANY other state (no ' (#N)' squash reference, tree mismatch, missing/
+  # failed/unfinished check, API error, timeout, exception, empty --required)
+  # and the job is continue-on-error, so even a guard crash reports
+  # needs.result=success and cannot block the heavy jobs. The dependent jobs'
+  # `!cancelled()` is load-bearing, not decoration — measured on a throwaway
+  # public branch 2026-09-16: a SKIPPED needs-job blocks a dependent whose if
+  # has no status function (the plain needs-outputs form fails CLOSED on every
+  # pull_request event), and on a concurrency supersede `!cancelled()`
+  # dependents never start while `always()` dependents strand `queued` after
+  # the cancel and keep holding the concurrency group.
+  #
+  # Tree-shape marker: the script probes the export-excluded
+  # tests/unit/test_sse_emit_consume_gate.py (the same marker idiom as the
+  # hashFiles() gates in this file) — absent in the public snapshot, where
+  # pushes are release snapshots with no PR gate to reuse, so the guard
+  # fail-opens there at zero cost. After changing the rule set, re-adjudicate
+  # history without CI: python3 scripts/ci_main_push_guard.py --replay \
+  #   --since <YYYY-MM-DD> --required <name> ...
+  #
+  # Branch-protection note: a guarded main push leaves the heavy jobs
+  # `skipped`, so they must NOT become required status checks on main.
+  guard:
+    name: main-push guard
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Real-run scope check under the SAME GH_TOKEN + permissions block:
+      # exercise the two token-scoped reads decide() depends on (the commit
+      # tree and `gh pr view --json statusCheckRollup`) so a scope gap shows
+      # up as an annotation instead of silently disabling the skip savings.
+      # Diagnostic only: continue-on-error + no step-output writes, so
+      # decide() and the dependent heavy jobs are unaffected either way.
+      - name: Probe workflow token scopes (real-run diagnostic)
+        id: probe-token
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_main_push_guard.py --probe-token
+
+      - name: Decide whether the PR gate already validated this exact tree
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci_main_push_guard.py \
+            --required "baseline-diff" \
+            --required "Unit tests (clean install)" \
+            --required "Integration tests (clean install)"
+
   baseline-diff:
+    needs: guard
+    if: ${{ !cancelled() && needs.guard.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,8 +137,14 @@ jobs:
       - name: Install ruff
         run: |
           python -m pip install --upgrade pip
-          # Pin to match the local developer ruff (see .pre-commit-config.yaml);
-          # baseline-diff results must be reproducible across local and CI.
+          # Must equal pyproject's `dev` extra pin — the version every other CI
+          # job gets by installing that extra — AND the local developer ruff;
+          # baseline-diff results have to be reproducible across local and CI,
+          # because a PATH-LESS `ruff format` scan lets ruff's own include set
+          # decide the SCOPE (>= 0.16 formats Python blocks inside Markdown).
+          # This job installs only `.[vulture]`, so no extra supplies the pin.
+          # tests/unit/test_ruff_pin_contract.py fails if this drifts from
+          # pyproject; scripts/check_ruff_pin.py guards the host binary.
           pip install ruff==0.15.21
 
       - name: Check no NEW F821 undefined names vs baseline
@@ -226,6 +328,10 @@ jobs:
         run: |
           python -m pip install -e ".[vulture]" --quiet
           python scripts/check_tree_sitter_core.py
+          # The other version-dependent tool this job executes: the gate scripts
+          # below shell out to `ruff` (check_lint_full.py), whose formatter
+          # SCOPE changed in 0.16. Same fail-closed shape as the core guard.
+          python scripts/check_ruff_pin.py
           python scripts/check_structural_scanners.py --gate-only
 
       - name: PLR2004 magic-value drift observation (report-only, never gates)
@@ -296,6 +402,8 @@ jobs:
   # webapp-coupled test exists, so the extra is inert-but-harmless. It is kept to
   # match release.yml's identical install command (SSOT for the gate surface).
   unit-tests:
+    needs: guard
+    if: ${{ !cancelled() && needs.guard.outputs.skip != 'true' }}
     name: Unit tests (clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -333,11 +441,24 @@ jobs:
           python-version: "3.12"
 
       - name: Install ripgrep
-        # Several read-path tests need rg; pinning its presence keeps the job
-        # deterministic instead of tracking whatever the runner image ships.
+        # ripgrep backs several read-path tests. The ubuntu-latest image does not
+        # ship it (actions/runner-images#12179, "Update/Add ripgrep", was closed),
+        # and the previous apt route (update + install) measured ~9-11s per job in
+        # the P46-C probe against ~0.5s for this checksum-verified release tarball,
+        # which also pins the exact version instead of tracking whatever the Ubuntu
+        # mirror serves. Keep every install site byte-identical;
+        # tests/unit/test_workflow_ripgrep_pin_gate.py enforces it.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ripgrep
+          cd /tmp
+          rg_version=14.1.1
+          rg_triple=x86_64-unknown-linux-musl
+          base="https://github.com/BurntSushi/ripgrep/releases/download/${rg_version}"
+          curl -fsSLO "$base/ripgrep-${rg_version}-${rg_triple}.tar.gz"
+          curl -fsSLO "$base/ripgrep-${rg_version}-${rg_triple}.tar.gz.sha256"
+          sha256sum -c "ripgrep-${rg_version}-${rg_triple}.tar.gz.sha256"
+          echo "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e  ripgrep-${rg_version}-${rg_triple}.tar.gz" | sha256sum -c -
+          sudo tar -xzf "ripgrep-${rg_version}-${rg_triple}.tar.gz" -C /usr/local/bin --strip-components=1 "ripgrep-${rg_version}-${rg_triple}/rg"
+          rg --version
 
       - name: Install package + test dependencies
         # [dev,webapp] — see the job comment above: the private full-tree
@@ -424,6 +545,8 @@ jobs:
   # (marker doc: deselected by default) and optional-dependency tests (numpy/faiss
   # vector cache) self-skip. Measured locally: 358 passed in ~3 min.
   integration-tests:
+    needs: guard
+    if: ${{ !cancelled() && needs.guard.outputs.skip != 'true' }}
     name: Integration tests (clean install)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -435,9 +558,24 @@ jobs:
           python-version: "3.12"
 
       - name: Install ripgrep
+        # ripgrep backs several read-path tests. The ubuntu-latest image does not
+        # ship it (actions/runner-images#12179, "Update/Add ripgrep", was closed),
+        # and the previous apt route (update + install) measured ~9-11s per job in
+        # the P46-C probe against ~0.5s for this checksum-verified release tarball,
+        # which also pins the exact version instead of tracking whatever the Ubuntu
+        # mirror serves. Keep every install site byte-identical;
+        # tests/unit/test_workflow_ripgrep_pin_gate.py enforces it.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ripgrep
+          cd /tmp
+          rg_version=14.1.1
+          rg_triple=x86_64-unknown-linux-musl
+          base="https://github.com/BurntSushi/ripgrep/releases/download/${rg_version}"
+          curl -fsSLO "$base/ripgrep-${rg_version}-${rg_triple}.tar.gz"
+          curl -fsSLO "$base/ripgrep-${rg_version}-${rg_triple}.tar.gz.sha256"
+          sha256sum -c "ripgrep-${rg_version}-${rg_triple}.tar.gz.sha256"
+          echo "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e  ripgrep-${rg_version}-${rg_triple}.tar.gz" | sha256sum -c -
+          sudo tar -xzf "ripgrep-${rg_version}-${rg_triple}.tar.gz" -C /usr/local/bin --strip-components=1 "ripgrep-${rg_version}-${rg_triple}/rg"
+          rg --version
 
       - name: Install package + test dependencies
         # webapp extra: the integration API tests exercise the FastAPI app.

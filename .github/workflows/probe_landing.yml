@@ -1,0 +1,47 @@
+# P46-C landing replay (THROWAWAY: probe/* branch only).
+# Executes the EXACT ripgrep install scripts as landed in this branch --
+# extracted from the checked-in workflow files by probe_extract.py (no
+# copy-paste), so the bytes executed here are the bytes that will land in the
+# private tree. Asserts the pinned version is what gets installed.
+name: probe-ripgrep-landing
+
+on:
+  push:
+    branches: [probe/p46c-landing]
+
+permissions:
+  contents: read
+
+jobs:
+  landing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract the install scripts from the workflow files
+        run: |
+          python -m pip install -q pyyaml
+          python probe_extract.py
+
+      - name: Execute every extracted script (as landed)
+        run: |
+          for f in /tmp/site_*.sh; do
+            echo "::group::RUN $f"
+            s=$(date +%s%3N)
+            bash -e "$f"
+            e=$(date +%s%3N)
+            echo "PROBE_LANDING script=$f total_ms=$((e-s))"
+            echo "::endgroup::"
+          done
+
+      - name: Assert rg is the pinned version
+        run: |
+          command -v rg
+          ls -l /usr/local/bin/rg
+          rg --version | head -1
+          rg --version | head -1 | grep -q "ripgrep 14.1.1" && echo "PROBE_LANDING version OK"

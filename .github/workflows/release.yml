@@ -64,22 +64,49 @@ jobs:
           python-version: "3.12"
 
       - name: Install ripgrep
+        # ripgrep backs several read-path tests. The ubuntu-latest image does not
+        # ship it (actions/runner-images#12179, "Update/Add ripgrep", was closed),
+        # and the previous apt route (update + install) measured ~9-11s per job in
+        # the P46-C probe against ~0.5s for this checksum-verified release tarball,
+        # which also pins the exact version instead of tracking whatever the Ubuntu
+        # mirror serves. Keep every install site byte-identical;
+        # tests/unit/test_workflow_ripgrep_pin_gate.py enforces it.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ripgrep
+          cd /tmp
+          rg_version=14.1.1
+          rg_triple=x86_64-unknown-linux-musl
+          base="https://github.com/BurntSushi/ripgrep/releases/download/${rg_version}"
+          curl -fsSLO "$base/ripgrep-${rg_version}-${rg_triple}.tar.gz"
+          curl -fsSLO "$base/ripgrep-${rg_version}-${rg_triple}.tar.gz.sha256"
+          sha256sum -c "ripgrep-${rg_version}-${rg_triple}.tar.gz.sha256"
+          echo "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e  ripgrep-${rg_version}-${rg_triple}.tar.gz" | sha256sum -c -
+          sudo tar -xzf "ripgrep-${rg_version}-${rg_triple}.tar.gz" -C /usr/local/bin --strip-components=1 "ripgrep-${rg_version}-${rg_triple}/rg"
+          rg --version
 
       - name: Install package + test dependencies
         run: |
           python -m pip install --upgrade pip
           # Pin ruff to match the local developer ruff AND lint.yml (see
-          # .pre-commit-config.yaml); the format gate in check_lint_full.py
-          # must see the same formatter as local development. Unpinned
-          # `ruff>=0.6` drifted to 0.16.4 on 2026-08-23, whose markdown
-          # formatter promoted preview → stable and flagged 3 docs/*.md files
-          # as drift, failing test_clean_repo_not_reported and blocking the
-          # v0.2.29 publish.
+          # .pre-commit-config.yaml). The pin is DECLARED in pyproject's `dev`
+          # extra (which `.[dev]` below installs) and repeated here + in
+          # lint.yml; the format gate in check_lint_full.py must see the same
+          # formatter as local development, because a PATH-LESS `ruff format`
+          # scan lets ruff's own include set decide the SCOPE: >= 0.16 formats
+          # Python blocks inside Markdown. Two measured incidents — unpinned
+          # `ruff>=0.6` drifted to 0.16.4 on 2026-08-23 (3 docs/*.md files
+          # flagged, blocking the v0.2.29 publish) and to 0.16.7 on 2026-09-14
+          # in lint.yml's unit job (PR #28: test_clean_repo_not_reported red
+          # while every pinned env was green). Sealed by
+          # tests/unit/test_ruff_pin_contract.py (the declarations) and
+          # scripts/check_ruff_pin.py (the host binary — step below).
           python -m pip install ruff==0.15.21
           python -m pip install -e '.[dev]'
+
+          # ruff pin env guard: the same surface argument as the core guard
+          # below — this clean-install test job is where an unpinned resolution
+          # showed up (PR #28), and the gate scripts execute whatever `ruff`
+          # $PATH resolves, not what pyproject declared.
+          python scripts/check_ruff_pin.py
 
           # tree-sitter core env guard: the exported-tree test job is the
           # clean-install surface closest to what ships — the core must be
