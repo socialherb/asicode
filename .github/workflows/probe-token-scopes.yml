@@ -1,0 +1,76 @@
+name: probe-token-scopes
+
+# Throwaway probe (P46 follow-up, 2026-09-16): measures what the guard job's
+# explicit `permissions:` block can read with the real GITHUB_TOKEN, using the
+# shipped probe mode of scripts/ci_main_push_guard.py. Differential jobs --
+# the shipped scope set, +statuses, +actions, and both -- so a failing rollup
+# read names the exact missing scope. Branch is deleted after the verdict.
+
+on:
+  push:
+    branches: ["probe/guard-token-scopes-20260916"]
+
+jobs:
+  shipped-scopes:
+    name: probe (contents+pull-requests+checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe workflow token scopes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_main_push_guard.py --probe-token
+
+  plus-statuses:
+    name: probe (+statuses)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe workflow token scopes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_main_push_guard.py --probe-token
+
+  plus-actions:
+    name: probe (+actions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe workflow token scopes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_main_push_guard.py --probe-token
+
+  plus-both:
+    name: probe (+statuses+actions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe workflow token scopes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_main_push_guard.py --probe-token
